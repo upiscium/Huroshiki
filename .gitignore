@@ -1,0 +1,12 @@
+/.direnv/
+/.packwiz-cache/
+**/dist/
+**/pack.local.yaml
+**/__pycache__/
+**/*.pyc
+*.mrpack
+*.zip
+
+# huroshiki transactions and state
+/.huroshiki/
+/.ruff_cache/
