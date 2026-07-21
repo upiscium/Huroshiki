@@ -1,0 +1,11 @@
+# Reusable MOD groups shared by all packs.
+#
+# Modrinth: project accepts a slug or project ID.
+# CurseForge: use the numeric project ID for reproducibility.
+# side must be client, server, or both.
+profiles:
+  base: []
+  client-performance: []
+  server-diagnostics: []
+  create: []
+  infection: []

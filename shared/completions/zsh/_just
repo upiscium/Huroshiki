@@ -1,0 +1,150 @@
+#compdef just
+
+_minecraft_modpack_root() {
+  local directory="$PWD"
+
+  while [[ "$directory" != "/" ]]; do
+    if [[ -f "$directory/Justfile" \
+       && -f "$directory/shared/scripts/packctl.py" \
+       && -d "$directory/packs" ]]; then
+      print -r -- "$directory"
+      return 0
+    fi
+    directory="${directory:h}"
+  done
+
+  return 1
+}
+
+_minecraft_modpack_candidates() {
+  local root="$1"
+  shift
+  command python "$root/shared/scripts/packctl.py" complete "$@" 2>/dev/null
+}
+
+_just() {
+  local root recipe selected_pack
+  local -a recipes packs templates sides metadata mods profiles
+
+  root="$(_minecraft_modpack_root)" || {
+    _message "not inside the Minecraft modpack monorepo"
+    return 1
+  }
+
+  selected_pack="${MODPACK-}"
+
+  if (( CURRENT == 2 )); then
+    recipes=(
+      ${(z)"$(
+        command just --justfile "$root/Justfile" --summary 2>/dev/null
+      )"}
+    )
+    _describe "recipe" recipes
+    return
+  fi
+
+  recipe="${words[2]}"
+
+  case "$recipe:$CURRENT" in
+    (use:3|show-for:3|tui-for:3|huroshiki-for:3|add-for:3|remove-for:3|side-for:3|profile-for:3|update-for:3|build-for:3|serve-for:3|deploy-for:3|restart-for:3|publish-for:3)
+      packs=("${(@f)$(_minecraft_modpack_candidates "$root" packs)}")
+      _describe "MODPACK" packs
+      return
+      ;;
+
+
+    (huroshiki-template:3|validate-template:3)
+      templates=("${(@f)$(_minecraft_modpack_candidates "$root" templates)}")
+      _describe "template project" templates
+      return
+      ;;
+
+    (add:4|side:4|add-for:5|side-for:5)
+      sides=(
+        "both:client and dedicated server"
+        "b:alias for both"
+        "client:client only"
+        "c:alias for client"
+        "server:dedicated server only"
+        "s:alias for server"
+      )
+      _describe "side" sides
+      return
+      ;;
+
+
+    (remove:3)
+      if [[ -n "$selected_pack" ]]; then
+        mods=(
+          "${(@f)$(
+            _minecraft_modpack_candidates "$root" mods "$selected_pack"
+          )}"
+        )
+        _describe "installed mod" mods
+      else
+        _message "enter a pack context with: just use <MODPACK>"
+      fi
+      return
+      ;;
+
+    (remove-for:4)
+      mods=(
+        "${(@f)$(
+          _minecraft_modpack_candidates "$root" mods "${words[3]}"
+        )}"
+      )
+      _describe "installed mod" mods
+      return
+      ;;
+
+    (side:3)
+      if [[ -n "$selected_pack" ]]; then
+        metadata=(
+          "${(@f)$(
+            _minecraft_modpack_candidates "$root" metadata "$selected_pack"
+          )}"
+        )
+        _describe "Packwiz metadata" metadata
+      else
+        _message "enter a pack context with: just use <MODPACK>"
+      fi
+      return
+      ;;
+
+    (side-for:4)
+      metadata=(
+        "${(@f)$(
+          _minecraft_modpack_candidates "$root" metadata "${words[3]}"
+        )}"
+      )
+      _describe "Packwiz metadata" metadata
+      return
+      ;;
+
+    (profile:3|profile:*)
+      if [[ -n "$selected_pack" ]]; then
+        profiles=(
+          "${(@f)$(
+            _minecraft_modpack_candidates "$root" profiles "$selected_pack"
+          )}"
+        )
+        _describe "profile" profiles
+      else
+        _message "enter a pack context with: just use <MODPACK>"
+      fi
+      return
+      ;;
+
+    (profile-for:4|profile-for:*)
+      profiles=(
+        "${(@f)$(
+          _minecraft_modpack_candidates "$root" profiles "${words[3]}"
+        )}"
+      )
+      _describe "profile" profiles
+      return
+      ;;
+  esac
+
+  _files
+}
