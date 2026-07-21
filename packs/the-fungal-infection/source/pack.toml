@@ -1,0 +1,13 @@
+name = "The fungal infection"
+author = "upiscium"
+version = "0.1.0"
+pack-format = "packwiz:1.1.0"
+
+[index]
+file = "index.toml"
+hash-format = "sha256"
+hash = "5668b0ac07b05e78d1aa3d14f7bf8170696288b4e2cd2b8f36f3a84e9dc4b300"
+
+[versions]
+minecraft = "1.21.1"
+neoforge = "21.1.234"
