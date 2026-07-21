@@ -1,0 +1,139 @@
+Screen {
+    layout: vertical;
+    background: $surface;
+}
+
+#screen-title {
+    height: 3;
+    padding: 1 2;
+    text-style: bold;
+    background: $primary;
+    color: $text;
+}
+
+Input {
+    margin: 1 2 0 2;
+}
+
+DataTable {
+    height: 1fr;
+    margin: 1 2;
+    border: round $primary;
+}
+
+#key-help {
+    height: 3;
+    padding: 1 2;
+    background: $panel;
+    color: $text-muted;
+}
+
+.section-label,
+#provider-label {
+    height: 2;
+    margin: 1 2 0 2;
+    padding: 0 1;
+    text-style: bold;
+}
+
+#project-actions-container,
+#update-container {
+    height: 1fr;
+    width: 100%;
+    align: center middle;
+}
+
+#project-actions,
+#update-options {
+    width: 46;
+    height: auto;
+    max-height: 14;
+}
+
+#update-message {
+    width: 60;
+    height: 3;
+    content-align: center middle;
+    text-style: bold;
+}
+
+ConfirmModal,
+MessageModal,
+NewPackModal,
+CreateFromTemplateModal,
+NewTemplateModal {
+    align: center middle;
+    background: $background 60%;
+}
+
+#modal-dialog {
+    width: 72;
+    height: auto;
+    max-height: 85%;
+    padding: 1 2;
+    border: thick $primary;
+    background: $surface;
+}
+
+#modal-dialog.wide-dialog {
+    width: 90;
+}
+
+#modal-dialog.form-dialog {
+    width: 78;
+}
+
+#modal-dialog Input {
+    margin: 0 0 1 0;
+}
+
+.modal-title {
+    height: 2;
+    text-style: bold;
+    color: $accent;
+}
+
+#modal-message {
+    height: auto;
+    max-height: 60vh;
+    overflow-y: auto;
+    padding: 1 0;
+}
+
+.modal-help {
+    height: 2;
+    margin-top: 1;
+    color: $text-muted;
+}
+
+#install-side-label,
+#packwiz-status {
+    height: 2;
+    margin: 0 2;
+    padding: 0 1;
+}
+
+#install-side-label {
+    text-style: bold;
+}
+
+#packwiz-status {
+    color: $text-muted;
+}
+
+#search-results-table {
+    height: 2fr;
+    min-height: 8;
+}
+
+#staged-table {
+    height: 1fr;
+    min-height: 7;
+}
+
+
+#template-editor {
+    height: 1fr;
+    margin: 1 2;
+    border: round $primary;
+}
