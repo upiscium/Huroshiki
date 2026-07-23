@@ -111,13 +111,8 @@ class ConfirmedDeployTest(unittest.TestCase):
             result = core.run_project_action("pack:demo", "deploy", self.preview())
 
         self.assertEqual(result, 0)
-        self.assertEqual(
-            run.call_args.args[0][-4:],
-            [
-                "--expected-target", "host:/demo",
-                "--expected-dist-digest", "digest",
-            ],
-        )
+        self.assertNotIn("--dry-run", run.call_args.args[0])
+        self.assertEqual(run.call_args.args[0][-1], "host:/demo/")
 
 
 if __name__ == "__main__":

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass, field
-import fcntl
 import hashlib
 import json
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -14,7 +15,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from typing import BinaryIO, Callable, Iterable
+from typing import Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
@@ -367,7 +368,7 @@ class PackTransaction:
     template_manifest: list[dict[str, str]] | None = None
     batches: list[TransactionBatch] = field(default_factory=list)
     active: bool = True
-    _state_lock: BinaryIO | None = field(default=None, init=False, repr=False)
+    _project_lock: packctl.ProjectLock | None = field(default=None, init=False, repr=False)
     _operation: PackwizAddOperation | None = field(default=None, init=False, repr=False)
     _lock: threading.RLock = field(
         default_factory=threading.RLock, init=False, repr=False
@@ -376,83 +377,83 @@ class PackTransaction:
     @classmethod
     def create(cls, project_key_value: str) -> "PackTransaction":
         kind, project_id = split_project_key(project_key_value)
-        real_root = project_root(project_key_value)
-
-        TRANSACTION_ROOT.mkdir(parents=True, exist_ok=True)
-        safe_prefix = project_key_value.replace(":", "-")
-        tx_root = Path(
-            tempfile.mkdtemp(
-                prefix=f"{safe_prefix}-",
-                dir=TRANSACTION_ROOT,
-            )
-        )
-        tx_source = tx_root / "source"
-        state_lock = (tx_root / ".lock").open("a+b")
-        fcntl.flock(state_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-        if kind == "pack":
-            real_source = real_root / "source"
-            if not real_source.is_dir():
-                raise HuroshikiError(
-                    f"Missing Packwiz source directory: {real_source}"
+        try:
+            project_lock = packctl.ProjectLock(
+                project_key_value, "transaction"
+            ).acquire()
+        except packctl.ConfigError as error:
+            raise HuroshikiError(str(error)) from error
+        tx_root: Path | None = None
+        try:
+            real_root = project_root(project_key_value)
+            TRANSACTION_ROOT.mkdir(parents=True, exist_ok=True)
+            safe_prefix = project_key_value.replace(":", "-")
+            tx_root = Path(
+                tempfile.mkdtemp(
+                    prefix=f"{safe_prefix}-",
+                    dir=TRANSACTION_ROOT,
                 )
-            shutil.copytree(real_source, tx_source, symlinks=True)
-            transaction = cls(
-                project_key=project_key_value,
-                root=tx_root,
-                source=tx_source,
-                baseline=metadata_digest_snapshot(tx_source),
-                baseline_contents=metadata_content_snapshot(tx_source),
-                real_source_baseline=tree_digest_snapshot(real_source),
             )
-            transaction._state_lock = state_lock
-            return transaction
+            tx_source = tx_root / "source"
 
-        config_path = real_root / "template.yaml"
-        config = packctl.load_template_config(project_id)
-        minecraft, loader, loader_version = packctl.template_versions(project_id)
-        create_resolver_source(
-            tx_source,
-            display_name=str(config.get("display_name", project_id)),
-            minecraft=minecraft,
-            loader=loader,
-            loader_version=loader_version,
-        )
-        transaction = cls(
-            project_key=project_key_value,
-            root=tx_root,
-            source=tx_source,
-            baseline={},
-            baseline_contents={},
-            template_config_baseline=file_digest(config_path),
-        )
-        transaction._state_lock = state_lock
-        return transaction
+            if kind == "pack":
+                real_source = real_root / "source"
+                if not real_source.is_dir():
+                    raise HuroshikiError(
+                        f"Missing Packwiz source directory: {real_source}"
+                    )
+                shutil.copytree(real_source, tx_source, symlinks=True)
+                transaction = cls(
+                    project_key=project_key_value,
+                    root=tx_root,
+                    source=tx_source,
+                    baseline=metadata_digest_snapshot(tx_source),
+                    baseline_contents=metadata_content_snapshot(tx_source),
+                    real_source_baseline=tree_digest_snapshot(real_source),
+                )
+            else:
+                config_path = real_root / "template.yaml"
+                config = packctl.load_template_config(project_id)
+                minecraft, loader, loader_version = packctl.template_versions(
+                    project_id
+                )
+                create_resolver_source(
+                    tx_source,
+                    display_name=str(config.get("display_name", project_id)),
+                    minecraft=minecraft,
+                    loader=loader,
+                    loader_version=loader_version,
+                )
+                transaction = cls(
+                    project_key=project_key_value,
+                    root=tx_root,
+                    source=tx_source,
+                    baseline={},
+                    baseline_contents={},
+                    template_config_baseline=file_digest(config_path),
+                )
+            transaction._project_lock = project_lock
+            return transaction
+        except BaseException:
+            if tx_root is not None:
+                shutil.rmtree(tx_root, ignore_errors=True)
+            project_lock.release()
+            raise
 
     def _finish_state(self) -> None:
         try:
             (self.root / ".completed").touch(exist_ok=True)
         except OSError:
             pass
-        if self._state_lock is not None:
-            try:
-                fcntl.flock(self._state_lock, fcntl.LOCK_UN)
-            finally:
-                self._state_lock.close()
-                self._state_lock = None
+        if self._project_lock is not None:
+            self._project_lock.release()
+            self._project_lock = None
 
     def __del__(self) -> None:
-        state_lock = getattr(self, "_state_lock", None)
-        if state_lock is not None:
-            try:
-                fcntl.flock(state_lock, fcntl.LOCK_UN)
-            except (OSError, ValueError):
-                pass
-            try:
-                state_lock.close()
-            except OSError:
-                pass
-            self._state_lock = None
+        project_lock = getattr(self, "_project_lock", None)
+        if project_lock is not None:
+            project_lock.release()
+            self._project_lock = None
 
     def ensure_active(self) -> None:
         if not self.active or not self.source.is_dir():
@@ -1368,25 +1369,29 @@ def create_template(
     target: str,
     relative_path: str,
 ) -> TemplateInfo:
-    normalized_target = normalize_template_target(target)
-    relative = normalize_template_relative_path(relative_path)
-    path = resolve_template_path(
-        project_key_value,
-        normalized_target,
-        relative,
-    )
-    if path.exists():
-        raise HuroshikiError(
-            f"Template file already exists: {normalized_target}/{relative}"
-        )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("", encoding="utf-8")
-    return TemplateInfo(
-        target=normalized_target,
-        relative_path=relative,
-        full_path=path,
-        size=0,
-    )
+    try:
+        with packctl.ProjectLock(project_key_value, "create template file"):
+            normalized_target = normalize_template_target(target)
+            relative = normalize_template_relative_path(relative_path)
+            path = resolve_template_path(
+                project_key_value,
+                normalized_target,
+                relative,
+            )
+            if path.exists():
+                raise HuroshikiError(
+                    f"Template file already exists: {normalized_target}/{relative}"
+                )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
+            return TemplateInfo(
+                target=normalized_target,
+                relative_path=relative,
+                full_path=path,
+                size=0,
+            )
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
 
 
 def read_template_text(
@@ -1415,16 +1420,20 @@ def write_template_text(
     relative_path: str | Path,
     text: str,
 ) -> None:
-    path = resolve_template_path(
-        project_key_value,
-        target,
-        relative_path,
-    )
-    if not path.is_file() or path.is_symlink():
-        raise HuroshikiError(f"Template file does not exist: {path}")
-    temporary = path.with_name(f".{path.name}.huroshiki-tmp")
-    temporary.write_text(text, encoding="utf-8")
-    temporary.replace(path)
+    try:
+        with packctl.ProjectLock(project_key_value, "write template file"):
+            path = resolve_template_path(
+                project_key_value,
+                target,
+                relative_path,
+            )
+            if not path.is_file() or path.is_symlink():
+                raise HuroshikiError(f"Template file does not exist: {path}")
+            temporary = path.with_name(f".{path.name}.huroshiki-tmp")
+            temporary.write_text(text, encoding="utf-8")
+            temporary.replace(path)
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
 
 
 def delete_template(
@@ -1432,23 +1441,27 @@ def delete_template(
     target: str,
     relative_path: str | Path,
 ) -> None:
-    base = template_base(project_key_value, target).resolve()
-    path = resolve_template_path(
-        project_key_value,
-        target,
-        relative_path,
-    )
-    if not path.is_file() or path.is_symlink():
-        raise HuroshikiError(f"Template file does not exist: {path}")
-    path.unlink()
+    try:
+        with packctl.ProjectLock(project_key_value, "delete template file"):
+            base = template_base(project_key_value, target).resolve()
+            path = resolve_template_path(
+                project_key_value,
+                target,
+                relative_path,
+            )
+            if not path.is_file() or path.is_symlink():
+                raise HuroshikiError(f"Template file does not exist: {path}")
+            path.unlink()
 
-    current = path.parent
-    while current != base and current.is_relative_to(base):
-        try:
-            current.rmdir()
-        except OSError:
-            break
-        current = current.parent
+            current = path.parent
+            while current != base and current.is_relative_to(base):
+                try:
+                    current.rmdir()
+                except OSError:
+                    break
+                current = current.parent
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
 
 
 def file_digest(path: Path) -> str:
@@ -1794,26 +1807,27 @@ def set_installed_mod_side(
     client: bool,
     server: bool,
 ) -> None:
-    kind, project_id = split_project_key(project_key_value)
-    side = side_from_flags(client, server)
-    if kind == "template":
-        mods = packctl.template_mods(project_id)
-        target = str(relative_path)
-        found = False
-        for entry in mods:
-            if str(template_mod_relative(entry["provider"], entry["project_id"])) == target:
-                entry["side"] = side
-                found = True
-                break
-        if not found:
-            raise HuroshikiError(f"Unknown template MOD: {relative_path}")
-        packctl.save_template_mods(project_id, mods)
-        return
-
-    source = project_source(project_key_value)
-    path = safe_child(source, relative_path)
     try:
-        packctl.set_side_and_refresh(source, path, side)
+        with packctl.ProjectLock(project_key_value, "side"):
+            kind, project_id = split_project_key(project_key_value)
+            side = side_from_flags(client, server)
+            if kind == "template":
+                mods = packctl.template_mods(project_id)
+                target = str(relative_path)
+                found = False
+                for entry in mods:
+                    if str(template_mod_relative(entry["provider"], entry["project_id"])) == target:
+                        entry["side"] = side
+                        found = True
+                        break
+                if not found:
+                    raise HuroshikiError(f"Unknown template MOD: {relative_path}")
+                packctl.save_template_mods(project_id, mods)
+                return
+
+            source = project_source(project_key_value)
+            path = safe_child(source, relative_path)
+            packctl.set_side_and_refresh(source, path, side)
     except packctl.ConfigError as error:
         raise HuroshikiError(str(error)) from error
 
@@ -1840,6 +1854,7 @@ def create_project(
     minecraft: str,
     loader: str,
     loader_version: str,
+    lock_held: bool = False,
 ) -> int:
     if kind == "pack":
         command_name = "new"
@@ -1847,17 +1862,23 @@ def create_project(
         command_name = "new-template"
     else:
         raise HuroshikiError(f"Unsupported project kind: {kind}")
-    command = [
-        sys.executable,
-        str(SCRIPTS / "packctl.py"),
-        command_name,
-        project_id,
-        display_name,
-        minecraft,
-        loader,
-        loader_version,
-    ]
-    return subprocess.run(command, cwd=ROOT, text=True, check=False).returncode
+    args = argparse.Namespace(
+        **{
+            "pack" if kind == "pack" else "template": project_id,
+            "display_name": display_name,
+            "minecraft": minecraft,
+            "loader": loader,
+            "loader_version": loader_version,
+        }
+    )
+    create = packctl._new_pack if command_name == "new" else packctl._new_template
+    if lock_held:
+        return create(args)
+    try:
+        with packctl.ProjectLock(project_key(kind, project_id), "create project"):
+            return create(args)
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
 
 
 def delete_project(project_key_value: str) -> packctl.TrashEntry:
@@ -1934,25 +1955,27 @@ def prepare_deploy_preview(
     kind, project_id = split_project_key(project_key_value)
     if kind != "pack" or action not in {"deploy", "publish"}:
         raise HuroshikiError(f"Deploy preview is not available for {action}")
-    ctl = [sys.executable, str(SCRIPTS / "packctl.py")]
-    result = subprocess.run(
-        ctl + ["build", project_id], cwd=ROOT, text=True, check=False
-    )
-    if result.returncode != 0:
-        raise HuroshikiError("Build failed; deploy preview was not created")
-    preview = packctl.deploy_preview(project_id)
-    restart_target = (
-        packctl.minecraft_server_target(project_id) if action == "publish" else None
-    )
-    return ProjectDeployPreview(
-        project_key_value,
-        action,
-        preview.target,
-        preview.dist_digest,
-        preview.changes,
-        preview.raw_lines,
-        restart_target,
-    )
+    try:
+        with packctl.ProjectLock(project_key_value, f"{action} preview"):
+            if packctl._build_pack(project_id) != 0:
+                raise HuroshikiError("Build failed; deploy preview was not created")
+            preview = packctl._deploy_preview(project_id)
+            restart_target = (
+                packctl.minecraft_server_target(project_id)
+                if action == "publish"
+                else None
+            )
+            return ProjectDeployPreview(
+                project_key_value,
+                action,
+                preview.target,
+                preview.dist_digest,
+                preview.changes,
+                preview.raw_lines,
+                restart_target,
+            )
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
 
 
 def run_project_action(
@@ -1976,60 +1999,54 @@ def run_project_action(
             check=False,
         ).returncode
 
+    if action not in {"build", "deploy", "restart", "publish"}:
+        raise HuroshikiError(f"Unknown project action: {action}")
     deploy_confirmation = (
         confirmation if isinstance(confirmation, ProjectDeployPreview) else None
     )
-    deploy_command = ctl + ["deploy", project_id]
-    if deploy_confirmation is not None:
-        deploy_command.extend(
-            (
-                "--expected-target",
-                deploy_confirmation.target,
-                "--expected-dist-digest",
-                deploy_confirmation.dist_digest,
-            )
-        )
-    commands: dict[str, list[tuple[list[str], bool]]] = {
-        "build": [(ctl + ["build", project_id], False)],
-        "deploy": [(deploy_command, True)],
-        "restart": [(ctl + ["restart", project_id], True)],
-        "publish": [
-            (deploy_command, True),
-            (ctl + ["restart", project_id], True),
-        ],
-    }
     try:
-        selected = commands[action]
-    except KeyError as error:
-        raise HuroshikiError(f"Unknown project action: {action}") from error
-
-    for command, remote in selected:
-        if action in {"deploy", "publish"} and remote:
-            if (
-                deploy_confirmation is None
-                or deploy_confirmation.project_key != project_key_value
-                or deploy_confirmation.action != action
-                or packctl.distribution_target(project_id)
-                != deploy_confirmation.target
-                or packctl.distribution_digest(packctl.distribution_root(project_id))
-                != deploy_confirmation.dist_digest
-                or (
-                    action == "publish"
-                    and packctl.minecraft_server_target(project_id)
-                    != deploy_confirmation.restart_target
+        with packctl.ProjectLock(project_key_value, action):
+            if action in {"deploy", "publish"}:
+                if (
+                    deploy_confirmation is None
+                    or deploy_confirmation.project_key != project_key_value
+                    or deploy_confirmation.action != action
+                    or packctl.distribution_target(project_id)
+                    != deploy_confirmation.target
+                    or packctl.distribution_digest(packctl.distribution_root(project_id))
+                    != deploy_confirmation.dist_digest
+                    or (
+                        action == "publish"
+                        and packctl.minecraft_server_target(project_id)
+                        != deploy_confirmation.restart_target
+                    )
+                ):
+                    raise HuroshikiError(
+                        "Deploy target or distribution changed after preview; action aborted"
+                    )
+                result = packctl._deploy_pack(
+                    project_id,
+                    expected_target=deploy_confirmation.target,
+                    expected_dist_digest=deploy_confirmation.dist_digest,
                 )
-            ):
+                if result != 0 or action == "deploy":
+                    return result
+            elif action == "build":
+                return packctl._build_pack(project_id)
+            elif project_action_confirmation(project_key_value, action) != confirmation:
                 raise HuroshikiError(
-                    "Deploy target or distribution changed after preview; action aborted"
+                    "Remote configuration changed after confirmation; action aborted"
                 )
-        elif remote and project_action_confirmation(project_key_value, action) != confirmation:
-            raise HuroshikiError(
-                "Remote configuration changed after confirmation; action aborted"
+
+            host, stack, service = packctl.minecraft_server_target(project_id)
+            remote = (
+                f"cd {shlex.quote(stack)} && docker compose restart "
+                f"{shlex.quote(service)}"
             )
-        result = subprocess.run(command, cwd=ROOT, text=True, check=False)
-        if result.returncode != 0:
-            return result.returncode
-    return 0
+            packctl.run(["ssh", host, remote])
+            return 0
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
 
 
 def update_all(project_key_value: str) -> int:
@@ -2103,7 +2120,7 @@ def find_installed_provider_mod(
     return None
 
 
-def create_pack_from_template(
+def _create_pack_from_template(
     *,
     template_id: str,
     project_id: str,
@@ -2129,6 +2146,7 @@ def create_pack_from_template(
         minecraft,
         loader,
         loader_version,
+        False,
     )
     if result != 0:
         raise HuroshikiError("Failed to create the destination MODPACK")
@@ -2241,3 +2259,24 @@ def create_pack_from_template(
                     f"{rollback_error}"
                 ) from error
         raise
+
+
+def create_pack_from_template(
+    *,
+    template_id: str,
+    project_id: str,
+    display_name: str,
+    minecraft: str,
+    loader: str,
+    loader_version: str,
+) -> TemplateCreationReport:
+    pack_key = project_key("pack", project_id)
+    with packctl.ProjectLock(pack_key, "create project"):
+        return _create_pack_from_template(
+            template_id=template_id,
+            project_id=project_id,
+            display_name=display_name,
+            minecraft=minecraft,
+            loader=loader,
+            loader_version=loader_version,
+        )

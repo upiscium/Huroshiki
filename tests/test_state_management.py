@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
-import fcntl
 import os
 from pathlib import Path
 import tempfile
@@ -125,21 +124,19 @@ class StateManagementTest(unittest.TestCase):
 
     def test_apply_removes_inactive_state_but_protects_active_lock(self) -> None:
         transactions = self.state / "transactions"
-        inactive = transactions / "pack-demo-inactive"
+        inactive = transactions / "pack-other-inactive"
         active = transactions / "pack-demo-active"
         inactive.mkdir(parents=True)
         active.mkdir()
         (inactive / ".completed").touch()
-        lock_path = active / ".lock"
-        lock = lock_path.open("a+b")
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        project_lock = packctl.ProjectLock("pack:demo", "transaction").acquire()
+        lock_path = project_lock.path
         global_lock = self.state / "manager.lock"
         global_lock.touch()
         try:
             report = packctl.clean_state(apply=True, older_than_days=0)
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
-            lock.close()
+            project_lock.release()
 
         self.assertFalse(inactive.exists())
         self.assertTrue(active.exists())

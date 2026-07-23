@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
@@ -58,6 +58,162 @@ LOADER_FLAGS = {
 
 class ConfigError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ProjectLockMetadata:
+    pid: int
+    process_start: str | None
+    operation: str
+    project_key: str
+    acquired_at: str
+
+
+def process_start_identity(pid: int) -> str | None:
+    """Return Linux's process start tick, which remains stable across PID reuse."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = stat[stat.rfind(")") + 2 :].split()
+        return fields[19]
+    except (IndexError, OSError, UnicodeError):
+        return None
+
+
+def _project_lock_root(project_key: str) -> Path:
+    kind, separator, project_id = project_key.partition(":")
+    if not separator:
+        raise ConfigError("Project key must be pack:<id> or template:<id>")
+    get_project_root(kind, project_id, must_exist=False)
+    projects = PACKS if kind == "pack" else TEMPLATES
+    return projects.parent / ".huroshiki" / "locks"
+
+
+def project_lock_path(project_key: str) -> Path:
+    kind, _, project_id = project_key.partition(":")
+    return _project_lock_root(project_key) / f"{kind}-{project_id}.lock"
+
+
+def _read_lock_metadata(handle: BinaryIO) -> ProjectLockMetadata | None:
+    try:
+        handle.seek(0)
+        value = json.loads(handle.read().decode("utf-8"))
+        return ProjectLockMetadata(
+            pid=int(value["pid"]),
+            process_start=(
+                str(value["process_start"])
+                if value.get("process_start") is not None
+                else None
+            ),
+            operation=str(value["operation"]),
+            project_key=str(value["project_key"]),
+            acquired_at=str(value["acquired_at"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, UnicodeError):
+        return None
+
+
+def _format_lock_owner(metadata: ProjectLockMetadata | None) -> str:
+    if metadata is None:
+        return "owner metadata is unavailable"
+    start = metadata.process_start or "unavailable"
+    return (
+        f"PID {metadata.pid}, process start {start}, operation "
+        f"{metadata.operation!r}, project {metadata.project_key}, acquired "
+        f"{metadata.acquired_at}"
+    )
+
+
+class ProjectLock:
+    """One non-reentrant, process-level advisory lock for a project."""
+
+    def __init__(self, project_key: str, operation: str) -> None:
+        self.project_key = project_key
+        self.operation = operation
+        self._handle: BinaryIO | None = None
+        self.path = project_lock_path(project_key)
+        self.metadata: ProjectLockMetadata | None = None
+
+    def acquire(self) -> "ProjectLock":
+        if self._handle is not None:
+            raise ConfigError(f"Project lock is already held: {self.project_key}")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.parent.is_symlink() or self.path.is_symlink():
+            raise ConfigError(f"Unsafe project lock path: {self.path}")
+        handle = self.path.open("a+b")
+        try:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                owner = _read_lock_metadata(handle)
+                raise ConfigError(
+                    f"Project is locked: {self.project_key} ({_format_lock_owner(owner)})"
+                ) from error
+            metadata = ProjectLockMetadata(
+                pid=os.getpid(),
+                process_start=process_start_identity(os.getpid()),
+                operation=self.operation,
+                project_key=self.project_key,
+                acquired_at=datetime.now(timezone.utc).isoformat(),
+            )
+            handle.seek(0)
+            handle.truncate()
+            handle.write(
+                (json.dumps(metadata.__dict__, sort_keys=True) + "\n").encode("utf-8")
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+            self.metadata = metadata
+            self._handle = handle
+            return self
+        except BaseException:
+            handle.close()
+            raise
+
+    def release(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        self._handle = None
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+    def __enter__(self) -> "ProjectLock":
+        return self.acquire()
+
+    def __exit__(self, *_: object) -> None:
+        self.release()
+
+    def __del__(self) -> None:
+        try:
+            self.release()
+        except (OSError, ValueError):
+            pass
+
+
+def _inspect_lock_path(path: Path) -> tuple[bool, ProjectLockMetadata | None]:
+    if not path.is_file() or path.is_symlink():
+        return False, None
+    with path.open("a+b") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True, _read_lock_metadata(handle)
+        finally:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    return False, None
+
+
+def active_project_lock(project_key: str) -> ProjectLockMetadata | None:
+    return _inspect_lock_path(project_lock_path(project_key))[1]
+
+
+def project_lock_is_active(project_key: str) -> bool:
+    return _inspect_lock_path(project_lock_path(project_key))[0]
 
 
 DEFAULT_RETENTION_DAYS = {
@@ -321,7 +477,7 @@ def list_trash() -> list[TrashEntry]:
     return sorted(entries, key=lambda item: item.created_at, reverse=True)
 
 
-def trash_project(kind: str, project_id: str) -> TrashEntry:
+def _trash_project(kind: str, project_id: str) -> TrashEntry:
     source = get_project_root(kind, project_id)
     TRASH_ROOT.mkdir(parents=True, exist_ok=True)
     if TRASH_ROOT.is_symlink() or source.stat().st_dev != TRASH_ROOT.stat().st_dev:
@@ -334,7 +490,12 @@ def trash_project(kind: str, project_id: str) -> TrashEntry:
     return parse_trash_entry(destination)
 
 
-def restore_trash(name: str) -> Path:
+def trash_project(kind: str, project_id: str) -> TrashEntry:
+    with ProjectLock(f"{kind}:{project_id}", "delete project"):
+        return _trash_project(kind, project_id)
+
+
+def _restore_trash(name: str) -> Path:
     entry = parse_trash_entry(_direct_state_child(TRASH_ROOT, name))
     destination = get_project_root(entry.kind, entry.project_id, must_exist=False)
     if destination.exists() or destination.is_symlink():
@@ -343,6 +504,12 @@ def restore_trash(name: str) -> Path:
         raise ConfigError("Project restore must stay on the same filesystem")
     entry.path.rename(destination)
     return destination
+
+
+def restore_trash(name: str) -> Path:
+    entry = parse_trash_entry(_direct_state_child(TRASH_ROOT, name))
+    with ProjectLock(entry.project_key, "restore project"):
+        return _restore_trash(name)
 
 
 def purge_trash(
@@ -377,7 +544,8 @@ def purge_trash(
         raise ConfigError(f"Unknown or filtered trash entry: {name}")
     total = sum(entry.bytes for entry in selected)
     for entry in selected:
-        shutil.rmtree(entry.path)
+        with ProjectLock(entry.project_key, "purge trash"):
+            shutil.rmtree(entry.path)
     return len(selected), total
 
 
@@ -730,12 +898,13 @@ def cmd_add(args: argparse.Namespace) -> int:
         selector = args.query
 
     print(f"Using Packwiz {provider} search/install.")
-    return install_and_classify(
-        args.pack,
-        provider,
-        selector,
-        args.side,
-    )
+    with ProjectLock(f"pack:{args.pack}", "add"):
+        return install_and_classify(
+            args.pack,
+            provider,
+            selector,
+            args.side,
+        )
 
 
 ACTIVE_PACK_ENV = "MODPACK"
@@ -869,7 +1038,7 @@ def init_packwiz_project(
     )
 
 
-def cmd_new(args: argparse.Namespace) -> int:
+def _new_pack(args: argparse.Namespace) -> int:
     root = get_pack_root(args.pack, must_exist=False)
     if root.exists():
         raise ConfigError(f"Pack already exists: {args.pack}")
@@ -905,7 +1074,12 @@ def cmd_new(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_new_template(args: argparse.Namespace) -> int:
+def cmd_new(args: argparse.Namespace) -> int:
+    with ProjectLock(f"pack:{args.pack}", "create project"):
+        return _new_pack(args)
+
+
+def _new_template(args: argparse.Namespace) -> int:
     root = get_template_root(args.template, must_exist=False)
     if root.exists():
         raise ConfigError(f"Template already exists: {args.template}")
@@ -931,14 +1105,20 @@ def cmd_new_template(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_new_template(args: argparse.Namespace) -> int:
+    with ProjectLock(f"template:{args.template}", "create project"):
+        return _new_template(args)
+
+
 def cmd_migrate_template(args: argparse.Namespace) -> int:
-    root = get_template_root(args.template)
-    config = load_template_config(args.template)
-    config_path = root / "template.yaml"
-    config_path.write_text(
-        yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
-    )
+    with ProjectLock(f"template:{args.template}", "migrate template"):
+        root = get_template_root(args.template)
+        config = load_template_config(args.template)
+        config_path = root / "template.yaml"
+        config_path.write_text(
+            yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
     print(
         f"Migrated templates/{args.template}/template.yaml to MOD-list format; "
         "legacy source/ files were left untouched"
@@ -970,14 +1150,15 @@ def cmd_update(args: argparse.Namespace) -> int:
 
 
 def cmd_side(args: argparse.Namespace) -> int:
-    side = normalize_side(args.side)
-    source = (get_pack_root(args.pack) / "source").resolve()
-    target = (source / args.metadata_file).resolve()
-    if source not in target.parents:
-        raise ConfigError("Metadata path escaped source/")
-    if not target.is_file() or not target.name.endswith(".pw.toml"):
-        raise ConfigError(f"Metadata file not found: {target}")
-    set_side_and_refresh(source, target, side)
+    with ProjectLock(f"pack:{args.pack}", "side"):
+        side = normalize_side(args.side)
+        source = (get_pack_root(args.pack) / "source").resolve()
+        target = (source / args.metadata_file).resolve()
+        if source not in target.parents:
+            raise ConfigError("Metadata path escaped source/")
+        if not target.is_file() or not target.name.endswith(".pw.toml"):
+            raise ConfigError(f"Metadata file not found: {target}")
+        set_side_and_refresh(source, target, side)
     print(f"{args.pack}/{target.relative_to(source)}: side = {side}")
     return 0
 
@@ -1070,28 +1251,29 @@ def apply_profile_entry(source: Path, entry: dict[str, Any]) -> None:
 
 
 def cmd_profile(args: argparse.Namespace) -> int:
-    root = get_pack_root(args.pack)
-    profiles = merge(
-        load_yaml(SHARED / "profiles.yaml"),
-        load_yaml(root / "profiles.yaml"),
-    ).get("profiles", {})
-    if not isinstance(profiles, dict):
-        raise ConfigError("Merged profiles must be a mapping")
-    source = root / "source"
-    for name in args.names:
-        if name not in profiles:
-            raise ConfigError(
-                f"Unknown profile {name!r}; available: {', '.join(sorted(profiles))}"
-            )
-        entries = profiles[name] or []
-        if not isinstance(entries, list):
-            raise ConfigError(f"Profile {name!r} must be a list")
-        print(f"== Applying {name} to {args.pack} ==")
-        for entry in entries:
-            if not isinstance(entry, dict):
-                raise ConfigError(f"Invalid profile entry: {entry!r}")
-            apply_profile_entry(source, entry)
-    run(["packwiz", "refresh"], cwd=source)
+    with ProjectLock(f"pack:{args.pack}", "profile"):
+        root = get_pack_root(args.pack)
+        profiles = merge(
+            load_yaml(SHARED / "profiles.yaml"),
+            load_yaml(root / "profiles.yaml"),
+        ).get("profiles", {})
+        if not isinstance(profiles, dict):
+            raise ConfigError("Merged profiles must be a mapping")
+        source = root / "source"
+        for name in args.names:
+            if name not in profiles:
+                raise ConfigError(
+                    f"Unknown profile {name!r}; available: {', '.join(sorted(profiles))}"
+                )
+            entries = profiles[name] or []
+            if not isinstance(entries, list):
+                raise ConfigError(f"Profile {name!r} must be a list")
+            print(f"== Applying {name} to {args.pack} ==")
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ConfigError(f"Invalid profile entry: {entry!r}")
+                apply_profile_entry(source, entry)
+        run(["packwiz", "refresh"], cwd=source)
     return 0
 
 
@@ -1450,7 +1632,7 @@ def build_target(
             shutil.rmtree(workspace, ignore_errors=True)
 
 
-def build_pack(pack_id: str) -> int:
+def _build_pack(pack_id: str) -> int:
     root = get_pack_root(pack_id)
     for required in (root / "source" / "pack.toml", root / "source" / "index.toml"):
         if not required.is_file():
@@ -1486,6 +1668,11 @@ def build_pack(pack_id: str) -> int:
             shutil.rmtree(workspace, ignore_errors=True)
     print(f"Built {pack_id}: packs/{pack_id}/dist/client and server")
     return 0
+
+
+def build_pack(pack_id: str) -> int:
+    with ProjectLock(f"pack:{pack_id}", "build"):
+        return _build_pack(pack_id)
 
 
 def cmd_build(args: argparse.Namespace) -> int:
@@ -1596,7 +1783,7 @@ def parse_rsync_changes(output: str) -> tuple[RsyncChange, ...]:
     return tuple(changes)
 
 
-def deploy_preview(pack_id: str) -> DeployPreview:
+def _deploy_preview(pack_id: str) -> DeployPreview:
     dist = distribution_root(pack_id)
     target = distribution_target(pack_id)
     before = distribution_digest(dist)
@@ -1611,6 +1798,13 @@ def deploy_preview(pack_id: str) -> DeployPreview:
         raise ConfigError("Deploy target or distribution changed during preview")
     raw_lines = tuple(line for line in result.stdout.splitlines() if line.strip())
     return DeployPreview(target, before, parse_rsync_changes(result.stdout), raw_lines)
+
+
+def deploy_preview(pack_id: str, *, build: bool = False) -> DeployPreview:
+    with ProjectLock(f"pack:{pack_id}", "deploy preview"):
+        if build and _build_pack(pack_id) != 0:
+            raise ConfigError("Build failed; deploy preview was not created")
+        return _deploy_preview(pack_id)
 
 
 def print_deploy_preview(pack_id: str, preview: DeployPreview) -> None:
@@ -1635,14 +1829,14 @@ def minecraft_server_target(pack_id: str) -> tuple[str, str, str]:
     )
 
 
-def deploy_pack(
+def _deploy_pack(
     pack_id: str,
     *,
     build: bool = False,
     expected_target: str | None = None,
     expected_dist_digest: str | None = None,
 ) -> int:
-    if build and build_pack(pack_id) != 0:
+    if build and _build_pack(pack_id) != 0:
         return 1
     target = distribution_target(pack_id)
     dist = distribution_root(pack_id)
@@ -1658,16 +1852,33 @@ def deploy_pack(
     return 0
 
 
+def deploy_pack(
+    pack_id: str,
+    *,
+    build: bool = False,
+    expected_target: str | None = None,
+    expected_dist_digest: str | None = None,
+) -> int:
+    with ProjectLock(f"pack:{pack_id}", "deploy"):
+        return _deploy_pack(
+            pack_id,
+            build=build,
+            expected_target=expected_target,
+            expected_dist_digest=expected_dist_digest,
+        )
+
+
 def cmd_deploy(args: argparse.Namespace) -> int:
     return deploy_pack(
         args.pack,
+        build=args.expected_dist_digest is None,
         expected_target=args.expected_target,
         expected_dist_digest=args.expected_dist_digest,
     )
 
 
 def cmd_deploy_dry_run(args: argparse.Namespace) -> int:
-    preview = deploy_preview(args.pack)
+    preview = deploy_preview(args.pack, build=True)
     print_deploy_preview(args.pack, preview)
     return 0
 
@@ -1756,16 +1967,8 @@ def _project_key_from_state_name(name: str) -> str | None:
 
 
 def _transaction_active(path: Path) -> bool:
-    lock_path = path / ".lock"
-    if not lock_path.exists():
-        return False
-    with lock_path.open("a+b") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        fcntl.flock(lock, fcntl.LOCK_UN)
-    return False
+    project = _project_key_from_state_name(path.name)
+    return project is not None and project_lock_is_active(project)
 
 
 def classify_state() -> list[StateItem]:
@@ -1786,7 +1989,9 @@ def classify_state() -> list[StateItem]:
                 continue
             project = _project_key_from_state_name(f"{project_dir.name}-session")
             for path in sorted(project_dir.iterdir()):
-                active = path.is_symlink()
+                active = path.is_symlink() or (
+                    project is not None and project_lock_is_active(project)
+                )
                 items.append(
                     StateItem(
                         "active_state" if active else "log",
@@ -1820,7 +2025,24 @@ def classify_state() -> list[StateItem]:
                     active,
                 )
             )
+    lock_root = STATE_ROOT / "locks"
+    if lock_root.is_dir() and not lock_root.is_symlink():
+        for path in sorted(lock_root.iterdir()):
+            active, metadata = _inspect_lock_path(path)
+            if not active:
+                continue
+            items.append(
+                StateItem(
+                    "active_lock",
+                    path,
+                    metadata.project_key if metadata is not None else None,
+                    path.lstat().st_mtime,
+                    path_bytes(path),
+                    True,
+                )
+            )
     for entry in list_trash():
+        active = project_lock_is_active(entry.project_key)
         items.append(
             StateItem(
                 "trash",
@@ -1828,10 +2050,11 @@ def classify_state() -> list[StateItem]:
                 entry.project_key,
                 entry.created_at,
                 entry.bytes,
+                active,
             )
         )
     if STATE_ROOT.is_dir() and not STATE_ROOT.is_symlink():
-        known = {LOG_ROOT.name, TRANSACTION_ROOT.name, TRASH_ROOT.name}
+        known = {LOG_ROOT.name, TRANSACTION_ROOT.name, TRASH_ROOT.name, "locks"}
         for path in sorted(STATE_ROOT.iterdir()):
             if path.name not in known:
                 items.append(
@@ -1894,22 +2117,25 @@ def clean_state(
     removed_bytes = 0
     if apply:
         for item in candidates:
-            if (
-                item.category in {
-                    "completed_transaction",
-                    "transaction_leftover",
-                }
-                and _transaction_active(item.path)
-            ):
+            cleanup_lock: ProjectLock | None = None
+            try:
+                if item.project_key is not None:
+                    cleanup_lock = ProjectLock(
+                        item.project_key, "state cleanup"
+                    ).acquire()
+                if item.path.is_symlink():
+                    continue
+                if item.path.is_dir():
+                    shutil.rmtree(item.path)
+                elif item.path.is_file():
+                    item.path.unlink()
+                removed_count += 1
+                removed_bytes += item.bytes
+            except ConfigError:
                 continue
-            if item.path.is_symlink():
-                continue
-            if item.path.is_dir():
-                shutil.rmtree(item.path)
-            elif item.path.is_file():
-                item.path.unlink()
-            removed_count += 1
-            removed_bytes += item.bytes
+            finally:
+                if cleanup_lock is not None:
+                    cleanup_lock.release()
     return StateCleanupReport(
         tuple(items),
         tuple(candidates),
