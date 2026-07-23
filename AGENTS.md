@@ -3,7 +3,7 @@
 ## Environment and Checks
 
 - Enter the pinned toolchain with `direnv allow` or `nix develop`; `flake.nix` supplies Python with Textual/PyYAML/tomlkit, Packwiz, Java 21, Just, rsync, and SSH.
-- Run the complete configured check with `just test-huroshiki`. There is no configured lint, formatter, or typecheck command.
+- Run the CI-equivalent checks locally with `nix flake check`, `nix develop --command just test-huroshiki`, and `nix develop --command bash -n shared/scripts/huroshiki-launcher.sh`. There is no configured lint, formatter, or typecheck command.
 - Run one test with `PYTHONPATH=shared/scripts python -m unittest tests.test_templates.TemplateManifestTest.test_candidate_matching_ignores_loader_version -v`. Bare imports such as `import packctl` require that `PYTHONPATH` outside the Nix-provided `huroshiki` launcher.
 - PTY tests are POSIX-only. The suite otherwise uses temporary repositories and mocks Packwiz where needed; it does not require a checked-in pack.
 
