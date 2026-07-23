@@ -5,8 +5,6 @@ import argparse
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from typing import Any, BinaryIO
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
@@ -25,6 +23,17 @@ from uuid import uuid4
 
 import tomlkit
 import yaml
+
+from deploy_support import (
+    DeployPreview,
+    RsyncChange,
+    distribution_digest,
+    parse_rsync_changes,
+    rsync_deploy_command,
+)
+from packctl_errors import ConfigError
+import project_locks
+from project_locks import ProjectLockMetadata, process_start_identity
 
 ROOT = Path(__file__).resolve().parents[2]
 PACKS = ROOT / "packs"
@@ -56,29 +65,6 @@ LOADER_FLAGS = {
 }
 
 
-class ConfigError(RuntimeError):
-    pass
-
-
-@dataclass(frozen=True)
-class ProjectLockMetadata:
-    pid: int
-    process_start: str | None
-    operation: str
-    project_key: str
-    acquired_at: str
-
-
-def process_start_identity(pid: int) -> str | None:
-    """Return Linux's process start tick, which remains stable across PID reuse."""
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-        fields = stat[stat.rfind(")") + 2 :].split()
-        return fields[19]
-    except (IndexError, OSError, UnicodeError):
-        return None
-
-
 def _project_lock_root(project_key: str) -> Path:
     kind, separator, project_id = project_key.partition(":")
     if not separator:
@@ -93,119 +79,14 @@ def project_lock_path(project_key: str) -> Path:
     return _project_lock_root(project_key) / f"{kind}-{project_id}.lock"
 
 
-def _read_lock_metadata(handle: BinaryIO) -> ProjectLockMetadata | None:
-    try:
-        handle.seek(0)
-        value = json.loads(handle.read().decode("utf-8"))
-        return ProjectLockMetadata(
-            pid=int(value["pid"]),
-            process_start=(
-                str(value["process_start"])
-                if value.get("process_start") is not None
-                else None
-            ),
-            operation=str(value["operation"]),
-            project_key=str(value["project_key"]),
-            acquired_at=str(value["acquired_at"]),
-        )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError, UnicodeError):
-        return None
+_read_lock_metadata = project_locks.read_lock_metadata
+_format_lock_owner = project_locks.format_lock_owner
+_inspect_lock_path = project_locks.inspect_lock_path
 
 
-def _format_lock_owner(metadata: ProjectLockMetadata | None) -> str:
-    if metadata is None:
-        return "owner metadata is unavailable"
-    start = metadata.process_start or "unavailable"
-    return (
-        f"PID {metadata.pid}, process start {start}, operation "
-        f"{metadata.operation!r}, project {metadata.project_key}, acquired "
-        f"{metadata.acquired_at}"
-    )
-
-
-class ProjectLock:
-    """One non-reentrant, process-level advisory lock for a project."""
-
+class ProjectLock(project_locks.ProjectLock):
     def __init__(self, project_key: str, operation: str) -> None:
-        self.project_key = project_key
-        self.operation = operation
-        self._handle: BinaryIO | None = None
-        self.path = project_lock_path(project_key)
-        self.metadata: ProjectLockMetadata | None = None
-
-    def acquire(self) -> "ProjectLock":
-        if self._handle is not None:
-            raise ConfigError(f"Project lock is already held: {self.project_key}")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.parent.is_symlink() or self.path.is_symlink():
-            raise ConfigError(f"Unsafe project lock path: {self.path}")
-        handle = self.path.open("a+b")
-        try:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                owner = _read_lock_metadata(handle)
-                raise ConfigError(
-                    f"Project is locked: {self.project_key} ({_format_lock_owner(owner)})"
-                ) from error
-            metadata = ProjectLockMetadata(
-                pid=os.getpid(),
-                process_start=process_start_identity(os.getpid()),
-                operation=self.operation,
-                project_key=self.project_key,
-                acquired_at=datetime.now(timezone.utc).isoformat(),
-            )
-            handle.seek(0)
-            handle.truncate()
-            handle.write(
-                (json.dumps(metadata.__dict__, sort_keys=True) + "\n").encode("utf-8")
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-            self.metadata = metadata
-            self._handle = handle
-            return self
-        except BaseException:
-            handle.close()
-            raise
-
-    def release(self) -> None:
-        handle = self._handle
-        if handle is None:
-            return
-        self._handle = None
-        try:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-        finally:
-            handle.close()
-
-    def __enter__(self) -> "ProjectLock":
-        return self.acquire()
-
-    def __exit__(self, *_: object) -> None:
-        self.release()
-
-    def __del__(self) -> None:
-        try:
-            self.release()
-        except (OSError, ValueError):
-            pass
-
-
-def _inspect_lock_path(path: Path) -> tuple[bool, ProjectLockMetadata | None]:
-    if not path.is_file() or path.is_symlink():
-        return False, None
-    with path.open("a+b") as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True, _read_lock_metadata(handle)
-        finally:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_UN)
-            except OSError:
-                pass
-    return False, None
+        super().__init__(project_key, operation, project_lock_path(project_key))
 
 
 def active_project_lock(project_key: str) -> ProjectLockMetadata | None:
@@ -1718,69 +1599,12 @@ def distribution_target(pack_id: str) -> str:
     )
 
 
-@dataclass(frozen=True)
-class RsyncChange:
-    category: str
-    path: str
-    raw: str
-
-
-@dataclass(frozen=True)
-class DeployPreview:
-    target: str
-    dist_digest: str
-    changes: tuple[RsyncChange, ...]
-    raw_lines: tuple[str, ...]
-
-
 def distribution_root(pack_id: str) -> Path:
     dist = get_pack_root(pack_id) / "dist"
     for side in ("client", "server"):
         if not (dist / side / "pack.toml").is_file():
             raise ConfigError(f"{side} distribution is not built for {pack_id}")
     return dist
-
-
-def distribution_digest(dist: Path) -> str:
-    digest = hashlib.sha256()
-    paths = (dist, *sorted(dist.rglob("*"), key=lambda item: item.as_posix()))
-    for path in paths:
-        relative = path.relative_to(dist).as_posix() or "."
-        stat = path.lstat()
-        digest.update(relative.encode("utf-8"))
-        digest.update(
-            f"\0{stat.st_mode}\0{stat.st_uid}\0{stat.st_gid}"
-            f"\0{stat.st_mtime_ns}\0".encode("ascii")
-        )
-        if path.is_symlink():
-            digest.update(os.readlink(path).encode("utf-8"))
-        elif path.is_file():
-            digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
-def rsync_deploy_command(dist: Path, target: str, *, dry_run: bool) -> list[str]:
-    command = ["rsync", "-av", "--delete"]
-    if dry_run:
-        command.extend(("--dry-run", "--itemize-changes"))
-    command.extend((f"{dist}/", target.rstrip("/") + "/"))
-    return command
-
-
-def parse_rsync_changes(output: str) -> tuple[RsyncChange, ...]:
-    changes: list[RsyncChange] = []
-    for line in output.splitlines():
-        if line.startswith("*deleting   "):
-            changes.append(RsyncChange("deleted", line[12:], line))
-            continue
-        if len(line) < 13 or line[11] != " ":
-            continue
-        itemized = line[:11]
-        if itemized[0] not in "<>ch.":
-            continue
-        category = "added" if itemized[2:] == "+++++++++" else "updated"
-        changes.append(RsyncChange(category, line[12:], line))
-    return tuple(changes)
 
 
 def _deploy_preview(pack_id: str) -> DeployPreview:
