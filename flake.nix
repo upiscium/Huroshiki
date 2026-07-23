@@ -23,26 +23,7 @@
           huroshiki = pkgs.writeShellApplication {
             name = "huroshiki";
             runtimeInputs = [ python ];
-            text = ''
-              root="''${HUROSHIKI_ROOT-}"
-              if [[ -z "$root" ]]; then
-                root="$PWD"
-                while [[ "$root" != "/" ]]; do
-                  if [[ -f "$root/shared/scripts/huroshiki.py" && -d "$root/packs" ]]; then
-                    break
-                  fi
-                  root="$(dirname "$root")"
-                done
-              fi
-
-              script="$root/shared/scripts/huroshiki.py"
-              if [[ ! -f "$script" ]]; then
-                echo "huroshiki: not inside the MODPACK monorepo" >&2
-                exit 1
-              fi
-
-              exec ${python}/bin/python "$script" "$@"
-            '';
+            text = builtins.readFile ./shared/scripts/huroshiki-launcher.sh;
           };
         in
         {
