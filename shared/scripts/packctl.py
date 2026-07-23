@@ -193,7 +193,10 @@ def derive_legacy_template_config(
 
 def load_template_config(template_id: str) -> dict[str, Any]:
     root = get_template_root(template_id)
-    config = load_yaml(root / "template.yaml")
+    config = merge(
+        load_yaml(root / "template.yaml"),
+        load_yaml(root / "template.local.yaml"),
+    )
     if config.get("id") != template_id:
         raise ConfigError(
             f"templates/{template_id}/template.yaml must contain id: {template_id}"

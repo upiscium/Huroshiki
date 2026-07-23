@@ -2,6 +2,7 @@
 /.packwiz-cache/
 **/dist/
 **/pack.local.yaml
+**/template.local.yaml
 **/__pycache__/
 **/*.pyc
 *.mrpack

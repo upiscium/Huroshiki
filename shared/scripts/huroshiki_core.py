@@ -498,6 +498,7 @@ class PackTransaction:
                 operation.cancel_event,
                 operation.log_dir,
                 project_info(self.project_key).loader,
+                project_url_max_jar_size_bytes(self.project_key),
             )
             if operation.cancelled or operation.cancel_event.is_set():
                 raise HuroshikiError("URL addition was cancelled")
@@ -835,6 +836,21 @@ def normalize_add_selector(provider: str, query: str) -> tuple[str, str]:
 
 URL_USER_AGENT = "huroshiki/1 self-hosted-mod-fetcher"
 URL_CHUNK_SIZE = 1024 * 1024
+DEFAULT_URL_MAX_JAR_SIZE_BYTES = 256 * 1024 * 1024
+
+
+def url_max_jar_size_bytes(config: dict[str, object]) -> int:
+    value = config.get(
+        "url_max_jar_size_bytes",
+        DEFAULT_URL_MAX_JAR_SIZE_BYTES,
+    )
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise packctl.ConfigError("url_max_jar_size_bytes must be a positive integer")
+    return value
+
+
+def project_url_max_jar_size_bytes(project_key_value: str) -> int:
+    return url_max_jar_size_bytes(project_config(project_key_value))
 
 
 def validate_public_url(url: str) -> None:
@@ -965,11 +981,21 @@ def download_url_artifact(
     cancel_event: threading.Event,
     log_dir: Path,
     target_loader: str,
+    max_size_bytes: int = DEFAULT_URL_MAX_JAR_SIZE_BYTES,
 ) -> UrlArtifact:
     validate_public_url(url)
+    if (
+        isinstance(max_size_bytes, bool)
+        or not isinstance(max_size_bytes, int)
+        or max_size_bytes <= 0
+    ):
+        raise HuroshikiError("URL JAR size limit must be a positive integer")
     filename = unquote(Path(urlparse(url).path).name)
     append_url_log(log_dir, f"Downloading {url}")
-    request = Request(url, headers={"User-Agent": URL_USER_AGENT})
+    request = Request(
+        url,
+        headers={"User-Agent": URL_USER_AGENT, "Connection": "close"},
+    )
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -981,12 +1007,47 @@ def download_url_artifact(
             digest = hashlib.sha256()
             try:
                 with urlopen(request, timeout=60) as response:
+                    if cancel_event.is_set():
+                        raise HuroshikiError("URL download cancelled")
+                    raw_content_length = response.headers.get("Content-Length")
+                    declared_size = (
+                        int(raw_content_length)
+                        if raw_content_length is not None
+                        and re.fullmatch(r"[0-9]+", raw_content_length.strip())
+                        else None
+                    )
+                    if declared_size is not None and declared_size > max_size_bytes:
+                        raise HuroshikiError(
+                            "Self-hosted JAR exceeds configured limit of "
+                            f"{max_size_bytes} bytes: declared size is "
+                            f"{declared_size} bytes"
+                        )
+
+                    # HTTPResponse otherwise stops at Content-Length and hides an
+                    # understated body. Connection: close makes EOF unambiguous.
+                    if declared_size is not None and not response.chunked:
+                        response.length = None
+                    received_size = 0
                     while True:
                         if cancel_event.is_set():
                             raise HuroshikiError("URL download cancelled")
-                        chunk = response.read(URL_CHUNK_SIZE)
+                        chunk = response.read(
+                            min(URL_CHUNK_SIZE, max_size_bytes - received_size + 1)
+                        )
                         if not chunk:
                             break
+                        received_size += len(chunk)
+                        if received_size > max_size_bytes:
+                            declared = (
+                                f" (declared {declared_size} bytes)"
+                                if declared_size is not None
+                                else ""
+                            )
+                            raise HuroshikiError(
+                                "Self-hosted JAR exceeds configured limit of "
+                                f"{max_size_bytes} bytes: received "
+                                f"{received_size} bytes{declared}"
+                            )
                         temporary.write(chunk)
                         digest.update(chunk)
             except HTTPError as error:
@@ -1719,6 +1780,9 @@ def create_pack_from_template(
             "The template must use the same Minecraft version and loader as the new MODPACK"
         )
     mods = packctl.template_mods(template_id)
+    max_url_jar_size_bytes = url_max_jar_size_bytes(
+        packctl.load_template_config(template_id)
+    )
     destination = packctl.get_pack_root(project_id, must_exist=False)
     destination_existed = destination.exists()
     result = create_project(
@@ -1762,6 +1826,7 @@ def create_pack_from_template(
                         / "template-create"
                         / f"{project_id}-{uuid4().hex[:8]}",
                         loader,
+                        max_url_jar_size_bytes,
                     )
                     if artifact.mod_id != remote_id:
                         raise HuroshikiError(

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import (
+    BaseHTTPRequestHandler,
+    SimpleHTTPRequestHandler,
+    ThreadingHTTPServer,
+)
 import os
 from pathlib import Path
 import tempfile
@@ -69,6 +73,41 @@ def serve(directory: Path):
         server.server_close()
 
 
+AUTO_CONTENT_LENGTH = object()
+
+
+@contextmanager
+def serve_bytes(payload: bytes, content_length=AUTO_CONTENT_LENGTH):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_GET(self) -> None:
+            self.send_response(200)
+            if content_length is AUTO_CONTENT_LENGTH:
+                self.send_header("Content-Length", str(len(payload)))
+            elif content_length is not None:
+                self.send_header("Content-Length", str(content_length))
+            self.end_headers()
+            try:
+                self.wfile.write(payload)
+            except BrokenPipeError:
+                pass
+
+        def log_message(self, format: str, *args) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://{host}:{port}/private-mod.jar"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
 class UrlProviderTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -76,6 +115,8 @@ class UrlProviderTest(unittest.TestCase):
         self.packs = self.root / "packs"
         self.templates = self.root / "templates"
         self.pack_root = self.packs / "demo"
+        self.downloads = self.root / "downloads"
+        self.downloads.mkdir()
         source = self.pack_root / "source"
         (source / "mods").mkdir(parents=True)
         (source / "pack.toml").write_text(PACK_TOML, encoding="utf-8")
@@ -114,6 +155,160 @@ loader_version: 21.1.234
         for item in reversed(self.patches):
             item.stop()
         self.temp.cleanup()
+
+    def jar_bytes(self) -> bytes:
+        path = self.root / "payload.jar"
+        write_neoforge_jar(path, "1.0.0")
+        return path.read_bytes()
+
+    def download_response(
+        self,
+        payload: bytes,
+        *,
+        content_length=AUTO_CONTENT_LENGTH,
+        limit: int,
+        cancel_event: threading.Event | None = None,
+    ) -> core.UrlArtifact:
+        named_temporary_file = tempfile.NamedTemporaryFile
+
+        def temporary_file(**kwargs):
+            return named_temporary_file(dir=self.downloads, **kwargs)
+
+        with serve_bytes(payload, content_length) as url, patch.object(
+            core.tempfile,
+            "NamedTemporaryFile",
+            side_effect=temporary_file,
+        ):
+            return core.download_url_artifact(
+                url,
+                cancel_event or threading.Event(),
+                self.root / "http-logs",
+                "neoforge",
+                limit,
+            )
+
+    def assert_downloads_cleaned(self) -> None:
+        self.assertEqual(list(self.downloads.iterdir()), [])
+
+    def test_download_accepts_valid_content_length(self) -> None:
+        payload = self.jar_bytes()
+
+        artifact = self.download_response(payload, limit=len(payload))
+
+        self.assertEqual(artifact.mod_id, "private_mod")
+        self.assert_downloads_cleaned()
+
+    def test_download_rejects_oversized_content_length_before_body(self) -> None:
+        with self.assertRaisesRegex(
+            core.HuroshikiError,
+            r"limit of 64 bytes: declared size is 65 bytes",
+        ):
+            self.download_response(b"", content_length=65, limit=64)
+
+        self.assert_downloads_cleaned()
+
+    def test_download_accepts_missing_content_length(self) -> None:
+        payload = self.jar_bytes()
+
+        artifact = self.download_response(
+            payload,
+            content_length=None,
+            limit=len(payload),
+        )
+
+        self.assertEqual(artifact.mod_id, "private_mod")
+        self.assert_downloads_cleaned()
+
+    def test_download_enforces_bytes_with_malformed_content_length(self) -> None:
+        with self.assertRaisesRegex(
+            core.HuroshikiError,
+            r"limit of 32 bytes: received 33 bytes$",
+        ):
+            self.download_response(
+                b"x" * 64,
+                content_length="invalid",
+                limit=32,
+            )
+
+        self.assert_downloads_cleaned()
+
+    def test_download_detects_understated_content_length(self) -> None:
+        with self.assertRaisesRegex(
+            core.HuroshikiError,
+            r"limit of 32 bytes: received 33 bytes \(declared 8 bytes\)",
+        ):
+            self.download_response(b"x" * 64, content_length=8, limit=32)
+
+        self.assert_downloads_cleaned()
+
+    def test_download_stops_stream_without_content_length_at_limit(self) -> None:
+        with self.assertRaisesRegex(
+            core.HuroshikiError,
+            r"limit of 32 bytes: received 33 bytes$",
+        ):
+            self.download_response(b"x" * 4096, content_length=None, limit=32)
+
+        self.assert_downloads_cleaned()
+
+    def test_cancelled_download_cleans_temporary_file(self) -> None:
+        cancelled = threading.Event()
+        cancelled.set()
+
+        with self.assertRaisesRegex(core.HuroshikiError, "download cancelled"):
+            self.download_response(
+                self.jar_bytes(),
+                limit=core.DEFAULT_URL_MAX_JAR_SIZE_BYTES,
+                cancel_event=cancelled,
+            )
+
+        self.assert_downloads_cleaned()
+
+    def test_pack_local_config_overrides_committed_url_limit(self) -> None:
+        payload = self.jar_bytes()
+        with (self.pack_root / "pack.yaml").open("a", encoding="utf-8") as config:
+            config.write("url_max_jar_size_bytes: 1\n")
+        (self.pack_root / "pack.local.yaml").write_text(
+            f"url_max_jar_size_bytes: {len(payload)}\n",
+            encoding="utf-8",
+        )
+
+        with serve_bytes(payload) as url:
+            transaction = core.PackTransaction.create(core.project_key("pack", "demo"))
+            result = transaction.begin_add(
+                "url", url, client=True, server=True
+            ).run()
+
+        self.assertTrue(result.success, result.message)
+
+    def test_template_local_config_controls_resolver_url_limit(self) -> None:
+        payload = self.jar_bytes()
+        template_root = self.templates / "private"
+        template_root.mkdir(parents=True)
+        (template_root / "template.yaml").write_text(
+            "id: private\n"
+            "display_name: Private\n"
+            "enabled: true\n"
+            "minecraft: 1.21.1\n"
+            "loader: neoforge\n"
+            "reference_loader_version: 21.1.234\n"
+            "url_max_jar_size_bytes: 1\n"
+            "mods: []\n",
+            encoding="utf-8",
+        )
+        (template_root / "template.local.yaml").write_text(
+            f"url_max_jar_size_bytes: {len(payload)}\n",
+            encoding="utf-8",
+        )
+
+        with serve_bytes(payload) as url:
+            transaction = core.PackTransaction.create(
+                core.project_key("template", "private")
+            )
+            result = transaction.begin_add(
+                "url", url, client=True, server=True
+            ).run()
+
+        self.assertTrue(result.success, result.message)
 
     def test_url_add_and_new_url_replace_same_metadata(self) -> None:
         public = self.root / "public" / "private-mod"
@@ -277,6 +472,14 @@ mods:
                 template_yaml,
                 encoding="utf-8",
             )
+            with (template_root / "template.yaml").open(
+                "a", encoding="utf-8"
+            ) as config:
+                config.write("url_max_jar_size_bytes: 1\n")
+            (template_root / "template.local.yaml").write_text(
+                f"url_max_jar_size_bytes: {jar_path.stat().st_size}\n",
+                encoding="utf-8",
+            )
 
             def fake_create(*args):
                 generated = self.packs / "generated"
@@ -306,9 +509,15 @@ mods:
                     return core.subprocess.CompletedProcess(command, 0, "", "")
                 return real_run(command, **kwargs)
 
-            with patch.object(core, "create_project", side_effect=fake_create), patch.object(
+            with patch.object(
+                core, "create_project", side_effect=fake_create
+            ), patch.object(
                 core.subprocess, "run", side_effect=fake_run
-            ):
+            ), patch.object(
+                core,
+                "download_url_artifact",
+                wraps=core.download_url_artifact,
+            ) as download:
                 report = core.create_pack_from_template(
                     template_id="private",
                     project_id="generated",
@@ -320,6 +529,7 @@ mods:
 
             self.assertEqual(report.installed, ("Private MOD",))
             self.assertEqual(report.failed, ())
+            self.assertEqual(download.call_args.args[4], jar_path.stat().st_size)
             installed = core.read_mod(
                 self.packs / "generated" / "source",
                 Path("mods/private_mod.pw.toml"),

@@ -73,6 +73,14 @@ mods:
 `reference_loader_version`はテンプレートのMODを検索・登録するときに使う基準値です。
 テンプレート候補の絞り込みには使用しません。
 
+URL providerのJARはデフォルトで256 MiBまでダウンロードできます。packまたはtemplateの
+`pack.yaml` / `template.yaml`、あるいはgit管理外の`pack.local.yaml` /
+`template.local.yaml`でバイト単位の上限を上書きできます。
+
+```yaml
+url_max_jar_size_bytes: 536870912
+```
+
 以前のPackwizプロジェクト型テンプレートは、次で`source/*.pw.toml`からMODリストを抽出できます。
 
 ```bash
