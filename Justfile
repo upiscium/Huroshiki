@@ -36,6 +36,26 @@ huroshiki-for pack:
 huroshiki-template template:
     huroshiki --template "{{template}}"
 
+# List recoverable deleted projects.
+trash-list:
+    {{ctl}} trash-list
+
+# Restore one trash entry shown by `just trash-list`.
+trash-restore entry:
+    {{ctl}} trash-restore "{{entry}}"
+
+# Permanently remove one trash entry.
+trash-purge entry:
+    {{ctl}} trash-purge "{{entry}}"
+
+# Preview state retention cleanup; pass filters after `--`.
+clean-huroshiki-state *args:
+    {{ctl}} clean-huroshiki-state {{args}}
+
+# Apply state retention cleanup; pass filters after `--`.
+purge-huroshiki-state *args:
+    {{ctl}} clean-huroshiki-state --apply {{args}}
+
 # Backward-compatible alias: open the selected MODPACK directly.
 tui:
     huroshiki --pack "${MODPACK:?No active MODPACK. Run: just use <MODPACK>}"

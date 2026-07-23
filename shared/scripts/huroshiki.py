@@ -92,6 +92,10 @@ class HuroshikiApp(App[None]):
         self.selected_project = None
         self.switch_screen(TemplateCandidateScreen(values))
 
+    def open_state(self) -> None:
+        self.selected_project = None
+        self.switch_screen(StateScreen())
+
     def get_transaction(self, project_key: str) -> core.PackTransaction:
         transaction = self.transactions.get(project_key)
         if transaction is None or not transaction.active:
@@ -421,7 +425,7 @@ class MainMenuScreen(BaseScreen):
     screen_title = "huroshiki / Projects"
     help_text = (
         "Tab: focus  Enter: search/open  j/k: move  p: project  "
-        "n: new  f: from template  d: delete  q: quit"
+        "n: new  f: from template  d: delete  r: state  q: quit"
     )
 
     def __init__(self) -> None:
@@ -514,7 +518,7 @@ class MainMenuScreen(BaseScreen):
                 [
                     f"Type: {project.type_label}",
                     f"Local directory: {location}",
-                    "This operation cannot be undone by huroshiki.",
+                    "The directory will move to .huroshiki/trash and can be restored.",
                 ],
             ),
             lambda confirmed: self.delete_confirmed(project.key, confirmed),
@@ -529,8 +533,8 @@ class MainMenuScreen(BaseScreen):
             return
         try:
             self.app.remove_transaction(project_key, discard=True)
-            core.delete_project(project_key)
-            self.app.notify(f"Deleted {project_key}")
+            entry = core.delete_project(project_key)
+            self.app.notify(f"Moved {project_key} to trash as {entry.name}")
             self.reload_projects(self.query_one("#pack-search", Input).value)
         except Exception as error:
             self.app.notify(str(error), severity="error")
@@ -585,11 +589,166 @@ class MainMenuScreen(BaseScreen):
                 self.new_from_template()
             elif event.key == "d":
                 self.request_delete()
+            elif event.key == "r":
+                self.app.open_state()
             elif event.key == "q":
                 self.app.exit()
             else:
                 return
             event.stop()
+
+
+class StateScreen(BaseScreen):
+    screen_title = "huroshiki / State and Trash"
+    help_text = (
+        "j/k: move  Enter: restore  p: purge  c: dry-run cleanup  "
+        "x: apply cleanup  Esc: main"
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.items: list[core.StateItem] = []
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        yield DataTable(id="state-table")
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#state-table", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns("Class", "Project", "Bytes", "State item")
+        self.reload()
+        table.focus()
+
+    def reload(self) -> None:
+        try:
+            self.items = core.state_items()
+        except Exception as error:
+            self.items = []
+            self.app.notify(str(error), severity="error")
+        table = self.query_one("#state-table", DataTable)
+        table.clear()
+        for item in self.items:
+            table.add_row(
+                item.category,
+                item.project_key or "-",
+                str(item.bytes),
+                str(item.path.relative_to(core.STATE_ROOT)),
+            )
+
+    def selected_item(self) -> core.StateItem | None:
+        table = self.query_one("#state-table", DataTable)
+        index = self.current_index(table, len(self.items))
+        return None if index is None else self.items[index]
+
+    def restore_selected(self) -> None:
+        item = self.selected_item()
+        if item is None or item.category != "trash":
+            self.app.notify("Select a trash item to restore", severity="warning")
+            return
+        try:
+            core.restore_trash(item.path.name)
+            self.app.notify(f"Restored {item.project_key}")
+            self.reload()
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+
+    def request_purge(self) -> None:
+        item = self.selected_item()
+        if item is None or item.category != "trash":
+            self.app.notify("Select a trash item to purge", severity="warning")
+            return
+        self.app.push_screen(
+            ConfirmModal(
+                "Permanently purge trash item?",
+                [
+                    item.project_key or item.path.name,
+                    f"Bytes: {item.bytes}",
+                    "This cannot be undone.",
+                ],
+            ),
+            lambda confirmed: self.purge_confirmed(item.path.name, confirmed),
+        )
+
+    def purge_confirmed(self, name: str, confirmed: bool | None) -> None:
+        if not confirmed:
+            return
+        try:
+            count, total = core.purge_trash(name)
+            self.app.notify(f"Purged {count} item(s), {total} bytes")
+            self.reload()
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+
+    def preview_cleanup(self) -> None:
+        try:
+            report = core.clean_state()
+            total = sum(item.bytes for item in report.selected)
+            self.app.push_screen(
+                MessageModal(
+                    "State cleanup dry run",
+                    [
+                        f"Would remove {len(report.selected)} item(s)",
+                        f"Would free {total} bytes",
+                    ],
+                )
+            )
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+
+    def request_cleanup(self) -> None:
+        try:
+            report = core.clean_state()
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+            return
+        total = sum(item.bytes for item in report.selected)
+        self.app.push_screen(
+            ConfirmModal(
+                "Apply state retention cleanup?",
+                [
+                    f"Remove {len(report.selected)} item(s)",
+                    f"Free {total} bytes",
+                    "Active transactions and locks are protected.",
+                ],
+            ),
+            self.cleanup_confirmed,
+        )
+
+    def cleanup_confirmed(self, confirmed: bool | None) -> None:
+        if not confirmed:
+            return
+        try:
+            report = core.clean_state(apply=True)
+            self.app.notify(
+                f"Removed {report.removed_count} item(s), "
+                f"{report.removed_bytes} bytes"
+            )
+            self.reload()
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+
+    def on_key(self, event: events.Key) -> None:
+        table = self.query_one("#state-table", DataTable)
+        if event.key == "j":
+            self.move_table(table, len(self.items), 1)
+        elif event.key == "k":
+            self.move_table(table, len(self.items), -1)
+        elif event.key == "enter":
+            self.restore_selected()
+        elif event.key == "p":
+            self.request_purge()
+        elif event.key == "c":
+            self.preview_cleanup()
+        elif event.key == "x":
+            self.request_cleanup()
+        elif event.key == "escape":
+            self.app.go_main()
+        else:
+            return
+        event.stop()
 
 
 class ProjectScreen(BaseScreen):

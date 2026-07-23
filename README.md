@@ -124,6 +124,7 @@ n         空のMODPACKまたはTEMPLATEを新規作成
 f         テンプレートからMODPACKを作成
 d         選択プロジェクトの削除確認
 q         huroshiki終了
+r         Trash・ログ・transaction状態の管理
 ```
 
 `f`では先に新規MODPACKの以下を入力します。
@@ -285,6 +286,37 @@ just test-huroshiki
 ```
 
 テンプレートからのMODPACK作成は、候補・警告を確認できるhuroshikiから実行します。
+
+## Trashと状態保持
+
+プロジェクト削除は`packs/`または`templates/`から同じfilesystem上の
+`.huroshiki/trash/<timestamp>-<kind>-<id>`へのrenameです。`pack.local.yaml`、
+Git管理外ファイル、作業中ファイルを含むディレクトリ全体を保持します。復元先に同じIDが
+存在する場合は上書きせず停止します。TUIではメイン画面の`r`から一覧、復元、個別purge、
+状態cleanupのdry-runと適用を操作できます。
+
+```bash
+just trash-list
+just trash-restore 20260723-120000-000000-pack-example
+just trash-purge 20260723-120000-000000-pack-example
+```
+
+`.huroshiki`の状態cleanupは、Packwizログ、完了済みtransaction残骸、異常終了した
+transaction候補、Trash、active transaction/lockを分類し、件数とbyte数を表示します。
+active transactionとlockは削除対象になりません。既定保持期間はログ30日、完了済み・
+異常終了transaction 7日、Trash 30日です。起動時の自動purgeは行いません。
+`clean-huroshiki-state`は常にdry-runで、削除には`--apply`または
+`purge-huroshiki-state`が必要です。
+
+```bash
+just clean-huroshiki-state
+just clean-huroshiki-state -- --older-than 14 --keep 5 --project pack:example
+just purge-huroshiki-state -- --older-than 14 --project pack:example
+python shared/scripts/packctl.py trash-purge --project pack:example
+```
+
+`--older-than DAYS`は全分類の既定期間を上書きし、`--keep COUNT`は分類ごとに新しい項目を
+指定件数保持します。`--project`は`pack:<id>`または`template:<id>`形式です。
 
 ## 配布
 

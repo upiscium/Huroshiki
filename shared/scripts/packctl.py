@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -26,6 +29,10 @@ ROOT = Path(__file__).resolve().parents[2]
 PACKS = ROOT / "packs"
 TEMPLATES = ROOT / "templates"
 SHARED = ROOT / "shared"
+STATE_ROOT = ROOT / ".huroshiki"
+TRANSACTION_ROOT = STATE_ROOT / "transactions"
+LOG_ROOT = STATE_ROOT / "logs"
+TRASH_ROOT = STATE_ROOT / "trash"
 VALID_SIDES = {"client", "server", "both"}
 SIDE_ALIASES = {
     "b": "both",
@@ -50,6 +57,50 @@ LOADER_FLAGS = {
 
 class ConfigError(RuntimeError):
     pass
+
+
+DEFAULT_RETENTION_DAYS = {
+    "log": 30,
+    "completed_transaction": 7,
+    "transaction_leftover": 7,
+    "trash": 30,
+}
+TRASH_NAME_RE = re.compile(
+    r"^(?P<timestamp>\d{8}-\d{6}-\d{6})-(?P<kind>pack|template)-(?P<id>[a-z0-9][a-z0-9._-]*)$"
+)
+
+
+@dataclass(frozen=True)
+class TrashEntry:
+    name: str
+    kind: str
+    project_id: str
+    path: Path
+    created_at: float
+    bytes: int
+
+    @property
+    def project_key(self) -> str:
+        return f"{self.kind}:{self.project_id}"
+
+
+@dataclass(frozen=True)
+class StateItem:
+    category: str
+    path: Path
+    project_key: str | None
+    modified_at: float
+    bytes: int
+    active: bool = False
+
+
+@dataclass(frozen=True)
+class StateCleanupReport:
+    items: tuple[StateItem, ...]
+    selected: tuple[StateItem, ...]
+    removed_count: int
+    removed_bytes: int
+    dry_run: bool
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -210,6 +261,123 @@ def get_project_root(kind: str, project_id: str, *, must_exist: bool = True) -> 
     if kind == "template":
         return get_template_root(project_id, must_exist=must_exist)
     raise ConfigError(f"Unsupported project kind: {kind}")
+
+
+def _direct_state_child(parent: Path, name: str) -> Path:
+    if not name or Path(name).name != name or name in {".", ".."}:
+        raise ConfigError(f"Invalid state item name: {name!r}")
+    parent.mkdir(parents=True, exist_ok=True)
+    path = parent / name
+    if path.parent.resolve() != parent.resolve():
+        raise ConfigError("State path escaped .huroshiki/")
+    return path
+
+
+def path_bytes(path: Path) -> int:
+    if path.is_symlink():
+        return path.lstat().st_size
+    if path.is_file():
+        return path.stat().st_size
+    if not path.is_dir():
+        return 0
+    return path.stat().st_size + sum(
+        path_bytes(child) for child in path.iterdir()
+    )
+
+
+def parse_trash_entry(path: Path) -> TrashEntry:
+    if (
+        TRASH_ROOT.is_symlink()
+        or path.parent.resolve() != TRASH_ROOT.resolve()
+        or path.is_symlink()
+        or not path.is_dir()
+    ):
+        raise ConfigError(f"Unsafe trash entry: {path}")
+    match = TRASH_NAME_RE.fullmatch(path.name)
+    if match is None:
+        raise ConfigError(f"Invalid trash entry name: {path.name}")
+    project_id = match.group("id")
+    validate_project_id(project_id)
+    created = datetime.strptime(
+        match.group("timestamp"), "%Y%m%d-%H%M%S-%f"
+    ).replace(tzinfo=timezone.utc)
+    return TrashEntry(
+        path.name,
+        match.group("kind"),
+        project_id,
+        path,
+        created.timestamp(),
+        path_bytes(path),
+    )
+
+
+def list_trash() -> list[TrashEntry]:
+    if not TRASH_ROOT.exists():
+        return []
+    if TRASH_ROOT.is_symlink() or not TRASH_ROOT.is_dir():
+        raise ConfigError(f"Unsafe trash root: {TRASH_ROOT}")
+    entries = [parse_trash_entry(path) for path in sorted(TRASH_ROOT.iterdir())]
+    return sorted(entries, key=lambda item: item.created_at, reverse=True)
+
+
+def trash_project(kind: str, project_id: str) -> TrashEntry:
+    source = get_project_root(kind, project_id)
+    TRASH_ROOT.mkdir(parents=True, exist_ok=True)
+    if TRASH_ROOT.is_symlink() or source.stat().st_dev != TRASH_ROOT.stat().st_dev:
+        raise ConfigError("Project trash must be on the same filesystem")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    destination = _direct_state_child(TRASH_ROOT, f"{timestamp}-{kind}-{project_id}")
+    if destination.exists() or destination.is_symlink():
+        raise ConfigError(f"Trash destination already exists: {destination.name}")
+    source.rename(destination)
+    return parse_trash_entry(destination)
+
+
+def restore_trash(name: str) -> Path:
+    entry = parse_trash_entry(_direct_state_child(TRASH_ROOT, name))
+    destination = get_project_root(entry.kind, entry.project_id, must_exist=False)
+    if destination.exists() or destination.is_symlink():
+        raise ConfigError(f"Project already exists: {entry.project_key}")
+    if destination.parent.stat().st_dev != entry.path.stat().st_dev:
+        raise ConfigError("Project restore must stay on the same filesystem")
+    entry.path.rename(destination)
+    return destination
+
+
+def purge_trash(
+    *,
+    name: str | None = None,
+    project_key: str | None = None,
+    older_than_days: int | None = None,
+) -> tuple[int, int]:
+    if name is None and project_key is None and older_than_days is None:
+        raise ConfigError("Trash purge requires an entry, --project, or --older-than")
+    if older_than_days is not None and older_than_days < 0:
+        raise ConfigError("--older-than must be non-negative")
+    if project_key is not None:
+        kind, separator, project_id = project_key.partition(":")
+        if not separator:
+            raise ConfigError("Project filter must be pack:<id> or template:<id>")
+        get_project_root(kind, project_id, must_exist=False)
+    now = datetime.now(timezone.utc).timestamp()
+    selected: list[TrashEntry] = []
+    for entry in list_trash():
+        if name is not None and entry.name != name:
+            continue
+        if project_key is not None and entry.project_key != project_key:
+            continue
+        if (
+            older_than_days is not None
+            and now - entry.created_at < older_than_days * 86400
+        ):
+            continue
+        selected.append(entry)
+    if name is not None and not selected:
+        raise ConfigError(f"Unknown or filtered trash entry: {name}")
+    total = sum(entry.bytes for entry in selected)
+    for entry in selected:
+        shutil.rmtree(entry.path)
+    return len(selected), total
 
 
 def load_project_config(kind: str, project_id: str) -> dict[str, Any]:
@@ -1443,6 +1611,243 @@ def cmd_complete(args: argparse.Namespace) -> int:
     raise ConfigError(f"Unsupported completion kind: {args.kind}")
 
 
+def _project_key_from_state_name(name: str) -> str | None:
+    for kind in ("pack", "template"):
+        prefix = f"{kind}-"
+        if name.startswith(prefix):
+            project_id = name[len(prefix):].rsplit("-", 1)[0]
+            try:
+                validate_project_id(project_id)
+            except ConfigError:
+                return None
+            return f"{kind}:{project_id}"
+    return None
+
+
+def _transaction_active(path: Path) -> bool:
+    lock_path = path / ".lock"
+    if not lock_path.exists():
+        return False
+    with lock_path.open("a+b") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    return False
+
+
+def classify_state() -> list[StateItem]:
+    items: list[StateItem] = []
+    if LOG_ROOT.is_dir() and not LOG_ROOT.is_symlink():
+        for project_dir in sorted(LOG_ROOT.iterdir()):
+            if project_dir.is_symlink() or not project_dir.is_dir():
+                items.append(
+                    StateItem(
+                        "active_state",
+                        project_dir,
+                        None,
+                        project_dir.lstat().st_mtime,
+                        path_bytes(project_dir),
+                        True,
+                    )
+                )
+                continue
+            project = _project_key_from_state_name(f"{project_dir.name}-session")
+            for path in sorted(project_dir.iterdir()):
+                active = path.is_symlink()
+                items.append(
+                    StateItem(
+                        "active_state" if active else "log",
+                        path,
+                        project,
+                        path.lstat().st_mtime,
+                        path_bytes(path),
+                        active,
+                    )
+                )
+    if TRANSACTION_ROOT.is_dir() and not TRANSACTION_ROOT.is_symlink():
+        for path in sorted(TRANSACTION_ROOT.iterdir()):
+            active = (
+                path.is_symlink()
+                or not path.is_dir()
+                or _transaction_active(path)
+            )
+            if active:
+                category = "active_transaction"
+            elif (path / ".completed").is_file():
+                category = "completed_transaction"
+            else:
+                category = "transaction_leftover"
+            items.append(
+                StateItem(
+                    category,
+                    path,
+                    _project_key_from_state_name(path.name),
+                    path.lstat().st_mtime,
+                    path_bytes(path),
+                    active,
+                )
+            )
+    for entry in list_trash():
+        items.append(
+            StateItem(
+                "trash",
+                entry.path,
+                entry.project_key,
+                entry.created_at,
+                entry.bytes,
+            )
+        )
+    if STATE_ROOT.is_dir() and not STATE_ROOT.is_symlink():
+        known = {LOG_ROOT.name, TRANSACTION_ROOT.name, TRASH_ROOT.name}
+        for path in sorted(STATE_ROOT.iterdir()):
+            if path.name not in known:
+                items.append(
+                    StateItem(
+                        "active_state",
+                        path,
+                        None,
+                        path.lstat().st_mtime,
+                        path_bytes(path),
+                        True,
+                    )
+                )
+    return sorted(
+        items,
+        key=lambda item: (item.category, -item.modified_at, str(item.path)),
+    )
+
+
+def clean_state(
+    *,
+    apply: bool = False,
+    older_than_days: int | None = None,
+    keep: int = 0,
+    project_key: str | None = None,
+    now: float | None = None,
+) -> StateCleanupReport:
+    if older_than_days is not None and older_than_days < 0:
+        raise ConfigError("--older-than must be non-negative")
+    if keep < 0:
+        raise ConfigError("--keep must be non-negative")
+    if project_key is not None:
+        kind, separator, project_id = project_key.partition(":")
+        if not separator:
+            raise ConfigError("Project filter must be pack:<id> or template:<id>")
+        get_project_root(kind, project_id, must_exist=False)
+    current_time = (
+        datetime.now(timezone.utc).timestamp() if now is None else now
+    )
+    items = classify_state()
+    candidates: list[StateItem] = []
+    by_category: dict[str, list[StateItem]] = {}
+    for item in items:
+        if item.active or item.category not in DEFAULT_RETENTION_DAYS:
+            continue
+        if project_key is not None and item.project_key != project_key:
+            continue
+        by_category.setdefault(item.category, []).append(item)
+    for category, matching in by_category.items():
+        retention = (
+            DEFAULT_RETENTION_DAYS[category]
+            if older_than_days is None
+            else older_than_days
+        )
+        newest = sorted(matching, key=lambda item: item.modified_at, reverse=True)
+        for item in newest[keep:]:
+            if current_time - item.modified_at >= retention * 86400:
+                candidates.append(item)
+    candidates.sort(key=lambda item: str(item.path))
+    removed_count = 0
+    removed_bytes = 0
+    if apply:
+        for item in candidates:
+            if (
+                item.category in {
+                    "completed_transaction",
+                    "transaction_leftover",
+                }
+                and _transaction_active(item.path)
+            ):
+                continue
+            if item.path.is_symlink():
+                continue
+            if item.path.is_dir():
+                shutil.rmtree(item.path)
+            elif item.path.is_file():
+                item.path.unlink()
+            removed_count += 1
+            removed_bytes += item.bytes
+    return StateCleanupReport(
+        tuple(items),
+        tuple(candidates),
+        removed_count,
+        removed_bytes,
+        not apply,
+    )
+
+
+def format_bytes(value: int) -> str:
+    return f"{value} bytes"
+
+
+def cmd_trash_list(_: argparse.Namespace) -> int:
+    entries = list_trash()
+    for entry in entries:
+        print(f"{entry.name}\t{entry.project_key}\t{format_bytes(entry.bytes)}")
+    total = sum(item.bytes for item in entries)
+    print(f"Trash: {len(entries)} item(s), {format_bytes(total)}")
+    return 0
+
+
+def cmd_trash_restore(args: argparse.Namespace) -> int:
+    destination = restore_trash(args.entry)
+    print(f"Restored {args.entry} to {destination.relative_to(ROOT)}")
+    return 0
+
+
+def cmd_trash_purge(args: argparse.Namespace) -> int:
+    count, total = purge_trash(
+        name=args.entry,
+        project_key=args.project,
+        older_than_days=args.older_than,
+    )
+    print(f"Purged {count} trash item(s), freed {format_bytes(total)}")
+    return 0
+
+
+def cmd_clean_state(args: argparse.Namespace) -> int:
+    report = clean_state(
+        apply=args.apply,
+        older_than_days=args.older_than,
+        keep=args.keep,
+        project_key=args.project,
+    )
+    for item in report.items:
+        status = (
+            "protected"
+            if item.active
+            else ("selected" if item in report.selected else "retained")
+        )
+        print(
+            f"{item.category}\t{status}\t{item.project_key or '-'}\t"
+            f"{format_bytes(item.bytes)}\t{item.path.relative_to(STATE_ROOT)}"
+        )
+    selected_bytes = sum(item.bytes for item in report.selected)
+    if report.dry_run:
+        print(
+            f"Dry run: would remove {len(report.selected)} item(s), "
+            f"{format_bytes(selected_bytes)}"
+        )
+    else:
+        print(
+            f"Removed {report.removed_count} item(s), freed "
+            f"{format_bytes(report.removed_bytes)}"
+        )
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Manage multiple Packwiz projects")
     sub = root.add_subparsers(dest="command", required=True)
@@ -1519,6 +1924,22 @@ def parser() -> argparse.ArgumentParser:
     item.set_defaults(func=cmd_restart)
     item = sub.add_parser("deploy-all")
     item.set_defaults(func=cmd_deploy_all)
+    item = sub.add_parser("trash-list")
+    item.set_defaults(func=cmd_trash_list)
+    item = sub.add_parser("trash-restore")
+    item.add_argument("entry")
+    item.set_defaults(func=cmd_trash_restore)
+    item = sub.add_parser("trash-purge")
+    item.add_argument("entry", nargs="?")
+    item.add_argument("--project")
+    item.add_argument("--older-than", type=int)
+    item.set_defaults(func=cmd_trash_purge)
+    item = sub.add_parser("clean-huroshiki-state")
+    item.add_argument("--apply", action="store_true")
+    item.add_argument("--older-than", type=int)
+    item.add_argument("--keep", type=int, default=0)
+    item.add_argument("--project")
+    item.set_defaults(func=cmd_clean_state)
     return root
 
 

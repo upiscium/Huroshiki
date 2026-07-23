@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import fcntl
 import hashlib
 import json
 from pathlib import Path
@@ -13,7 +14,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from typing import Callable, Iterable
+from typing import BinaryIO, Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
@@ -34,6 +35,7 @@ SCRIPTS = ROOT / "shared" / "scripts"
 STATE_ROOT = ROOT / ".huroshiki"
 TRANSACTION_ROOT = STATE_ROOT / "transactions"
 LOG_ROOT = STATE_ROOT / "logs"
+TRASH_ROOT = STATE_ROOT / "trash"
 
 
 class HuroshikiError(RuntimeError):
@@ -41,6 +43,7 @@ class HuroshikiError(RuntimeError):
 
 
 PROJECT_KINDS = ("pack", "template")
+StateItem = packctl.StateItem
 
 
 def project_key(kind: str, project_id: str) -> str:
@@ -302,6 +305,7 @@ class PackTransaction:
     template_config_baseline: str = ""
     batches: list[TransactionBatch] = field(default_factory=list)
     active: bool = True
+    _state_lock: BinaryIO | None = field(default=None, init=False, repr=False)
     _operation: PackwizAddOperation | None = field(default=None, init=False, repr=False)
     _lock: threading.RLock = field(
         default_factory=threading.RLock, init=False, repr=False
@@ -321,6 +325,8 @@ class PackTransaction:
             )
         )
         tx_source = tx_root / "source"
+        state_lock = (tx_root / ".lock").open("a+b")
+        fcntl.flock(state_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
         if kind == "pack":
             real_source = real_root / "source"
@@ -329,7 +335,7 @@ class PackTransaction:
                     f"Missing Packwiz source directory: {real_source}"
                 )
             shutil.copytree(real_source, tx_source, symlinks=True)
-            return cls(
+            transaction = cls(
                 project_key=project_key_value,
                 root=tx_root,
                 source=tx_source,
@@ -337,6 +343,8 @@ class PackTransaction:
                 baseline_contents=metadata_content_snapshot(tx_source),
                 real_source_baseline=tree_digest_snapshot(real_source),
             )
+            transaction._state_lock = state_lock
+            return transaction
 
         config_path = real_root / "template.yaml"
         config = packctl.load_template_config(project_id)
@@ -348,7 +356,7 @@ class PackTransaction:
             loader=loader,
             loader_version=loader_version,
         )
-        return cls(
+        transaction = cls(
             project_key=project_key_value,
             root=tx_root,
             source=tx_source,
@@ -356,6 +364,33 @@ class PackTransaction:
             baseline_contents={},
             template_config_baseline=file_digest(config_path),
         )
+        transaction._state_lock = state_lock
+        return transaction
+
+    def _finish_state(self) -> None:
+        try:
+            (self.root / ".completed").touch(exist_ok=True)
+        except OSError:
+            pass
+        if self._state_lock is not None:
+            try:
+                fcntl.flock(self._state_lock, fcntl.LOCK_UN)
+            finally:
+                self._state_lock.close()
+                self._state_lock = None
+
+    def __del__(self) -> None:
+        state_lock = getattr(self, "_state_lock", None)
+        if state_lock is not None:
+            try:
+                fcntl.flock(state_lock, fcntl.LOCK_UN)
+            except (OSError, ValueError):
+                pass
+            try:
+                state_lock.close()
+            except OSError:
+                pass
+            self._state_lock = None
 
     def ensure_active(self) -> None:
         if not self.active or not self.source.is_dir():
@@ -684,6 +719,7 @@ class PackTransaction:
                     entry["url"] = mod.source_url
                 merged[(provider, mod.project_id)] = entry
             packctl.save_template_mods(project_id, list(merged.values()))
+            self._finish_state()
             shutil.rmtree(self.root, ignore_errors=True)
             self.active = False
             return
@@ -718,6 +754,7 @@ class PackTransaction:
             raise
 
         shutil.rmtree(backup)
+        self._finish_state()
         shutil.rmtree(self.root, ignore_errors=True)
         self.active = False
 
@@ -730,6 +767,7 @@ class PackTransaction:
         if operation is not None and not operation.done.is_set():
             operation.cancel()
             operation.wait(3.0)
+        self._finish_state()
         shutil.rmtree(self.root, ignore_errors=True)
 
 
@@ -1627,9 +1665,41 @@ def create_project(
     return subprocess.run(command, cwd=ROOT, text=True, check=False).returncode
 
 
-def delete_project(project_key_value: str) -> None:
+def delete_project(project_key_value: str) -> packctl.TrashEntry:
     kind, project_id = split_project_key(project_key_value)
-    shutil.rmtree(project_root(project_key_value))
+    try:
+        return packctl.trash_project(kind, project_id)
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def list_trash() -> list[packctl.TrashEntry]:
+    return packctl.list_trash()
+
+
+def restore_trash(name: str) -> Path:
+    try:
+        return packctl.restore_trash(name)
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def purge_trash(name: str) -> tuple[int, int]:
+    try:
+        return packctl.purge_trash(name=name)
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def state_items() -> list[StateItem]:
+    return packctl.classify_state()
+
+
+def clean_state(*, apply: bool = False) -> packctl.StateCleanupReport:
+    try:
+        return packctl.clean_state(apply=apply)
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
 
 
 def project_actions(project_key_value: str) -> tuple[str, ...]:
