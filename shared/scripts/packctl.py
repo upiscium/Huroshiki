@@ -911,16 +911,273 @@ def project_versions(source: Path) -> tuple[str, str, str]:
     versions = data.get("versions", {})
     if not isinstance(versions, dict):
         raise ConfigError(f"{source}/pack.toml versions must be a mapping")
-    minecraft = str(versions.get("minecraft", ""))
-    loaders = [
-        (loader, str(versions[loader])) for loader in LOADER_FLAGS if loader in versions
-    ]
+    minecraft = versions.get("minecraft")
+    if not isinstance(minecraft, str) or not minecraft.strip():
+        raise ConfigError(
+            f"{source}/pack.toml versions.minecraft must be a non-empty string"
+        )
+    loaders = [loader for loader in LOADER_FLAGS if loader in versions]
     if len(loaders) != 1:
         raise ConfigError(
             f"{source}/pack.toml must define exactly one supported loader"
         )
-    loader, loader_version = loaders[0]
-    return minecraft, loader, loader_version
+    loader = loaders[0]
+    loader_version = versions[loader]
+    if not isinstance(loader_version, str) or not loader_version.strip():
+        raise ConfigError(
+            f"{source}/pack.toml versions.{loader} must be a non-empty string"
+        )
+    return minecraft.strip(), loader, loader_version.strip()
+
+
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def project_directories(parent: Path) -> list[Path]:
+    if not parent.is_dir():
+        return []
+    return sorted(
+        path
+        for path in parent.iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    )
+
+
+def validation_yaml(path: Path, errors: list[str]) -> dict[str, Any] | None:
+    if not path.is_file():
+        errors.append(f"{display_path(path)}: missing required file")
+        return None
+    try:
+        return load_yaml(path)
+    except (ConfigError, OSError, UnicodeError, yaml.YAMLError) as error:
+        errors.append(f"{display_path(path)}: {error}")
+        return None
+
+
+def validation_text(
+    config: dict[str, Any], key: str, path: Path, errors: list[str]
+) -> str | None:
+    try:
+        return require_text(config, key, display_path(path))
+    except ConfigError as error:
+        errors.append(f"{display_path(path)}: {error}")
+        return None
+
+
+def validate_manifest_identity(
+    root: Path,
+    config: dict[str, Any],
+    manifest: Path,
+    errors: list[str],
+) -> None:
+    project_id = validation_text(config, "id", manifest, errors)
+    if project_id is None:
+        return
+    try:
+        validate_project_id(project_id)
+    except ConfigError as error:
+        errors.append(f"{display_path(manifest)}: id {project_id!r}: {error}")
+    if project_id != root.name:
+        errors.append(
+            f"{display_path(manifest)}: id {project_id!r} must match directory "
+            f"name {root.name!r}"
+        )
+
+
+def validate_enabled(config: dict[str, Any], path: Path, errors: list[str]) -> None:
+    if not isinstance(config.get("enabled"), bool):
+        errors.append(f"{display_path(path)}: enabled must be a boolean")
+
+
+def validate_deployment_config(
+    config: dict[str, Any], path: Path, errors: list[str]
+) -> None:
+    sections = {
+        "distribution": ("rsync_target",),
+        "minecraft_server": ("ssh_host", "stack_dir", "service"),
+    }
+    for section, fields in sections.items():
+        try:
+            mapping = require_mapping(config, section, display_path(path))
+        except ConfigError as error:
+            errors.append(f"{display_path(path)}: {error}")
+            continue
+        for field in fields:
+            try:
+                require_text(mapping, field, f"{display_path(path)}.{section}")
+            except ConfigError as error:
+                errors.append(f"{display_path(path)}: {error}")
+
+
+def validate_packwiz_versions(source: Path, errors: list[str]) -> None:
+    pack_toml = source / "pack.toml"
+    try:
+        data = read_toml(pack_toml)
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        errors.append(f"{display_path(pack_toml)}: {error}")
+        return
+    versions = data.get("versions")
+    if not isinstance(versions, dict):
+        errors.append(f"{display_path(pack_toml)}: versions must be a mapping")
+        return
+
+    minecraft = versions.get("minecraft")
+    if not isinstance(minecraft, str) or not minecraft.strip():
+        errors.append(
+            f"{display_path(pack_toml)}: versions.minecraft must be a non-empty string"
+        )
+    loaders = [loader for loader in LOADER_FLAGS if loader in versions]
+    if len(loaders) != 1:
+        errors.append(
+            f"{display_path(pack_toml)}: must define exactly one supported loader"
+        )
+    else:
+        loader = loaders[0]
+        loader_version = versions[loader]
+        if not isinstance(loader_version, str) or not loader_version.strip():
+            errors.append(
+                f"{display_path(pack_toml)}: versions.{loader} must be a "
+                "non-empty string"
+            )
+
+
+def validate_pack_directory(root: Path) -> list[str]:
+    errors: list[str] = []
+    manifest = root / "pack.yaml"
+    config = validation_yaml(manifest, errors)
+    local_path = root / "pack.local.yaml"
+    local: dict[str, Any] | None = {}
+    if local_path.exists():
+        local = validation_yaml(local_path, errors)
+
+    try:
+        validate_project_id(root.name)
+    except ConfigError as error:
+        errors.append(f"{display_path(root)}: invalid directory name: {error}")
+
+    if config is not None:
+        validate_manifest_identity(root, config, manifest, errors)
+        validation_text(config, "display_name", manifest, errors)
+        validate_enabled(config, manifest, errors)
+        validate_deployment_config(merge(config, local or {}), manifest, errors)
+
+    source = root / "source"
+    pack_toml = source / "pack.toml"
+    index_toml = source / "index.toml"
+    for required in (pack_toml, index_toml):
+        if not required.is_file():
+            errors.append(f"{display_path(required)}: missing required file")
+
+    if pack_toml.is_file():
+        validate_packwiz_versions(source, errors)
+
+    if source.is_dir():
+        for metadata in metadata_files(source):
+            try:
+                side = read_toml(metadata).get("side")
+                if side not in VALID_SIDES:
+                    errors.append(
+                        f"{display_path(metadata)}: side must be client, server, or both"
+                    )
+            except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+                errors.append(f"{display_path(metadata)}: {error}")
+    return errors
+
+
+def validate_template_directory(root: Path) -> list[str]:
+    errors: list[str] = []
+    manifest = root / "template.yaml"
+    config = validation_yaml(manifest, errors)
+    try:
+        validate_project_id(root.name)
+    except ConfigError as error:
+        errors.append(f"{display_path(root)}: invalid directory name: {error}")
+    if config is None:
+        return errors
+
+    validate_manifest_identity(root, config, manifest, errors)
+    validation_text(config, "display_name", manifest, errors)
+    validate_enabled(config, manifest, errors)
+    validation_text(config, "minecraft", manifest, errors)
+    loader = validation_text(config, "loader", manifest, errors)
+    if loader is not None and loader.lower() not in LOADER_FLAGS:
+        errors.append(
+            f"{display_path(manifest)}: loader must be one of "
+            f"{', '.join(sorted(LOADER_FLAGS))}"
+        )
+    validation_text(config, "reference_loader_version", manifest, errors)
+
+    mods = config.get("mods")
+    if not isinstance(mods, list):
+        errors.append(f"{display_path(manifest)}: mods must be a list")
+        return errors
+    for index, entry in enumerate(mods):
+        context = f"mods[{index}]"
+        if not isinstance(entry, dict):
+            errors.append(f"{display_path(manifest)}: {context} must be a mapping")
+            continue
+        provider = str(entry.get("provider", "")).strip().lower()
+        if provider not in {"modrinth", "curseforge", "url"}:
+            errors.append(
+                f"{display_path(manifest)}: {context}.provider must be modrinth, "
+                "curseforge, or url"
+            )
+        if not str(entry.get("project_id", "")).strip():
+            errors.append(
+                f"{display_path(manifest)}: {context}.project_id must be a "
+                "non-empty string"
+            )
+        side = str(entry.get("side", "both")).strip().lower()
+        if side not in VALID_SIDES:
+            errors.append(
+                f"{display_path(manifest)}: {context}.side must be client, server, "
+                "or both"
+            )
+        if provider == "url":
+            url = str(entry.get("url", "")).strip()
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                errors.append(
+                    f"{display_path(manifest)}: {context}.url must be a public "
+                    "http(s) URL"
+                )
+            elif not unquote(Path(parsed.path).name).lower().endswith(".jar"):
+                errors.append(
+                    f"{display_path(manifest)}: {context}.url must point to a .jar file"
+                )
+    return errors
+
+
+def print_validation_result(errors: list[str], subject: str) -> int:
+    if errors:
+        print(f"Validation failed with {len(errors)} error(s):", file=sys.stderr)
+        for error in errors:
+            print(f"  - {error}", file=sys.stderr)
+        return 1
+    print(f"Validated {subject}")
+    return 0
+
+
+def cmd_validate(_: argparse.Namespace) -> int:
+    errors: list[str] = []
+    packs = project_directories(PACKS)
+    templates = project_directories(TEMPLATES)
+    for root in packs:
+        errors.extend(validate_pack_directory(root))
+    for root in templates:
+        errors.extend(validate_template_directory(root))
+    return print_validation_result(
+        errors, f"{len(packs)} pack(s) and {len(templates)} template(s)"
+    )
+
+
+def cmd_validate_for(args: argparse.Namespace) -> int:
+    root = get_pack_root(args.pack)
+    return print_validation_result(validate_pack_directory(root), f"pack {args.pack}")
 
 
 def copy_metadata(source: Path, destination: Path) -> None:
@@ -1220,6 +1477,11 @@ def parser() -> argparse.ArgumentParser:
     item = sub.add_parser("validate-template")
     item.add_argument("template")
     item.set_defaults(func=cmd_validate_template)
+    item = sub.add_parser("validate")
+    item.set_defaults(func=cmd_validate)
+    item = sub.add_parser("validate-for")
+    item.add_argument("pack")
+    item.set_defaults(func=cmd_validate_for)
     item = sub.add_parser("migrate-template")
     item.add_argument("template")
     item.set_defaults(func=cmd_migrate_template)

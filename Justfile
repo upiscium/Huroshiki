@@ -64,6 +64,14 @@ template-projects:
 validate-template template:
     {{ctl}} validate-template "{{template}}"
 
+# Validate all packs and templates without changing them.
+validate:
+    {{ctl}} validate
+
+# Validate one pack without changing it.
+validate-for pack:
+    {{ctl}} validate-for "{{pack}}"
+
 # Convert a legacy Packwiz template project into the MOD-list manifest format.
 migrate-template template:
     {{ctl}} migrate-template "{{template}}"
