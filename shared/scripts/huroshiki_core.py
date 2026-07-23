@@ -135,7 +135,7 @@ class UrlArtifact:
     filename: str
     url: str
     sha256: str
-    loader: str
+    loaders: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -497,6 +497,7 @@ class PackTransaction:
                 operation.query,
                 operation.cancel_event,
                 operation.log_dir,
+                project_info(self.project_key).loader,
             )
             if operation.cancelled or operation.cancel_event.is_set():
                 raise HuroshikiError("URL addition was cancelled")
@@ -857,18 +858,8 @@ def sanitize_mod_id(value: str) -> str:
     return normalized[:128]
 
 
-def fallback_mod_id(filename: str) -> str:
-    stem = Path(filename).stem
-    without_version = re.sub(
-        r"[-_](?:v)?\d+(?:[._+-]\d+)*(?:[-+].*)?$",
-        "",
-        stem,
-        flags=re.IGNORECASE,
-    )
-    return sanitize_mod_id(without_version or stem)
-
-
-def parse_jar_identity(path: Path, filename: str) -> tuple[str, str, str, str]:
+def parse_jar_identity(path: Path) -> tuple[str, str, str, tuple[str, ...]]:
+    identities: list[tuple[str, str, str, str]] = []
     try:
         with zipfile.ZipFile(path) as jar:
             names = set(jar.namelist())
@@ -878,7 +869,10 @@ def parse_jar_identity(path: Path, filename: str) -> tuple[str, str, str, str]:
             ):
                 if metadata_name not in names:
                     continue
-                data = tomllib.loads(jar.read(metadata_name).decode("utf-8"))
+                try:
+                    data = tomllib.loads(jar.read(metadata_name).decode("utf-8"))
+                except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+                    continue
                 mods = data.get("mods", [])
                 if isinstance(mods, list) and mods and isinstance(mods[0], dict):
                     entry = mods[0]
@@ -887,20 +881,26 @@ def parse_jar_identity(path: Path, filename: str) -> tuple[str, str, str, str]:
                         mod_id = sanitize_mod_id(raw_mod_id)
                         name = str(entry.get("displayName", mod_id)).strip() or mod_id
                         version = str(entry.get("version", "")).strip()
-                        return mod_id, name, version, loader
+                        identities.append((mod_id, name, version, loader))
 
             if "fabric.mod.json" in names:
-                data = json.loads(jar.read("fabric.mod.json").decode("utf-8"))
+                try:
+                    data = json.loads(jar.read("fabric.mod.json").decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    data = None
                 if isinstance(data, dict):
                     raw_mod_id = str(data.get("id", "")).strip()
                     if raw_mod_id:
                         mod_id = sanitize_mod_id(raw_mod_id)
                         name = str(data.get("name", mod_id)).strip() or mod_id
                         version = str(data.get("version", "")).strip()
-                        return mod_id, name, version, "fabric"
+                        identities.append((mod_id, name, version, "fabric"))
 
             if "quilt.mod.json" in names:
-                data = json.loads(jar.read("quilt.mod.json").decode("utf-8"))
+                try:
+                    data = json.loads(jar.read("quilt.mod.json").decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    data = None
                 loader_data = data.get("quilt_loader", {}) if isinstance(data, dict) else {}
                 metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
                 if isinstance(loader_data, dict):
@@ -913,17 +913,16 @@ def parse_jar_identity(path: Path, filename: str) -> tuple[str, str, str, str]:
                             else mod_id
                         ) or mod_id
                         version = str(loader_data.get("version", "")).strip()
-                        return mod_id, name, version, "quilt"
-    except (
-        zipfile.BadZipFile,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-        tomllib.TOMLDecodeError,
-    ):
-        pass
+                        identities.append((mod_id, name, version, "quilt"))
+    except zipfile.BadZipFile as error:
+        raise HuroshikiError("The downloaded JAR is not a valid archive") from error
 
-    mod_id = fallback_mod_id(filename)
-    return mod_id, Path(filename).stem, "", "unknown"
+    if not identities:
+        raise HuroshikiError(
+            "The downloaded JAR does not contain recognized mod metadata"
+        )
+    mod_id, name, version, _ = identities[0]
+    return mod_id, name, version, tuple(item[3] for item in identities)
 
 
 def url_log_paths(log_dir: Path) -> tuple[Path, Path, Path]:
@@ -959,6 +958,7 @@ def download_url_artifact(
     url: str,
     cancel_event: threading.Event,
     log_dir: Path,
+    target_loader: str,
 ) -> UrlArtifact:
     validate_public_url(url)
     filename = unquote(Path(urlparse(url).path).name)
@@ -992,10 +992,15 @@ def download_url_artifact(
                     f"Could not download self-hosted MOD: {error.reason}"
                 ) from error
 
-        mod_id, name, version, loader = parse_jar_identity(temporary_path, filename)
+        mod_id, name, version, loaders = parse_jar_identity(temporary_path)
+        if target_loader not in loaders:
+            raise HuroshikiError(
+                f"The downloaded MOD supports {', '.join(loaders)}, not {target_loader}"
+            )
         append_url_log(
             log_dir,
-            f"Resolved {name} ({mod_id}) version={version or 'unknown'} loader={loader}",
+            f"Resolved {name} ({mod_id}) version={version or 'unknown'} "
+            f"loaders={','.join(loaders)}",
         )
         return UrlArtifact(
             name=name,
@@ -1004,7 +1009,7 @@ def download_url_artifact(
             filename=filename,
             url=url,
             sha256=digest.hexdigest(),
-            loader=loader,
+            loaders=loaders,
         )
     finally:
         if temporary_path is not None:
@@ -1495,16 +1500,10 @@ def set_installed_mod_side(
 
     source = project_source(project_key_value)
     path = safe_child(source, relative_path)
-    packctl.set_side_file(path, side)
-    refresh = subprocess.run(
-        ["packwiz", "refresh"],
-        cwd=source,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if refresh.returncode != 0:
-        raise HuroshikiError(refresh.stderr.strip() or "packwiz refresh failed")
+    try:
+        packctl.set_side_and_refresh(source, path, side)
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
 
 
 def remove_installed_mods(project_key_value: str, slugs: Iterable[str]) -> int:
@@ -1677,15 +1676,25 @@ def create_pack_from_template(
         raise HuroshikiError(
             "The template must use the same Minecraft version and loader as the new MODPACK"
         )
-    result = create_project(
-        "pack",
-        project_id,
-        display_name,
-        minecraft,
-        loader,
-        loader_version,
-    )
+    mods = packctl.template_mods(template_id)
+    destination = packctl.get_pack_root(project_id, must_exist=False)
+    destination_existed = destination.exists()
+    try:
+        result = create_project(
+            "pack",
+            project_id,
+            display_name,
+            minecraft,
+            loader,
+            loader_version,
+        )
+    except Exception:
+        if not destination_existed:
+            shutil.rmtree(destination, ignore_errors=True)
+        raise
     if result != 0:
+        if not destination_existed:
+            shutil.rmtree(destination, ignore_errors=True)
         raise HuroshikiError("Failed to create the destination MODPACK")
 
     pack_key = project_key("pack", project_id)
@@ -1693,100 +1702,98 @@ def create_pack_from_template(
     installed: list[str] = []
     failures: list[TemplateInstallFailure] = []
 
-    for entry in packctl.template_mods(template_id):
-        name = entry["name"]
-        provider = entry["provider"]
-        remote_id = entry["project_id"]
-        print(f"== Installing {name} ({provider}:{remote_id}) ==", flush=True)
-        existing = find_installed_provider_mod(source, provider, remote_id)
-        if existing is not None:
-            packctl.set_side_file(source / existing.relative_path, entry["side"])
-            installed.append(name)
-            print(f"already installed as dependency: {name}", flush=True)
-            continue
-        checkpoint = source.parent / f".template-checkpoint-{uuid4().hex}"
-        shutil.copytree(source, checkpoint, symlinks=True)
-        before = metadata_digest_snapshot(source)
-        if canonical_provider(provider) == "url":
-            try:
-                artifact = download_url_artifact(
-                    entry["url"],
-                    threading.Event(),
-                    LOG_ROOT
-                    / "template-create"
-                    / f"{project_id}-{uuid4().hex[:8]}",
-                )
-                if artifact.mod_id != remote_id:
-                    raise HuroshikiError(
-                        f"URL now contains MOD ID {artifact.mod_id}, expected {remote_id}"
+    try:
+        for entry in mods:
+            name = entry["name"]
+            provider = entry["provider"]
+            remote_id = entry["project_id"]
+            print(f"== Installing {name} ({provider}:{remote_id}) ==", flush=True)
+            existing = find_installed_provider_mod(source, provider, remote_id)
+            if existing is not None:
+                packctl.set_side_file(source / existing.relative_path, entry["side"])
+                installed.append(name)
+                print(f"already installed as dependency: {name}", flush=True)
+                continue
+            checkpoint = source.parent / f".template-checkpoint-{uuid4().hex}"
+            shutil.copytree(source, checkpoint, symlinks=True)
+            before = metadata_digest_snapshot(source)
+            if canonical_provider(provider) == "url":
+                try:
+                    artifact = download_url_artifact(
+                        entry["url"],
+                        threading.Event(),
+                        LOG_ROOT
+                        / "template-create"
+                        / f"{project_id}-{uuid4().hex[:8]}",
+                        loader,
                     )
-                write_url_metadata(
-                    source,
-                    Path("mods") / f"{remote_id}.pw.toml",
-                    artifact,
-                    entry["side"],
+                    if artifact.mod_id != remote_id:
+                        raise HuroshikiError(
+                            f"URL now contains MOD ID {artifact.mod_id}, expected {remote_id}"
+                        )
+                    write_url_metadata(
+                        source,
+                        Path("mods") / f"{remote_id}.pw.toml",
+                        artifact,
+                        entry["side"],
+                    )
+                    process = subprocess.CompletedProcess(
+                        ["huroshiki", "url", "add"], 0, "", ""
+                    )
+                except HuroshikiError as error:
+                    process = subprocess.CompletedProcess(
+                        ["huroshiki", "url", "add"], 1, "", str(error)
+                    )
+            else:
+                command = template_install_command(provider, remote_id)
+                process = subprocess.run(
+                    command,
+                    cwd=source,
+                    text=True,
+                    capture_output=True,
+                    check=False,
                 )
-                process = subprocess.CompletedProcess(
-                    ["huroshiki", "url", "add"], 0, "", ""
+            after = metadata_digest_snapshot(source)
+            changed = sorted(changed_paths(before, after))
+            if process.returncode != 0 or not changed:
+                shutil.rmtree(source, ignore_errors=True)
+                checkpoint.rename(source)
+                reason = (
+                    concise_process_error(process)
+                    if process.returncode != 0
+                    else "No metadata changes were produced"
                 )
-            except Exception as error:
-                process = subprocess.CompletedProcess(
-                    ["huroshiki", "url", "add"], 1, "", str(error)
+                print(f"warning: {name}: {reason}", file=sys.stderr, flush=True)
+                failures.append(
+                    TemplateInstallFailure(name, provider, remote_id, reason)
                 )
-        else:
-            command = template_install_command(provider, remote_id)
-            process = subprocess.run(
-                command,
-                cwd=source,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-        after = metadata_digest_snapshot(source)
-        changed = sorted(changed_paths(before, after))
-        if process.returncode != 0 or not changed:
-            shutil.rmtree(source, ignore_errors=True)
-            checkpoint.rename(source)
-            reason = (
-                concise_process_error(process)
-                if process.returncode != 0
-                else "No metadata changes were produced"
-            )
-            print(f"warning: {name}: {reason}", file=sys.stderr, flush=True)
-            failures.append(
-                TemplateInstallFailure(name, provider, remote_id, reason)
-            )
-            continue
+                continue
 
-        side = entry["side"]
-        for relative in changed:
-            metadata = source / relative
-            if metadata.is_file() and metadata.name.endswith(".pw.toml"):
-                packctl.set_side_file(metadata, side)
-        shutil.rmtree(checkpoint, ignore_errors=True)
-        installed.append(name)
+            side = entry["side"]
+            for relative in changed:
+                metadata = source / relative
+                if metadata.is_file() and metadata.name.endswith(".pw.toml"):
+                    packctl.set_side_file(metadata, side)
+            shutil.rmtree(checkpoint, ignore_errors=True)
+            installed.append(name)
 
-    refresh = subprocess.run(
-        ["packwiz", "refresh"],
-        cwd=source,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if refresh.returncode != 0:
-        failures.append(
-            TemplateInstallFailure(
-                "Packwiz index refresh",
-                "packwiz",
-                "refresh",
-                concise_process_error(refresh),
-            )
+        refresh = subprocess.run(
+            ["packwiz", "refresh"],
+            cwd=source,
+            text=True,
+            capture_output=True,
+            check=False,
         )
+        if refresh.returncode != 0:
+            raise HuroshikiError(concise_process_error(refresh))
 
-    return TemplateCreationReport(
-        pack_key=pack_key,
-        template_id=template_id,
-        installed=tuple(installed),
-        failed=tuple(failures),
-    )
-
+        return TemplateCreationReport(
+            pack_key=pack_key,
+            template_id=template_id,
+            installed=tuple(installed),
+            failed=tuple(failures),
+        )
+    except Exception:
+        if not destination_existed:
+            shutil.rmtree(destination, ignore_errors=True)
+        raise

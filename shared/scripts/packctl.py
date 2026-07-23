@@ -386,6 +386,33 @@ def set_side_file(path: Path, side: str) -> None:
     path.write_text(tomlkit.dumps(doc), encoding="utf-8")
 
 
+def set_side_and_refresh(source: Path, path: Path, side: str) -> None:
+    snapshots = {
+        item: item.read_bytes() if item.exists() else None
+        for item in (path, source / "index.toml", source / "pack.toml")
+    }
+    try:
+        set_side_file(path, side)
+        result = subprocess.run(
+            ["packwiz", "refresh"],
+            cwd=source,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ConfigError(result.stderr.strip() or "packwiz refresh failed")
+    except Exception:
+        for item, content in snapshots.items():
+            if content is None:
+                item.unlink(missing_ok=True)
+            else:
+                temporary = item.with_name(f".{item.name}.huroshiki-side-rollback")
+                temporary.write_bytes(content)
+                temporary.replace(item)
+        raise
+
+
 def metadata_snapshot(source: Path) -> dict[Path, bytes]:
     return {path.resolve(): path.read_bytes() for path in metadata_files(source)}
 
@@ -744,8 +771,7 @@ def cmd_side(args: argparse.Namespace) -> int:
         raise ConfigError("Metadata path escaped source/")
     if not target.is_file() or not target.name.endswith(".pw.toml"):
         raise ConfigError(f"Metadata file not found: {target}")
-    set_side_file(target, side)
-    run(["packwiz", "refresh"], cwd=source)
+    set_side_and_refresh(source, target, side)
     print(f"{args.pack}/{target.relative_to(source)}: side = {side}")
     return 0
 

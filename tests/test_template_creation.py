@@ -25,6 +25,113 @@ neoforge = "21.1.999"
 
 
 class TemplateCreationTest(unittest.TestCase):
+    def test_malformed_manifest_is_validated_before_pack_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            template_root = templates / "base"
+            template_root.mkdir(parents=True)
+            (template_root / "template.yaml").write_text(
+                '''id: base
+display_name: Base
+enabled: true
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+  - name: Broken
+    provider: unsupported
+    project_id: broken
+    side: both
+''',
+                encoding="utf-8",
+            )
+            patches = [
+                patch.object(core, "ROOT", root),
+                patch.object(core, "PACKS", packs),
+                patch.object(core, "TEMPLATES", templates),
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+            ]
+            for item in patches:
+                item.start()
+            try:
+                with patch.object(core, "create_project") as create:
+                    with self.assertRaises(packctl.ConfigError):
+                        core.create_pack_from_template(
+                            template_id="base",
+                            project_id="generated",
+                            display_name="Generated",
+                            minecraft="1.21.1",
+                            loader="neoforge",
+                            loader_version="21.1.999",
+                        )
+                create.assert_not_called()
+                self.assertFalse((packs / "generated").exists())
+            finally:
+                for item in reversed(patches):
+                    item.stop()
+
+    def test_fatal_error_after_creation_removes_destination_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            template_root = templates / "base"
+            template_root.mkdir(parents=True)
+            (template_root / "template.yaml").write_text(
+                '''id: base
+display_name: Base
+enabled: true
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+  - name: Fatal
+    provider: modrinth
+    project_id: fatal
+    side: both
+''',
+                encoding="utf-8",
+            )
+            patches = [
+                patch.object(core, "ROOT", root),
+                patch.object(core, "PACKS", packs),
+                patch.object(core, "TEMPLATES", templates),
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+            ]
+            for item in patches:
+                item.start()
+
+            def fake_create(*args):
+                source = packs / "generated" / "source"
+                (source / "mods").mkdir(parents=True)
+                (source / "pack.toml").write_text(PACK_TOML, encoding="utf-8")
+                (source / "index.toml").write_text("original index\n", encoding="utf-8")
+                return 0
+
+            try:
+                with patch.object(core, "create_project", side_effect=fake_create), patch.object(
+                    core.subprocess, "run", side_effect=OSError("packwiz unavailable")
+                ):
+                    with self.assertRaisesRegex(OSError, "packwiz unavailable"):
+                        core.create_pack_from_template(
+                            template_id="base",
+                            project_id="generated",
+                            display_name="Generated",
+                            minecraft="1.21.1",
+                            loader="neoforge",
+                            loader_version="21.1.999",
+                        )
+                self.assertFalse((packs / "generated").exists())
+            finally:
+                for item in reversed(patches):
+                    item.stop()
+
     def test_partial_install_keeps_successes_and_reports_failures(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

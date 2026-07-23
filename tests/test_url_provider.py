@@ -43,6 +43,17 @@ displayName="Private MOD"
         jar.writestr("META-INF/neoforge.mods.toml", metadata)
 
 
+def write_fabric_jar(path: Path, version: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as jar:
+        jar.writestr(
+            "fabric.mod.json",
+            '{"id":"private_mod","name":"Private MOD","version":"'
+            + version
+            + '"}',
+        )
+
+
 @contextmanager
 def serve(directory: Path):
     handler = partial(SimpleHTTPRequestHandler, directory=str(directory))
@@ -135,6 +146,56 @@ loader_version: 21.1.234
             self.assertEqual(staged[0].filename, "private-mod-1.1.0.jar")
             self.assertEqual(staged[0].source_url, second_url)
             self.assertTrue(staged[0].server)
+
+    def test_url_add_rejects_jar_for_wrong_loader(self) -> None:
+        public = self.root / "public" / "private-mod.jar"
+        write_fabric_jar(public, "1.0.0")
+
+        with serve(self.root / "public") as base_url:
+            transaction = core.PackTransaction.create(core.project_key("pack", "demo"))
+            result = transaction.begin_add(
+                "url", f"{base_url}/private-mod.jar", client=True, server=True
+            ).run()
+
+        self.assertFalse(result.success)
+        self.assertIn("supports fabric, not neoforge", result.message)
+        self.assertEqual(transaction.staged_mods(), [])
+
+    def test_url_add_accepts_multi_loader_jar_and_preserves_identity(self) -> None:
+        public = self.root / "public" / "private-mod.jar"
+        write_neoforge_jar(public, "1.0.0")
+        with zipfile.ZipFile(public, "a") as jar:
+            jar.writestr(
+                "fabric.mod.json",
+                '{"id":"fabric_alias","name":"Fabric Alias","version":"1.0.0"}',
+            )
+
+        with serve(self.root / "public") as base_url:
+            transaction = core.PackTransaction.create(core.project_key("pack", "demo"))
+            result = transaction.begin_add(
+                "url", f"{base_url}/private-mod.jar", client=True, server=True
+            ).run()
+
+        self.assertTrue(result.success)
+        staged = transaction.staged_mods()
+        self.assertEqual(staged[0].project_id, "private_mod")
+        self.assertEqual(staged[0].name, "Private MOD")
+
+    def test_url_add_rejects_jar_without_mod_metadata(self) -> None:
+        public = self.root / "public" / "library.jar"
+        public.parent.mkdir(parents=True)
+        with zipfile.ZipFile(public, "w") as jar:
+            jar.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
+
+        with serve(self.root / "public") as base_url:
+            transaction = core.PackTransaction.create(core.project_key("pack", "demo"))
+            result = transaction.begin_add(
+                "url", f"{base_url}/library.jar", client=True, server=True
+            ).run()
+
+        self.assertFalse(result.success)
+        self.assertIn("does not contain recognized mod metadata", result.message)
+        self.assertEqual(transaction.staged_mods(), [])
 
     def test_url_template_manifest_is_supported(self) -> None:
         template_root = self.templates / "private"
