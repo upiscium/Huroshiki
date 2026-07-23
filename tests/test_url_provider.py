@@ -181,6 +181,27 @@ loader_version: 21.1.234
         self.assertEqual(staged[0].project_id, "private_mod")
         self.assertEqual(staged[0].name, "Private MOD")
 
+    def test_multi_loader_jar_uses_target_loader_identity(self) -> None:
+        public = self.root / "public" / "private-mod.jar"
+        write_neoforge_jar(public, "2.0.0")
+        with zipfile.ZipFile(public, "a") as jar:
+            jar.writestr(
+                "fabric.mod.json",
+                '{"id":"fabric_id","name":"Fabric Name","version":"1.0.0"}',
+            )
+        with serve(self.root / "public") as base_url:
+            artifact = core.download_url_artifact(
+                f"{base_url}/private-mod.jar",
+                threading.Event(),
+                self.root / "logs",
+                "fabric",
+            )
+
+        self.assertEqual(artifact.mod_id, "fabric_id")
+        self.assertEqual(artifact.name, "Fabric Name")
+        self.assertEqual(artifact.version, "1.0.0")
+        self.assertEqual(artifact.loaders, ("neoforge", "fabric"))
+
     def test_url_add_rejects_jar_without_mod_metadata(self) -> None:
         public = self.root / "public" / "library.jar"
         public.parent.mkdir(parents=True)

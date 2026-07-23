@@ -72,6 +72,41 @@ class SideTransactionTest(unittest.TestCase):
                 )
         self.assert_rolled_back()
 
+    def test_keyboard_interrupt_rolls_back_files(self) -> None:
+        def interrupted_refresh(command, **kwargs):
+            self.metadata.write_bytes(b"partial metadata")
+            (self.source / "index.toml").write_bytes(b"partial index")
+            (self.source / "pack.toml").write_bytes(b"partial pack")
+            raise KeyboardInterrupt
+
+        with patch.object(packctl.subprocess, "run", side_effect=interrupted_refresh):
+            with self.assertRaises(KeyboardInterrupt):
+                packctl.set_side_and_refresh(self.source, self.metadata, "server")
+        self.assert_rolled_back()
+
+    def test_rollback_attempts_every_snapshot_after_restore_failures(self) -> None:
+        real_replace = Path.replace
+
+        def fail_two_restores(path: Path, target: Path):
+            if "huroshiki-side-rollback" in path.name and target.name in {
+                self.metadata.name,
+                "index.toml",
+            }:
+                raise OSError(f"cannot restore {target.name}")
+            return real_replace(path, target)
+
+        with (
+            patch.object(packctl.subprocess, "run", side_effect=self.failed_refresh),
+            patch.object(Path, "replace", fail_two_restores),
+        ):
+            with self.assertRaises(packctl.ConfigError) as raised:
+                packctl.set_side_and_refresh(self.source, self.metadata, "server")
+
+        message = str(raised.exception)
+        self.assertIn("cannot restore example.pw.toml", message)
+        self.assertIn("cannot restore index.toml", message)
+        self.assertEqual((self.source / "pack.toml").read_bytes(), PACK_TOML)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -125,7 +125,7 @@ class ConfirmModal(ModalScreen[bool]):
         text = "\n".join(self.lines)
         with Container(id="modal-dialog"):
             yield Static(self.dialog_title, classes="modal-title")
-            yield Static(text, id="modal-message")
+            yield Static(text, id="modal-message", markup=False)
             yield Static("Enter: confirm    Esc: cancel", classes="modal-help")
 
     def action_confirm(self) -> None:
@@ -653,18 +653,35 @@ class ProjectScreen(BaseScreen):
         if confirmation is not None:
             self.app.push_screen(
                 ConfirmModal("Confirm remote action?", confirmation),
-                lambda confirmed: self.run_confirmed(action, confirmed),
+                lambda confirmed: self.run_confirmed(
+                    action, confirmation, confirmed
+                ),
             )
             return
         self.run_action(action)
 
-    def run_confirmed(self, action: str, confirmed: bool | None) -> None:
+    def run_confirmed(
+        self,
+        action: str,
+        confirmation: tuple[str, ...],
+        confirmed: bool | None,
+    ) -> None:
         if confirmed:
-            self.run_action(action)
+            self.run_action(action, confirmation)
 
-    def run_action(self, action: str) -> None:
-        with self.app.suspend():
-            result = core.run_project_action(self.project_key, action)
+    def run_action(
+        self,
+        action: str,
+        confirmation: tuple[str, ...] | None = None,
+    ) -> None:
+        try:
+            with self.app.suspend():
+                result = core.run_project_action(
+                    self.project_key, action, confirmation
+                )
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+            return
         if result == 0:
             self.app.notify(f"{action} completed")
         else:

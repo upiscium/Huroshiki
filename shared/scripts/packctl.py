@@ -15,8 +15,9 @@ import tempfile
 import tomllib
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 import tomlkit
 import yaml
@@ -274,6 +275,8 @@ def normalize_template_mod(entry: object, context: str) -> dict[str, str]:
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ConfigError(f"{context}.url must be a public http(s) URL")
+        if not unquote(Path(parsed.path).name).lower().endswith(".jar"):
+            raise ConfigError(f"{context}.url must point to a .jar file")
         result["url"] = url
     return result
 
@@ -403,14 +406,27 @@ def set_side_and_refresh(source: Path, path: Path, side: str) -> None:
         )
         if result.returncode != 0:
             raise ConfigError(result.stderr.strip() or "packwiz refresh failed")
-    except Exception:
+    except BaseException as error:
+        rollback_errors: list[str] = []
         for item, content in snapshots.items():
-            if content is None:
-                item.unlink(missing_ok=True)
-            else:
-                temporary = item.with_name(f".{item.name}.huroshiki-side-rollback")
-                temporary.write_bytes(content)
-                temporary.replace(item)
+            try:
+                if content is None:
+                    item.unlink(missing_ok=True)
+                else:
+                    temporary = item.with_name(
+                        f".{item.name}.huroshiki-side-rollback-{uuid4().hex}"
+                    )
+                    try:
+                        temporary.write_bytes(content)
+                        temporary.replace(item)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+            except BaseException as rollback_error:
+                rollback_errors.append(f"{item}: {rollback_error}")
+        if rollback_errors:
+            raise ConfigError(
+                f"{error}; rollback also failed: {'; '.join(rollback_errors)}"
+            ) from error
         raise
 
 
@@ -917,15 +933,17 @@ def copy_metadata(source: Path, destination: Path) -> None:
 
 def swap_directory(staged: Path, destination: Path, backup: Path) -> None:
     had_destination = destination.exists()
-    if had_destination:
-        destination.replace(backup)
     try:
-        staged.replace(destination)
-    except OSError as swap_error:
         if had_destination:
+            destination.replace(backup)
+        staged.replace(destination)
+    except BaseException as swap_error:
+        if had_destination and backup.exists():
             try:
+                if destination.exists():
+                    shutil.rmtree(destination)
                 backup.replace(destination)
-            except OSError as rollback_error:
+            except BaseException as rollback_error:
                 raise ConfigError(
                     f"Failed to replace {destination} and restore the previous build; "
                     f"it remains at {backup}: {rollback_error}"

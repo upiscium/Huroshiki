@@ -109,6 +109,25 @@ class TransactionalBuildTest(unittest.TestCase):
             self.assertEqual((output / "new.txt").read_text(), "new build")
             self.assertTrue((output / "mods" / "demo.pw.toml").is_file())
 
+    def test_keyboard_interrupt_during_swap_restores_dist(self) -> None:
+        self.write_metadata("both")
+        before = self.dist_snapshot()
+        real_replace = Path.replace
+
+        def interrupt_staged_swap(path: Path, target: Path):
+            if path.name == "dist" and path.parent.name.startswith(".build-dist-"):
+                raise KeyboardInterrupt
+            return real_replace(path, target)
+
+        with (
+            patch.object(packctl, "run"),
+            patch.object(Path, "replace", interrupt_staged_swap),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                packctl.build_pack("demo")
+
+        self.assertEqual(self.dist_snapshot(), before)
+
     def test_invalid_side_prints_exact_side_for_guidance(self) -> None:
         self.write_metadata("unknown")
         stderr = StringIO()

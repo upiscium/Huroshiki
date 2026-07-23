@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from textual.app import App
+from textual.widgets import Static
 
 import huroshiki
 import huroshiki_core as core
@@ -92,13 +93,42 @@ minecraft_server:
                     core.project_action_confirmation("pack:demo", "build")
                 )
 
+    def test_remote_action_aborts_if_config_changes_after_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            packs = Path(directory) / "packs"
+            pack = packs / "demo"
+            pack.mkdir(parents=True)
+            (pack / "pack.yaml").write_text(
+                "id: demo\ndistribution:\n  rsync_target: old:/demo\n",
+                encoding="utf-8",
+            )
+
+            def run(command, **kwargs):
+                (pack / "pack.local.yaml").write_text(
+                    "distribution:\n  rsync_target: new:/demo\n",
+                    encoding="utf-8",
+                )
+                return core.subprocess.CompletedProcess(command, 0)
+
+            with patch.object(packctl, "PACKS", packs), patch.object(
+                core.subprocess, "run", side_effect=run
+            ) as subprocess_run:
+                confirmation = core.project_action_confirmation("pack:demo", "deploy")
+                with self.assertRaisesRegex(
+                    core.HuroshikiError, "changed after confirmation"
+                ):
+                    core.run_project_action("pack:demo", "deploy", confirmation)
+
+            self.assertEqual(subprocess_run.call_count, 1)
+            self.assertEqual(subprocess_run.call_args.args[0][-2:], ["build", "demo"])
+
 
 class ProjectScreenActionTest(unittest.IsolatedAsyncioTestCase):
     async def test_publish_confirmation_contents_and_cancel(self) -> None:
         lines = (
             "Pack: demo",
             "Action: publish",
-            "Rsync target: deploy@remote:/packs/demo",
+            "Rsync target: [deploy]@remote:/packs/demo",
             "SSH target: ops@remote",
         )
         with (
@@ -118,6 +148,9 @@ class ProjectScreenActionTest(unittest.IsolatedAsyncioTestCase):
                 modal = app.screen
                 self.assertIsInstance(modal, huroshiki.ConfirmModal)
                 self.assertEqual(modal.lines, list(lines))
+                message = modal.query_one("#modal-message", Static)
+                self.assertEqual(message.content, "\n".join(lines))
+                self.assertIn("[deploy]", str(message.render()))
 
                 await pilot.press("escape")
                 await pilot.pause()
@@ -146,7 +179,11 @@ class ProjectScreenActionTest(unittest.IsolatedAsyncioTestCase):
 
                     await pilot.press("enter")
                     await pilot.pause()
-                    run_action.assert_called_once_with("pack:demo", "deploy")
+                    run_action.assert_called_once_with(
+                        "pack:demo",
+                        "deploy",
+                        ("Pack: demo", "Action: deploy"),
+                    )
 
     async def test_build_runs_immediately(self) -> None:
         with (
@@ -169,7 +206,7 @@ class ProjectScreenActionTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause()
 
                     confirmation.assert_called_once_with("pack:demo", "build")
-                    run_action.assert_called_once_with("pack:demo", "build")
+                    run_action.assert_called_once_with("pack:demo", "build", None)
                     self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
 
 

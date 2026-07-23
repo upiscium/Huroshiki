@@ -858,7 +858,10 @@ def sanitize_mod_id(value: str) -> str:
     return normalized[:128]
 
 
-def parse_jar_identity(path: Path) -> tuple[str, str, str, tuple[str, ...]]:
+def parse_jar_identity(
+    path: Path,
+    target_loader: str,
+) -> tuple[str, str, str, tuple[str, ...]]:
     identities: list[tuple[str, str, str, str]] = []
     try:
         with zipfile.ZipFile(path) as jar:
@@ -921,7 +924,10 @@ def parse_jar_identity(path: Path) -> tuple[str, str, str, tuple[str, ...]]:
         raise HuroshikiError(
             "The downloaded JAR does not contain recognized mod metadata"
         )
-    mod_id, name, version, _ = identities[0]
+    identity = next(
+        (item for item in identities if item[3] == target_loader), identities[0]
+    )
+    mod_id, name, version, _ = identity
     return mod_id, name, version, tuple(item[3] for item in identities)
 
 
@@ -992,7 +998,9 @@ def download_url_artifact(
                     f"Could not download self-hosted MOD: {error.reason}"
                 ) from error
 
-        mod_id, name, version, loaders = parse_jar_identity(temporary_path)
+        mod_id, name, version, loaders = parse_jar_identity(
+            temporary_path, target_loader
+        )
         if target_loader not in loaders:
             raise HuroshikiError(
                 f"The downloaded MOD supports {', '.join(loaders)}, not {target_loader}"
@@ -1593,7 +1601,11 @@ def project_action_confirmation(
     return tuple(lines)
 
 
-def run_project_action(project_key_value: str, action: str) -> int:
+def run_project_action(
+    project_key_value: str,
+    action: str,
+    confirmation: tuple[str, ...] | None = None,
+) -> int:
     kind, project_id = split_project_key(project_key_value)
     ctl = [sys.executable, str(SCRIPTS / "packctl.py")]
     if kind == "template":
@@ -1610,14 +1622,17 @@ def run_project_action(project_key_value: str, action: str) -> int:
             check=False,
         ).returncode
 
-    commands: dict[str, list[list[str]]] = {
-        "build": [ctl + ["build", project_id]],
-        "deploy": [ctl + ["build", project_id], ctl + ["deploy", project_id]],
-        "restart": [ctl + ["restart", project_id]],
+    commands: dict[str, list[tuple[list[str], bool]]] = {
+        "build": [(ctl + ["build", project_id], False)],
+        "deploy": [
+            (ctl + ["build", project_id], False),
+            (ctl + ["deploy", project_id], True),
+        ],
+        "restart": [(ctl + ["restart", project_id], True)],
         "publish": [
-            ctl + ["build", project_id],
-            ctl + ["deploy", project_id],
-            ctl + ["restart", project_id],
+            (ctl + ["build", project_id], False),
+            (ctl + ["deploy", project_id], True),
+            (ctl + ["restart", project_id], True),
         ],
     }
     try:
@@ -1625,7 +1640,11 @@ def run_project_action(project_key_value: str, action: str) -> int:
     except KeyError as error:
         raise HuroshikiError(f"Unknown project action: {action}") from error
 
-    for command in selected:
+    for command, remote in selected:
+        if remote and project_action_confirmation(project_key_value, action) != confirmation:
+            raise HuroshikiError(
+                "Remote configuration changed after confirmation; action aborted"
+            )
         result = subprocess.run(command, cwd=ROOT, text=True, check=False)
         if result.returncode != 0:
             return result.returncode
@@ -1702,23 +1721,17 @@ def create_pack_from_template(
     mods = packctl.template_mods(template_id)
     destination = packctl.get_pack_root(project_id, must_exist=False)
     destination_existed = destination.exists()
-    try:
-        result = create_project(
-            "pack",
-            project_id,
-            display_name,
-            minecraft,
-            loader,
-            loader_version,
-        )
-    except Exception:
-        if not destination_existed:
-            shutil.rmtree(destination, ignore_errors=True)
-        raise
+    result = create_project(
+        "pack",
+        project_id,
+        display_name,
+        minecraft,
+        loader,
+        loader_version,
+    )
     if result != 0:
-        if not destination_existed:
-            shutil.rmtree(destination, ignore_errors=True)
         raise HuroshikiError("Failed to create the destination MODPACK")
+    owns_destination = not destination_existed
 
     pack_key = project_key("pack", project_id)
     source = project_source(pack_key)
@@ -1816,7 +1829,13 @@ def create_pack_from_template(
             installed=tuple(installed),
             failed=tuple(failures),
         )
-    except Exception:
-        if not destination_existed:
-            shutil.rmtree(destination, ignore_errors=True)
+    except BaseException as error:
+        if owns_destination:
+            try:
+                shutil.rmtree(destination)
+            except BaseException as rollback_error:
+                raise HuroshikiError(
+                    f"{error}; failed to roll back destination {destination}: "
+                    f"{rollback_error}"
+                ) from error
         raise
