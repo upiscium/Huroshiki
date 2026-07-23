@@ -1570,6 +1570,29 @@ def project_actions(project_key_value: str) -> tuple[str, ...]:
     return ("create MODPACK", "validate")
 
 
+def project_action_confirmation(
+    project_key_value: str,
+    action: str,
+) -> tuple[str, ...] | None:
+    kind, project_id = split_project_key(project_key_value)
+    if kind != "pack" or action not in {"deploy", "publish", "restart"}:
+        return None
+
+    lines = [f"Pack: {project_id}", f"Action: {action}"]
+    if action in {"deploy", "publish"}:
+        lines.append(f"Rsync target: {packctl.distribution_target(project_id)}")
+    if action in {"publish", "restart"}:
+        host, stack, service = packctl.minecraft_server_target(project_id)
+        lines.extend(
+            (
+                f"SSH target: {host}",
+                f"Stack directory: {stack}",
+                f"Compose service: {service}",
+            )
+        )
+    return tuple(lines)
+
+
 def run_project_action(project_key_value: str, action: str) -> int:
     kind, project_id = split_project_key(project_key_value)
     ctl = [sys.executable, str(SCRIPTS / "packctl.py")]

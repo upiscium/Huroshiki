@@ -642,6 +642,27 @@ class ProjectScreen(BaseScreen):
                 self.create_from_selected_template,
             )
             return
+        try:
+            confirmation = core.project_action_confirmation(
+                self.project_key,
+                action,
+            )
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+            return
+        if confirmation is not None:
+            self.app.push_screen(
+                ConfirmModal("Confirm remote action?", confirmation),
+                lambda confirmed: self.run_confirmed(action, confirmed),
+            )
+            return
+        self.run_action(action)
+
+    def run_confirmed(self, action: str, confirmed: bool | None) -> None:
+        if confirmed:
+            self.run_action(action)
+
+    def run_action(self, action: str) -> None:
         with self.app.suspend():
             result = core.run_project_action(self.project_key, action)
         if result == 0:

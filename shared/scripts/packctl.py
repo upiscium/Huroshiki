@@ -1067,6 +1067,16 @@ def distribution_target(pack_id: str) -> str:
     )
 
 
+def minecraft_server_target(pack_id: str) -> tuple[str, str, str]:
+    config = load_pack_config(pack_id)
+    server = require_mapping(config, "minecraft_server", pack_id)
+    return (
+        require_text(server, "ssh_host", f"{pack_id}.minecraft_server"),
+        require_text(server, "stack_dir", f"{pack_id}.minecraft_server"),
+        require_text(server, "service", f"{pack_id}.minecraft_server"),
+    )
+
+
 def deploy_pack(pack_id: str, *, build: bool = False) -> int:
     if build and build_pack(pack_id) != 0:
         return 1
@@ -1086,11 +1096,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
 
 
 def cmd_restart(args: argparse.Namespace) -> int:
-    config = load_pack_config(args.pack)
-    server = require_mapping(config, "minecraft_server", args.pack)
-    host = require_text(server, "ssh_host", f"{args.pack}.minecraft_server")
-    stack = require_text(server, "stack_dir", f"{args.pack}.minecraft_server")
-    service = require_text(server, "service", f"{args.pack}.minecraft_server")
+    host, stack, service = minecraft_server_target(args.pack)
     remote = f"cd {shlex.quote(stack)} && docker compose restart {shlex.quote(service)}"
     run(["ssh", host, remote])
     return 0
