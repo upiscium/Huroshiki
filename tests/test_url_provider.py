@@ -9,6 +9,7 @@ from http.server import (
 )
 import os
 from pathlib import Path
+import struct
 import tempfile
 import threading
 import unittest
@@ -421,9 +422,37 @@ loader_version: 21.1.234
             jar.writestr("one", "")
             jar.writestr("two", "")
 
-        with patch.object(url_artifacts, "MAX_ZIP_ENTRIES", 2):
+        with patch.object(url_artifacts, "MAX_ZIP_ENTRIES", 2), patch.object(
+            url_artifacts.zipfile, "ZipFile", wraps=zipfile.ZipFile
+        ) as zip_file:
             with self.assertRaisesRegex(core.HuroshikiError, "more than 2 entries"):
                 core.parse_jar_identity(path, "fabric")
+        zip_file.assert_not_called()
+
+    def test_jar_identity_rejects_zip64_sentinel_before_open(self) -> None:
+        path = self.root / "zip64.jar"
+        write_fabric_jar(path, "1.0.0")
+        data = bytearray(path.read_bytes())
+        eocd = data.rfind(b"PK\x05\x06")
+        struct.pack_into("<H", data, eocd + 10, 0xFFFF)
+        path.write_bytes(data)
+
+        with patch.object(
+            url_artifacts.zipfile, "ZipFile", wraps=zipfile.ZipFile
+        ) as zip_file:
+            with self.assertRaisesRegex(core.HuroshikiError, "ZIP64"):
+                core.parse_jar_identity(path, "fabric")
+        zip_file.assert_not_called()
+
+    def test_jar_identity_accepts_archive_comment(self) -> None:
+        path = self.root / "commented.jar"
+        write_fabric_jar(path, "1.0.0")
+        with zipfile.ZipFile(path, "a") as jar:
+            jar.comment = b"valid archive comment"
+
+        mod_id, _name, version, loaders = core.parse_jar_identity(path, "fabric")
+
+        self.assertEqual((mod_id, version, loaders), ("private_mod", "1.0.0", ("fabric",)))
 
     def test_jar_identity_rejects_oversized_recognized_metadata(self) -> None:
         path = self.root / "metadata-bomb.jar"
@@ -439,6 +468,123 @@ loader_version: 21.1.234
 
     def test_deadline_closes_blocked_response_and_bounds_worker(self) -> None:
         self._assert_blocked_response_is_closed(cancel=False)
+
+    def test_cancellation_bounds_blocked_opener(self) -> None:
+        self._assert_blocked_opener_is_bounded(cancel=True)
+
+    def test_deadline_bounds_blocked_opener(self) -> None:
+        self._assert_blocked_opener_is_bounded(cancel=False)
+
+    def _assert_blocked_opener_is_bounded(self, *, cancel: bool) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        cancel_event = threading.Event()
+
+        def blocked_open(*args, **kwargs):
+            entered.set()
+            release.wait()
+            return LateResponse()
+
+        class LateResponse:
+            def close(self) -> None:
+                pass
+
+        def cancel_after_open() -> None:
+            entered.wait(1)
+            cancel_event.set()
+
+        canceller = threading.Thread(target=cancel_after_open)
+        if cancel:
+            canceller.start()
+        try:
+            with patch.object(url_artifacts, "urlopen", side_effect=blocked_open):
+                with self.assertRaisesRegex(
+                    core.HuroshikiError,
+                    "cancelled" if cancel else "deadline exceeded",
+                ):
+                    core.download_url_artifact(
+                        "https://example.invalid/private.jar",
+                        cancel_event,
+                        self.root / "blocked-open-logs",
+                        "neoforge",
+                        total_timeout_seconds=10 if cancel else 0.02,
+                    )
+        finally:
+            release.set()
+            if cancel:
+                canceller.join(1)
+
+    def test_abandoned_opener_closes_late_response(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        closed = threading.Event()
+        cancel_event = threading.Event()
+
+        class LateResponse:
+            def close(self) -> None:
+                closed.set()
+
+        def blocked_open(*args, **kwargs):
+            entered.set()
+            release.wait()
+            return LateResponse()
+
+        def cancel_after_open() -> None:
+            entered.wait(1)
+            cancel_event.set()
+
+        canceller = threading.Thread(target=cancel_after_open)
+        canceller.start()
+        with patch.object(url_artifacts, "urlopen", side_effect=blocked_open):
+            with self.assertRaisesRegex(core.HuroshikiError, "cancelled"):
+                core.download_url_artifact(
+                    "https://example.invalid/private.jar",
+                    cancel_event,
+                    self.root / "late-open-logs",
+                    "neoforge",
+                    total_timeout_seconds=10,
+                )
+            release.set()
+            self.assertTrue(closed.wait(1))
+        canceller.join(1)
+
+    def test_successful_mocked_open_transfers_response_ownership(self) -> None:
+        payload = self.jar_bytes()
+
+        class Response:
+            headers = {"Content-Length": str(len(payload))}
+            chunked = False
+            length = len(payload)
+
+            def __init__(self) -> None:
+                self.offset = 0
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.close()
+
+            def read(self, size: int) -> bytes:
+                chunk = payload[self.offset : self.offset + size]
+                self.offset += len(chunk)
+                return chunk
+
+            def close(self) -> None:
+                self.closed = True
+
+        response = Response()
+        with patch.object(url_artifacts, "urlopen", return_value=response):
+            artifact = core.download_url_artifact(
+                "https://example.invalid/private.jar",
+                threading.Event(),
+                self.root / "successful-open-logs",
+                "neoforge",
+            )
+
+        self.assertEqual(artifact.mod_id, "private_mod")
+        self.assertTrue(response.closed)
 
     def _assert_blocked_response_is_closed(self, *, cancel: bool) -> None:
         entered = threading.Event()

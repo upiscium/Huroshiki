@@ -4,7 +4,9 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+import queue
 import re
+import struct
 import tempfile
 import threading
 import time
@@ -39,6 +41,50 @@ DEFAULT_URL_MAX_JAR_SIZE_BYTES = 256 * 1024 * 1024
 DEFAULT_URL_TOTAL_TIMEOUT_SECONDS = 120.0
 MAX_ZIP_ENTRIES = 10_000
 MAX_METADATA_ENTRY_SIZE_BYTES = 1024 * 1024
+ZIP_EOCD_SIZE = 22
+ZIP_MAX_COMMENT_SIZE = 65_535
+
+
+def _preflight_zip_entry_count(path: Path) -> None:
+    with path.open("rb") as archive:
+        archive.seek(0, 2)
+        archive_size = archive.tell()
+        tail_size = min(archive_size, ZIP_EOCD_SIZE + ZIP_MAX_COMMENT_SIZE)
+        archive.seek(-tail_size, 2)
+        tail = archive.read(tail_size)
+
+    signature = b"PK\x05\x06"
+    offset = tail.rfind(signature)
+    while offset >= 0:
+        if offset + ZIP_EOCD_SIZE <= len(tail):
+            comment_size = int.from_bytes(tail[offset + 20 : offset + 22], "little")
+            if offset + ZIP_EOCD_SIZE + comment_size == len(tail):
+                break
+        offset = tail.rfind(signature, 0, offset)
+    if offset < 0:
+        return
+
+    (
+        _signature,
+        _disk_number,
+        _central_directory_disk,
+        entries_on_disk,
+        total_entries,
+        central_directory_size,
+        central_directory_offset,
+        _comment_size,
+    ) = struct.unpack_from("<4s4H2LH", tail, offset)
+    if (
+        entries_on_disk == 0xFFFF
+        or total_entries == 0xFFFF
+        or central_directory_size == 0xFFFFFFFF
+        or central_directory_offset == 0xFFFFFFFF
+    ):
+        raise HuroshikiError("Downloaded JAR uses unsupported ZIP64 metadata")
+    if max(entries_on_disk, total_entries) > MAX_ZIP_ENTRIES:
+        raise HuroshikiError(
+            f"Downloaded JAR contains more than {MAX_ZIP_ENTRIES} entries"
+        )
 
 
 def _read_metadata_entry(jar: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
@@ -84,6 +130,7 @@ def parse_jar_identity(
 ) -> tuple[str, str, str, tuple[str, ...]]:
     identities: list[tuple[str, str, str, str]] = []
     try:
+        _preflight_zip_entry_count(path)
         with zipfile.ZipFile(path) as jar:
             infos = jar.infolist()
             if len(infos) > MAX_ZIP_ENTRIES:
@@ -237,9 +284,60 @@ def download_url_artifact(
             temporary_path = Path(temporary.name)
             digest = hashlib.sha256()
             try:
-                with urlopen(
-                    request, timeout=min(60.0, total_timeout_seconds)
-                ) as response:
+                open_results: queue.Queue[tuple[object | None, BaseException | None]] = (
+                    queue.Queue(maxsize=1)
+                )
+                open_ready = threading.Event()
+                open_claimed = threading.Event()
+                open_abandoned = threading.Event()
+
+                def open_request() -> None:
+                    try:
+                        response = urlopen(
+                            request, timeout=min(60.0, total_timeout_seconds)
+                        )
+                    except BaseException as error:
+                        if not open_abandoned.is_set():
+                            open_results.put((None, error))
+                            open_ready.set()
+                        return
+
+                    if open_abandoned.is_set():
+                        response.close()
+                        return
+                    open_results.put((response, None))
+                    open_ready.set()
+                    while not open_claimed.wait(0.1):
+                        if open_abandoned.is_set():
+                            response.close()
+                            return
+
+                opener = threading.Thread(
+                    target=open_request,
+                    daemon=True,
+                    name="huroshiki-url-opener",
+                )
+                check_cancel_deadline()
+                opener.start()
+                while not open_ready.is_set():
+                    try:
+                        check_cancel_deadline()
+                    except HuroshikiError:
+                        open_abandoned.set()
+                        raise
+                    open_ready.wait(min(max(deadline - time.monotonic(), 0), 0.05))
+                try:
+                    check_cancel_deadline()
+                except HuroshikiError:
+                    open_abandoned.set()
+                    raise
+                response_result, open_error = open_results.get_nowait()
+                if open_error is not None:
+                    raise open_error
+                open_claimed.set()
+                response = response_result
+
+                with response:
                     watcher_stop = threading.Event()
                     deadline_reached = threading.Event()
 
