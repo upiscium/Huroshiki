@@ -17,7 +17,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        uses: DeterminateSystems/determinate-nix-action@d96678350ffd6a456235832eb11e1c491589b7bb # v3.21.8
         with:
           determinate: false
 
@@ -26,6 +26,7 @@ jobs:
         with:
           use-flakehub: false
           use-gha-cache: true
+          source-revision: 03659f4394aec2317771e29041ef266669e2ee12
 
       - name: Check flake
         run: nix flake check

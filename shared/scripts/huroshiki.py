@@ -714,14 +714,18 @@ class StateScreen(BaseScreen):
                     "Active transactions and locks are protected.",
                 ],
             ),
-            self.cleanup_confirmed,
+            lambda confirmed: self.cleanup_confirmed(report.selected, confirmed),
         )
 
-    def cleanup_confirmed(self, confirmed: bool | None) -> None:
+    def cleanup_confirmed(
+        self,
+        selected: tuple[core.StateItem, ...],
+        confirmed: bool | None,
+    ) -> None:
         if not confirmed:
             return
         try:
-            report = core.clean_state(apply=True)
+            report = core.clean_state(apply=True, expected=selected)
             self.app.notify(
                 f"Removed {report.removed_count} item(s), "
                 f"{report.removed_bytes} bytes"
@@ -842,6 +846,8 @@ class ProjectScreen(BaseScreen):
     ) -> None:
         if confirmed:
             self.run_action(action, confirmation)
+        elif isinstance(confirmation, core.ProjectDeployPreview):
+            core.discard_deploy_preview(confirmation)
 
     def run_action(
         self,

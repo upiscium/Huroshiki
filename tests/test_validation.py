@@ -270,6 +270,42 @@ minecraft_server:
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")
 
+    def test_effective_local_fields_and_ids_are_validated(self) -> None:
+        (self.pack_root / "pack.local.yaml").write_text(
+            "id: other\ndisplay_name: ''\nenabled: 'yes'\n"
+            "url_max_jar_size_bytes: 0\n",
+            encoding="utf-8",
+        )
+        (self.template_root / "template.local.yaml").write_text(
+            "id: other\nloader: unsupported\nmods: invalid\n"
+            "url_max_jar_size_bytes: false\n",
+            encoding="utf-8",
+        )
+
+        result, _, stderr = self.validate_all()
+
+        self.assertEqual(result, 1)
+        for expected in (
+            "packs/demo/pack.yaml: id 'other' must match directory name 'demo'",
+            "display_name must be a non-empty string",
+            "enabled must be a boolean",
+            "url_max_jar_size_bytes must be a positive integer",
+            "templates/base/template.yaml: id 'other' must match directory name 'base'",
+            "loader must be one of",
+            "mods must be a list",
+        ):
+            self.assertIn(expected, stderr)
+
+    def test_reports_malformed_template_local_yaml(self) -> None:
+        (self.template_root / "template.local.yaml").write_text(
+            "invalid: [", encoding="utf-8"
+        )
+
+        result, _, stderr = self.validate_all()
+
+        self.assertEqual(result, 1)
+        self.assertIn("templates/base/template.local.yaml", stderr)
+
     def test_validate_for_ignores_templates_and_other_packs(self) -> None:
         (self.template_root / "template.yaml").write_text("invalid: [", encoding="utf-8")
         other = self.packs / "other"

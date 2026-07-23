@@ -28,6 +28,10 @@ minecraft-modpacks-monorepo/
 │       ├── packctl.py
 │       ├── huroshiki.py
 │       ├── huroshiki_core.py
+│       ├── deploy_support.py
+│       ├── packctl_errors.py
+│       ├── project_locks.py
+│       ├── url_artifacts.py
 │       ├── packwiz_pty.py
 │       └── packwiz_parser.py
 ├── templates/
@@ -310,8 +314,8 @@ active transactionとlockは削除対象になりません。既定保持期間�
 
 ```bash
 just clean-huroshiki-state
-just clean-huroshiki-state -- --older-than 14 --keep 5 --project pack:example
-just purge-huroshiki-state -- --older-than 14 --project pack:example
+just clean-huroshiki-state --older-than 14 --keep 5 --project pack:example
+just purge-huroshiki-state --older-than 14 --project pack:example
 python shared/scripts/packctl.py trash-purge --project pack:example
 ```
 

@@ -25,6 +25,50 @@ neoforge = "21.1.999"
 
 
 class TemplateCreationTest(unittest.TestCase):
+    def test_creation_uses_already_held_lock_without_self_deadlock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            template = templates / "base"
+            template.mkdir(parents=True)
+            (template / "template.yaml").write_text(
+                "id: base\ndisplay_name: Base\nenabled: true\n"
+                "minecraft: 1.21.1\nloader: neoforge\n"
+                "reference_loader_version: 21.1.234\nmods: []\n",
+                encoding="utf-8",
+            )
+
+            def fake_packwiz(command, *, cwd=None, **kwargs):
+                source = Path(cwd)
+                (source / "pack.toml").write_text(PACK_TOML, encoding="utf-8")
+                (source / "index.toml").write_text(
+                    'hash-format = "sha256"\n', encoding="utf-8"
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                patch.object(core, "ROOT", root),
+                patch.object(core, "PACKS", packs),
+                patch.object(core, "TEMPLATES", templates),
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+                patch.object(packctl, "run", side_effect=fake_packwiz),
+                patch.object(core.subprocess, "run", side_effect=fake_packwiz),
+            ):
+                report = core.create_pack_from_template(
+                    template_id="base",
+                    project_id="generated",
+                    display_name="Generated",
+                    minecraft="1.21.1",
+                    loader="neoforge",
+                    loader_version="21.1.999",
+                )
+
+            self.assertEqual(report.pack_key, "pack:generated")
+            self.assertTrue((packs / "generated" / "pack.yaml").is_file())
+
     def test_invalid_url_is_rejected_before_pack_creation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

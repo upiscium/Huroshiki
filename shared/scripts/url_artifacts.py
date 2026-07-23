@@ -36,6 +36,25 @@ class UrlArtifact:
 URL_USER_AGENT = "huroshiki/1 self-hosted-mod-fetcher"
 URL_CHUNK_SIZE = 1024 * 1024
 DEFAULT_URL_MAX_JAR_SIZE_BYTES = 256 * 1024 * 1024
+DEFAULT_URL_TOTAL_TIMEOUT_SECONDS = 120.0
+MAX_ZIP_ENTRIES = 10_000
+MAX_METADATA_ENTRY_SIZE_BYTES = 1024 * 1024
+
+
+def _read_metadata_entry(jar: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
+    if info.file_size > MAX_METADATA_ENTRY_SIZE_BYTES:
+        raise HuroshikiError(
+            f"JAR metadata entry {info.filename} exceeds "
+            f"{MAX_METADATA_ENTRY_SIZE_BYTES} bytes"
+        )
+    with jar.open(info) as stream:
+        data = stream.read(MAX_METADATA_ENTRY_SIZE_BYTES + 1)
+    if len(data) > MAX_METADATA_ENTRY_SIZE_BYTES:
+        raise HuroshikiError(
+            f"JAR metadata entry {info.filename} exceeds "
+            f"{MAX_METADATA_ENTRY_SIZE_BYTES} bytes"
+        )
+    return data
 
 
 def validate_public_url(url: str) -> None:
@@ -66,15 +85,22 @@ def parse_jar_identity(
     identities: list[tuple[str, str, str, str]] = []
     try:
         with zipfile.ZipFile(path) as jar:
-            names = set(jar.namelist())
+            infos = jar.infolist()
+            if len(infos) > MAX_ZIP_ENTRIES:
+                raise HuroshikiError(
+                    f"Downloaded JAR contains more than {MAX_ZIP_ENTRIES} entries"
+                )
+            entries = {info.filename: info for info in infos}
             for metadata_name, loader in (
                 ("META-INF/neoforge.mods.toml", "neoforge"),
                 ("META-INF/mods.toml", "forge"),
             ):
-                if metadata_name not in names:
+                if metadata_name not in entries:
                     continue
                 try:
-                    data = tomllib.loads(jar.read(metadata_name).decode("utf-8"))
+                    data = tomllib.loads(
+                        _read_metadata_entry(jar, entries[metadata_name]).decode("utf-8")
+                    )
                 except (UnicodeDecodeError, tomllib.TOMLDecodeError):
                     continue
                 mods = data.get("mods", [])
@@ -87,9 +113,13 @@ def parse_jar_identity(
                         version = str(entry.get("version", "")).strip()
                         identities.append((mod_id, name, version, loader))
 
-            if "fabric.mod.json" in names:
+            if "fabric.mod.json" in entries:
                 try:
-                    data = json.loads(jar.read("fabric.mod.json").decode("utf-8"))
+                    data = json.loads(
+                        _read_metadata_entry(jar, entries["fabric.mod.json"]).decode(
+                            "utf-8"
+                        )
+                    )
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     data = None
                 if isinstance(data, dict):
@@ -100,9 +130,13 @@ def parse_jar_identity(
                         version = str(data.get("version", "")).strip()
                         identities.append((mod_id, name, version, "fabric"))
 
-            if "quilt.mod.json" in names:
+            if "quilt.mod.json" in entries:
                 try:
-                    data = json.loads(jar.read("quilt.mod.json").decode("utf-8"))
+                    data = json.loads(
+                        _read_metadata_entry(jar, entries["quilt.mod.json"]).decode(
+                            "utf-8"
+                        )
+                    )
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     data = None
                 loader_data = data.get("quilt_loader", {}) if isinstance(data, dict) else {}
@@ -167,6 +201,8 @@ def download_url_artifact(
     log_dir: Path,
     target_loader: str,
     max_size_bytes: int = DEFAULT_URL_MAX_JAR_SIZE_BYTES,
+    *,
+    total_timeout_seconds: float = DEFAULT_URL_TOTAL_TIMEOUT_SECONDS,
 ) -> UrlArtifact:
     validate_public_url(url)
     if (
@@ -175,6 +211,16 @@ def download_url_artifact(
         or max_size_bytes <= 0
     ):
         raise HuroshikiError("URL JAR size limit must be a positive integer")
+    if total_timeout_seconds <= 0:
+        raise HuroshikiError("URL download deadline must be positive")
+    deadline = time.monotonic() + total_timeout_seconds
+
+    def check_cancel_deadline() -> None:
+        if cancel_event.is_set():
+            raise HuroshikiError("URL download cancelled")
+        if time.monotonic() >= deadline:
+            raise HuroshikiError("URL download deadline exceeded")
+
     filename = unquote(Path(urlparse(url).path).name)
     append_url_log(log_dir, f"Downloading {url}")
     request = Request(
@@ -191,49 +237,87 @@ def download_url_artifact(
             temporary_path = Path(temporary.name)
             digest = hashlib.sha256()
             try:
-                with urlopen(request, timeout=60) as response:
-                    if cancel_event.is_set():
-                        raise HuroshikiError("URL download cancelled")
-                    raw_content_length = response.headers.get("Content-Length")
-                    declared_size = (
-                        int(raw_content_length)
-                        if raw_content_length is not None
-                        and re.fullmatch(r"[0-9]+", raw_content_length.strip())
-                        else None
-                    )
-                    if declared_size is not None and declared_size > max_size_bytes:
-                        raise HuroshikiError(
-                            "Self-hosted JAR exceeds configured limit of "
-                            f"{max_size_bytes} bytes: declared size is "
-                            f"{declared_size} bytes"
-                        )
+                with urlopen(
+                    request, timeout=min(60.0, total_timeout_seconds)
+                ) as response:
+                    watcher_stop = threading.Event()
+                    deadline_reached = threading.Event()
 
-                    # Read to EOF so an understated Content-Length cannot hide bytes.
-                    if declared_size is not None and not response.chunked:
-                        response.length = None
-                    received_size = 0
-                    while True:
-                        if cancel_event.is_set():
-                            raise HuroshikiError("URL download cancelled")
-                        chunk = response.read(
-                            min(URL_CHUNK_SIZE, max_size_bytes - received_size + 1)
+                    def close_on_cancel_or_deadline() -> None:
+                        while not watcher_stop.is_set():
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                deadline_reached.set()
+                                response.close()
+                                return
+                            if cancel_event.wait(min(remaining, 0.1)):
+                                response.close()
+                                return
+
+                    watcher = threading.Thread(
+                        target=close_on_cancel_or_deadline,
+                        daemon=True,
+                        name="huroshiki-url-deadline",
+                    )
+                    watcher.start()
+                    check_cancel_deadline()
+                    try:
+                        raw_content_length = response.headers.get("Content-Length")
+                        declared_size = (
+                            int(raw_content_length)
+                            if raw_content_length is not None
+                            and re.fullmatch(r"[0-9]+", raw_content_length.strip())
+                            else None
                         )
-                        if not chunk:
-                            break
-                        received_size += len(chunk)
-                        if received_size > max_size_bytes:
-                            declared = (
-                                f" (declared {declared_size} bytes)"
-                                if declared_size is not None
-                                else ""
-                            )
+                        if declared_size is not None and declared_size > max_size_bytes:
                             raise HuroshikiError(
                                 "Self-hosted JAR exceeds configured limit of "
-                                f"{max_size_bytes} bytes: received "
-                                f"{received_size} bytes{declared}"
+                                f"{max_size_bytes} bytes: declared size is "
+                                f"{declared_size} bytes"
                             )
-                        temporary.write(chunk)
-                        digest.update(chunk)
+
+                        # Read to EOF so an understated Content-Length cannot hide bytes.
+                        if declared_size is not None and not response.chunked:
+                            response.length = None
+                        received_size = 0
+                        while True:
+                            check_cancel_deadline()
+                            if deadline_reached.is_set():
+                                raise HuroshikiError("URL download deadline exceeded")
+                            try:
+                                chunk = response.read(
+                                    min(
+                                        URL_CHUNK_SIZE,
+                                        max_size_bytes - received_size + 1,
+                                    )
+                                )
+                            except (OSError, ValueError) as error:
+                                if cancel_event.is_set():
+                                    raise HuroshikiError("URL download cancelled") from error
+                                if deadline_reached.is_set():
+                                    raise HuroshikiError(
+                                        "URL download deadline exceeded"
+                                    ) from error
+                                raise
+                            if not chunk:
+                                break
+                            received_size += len(chunk)
+                            if received_size > max_size_bytes:
+                                declared = (
+                                    f" (declared {declared_size} bytes)"
+                                    if declared_size is not None
+                                    else ""
+                                )
+                                raise HuroshikiError(
+                                    "Self-hosted JAR exceeds configured limit of "
+                                    f"{max_size_bytes} bytes: received "
+                                    f"{received_size} bytes{declared}"
+                                )
+                            temporary.write(chunk)
+                            digest.update(chunk)
+                    finally:
+                        watcher_stop.set()
+                        watcher.join(timeout=1)
             except HTTPError as error:
                 raise HuroshikiError(
                     f"Self-hosted URL returned HTTP {error.code}: {url}"
@@ -243,9 +327,11 @@ def download_url_artifact(
                     f"Could not download self-hosted MOD: {error.reason}"
                 ) from error
 
+        check_cancel_deadline()
         mod_id, name, version, loaders = parse_jar_identity(
             temporary_path, target_loader
         )
+        check_cancel_deadline()
         if target_loader not in loaders:
             raise HuroshikiError(
                 f"The downloaded MOD supports {', '.join(loaders)}, not {target_loader}"

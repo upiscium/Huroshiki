@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import huroshiki
 import packctl
 
 
@@ -28,6 +29,7 @@ class StateManagementTest(unittest.TestCase):
             ("TRANSACTION_ROOT", self.state / "transactions"),
             ("LOG_ROOT", self.state / "logs"),
             ("TRASH_ROOT", self.state / "trash"),
+            ("DEPLOY_SNAPSHOT_ROOT", self.state / "deploy-snapshots"),
         ):
             self.stack.enter_context(patch.object(packctl, name, value))
 
@@ -146,6 +148,60 @@ class StateManagementTest(unittest.TestCase):
         active_items = [item for item in report.items if item.path == active]
         self.assertEqual(active_items[0].category, "active_transaction")
         self.assertTrue(active_items[0].active)
+
+    def test_symlinked_state_root_cannot_write_or_remove_external_files(self) -> None:
+        external = self.root / "external"
+        external.mkdir()
+        marker = external / "keep"
+        marker.write_text("safe", encoding="utf-8")
+        self.state.symlink_to(external, target_is_directory=True)
+        self.create_pack()
+
+        with self.assertRaisesRegex(packctl.ConfigError, "symlink"):
+            packctl.trash_project("pack", "demo")
+        with self.assertRaisesRegex(packctl.ConfigError, "symlink"):
+            packctl.clean_state(apply=True, older_than_days=0)
+
+        self.assertEqual(marker.read_text(encoding="utf-8"), "safe")
+        self.assertTrue((self.packs / "demo").is_dir())
+
+    def test_apply_aborts_when_previewed_cleanup_candidates_change(self) -> None:
+        old = self.state / "logs" / "pack-demo" / "old"
+        old.mkdir(parents=True)
+        (old / "session.txt").write_text("before", encoding="utf-8")
+        preview = packctl.clean_state(older_than_days=0, now=2_000_000_000)
+        (old / "session.txt").write_text("after and larger", encoding="utf-8")
+
+        with self.assertRaisesRegex(packctl.ConfigError, "changed after preview"):
+            packctl.clean_state(
+                apply=True,
+                older_than_days=0,
+                now=2_000_000_000,
+                expected=preview.selected,
+            )
+
+        self.assertTrue(old.exists())
+
+    def test_tui_applies_exact_previewed_cleanup_selection(self) -> None:
+        selected = (
+            packctl.StateItem("log", self.state / "logs" / "old", None, 1, 2),
+        )
+        result = packctl.StateCleanupReport(selected, selected, 1, 2, False)
+
+        class App:
+            def notify(self, *args, **kwargs) -> None:
+                pass
+
+        class Screen:
+            app = App()
+
+            def reload(self) -> None:
+                pass
+
+        with patch.object(huroshiki.core, "clean_state", return_value=result) as clean:
+            huroshiki.StateScreen.cleanup_confirmed(Screen(), selected, True)
+
+        clean.assert_called_once_with(apply=True, expected=selected)
 
 
 if __name__ == "__main__":

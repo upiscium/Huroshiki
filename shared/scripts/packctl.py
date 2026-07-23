@@ -30,6 +30,7 @@ from deploy_support import (
     distribution_digest,
     parse_rsync_changes,
     rsync_deploy_command,
+    validate_rsync_target,
 )
 from packctl_errors import ConfigError
 import project_locks
@@ -43,6 +44,7 @@ STATE_ROOT = ROOT / ".huroshiki"
 TRANSACTION_ROOT = STATE_ROOT / "transactions"
 LOG_ROOT = STATE_ROOT / "logs"
 TRASH_ROOT = STATE_ROOT / "trash"
+DEPLOY_SNAPSHOT_ROOT = STATE_ROOT / "deploy-snapshots"
 VALID_SIDES = {"client", "server", "both"}
 SIDE_ALIASES = {
     "b": "both",
@@ -71,7 +73,11 @@ def _project_lock_root(project_key: str) -> Path:
         raise ConfigError("Project key must be pack:<id> or template:<id>")
     get_project_root(kind, project_id, must_exist=False)
     projects = PACKS if kind == "pack" else TEMPLATES
-    return projects.parent / ".huroshiki" / "locks"
+    repository = projects.parent
+    state = repository / ".huroshiki"
+    return ensure_safe_state_path(
+        state / "locks", state_root=state, repository_root=repository
+    )
 
 
 def project_lock_path(project_key: str) -> Path:
@@ -102,6 +108,7 @@ DEFAULT_RETENTION_DAYS = {
     "completed_transaction": 7,
     "transaction_leftover": 7,
     "trash": 30,
+    "deploy_snapshot": 7,
 }
 TRASH_NAME_RE = re.compile(
     r"^(?P<timestamp>\d{8}-\d{6}-\d{6})-(?P<kind>pack|template)-(?P<id>[a-z0-9][a-z0-9._-]*)$"
@@ -160,6 +167,59 @@ def merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
         else:
             result[key] = deepcopy(value)
     return result
+
+
+def ensure_safe_state_path(
+    path: Path,
+    *,
+    state_root: Path | None = None,
+    repository_root: Path | None = None,
+) -> Path:
+    repository = Path(os.path.abspath(repository_root or ROOT))
+    state = Path(os.path.abspath(state_root or (repository / ".huroshiki")))
+    candidate = Path(os.path.abspath(path))
+    try:
+        state.relative_to(repository)
+        candidate.relative_to(state)
+    except ValueError as error:
+        raise ConfigError("State path escaped repository .huroshiki/") from error
+
+    current = repository
+    for part in candidate.relative_to(repository).parts:
+        current /= part
+        if current.is_symlink():
+            raise ConfigError(f"Unsafe symlink in state path: {current}")
+        if not current.exists():
+            break
+
+    resolved_repository = repository.resolve()
+    resolved_state = state.resolve(strict=False)
+    resolved_candidate = candidate.resolve(strict=False)
+    if (
+        resolved_state == resolved_repository
+        or resolved_repository not in resolved_state.parents
+        or (
+            resolved_candidate != resolved_state
+            and resolved_state not in resolved_candidate.parents
+        )
+    ):
+        raise ConfigError("Resolved state path escaped repository ROOT")
+    return candidate
+
+
+def make_state_directory(
+    path: Path,
+    *,
+    state_root: Path | None = None,
+    repository_root: Path | None = None,
+) -> Path:
+    safe = ensure_safe_state_path(
+        path, state_root=state_root, repository_root=repository_root
+    )
+    safe.mkdir(parents=True, exist_ok=True)
+    return ensure_safe_state_path(
+        safe, state_root=state_root, repository_root=repository_root
+    )
 
 
 def validate_project_id(project_id: str) -> None:
@@ -304,11 +364,8 @@ def get_project_root(kind: str, project_id: str, *, must_exist: bool = True) -> 
 def _direct_state_child(parent: Path, name: str) -> Path:
     if not name or Path(name).name != name or name in {".", ".."}:
         raise ConfigError(f"Invalid state item name: {name!r}")
-    parent.mkdir(parents=True, exist_ok=True)
-    path = parent / name
-    if path.parent.resolve() != parent.resolve():
-        raise ConfigError("State path escaped .huroshiki/")
-    return path
+    safe_parent = make_state_directory(parent)
+    return ensure_safe_state_path(safe_parent / name)
 
 
 def path_bytes(path: Path) -> int:
@@ -324,6 +381,7 @@ def path_bytes(path: Path) -> int:
 
 
 def parse_trash_entry(path: Path) -> TrashEntry:
+    path = ensure_safe_state_path(path)
     if (
         TRASH_ROOT.is_symlink()
         or path.parent.resolve() != TRASH_ROOT.resolve()
@@ -350,6 +408,7 @@ def parse_trash_entry(path: Path) -> TrashEntry:
 
 
 def list_trash() -> list[TrashEntry]:
+    ensure_safe_state_path(TRASH_ROOT)
     if not TRASH_ROOT.exists():
         return []
     if TRASH_ROOT.is_symlink() or not TRASH_ROOT.is_dir():
@@ -360,7 +419,7 @@ def list_trash() -> list[TrashEntry]:
 
 def _trash_project(kind: str, project_id: str) -> TrashEntry:
     source = get_project_root(kind, project_id)
-    TRASH_ROOT.mkdir(parents=True, exist_ok=True)
+    make_state_directory(TRASH_ROOT)
     if TRASH_ROOT.is_symlink() or source.stat().st_dev != TRASH_ROOT.stat().st_dev:
         raise ConfigError("Project trash must be on the same filesystem")
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
@@ -426,6 +485,7 @@ def purge_trash(
     total = sum(entry.bytes for entry in selected)
     for entry in selected:
         with ProjectLock(entry.project_key, "purge trash"):
+            ensure_safe_state_path(entry.path)
             shutil.rmtree(entry.path)
     return len(selected), total
 
@@ -1245,6 +1305,18 @@ def validate_enabled(config: dict[str, Any], path: Path, errors: list[str]) -> N
         errors.append(f"{display_path(path)}: enabled must be a boolean")
 
 
+def validate_url_size_limit(
+    config: dict[str, Any], path: Path, errors: list[str]
+) -> None:
+    value = config.get("url_max_jar_size_bytes")
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+    ):
+        errors.append(
+            f"{display_path(path)}: url_max_jar_size_bytes must be a positive integer"
+        )
+
+
 def validate_deployment_config(
     config: dict[str, Any], path: Path, errors: list[str]
 ) -> None:
@@ -1260,8 +1332,12 @@ def validate_deployment_config(
             continue
         for field in fields:
             try:
-                require_text(mapping, field, f"{display_path(path)}.{section}")
+                value = require_text(mapping, field, f"{display_path(path)}.{section}")
+                if section == "distribution" and field == "rsync_target":
+                    validate_rsync_target(value)
             except ConfigError as error:
+                errors.append(f"{display_path(path)}: {error}")
+            except ValueError as error:
                 errors.append(f"{display_path(path)}: {error}")
 
 
@@ -1312,10 +1388,12 @@ def validate_pack_directory(root: Path) -> list[str]:
         errors.append(f"{display_path(root)}: invalid directory name: {error}")
 
     if config is not None:
-        validate_manifest_identity(root, config, manifest, errors)
-        validation_text(config, "display_name", manifest, errors)
-        validate_enabled(config, manifest, errors)
-        validate_deployment_config(merge(config, local or {}), manifest, errors)
+        effective = merge(config, local or {})
+        validate_manifest_identity(root, effective, manifest, errors)
+        validation_text(effective, "display_name", manifest, errors)
+        validate_enabled(effective, manifest, errors)
+        validate_url_size_limit(effective, manifest, errors)
+        validate_deployment_config(effective, manifest, errors)
 
     source = root / "source"
     pack_toml = source / "pack.toml"
@@ -1344,12 +1422,17 @@ def validate_template_directory(root: Path) -> list[str]:
     errors: list[str] = []
     manifest = root / "template.yaml"
     config = validation_yaml(manifest, errors)
+    local_path = root / "template.local.yaml"
+    local: dict[str, Any] | None = {}
+    if local_path.exists():
+        local = validation_yaml(local_path, errors)
     try:
         validate_project_id(root.name)
     except ConfigError as error:
         errors.append(f"{display_path(root)}: invalid directory name: {error}")
     if config is None:
         return errors
+    config = merge(config, local or {})
 
     validate_manifest_identity(root, config, manifest, errors)
     validation_text(config, "display_name", manifest, errors)
@@ -1362,6 +1445,7 @@ def validate_template_directory(root: Path) -> list[str]:
             f"{', '.join(sorted(LOADER_FLAGS))}"
         )
     validation_text(config, "reference_loader_version", manifest, errors)
+    validate_url_size_limit(config, manifest, errors)
 
     mods = config.get("mods")
     if not isinstance(mods, list):
@@ -1592,11 +1676,15 @@ def cmd_validate_template(args: argparse.Namespace) -> int:
 def distribution_target(pack_id: str) -> str:
     config = load_pack_config(pack_id)
     distribution = require_mapping(config, "distribution", pack_id)
-    return require_text(
+    target = require_text(
         distribution,
         "rsync_target",
         f"{pack_id}.distribution",
     )
+    try:
+        return validate_rsync_target(target)
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
 
 
 def distribution_root(pack_id: str) -> Path:
@@ -1607,21 +1695,74 @@ def distribution_root(pack_id: str) -> Path:
     return dist
 
 
+def _make_deploy_snapshot(pack_id: str, dist: Path) -> Path:
+    repository = PACKS.parent
+    state_root = repository / ".huroshiki"
+    snapshot_root = make_state_directory(
+        state_root / "deploy-snapshots",
+        state_root=state_root,
+        repository_root=repository,
+    )
+    if snapshot_root.stat().st_dev != dist.stat().st_dev:
+        raise ConfigError("Deploy snapshot must be on the distribution filesystem")
+    snapshot = ensure_safe_state_path(
+        snapshot_root / f"pack-{pack_id}-{uuid4().hex}",
+        state_root=state_root,
+        repository_root=repository,
+    )
+    before = distribution_digest(dist)
+    try:
+        shutil.copytree(dist, snapshot, symlinks=False)
+        if distribution_digest(dist) != before:
+            raise ConfigError("Distribution changed while creating deploy snapshot")
+        for path in (snapshot, *snapshot.rglob("*")):
+            path.chmod(path.stat().st_mode & ~0o222)
+        return snapshot
+    except BaseException:
+        if snapshot.exists():
+            for path in (snapshot, *snapshot.rglob("*")):
+                if not path.is_symlink():
+                    path.chmod(path.stat().st_mode | 0o700)
+            shutil.rmtree(snapshot, ignore_errors=True)
+        raise
+
+
+def discard_deploy_snapshot(snapshot: Path) -> None:
+    repository = PACKS.parent
+    safe = ensure_safe_state_path(
+        snapshot,
+        state_root=repository / ".huroshiki",
+        repository_root=repository,
+    )
+    if safe.exists():
+        for path in (safe, *safe.rglob("*")):
+            if not path.is_symlink():
+                path.chmod(path.stat().st_mode | 0o700)
+        shutil.rmtree(safe)
+
+
 def _deploy_preview(pack_id: str) -> DeployPreview:
     dist = distribution_root(pack_id)
     target = distribution_target(pack_id)
-    before = distribution_digest(dist)
-    command = rsync_deploy_command(dist, target, dry_run=True)
-    print("+", " ".join(shlex.quote(part) for part in command))
-    result = subprocess.run(command, check=True, text=True, capture_output=True)
-    if result.stdout:
-        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
-    if result.stderr:
-        print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
-    if distribution_target(pack_id) != target or distribution_digest(dist) != before:
-        raise ConfigError("Deploy target or distribution changed during preview")
-    raw_lines = tuple(line for line in result.stdout.splitlines() if line.strip())
-    return DeployPreview(target, before, parse_rsync_changes(result.stdout), raw_lines)
+    snapshot = _make_deploy_snapshot(pack_id, dist)
+    try:
+        digest = distribution_digest(snapshot)
+        command = rsync_deploy_command(snapshot, target, dry_run=True)
+        print("+", " ".join(shlex.quote(part) for part in command))
+        result = subprocess.run(command, check=True, text=True, capture_output=True)
+        if result.stdout:
+            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+        if distribution_target(pack_id) != target or distribution_digest(snapshot) != digest:
+            raise ConfigError("Deploy target or snapshot changed during preview")
+        raw_lines = tuple(line for line in result.stdout.splitlines() if line.strip())
+        return DeployPreview(
+            target, digest, parse_rsync_changes(result.stdout), raw_lines, snapshot
+        )
+    except BaseException:
+        discard_deploy_snapshot(snapshot)
+        raise
 
 
 def deploy_preview(pack_id: str, *, build: bool = False) -> DeployPreview:
@@ -1659,21 +1800,35 @@ def _deploy_pack(
     build: bool = False,
     expected_target: str | None = None,
     expected_dist_digest: str | None = None,
+    snapshot: Path | None = None,
 ) -> int:
     if build and _build_pack(pack_id) != 0:
         return 1
     target = distribution_target(pack_id)
-    dist = distribution_root(pack_id)
-    if expected_target is not None and target != expected_target:
-        raise ConfigError("Deploy target changed after preview; deployment aborted")
-    if (
-        expected_dist_digest is not None
-        and distribution_digest(dist) != expected_dist_digest
-    ):
-        raise ConfigError("Distribution changed after preview; deployment aborted")
-    run(rsync_deploy_command(dist, target, dry_run=False))
-    print(f"Deployed {pack_id} to {target}")
-    return 0
+    owned_snapshot = snapshot is None
+    dist = (
+        _make_deploy_snapshot(pack_id, distribution_root(pack_id))
+        if owned_snapshot
+        else ensure_safe_state_path(
+            snapshot,
+            state_root=PACKS.parent / ".huroshiki",
+            repository_root=PACKS.parent,
+        )
+    )
+    try:
+        if expected_target is not None and target != expected_target:
+            raise ConfigError("Deploy target changed after preview; deployment aborted")
+        if (
+            expected_dist_digest is not None
+            and distribution_digest(dist) != expected_dist_digest
+        ):
+            raise ConfigError("Distribution changed after preview; deployment aborted")
+        run(rsync_deploy_command(dist, target, dry_run=False))
+        print(f"Deployed {pack_id} to {target}")
+        return 0
+    finally:
+        if owned_snapshot:
+            discard_deploy_snapshot(dist)
 
 
 def deploy_pack(
@@ -1682,6 +1837,7 @@ def deploy_pack(
     build: bool = False,
     expected_target: str | None = None,
     expected_dist_digest: str | None = None,
+    snapshot: Path | None = None,
 ) -> int:
     with ProjectLock(f"pack:{pack_id}", "deploy"):
         return _deploy_pack(
@@ -1689,6 +1845,7 @@ def deploy_pack(
             build=build,
             expected_target=expected_target,
             expected_dist_digest=expected_dist_digest,
+            snapshot=snapshot,
         )
 
 
@@ -1703,7 +1860,10 @@ def cmd_deploy(args: argparse.Namespace) -> int:
 
 def cmd_deploy_dry_run(args: argparse.Namespace) -> int:
     preview = deploy_preview(args.pack, build=True)
-    print_deploy_preview(args.pack, preview)
+    try:
+        print_deploy_preview(args.pack, preview)
+    finally:
+        discard_deploy_snapshot(preview.snapshot)
     return 0
 
 
@@ -1796,6 +1956,9 @@ def _transaction_active(path: Path) -> bool:
 
 
 def classify_state() -> list[StateItem]:
+    ensure_safe_state_path(STATE_ROOT)
+    for root in (LOG_ROOT, TRANSACTION_ROOT, TRASH_ROOT, DEPLOY_SNAPSHOT_ROOT):
+        ensure_safe_state_path(root)
     items: list[StateItem] = []
     if LOG_ROOT.is_dir() and not LOG_ROOT.is_symlink():
         for project_dir in sorted(LOG_ROOT.iterdir()):
@@ -1827,6 +1990,7 @@ def classify_state() -> list[StateItem]:
                     )
                 )
     if TRANSACTION_ROOT.is_dir() and not TRANSACTION_ROOT.is_symlink():
+        ensure_safe_state_path(TRANSACTION_ROOT)
         for path in sorted(TRANSACTION_ROOT.iterdir()):
             active = (
                 path.is_symlink()
@@ -1842,6 +2006,20 @@ def classify_state() -> list[StateItem]:
             items.append(
                 StateItem(
                     category,
+                    path,
+                    _project_key_from_state_name(path.name),
+                    path.lstat().st_mtime,
+                    path_bytes(path),
+                    active,
+                )
+            )
+    if DEPLOY_SNAPSHOT_ROOT.is_dir() and not DEPLOY_SNAPSHOT_ROOT.is_symlink():
+        ensure_safe_state_path(DEPLOY_SNAPSHOT_ROOT)
+        for path in sorted(DEPLOY_SNAPSHOT_ROOT.iterdir()):
+            active = path.is_symlink() or not path.is_dir()
+            items.append(
+                StateItem(
+                    "active_state" if active else "deploy_snapshot",
                     path,
                     _project_key_from_state_name(path.name),
                     path.lstat().st_mtime,
@@ -1878,7 +2056,13 @@ def classify_state() -> list[StateItem]:
             )
         )
     if STATE_ROOT.is_dir() and not STATE_ROOT.is_symlink():
-        known = {LOG_ROOT.name, TRANSACTION_ROOT.name, TRASH_ROOT.name, "locks"}
+        known = {
+            LOG_ROOT.name,
+            TRANSACTION_ROOT.name,
+            TRASH_ROOT.name,
+            DEPLOY_SNAPSHOT_ROOT.name,
+            "locks",
+        }
         for path in sorted(STATE_ROOT.iterdir()):
             if path.name not in known:
                 items.append(
@@ -1904,6 +2088,7 @@ def clean_state(
     keep: int = 0,
     project_key: str | None = None,
     now: float | None = None,
+    expected: tuple[StateItem, ...] | None = None,
 ) -> StateCleanupReport:
     if older_than_days is not None and older_than_days < 0:
         raise ConfigError("--older-than must be non-negative")
@@ -1937,6 +2122,8 @@ def clean_state(
             if current_time - item.modified_at >= retention * 86400:
                 candidates.append(item)
     candidates.sort(key=lambda item: str(item.path))
+    if apply and expected is not None and tuple(candidates) != expected:
+        raise ConfigError("State cleanup candidates changed after preview; cleanup aborted")
     removed_count = 0
     removed_bytes = 0
     if apply:
@@ -1947,6 +2134,7 @@ def clean_state(
                     cleanup_lock = ProjectLock(
                         item.project_key, "state cleanup"
                     ).acquire()
+                ensure_safe_state_path(item.path)
                 if item.path.is_symlink():
                     continue
                 if item.path.is_dir():

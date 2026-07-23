@@ -87,6 +87,7 @@ class ProjectDeployPreview:
     changes: tuple[packctl.RsyncChange, ...]
     raw_lines: tuple[str, ...]
     restart_target: tuple[str, str, str] | None = None
+    snapshot: Path | None = None
 
     @property
     def confirmation_lines(self) -> tuple[str, ...]:
@@ -278,9 +279,14 @@ class PackwizAddOperation:
 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         self.log_dir = (
-            LOG_ROOT
+            ROOT / ".huroshiki" / "logs"
             / transaction.project_key.replace(":", "-")
             / f"{timestamp}-{uuid4().hex[:8]}"
+        )
+        packctl.ensure_safe_state_path(
+            self.log_dir,
+            state_root=ROOT / ".huroshiki",
+            repository_root=ROOT,
         )
         self.session: PackwizPtySession | None = None
         if self.provider != "url":
@@ -382,12 +388,17 @@ class PackTransaction:
         tx_root: Path | None = None
         try:
             real_root = project_root(project_key_value)
-            TRANSACTION_ROOT.mkdir(parents=True, exist_ok=True)
+            transaction_root = ROOT / ".huroshiki" / "transactions"
+            packctl.make_state_directory(
+                transaction_root,
+                state_root=ROOT / ".huroshiki",
+                repository_root=ROOT,
+            )
             safe_prefix = project_key_value.replace(":", "-")
             tx_root = Path(
                 tempfile.mkdtemp(
                     prefix=f"{safe_prefix}-",
-                    dir=TRANSACTION_ROOT,
+                    dir=transaction_root,
                 )
             )
             tx_source = tx_root / "source"
@@ -597,19 +608,18 @@ class PackTransaction:
             if operation.cancelled or operation.cancel_event.is_set():
                 raise HuroshikiError("URL addition was cancelled")
 
-            relative_path = Path("mods") / f"{artifact.mod_id}.pw.toml"
-            write_url_metadata(
-                self.source,
-                relative_path,
-                artifact,
-                side_from_flags(operation.client, operation.server),
-            )
-
             with self._lock:
                 if not self.active or self._operation is not operation:
                     raise HuroshikiError(
                         "Transaction was closed before the URL download completed"
                     )
+                relative_path = Path("mods") / f"{artifact.mod_id}.pw.toml"
+                write_url_metadata(
+                    self.source,
+                    relative_path,
+                    artifact,
+                    side_from_flags(operation.client, operation.server),
+                )
                 changed = tuple(
                     sorted(
                         changed_paths(
@@ -894,7 +904,21 @@ class PackTransaction:
             operation = self._operation
         if operation is not None and not operation.done.is_set():
             operation.cancel()
-            operation.wait(3.0)
+            if not operation.wait(3.0):
+                threading.Thread(
+                    target=self._finish_discard_after_operation,
+                    args=(operation,),
+                    daemon=True,
+                    name=f"huroshiki-discard-{self.project_key}",
+                ).start()
+                return
+        self._finish_discard()
+
+    def _finish_discard_after_operation(self, operation: PackwizAddOperation) -> None:
+        operation.wait()
+        self._finish_discard()
+
+    def _finish_discard(self) -> None:
         self._finish_state()
         shutil.rmtree(self.root, ignore_errors=True)
 
@@ -1648,9 +1672,13 @@ def state_items() -> list[StateItem]:
     return packctl.classify_state()
 
 
-def clean_state(*, apply: bool = False) -> packctl.StateCleanupReport:
+def clean_state(
+    *,
+    apply: bool = False,
+    expected: tuple[StateItem, ...] | None = None,
+) -> packctl.StateCleanupReport:
     try:
-        return packctl.clean_state(apply=apply)
+        return packctl.clean_state(apply=apply, expected=expected)
     except packctl.ConfigError as error:
         raise HuroshikiError(str(error)) from error
 
@@ -1685,6 +1713,21 @@ def project_action_confirmation(
     return tuple(lines)
 
 
+def _restart_confirmation(
+    project_id: str,
+    action: str,
+    target: tuple[str, str, str],
+) -> tuple[str, ...]:
+    host, stack, service = target
+    return (
+        f"Pack: {project_id}",
+        f"Action: {action}",
+        f"SSH target: {host}",
+        f"Stack directory: {stack}",
+        f"Compose service: {service}",
+    )
+
+
 def prepare_deploy_preview(
     project_key_value: str,
     action: str,
@@ -1710,7 +1753,17 @@ def prepare_deploy_preview(
                 preview.changes,
                 preview.raw_lines,
                 restart_target,
+                preview.snapshot,
             )
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def discard_deploy_preview(preview: ProjectDeployPreview) -> None:
+    if preview.snapshot is None:
+        return
+    try:
+        packctl.discard_deploy_snapshot(preview.snapshot)
     except packctl.ConfigError as error:
         raise HuroshikiError(str(error)) from error
 
@@ -1744,13 +1797,24 @@ def run_project_action(
     try:
         with packctl.ProjectLock(project_key_value, action):
             if action in {"deploy", "publish"}:
+                snapshot = (
+                    None
+                    if deploy_confirmation is None
+                    or deploy_confirmation.snapshot is None
+                    else packctl.ensure_safe_state_path(
+                        deploy_confirmation.snapshot,
+                        state_root=packctl.PACKS.parent / ".huroshiki",
+                        repository_root=packctl.PACKS.parent,
+                    )
+                )
                 if (
                     deploy_confirmation is None
                     or deploy_confirmation.project_key != project_key_value
                     or deploy_confirmation.action != action
                     or packctl.distribution_target(project_id)
                     != deploy_confirmation.target
-                    or packctl.distribution_digest(packctl.distribution_root(project_id))
+                    or snapshot is None
+                    or packctl.distribution_digest(snapshot)
                     != deploy_confirmation.dist_digest
                     or (
                         action == "publish"
@@ -1765,17 +1829,30 @@ def run_project_action(
                     project_id,
                     expected_target=deploy_confirmation.target,
                     expected_dist_digest=deploy_confirmation.dist_digest,
+                    snapshot=snapshot,
                 )
                 if result != 0 or action == "deploy":
                     return result
+                restart_target = packctl.minecraft_server_target(project_id)
+                if restart_target != deploy_confirmation.restart_target:
+                    raise HuroshikiError(
+                        "Restart target changed during deployment; restart aborted"
+                    )
             elif action == "build":
                 return packctl._build_pack(project_id)
-            elif project_action_confirmation(project_key_value, action) != confirmation:
-                raise HuroshikiError(
-                    "Remote configuration changed after confirmation; action aborted"
-                )
+            else:
+                restart_target = packctl.minecraft_server_target(project_id)
+                if _restart_confirmation(project_id, action, restart_target) != confirmation:
+                    raise HuroshikiError(
+                        "Remote configuration changed after confirmation; action aborted"
+                    )
 
-            host, stack, service = packctl.minecraft_server_target(project_id)
+            if deploy_confirmation is not None:
+                if deploy_confirmation.restart_target is None:
+                    raise HuroshikiError("Confirmed publish has no restart target")
+                host, stack, service = deploy_confirmation.restart_target
+            else:
+                host, stack, service = restart_target
             remote = (
                 f"cd {shlex.quote(stack)} && docker compose restart "
                 f"{shlex.quote(service)}"
@@ -1784,6 +1861,12 @@ def run_project_action(
             return 0
     except packctl.ConfigError as error:
         raise HuroshikiError(str(error)) from error
+    finally:
+        if deploy_confirmation is not None and deploy_confirmation.snapshot is not None:
+            try:
+                packctl.discard_deploy_snapshot(deploy_confirmation.snapshot)
+            except packctl.ConfigError:
+                pass
 
 
 def update_all(project_key_value: str) -> int:
@@ -1883,7 +1966,7 @@ def _create_pack_from_template(
         minecraft,
         loader,
         loader_version,
-        False,
+        True,
     )
     if result != 0:
         raise HuroshikiError("Failed to create the destination MODPACK")
@@ -1911,12 +1994,20 @@ def _create_pack_from_template(
             before = metadata_digest_snapshot(source)
             if canonical_provider(provider) == "url":
                 try:
+                    log_dir = (
+                        ROOT / ".huroshiki" / "logs"
+                        / "template-create"
+                        / f"{project_id}-{uuid4().hex[:8]}"
+                    )
+                    packctl.ensure_safe_state_path(
+                        log_dir,
+                        state_root=ROOT / ".huroshiki",
+                        repository_root=ROOT,
+                    )
                     artifact = download_url_artifact(
                         entry["url"],
                         threading.Event(),
-                        LOG_ROOT
-                        / "template-create"
-                        / f"{project_id}-{uuid4().hex[:8]}",
+                        log_dir,
                         loader,
                         max_url_jar_size_bytes,
                     )

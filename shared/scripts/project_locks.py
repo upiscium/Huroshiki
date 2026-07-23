@@ -107,7 +107,7 @@ class ProjectLock:
             raise
 
     def release(self) -> None:
-        handle = self._handle
+        handle = getattr(self, "_handle", None)
         if handle is None:
             return
         self._handle = None

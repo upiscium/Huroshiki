@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import ipaddress
 import os
 from pathlib import Path
+import re
 
 
 @dataclass(frozen=True)
@@ -19,6 +21,7 @@ class DeployPreview:
     dist_digest: str
     changes: tuple[RsyncChange, ...]
     raw_lines: tuple[str, ...]
+    snapshot: Path
 
 
 def distribution_digest(dist: Path) -> str:
@@ -40,11 +43,36 @@ def distribution_digest(dist: Path) -> str:
 
 
 def rsync_deploy_command(dist: Path, target: str, *, dry_run: bool) -> list[str]:
+    validate_rsync_target(target)
     command = ["rsync", "-av", "--delete"]
     if dry_run:
         command.extend(("--dry-run", "--itemize-changes"))
-    command.extend((f"{dist}/", target.rstrip("/") + "/"))
+    command.extend(("--", f"{dist}/", target.rstrip("/") + "/"))
     return command
+
+
+def validate_rsync_target(target: str) -> str:
+    if not isinstance(target, str) or target != target.strip() or not target:
+        raise ValueError("rsync_target must be a non-empty remote target")
+    if any(ord(character) < 32 or ord(character) == 127 for character in target):
+        raise ValueError("rsync_target must not contain control characters")
+    match = re.fullmatch(
+        r"(?:(?P<user>[A-Za-z0-9][A-Za-z0-9._-]*)@)?"
+        r"(?P<host>[A-Za-z0-9][A-Za-z0-9._-]*|\[[0-9A-Fa-f:.]+\])"
+        r":(?P<path>/[A-Za-z0-9._/@+,:=-]*(?:/[A-Za-z0-9._/@+,:=-]*)*)",
+        target,
+    )
+    if match is None:
+        raise ValueError(
+            "rsync_target must be an explicit host:/absolute/path remote target"
+        )
+    host = match.group("host")
+    if host.startswith("["):
+        try:
+            ipaddress.IPv6Address(host[1:-1])
+        except ValueError as error:
+            raise ValueError("rsync_target contains an invalid IPv6 address") from error
+    return target
 
 
 def parse_rsync_changes(output: str) -> tuple[RsyncChange, ...]:

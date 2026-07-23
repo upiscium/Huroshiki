@@ -134,6 +134,7 @@ class ProjectScreenActionTest(unittest.IsolatedAsyncioTestCase):
                 return_value=preview,
             ),
             patch.object(huroshiki.core, "run_project_action") as run_action,
+            patch.object(huroshiki.core, "discard_deploy_preview") as discard,
         ):
             app = _ProjectTestApp()
             with patch.object(app, "suspend", return_value=nullcontext()):
@@ -154,6 +155,7 @@ class ProjectScreenActionTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.press("escape")
                     await pilot.pause()
                     run_action.assert_not_called()
+                    discard.assert_called_once_with(preview)
 
     async def test_confirmed_deploy_runs_action(self) -> None:
         preview = core.ProjectDeployPreview(

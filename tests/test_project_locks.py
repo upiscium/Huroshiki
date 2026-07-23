@@ -6,6 +6,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -223,6 +224,57 @@ class ProjectLockTest(unittest.TestCase):
         self.assertEqual(results.get(timeout=5)[0], "acquired")
         process.join(5)
         self.assertEqual(process.exitcode, 0)
+
+    def test_discard_keeps_lock_and_tree_until_blocked_url_worker_finishes(self) -> None:
+        transaction = core.PackTransaction.create("pack:demo")
+        operation = transaction.begin_add(
+            "url",
+            "https://example.invalid/private.jar",
+            client=True,
+            server=True,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        cleaned = threading.Event()
+
+        def blocked_download(*args, **kwargs):
+            entered.set()
+            release.wait()
+            return core.UrlArtifact(
+                "Private", "private", "1.0", "private.jar",
+                "https://example.invalid/private.jar", "00", ("neoforge",),
+            )
+
+        original_wait = operation.wait
+        operation.wait = lambda timeout=None: (
+            False if timeout is not None else original_wait(None)
+        )
+        original_finish = transaction._finish_discard
+
+        def finish_discard() -> None:
+            original_finish()
+            cleaned.set()
+
+        transaction._finish_discard = finish_discard
+        with patch.object(core, "download_url_artifact", side_effect=blocked_download):
+            worker = threading.Thread(target=operation.run)
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            transaction.discard()
+
+            self.assertTrue(transaction.root.is_dir())
+            self.assertTrue(packctl.project_lock_is_active("pack:demo"))
+            with self.assertRaisesRegex(core.HuroshikiError, "locked"):
+                core.PackTransaction.create("pack:demo")
+
+            release.set()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(cleaned.wait(2))
+
+        self.assertFalse(transaction.root.exists())
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+        self.assertFalse((transaction.root / "source" / "mods" / "private.pw.toml").exists())
 
 
 if __name__ == "__main__":

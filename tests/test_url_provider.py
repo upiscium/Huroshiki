@@ -17,6 +17,7 @@ import zipfile
 
 import huroshiki_core as core
 import packctl
+import url_artifacts
 
 
 PACK_TOML = '''name = "Demo"
@@ -412,6 +413,85 @@ loader_version: 21.1.234
         self.assertFalse(result.success)
         self.assertIn("does not contain recognized mod metadata", result.message)
         self.assertEqual(transaction.staged_mods(), [])
+
+    def test_jar_identity_rejects_excessive_archive_entries(self) -> None:
+        path = self.root / "many.jar"
+        with zipfile.ZipFile(path, "w") as jar:
+            jar.writestr("fabric.mod.json", '{"id":"demo"}')
+            jar.writestr("one", "")
+            jar.writestr("two", "")
+
+        with patch.object(url_artifacts, "MAX_ZIP_ENTRIES", 2):
+            with self.assertRaisesRegex(core.HuroshikiError, "more than 2 entries"):
+                core.parse_jar_identity(path, "fabric")
+
+    def test_jar_identity_rejects_oversized_recognized_metadata(self) -> None:
+        path = self.root / "metadata-bomb.jar"
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as jar:
+            jar.writestr("fabric.mod.json", b" " * 1024)
+
+        with patch.object(url_artifacts, "MAX_METADATA_ENTRY_SIZE_BYTES", 32):
+            with self.assertRaisesRegex(core.HuroshikiError, "exceeds 32 bytes"):
+                core.parse_jar_identity(path, "fabric")
+
+    def test_cancellation_closes_blocked_response_and_bounds_worker(self) -> None:
+        self._assert_blocked_response_is_closed(cancel=True)
+
+    def test_deadline_closes_blocked_response_and_bounds_worker(self) -> None:
+        self._assert_blocked_response_is_closed(cancel=False)
+
+    def _assert_blocked_response_is_closed(self, *, cancel: bool) -> None:
+        entered = threading.Event()
+        closed = threading.Event()
+        cancel_event = threading.Event()
+        errors: list[BaseException] = []
+
+        class BlockingResponse:
+            headers: dict[str, str] = {}
+            chunked = False
+            length = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.close()
+
+            def read(self, size: int) -> bytes:
+                entered.set()
+                closed.wait()
+                raise ValueError("response closed")
+
+            def close(self) -> None:
+                closed.set()
+
+        def download() -> None:
+            try:
+                core.download_url_artifact(
+                    "https://example.invalid/private.jar",
+                    cancel_event,
+                    self.root / "blocked-logs",
+                    "neoforge",
+                    total_timeout_seconds=10 if cancel else 0.02,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with patch.object(url_artifacts, "urlopen", return_value=BlockingResponse()):
+            worker = threading.Thread(target=download)
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            if cancel:
+                cancel_event.set()
+            worker.join(1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(closed.is_set())
+        self.assertEqual(len(errors), 1)
+        self.assertIn(
+            "cancelled" if cancel else "deadline exceeded",
+            str(errors[0]),
+        )
 
     def test_url_template_manifest_is_supported(self) -> None:
         template_root = self.templates / "private"
