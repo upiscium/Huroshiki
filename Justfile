@@ -132,12 +132,12 @@ profile-for pack *names:
 
 # Update the selected pack, then rebuild.
 update:
-    cd "packs/${MODPACK:?No active MODPACK. Run: just use <MODPACK>}/source" && packwiz update --all
+    {{ctl}} update "${MODPACK:?No active MODPACK. Run: just use <MODPACK>}"
     {{ctl}} build "$MODPACK"
 
 # Update an explicitly named pack.
 update-for pack:
-    cd "packs/{{pack}}/source" && packwiz update --all
+    {{ctl}} update "{{pack}}"
     {{ctl}} build "{{pack}}"
 
 # Build the selected pack.

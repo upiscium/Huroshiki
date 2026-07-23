@@ -42,6 +42,12 @@ class HuroshikiError(RuntimeError):
     pass
 
 
+class PackwizCommandError(HuroshikiError):
+    def __init__(self, message: str, returncode: int) -> None:
+        super().__init__(message)
+        self.returncode = returncode
+
+
 PROJECT_KINDS = ("pack", "template")
 StateItem = packctl.StateItem
 
@@ -160,6 +166,21 @@ class ModInfo:
     @property
     def side_label(self) -> str:
         return f"[{'x' if self.client else ' '}] [{'x' if self.server else ' '}]"
+
+
+@dataclass(frozen=True)
+class UpdateCandidate:
+    relative_path: Path
+    slug: str
+    name: str
+    provider: str
+    current_version: str
+    new_version: str
+    status: str
+
+    @property
+    def available(self) -> bool:
+        return self.status == "update"
 
 
 @dataclass(frozen=True)
@@ -343,6 +364,7 @@ class PackTransaction:
     baseline_contents: dict[Path, bytes] = field(default_factory=dict)
     real_source_baseline: dict[Path, str] = field(default_factory=dict)
     template_config_baseline: str = ""
+    template_manifest: list[dict[str, str]] | None = None
     batches: list[TransactionBatch] = field(default_factory=list)
     active: bool = True
     _state_lock: BinaryIO | None = field(default=None, init=False, repr=False)
@@ -720,6 +742,71 @@ class PackTransaction:
                     )
             self.batches = remaining_batches
 
+    def prepare_updates(self) -> list[UpdateCandidate]:
+        self.ensure_active()
+        kind, _ = split_project_key(self.project_key)
+        if kind != "pack":
+            raise HuroshikiError(
+                "Template entries resolve compatible versions during MODPACK creation"
+            )
+        result = subprocess.run(
+            ["packwiz", "--yes", "update", "--all"],
+            cwd=self.source,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise PackwizCommandError(
+                f"packwiz update failed with exit code {result.returncode}; "
+                "transaction was not applied",
+                result.returncode,
+            )
+        return update_candidates(self.source, self.baseline_contents)
+
+    def select_updates(self, selected_paths: Iterable[Path]) -> None:
+        self.ensure_active()
+        selected = set(selected_paths)
+        changed = changed_paths(
+            self.baseline,
+            metadata_digest_snapshot(self.source),
+        )
+        unknown = selected - changed
+        if unknown:
+            raise HuroshikiError(
+                f"Unknown update selection: {', '.join(map(str, sorted(unknown)))}"
+            )
+        for relative_path in changed - selected:
+            original = self.baseline_contents.get(relative_path)
+            path = safe_child(self.source, relative_path)
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(original)
+
+    def remove_mods(self, slugs: Iterable[str]) -> int:
+        self.ensure_active()
+        selected = set(slugs)
+        kind, project_id = split_project_key(self.project_key)
+        if kind == "template":
+            self.template_manifest = [
+                entry
+                for entry in packctl.template_mods(project_id)
+                if f"{canonical_provider(entry['provider'])}-{entry['project_id']}"
+                not in selected
+            ]
+            return 0
+
+        for slug in sorted(selected):
+            result = subprocess.run(
+                ["packwiz", "remove", slug],
+                cwd=self.source,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                return result.returncode
+        return 0
+
     def apply(self) -> None:
         self.ensure_active()
         with self._lock:
@@ -734,7 +821,11 @@ class PackTransaction:
                     "The template manifest changed while this transaction was open. "
                     "Discard the staged transaction and retry."
                 )
-            existing = packctl.template_mods(project_id)
+            existing = (
+                self.template_manifest
+                if self.template_manifest is not None
+                else packctl.template_mods(project_id)
+            )
             merged: dict[tuple[str, str], dict[str, str]] = {
                 (item["provider"], item["project_id"]): dict(item)
                 for item in existing
@@ -1534,9 +1625,83 @@ def extract_project_id(value: object) -> str:
 def read_mod(source: Path, relative_path: Path) -> ModInfo:
     path = safe_child(source, relative_path)
     data = tomllib.loads(path.read_text(encoding="utf-8"))
+    return read_mod_data(relative_path, data)
+
+
+def metadata_version(data: dict[str, object], provider: str) -> str:
+    update = data.get("update", {})
+    if isinstance(update, dict):
+        provider_data = update.get(canonical_provider(provider), {})
+        if isinstance(provider_data, dict):
+            for key in ("version", "version-id", "file-id", "fileId"):
+                if key in provider_data:
+                    return str(provider_data[key])
+    filename = str(data.get("filename", ""))
+    return filename or "unknown"
+
+
+def metadata_is_pinned(data: dict[str, object]) -> bool:
+    if data.get("pin") is True:
+        return True
+    update = data.get("update", {})
+    return isinstance(update, dict) and update.get("pin") is True
+
+
+def update_candidates(
+    source: Path,
+    baseline_contents: dict[Path, bytes],
+) -> list[UpdateCandidate]:
+    current = metadata_digest_snapshot(source)
+    baseline = {
+        path: hashlib.sha256(contents).hexdigest()
+        for path, contents in baseline_contents.items()
+    }
+    changed = changed_paths(baseline, current)
+    candidates: list[UpdateCandidate] = []
+    for relative_path, original in sorted(baseline_contents.items()):
+        old_data = tomllib.loads(original.decode("utf-8"))
+        old_mod = read_mod_data(relative_path, old_data)
+        path = safe_child(source, relative_path)
+        new_data = (
+            tomllib.loads(path.read_text(encoding="utf-8"))
+            if path.is_file()
+            else old_data
+        )
+        provider = old_mod.provider
+        has_update_provider = canonical_provider(provider) in {
+            "modrinth",
+            "curseforge",
+        }
+        if relative_path in changed:
+            status = "update"
+        elif metadata_is_pinned(old_data):
+            status = "pinned"
+        elif not has_update_provider:
+            status = "unavailable"
+        else:
+            status = "current"
+        candidates.append(
+            UpdateCandidate(
+                relative_path=relative_path,
+                slug=old_mod.slug,
+                name=old_mod.name,
+                provider=provider,
+                current_version=metadata_version(old_data, provider),
+                new_version=(
+                    metadata_version(new_data, provider)
+                    if status == "update"
+                    else "-"
+                ),
+                status=status,
+            )
+        )
+    return candidates
+
+
+def read_mod_data(relative_path: Path, data: dict[str, object]) -> ModInfo:
     client, server = flags_from_side(str(data.get("side", "both")))
     provider, project_id = provider_from_metadata(data)
-    slug = path.name.removesuffix(".pw.toml")
+    slug = relative_path.name.removesuffix(".pw.toml")
     download = data.get("download", {})
     source_url = (
         str(download.get("url", ""))
@@ -1654,28 +1819,18 @@ def set_installed_mod_side(
 
 
 def remove_installed_mods(project_key_value: str, slugs: Iterable[str]) -> int:
-    kind, project_id = split_project_key(project_key_value)
     selected = set(slugs)
-    if kind == "template":
-        mods = [
-            entry
-            for entry in packctl.template_mods(project_id)
-            if f"{canonical_provider(entry['provider'])}-{entry['project_id']}" not in selected
-        ]
-        packctl.save_template_mods(project_id, mods)
+    if not selected:
         return 0
-
-    source = project_source(project_key_value)
-    for slug in selected:
-        result = subprocess.run(
-            ["packwiz", "remove", slug],
-            cwd=source,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            return result.returncode
-    return 0
+    transaction = PackTransaction.create(project_key_value)
+    try:
+        result = transaction.remove_mods(selected)
+        if result != 0:
+            return result
+        transaction.apply()
+        return 0
+    finally:
+        transaction.discard()
 
 
 def create_project(
@@ -1883,12 +2038,29 @@ def update_all(project_key_value: str) -> int:
         raise HuroshikiError(
             "Template entries always resolve the newest compatible file when a MODPACK is created"
         )
-    return subprocess.run(
-        ["packwiz", "--yes", "update", "--all"],
-        cwd=project_source(project_key_value),
-        text=True,
-        check=False,
-    ).returncode
+    transaction = PackTransaction.create(project_key_value)
+    try:
+        try:
+            candidates = transaction.prepare_updates()
+        except PackwizCommandError as error:
+            return error.returncode
+        available = [candidate for candidate in candidates if candidate.available]
+        if not available:
+            print("No MOD updates are available.")
+            return 0
+        print("MOD updates:")
+        for candidate in available:
+            print(
+                f"  {candidate.name} [{candidate.provider}] "
+                f"{candidate.current_version} -> {candidate.new_version}"
+            )
+        transaction.select_updates(
+            candidate.relative_path for candidate in available
+        )
+        transaction.apply()
+        return 0
+    finally:
+        transaction.discard()
 
 
 def compatible_templates(minecraft: str, loader: str) -> list[ProjectInfo]:

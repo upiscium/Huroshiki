@@ -43,15 +43,19 @@ DataTable {
     align: center middle;
 }
 
-#project-actions,
-#update-options {
+#project-actions {
     width: 46;
     height: auto;
     max-height: 14;
 }
 
+#update-options {
+    width: 1fr;
+    height: 1fr;
+}
+
 #update-message {
-    width: 60;
+    width: 100%;
     height: 3;
     content-align: center middle;
     text-style: bold;

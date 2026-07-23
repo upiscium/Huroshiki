@@ -11,7 +11,7 @@ try:
     from textual import events, on
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Container, Vertical
+    from textual.containers import Container
     from textual.screen import ModalScreen, Screen
     from textual.widgets import DataTable, Input, Static, TextArea
 except ModuleNotFoundError as error:
@@ -1829,7 +1829,7 @@ class InstalledModsScreen(BaseScreen):
                 [
                     *(mod.name for mod in selected),
                     "",
-                    "Packwiz will update the index after each removal.",
+                    "All removals and the refreshed index will be applied atomically.",
                 ],
             ),
             lambda confirmed: self.delete_confirmed(selected, confirmed),
@@ -1842,11 +1842,16 @@ class InstalledModsScreen(BaseScreen):
     ) -> None:
         if not confirmed:
             return
-        with self.app.suspend():
-            result = core.remove_installed_mods(
-                self.project_key,
-                [mod.slug for mod in selected],
-            )
+        try:
+            with self.app.suspend():
+                result = core.remove_installed_mods(
+                    self.project_key,
+                    [mod.slug for mod in selected],
+                )
+        except Exception as error:
+            self.reload_mods()
+            self.app.notify(str(error), severity="error")
+            return
         if result == 0:
             self.selected_paths.clear()
             self.reload_mods()
@@ -1915,8 +1920,7 @@ class InstalledModsScreen(BaseScreen):
 
 
 class UpdateScreen(BaseScreen):
-    help_text = "j/k: move  Enter: select  i: install  l: list  p: project  Esc: main"
-    OPTIONS = ("Update all", "Cancel")
+    help_text = "j/k: move  Space: toggle  Enter: apply  i: install  l: list  Esc: discard"
 
     def __init__(self, project_key: str) -> None:
         super().__init__()
@@ -1924,61 +1928,136 @@ class UpdateScreen(BaseScreen):
         config = core.project_config(project_key)
         self.display_name = str(config.get("display_name", core.split_project_key(project_key)[1]))
         self.screen_title = f"{self.display_name} / Update"
+        self.transaction: core.PackTransaction | None = None
+        self.candidates: list[core.UpdateCandidate] = []
+        self.selected_paths: set[Path] = set()
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
-        with Vertical(id="update-container"):
-            yield Static(
-                "Run Packwiz update for every installed MOD?", id="update-message"
-            )
-            yield DataTable(id="update-options")
+        yield Static(
+            "Updates are staged on a transaction copy. Toggle candidates before applying.",
+            id="update-message",
+        )
+        yield DataTable(id="update-options")
         yield from self.compose_footer()
 
     def on_mount(self) -> None:
         table = self.query_one("#update-options", DataTable)
         table.cursor_type = "row"
-        table.show_header = False
-        table.add_column("Action")
-        for option in self.OPTIONS:
-            table.add_row(option)
+        table.zebra_stripes = True
+        table.add_columns("Use", "MOD", "Provider", "Current", "New", "Status")
+        try:
+            self.transaction = core.PackTransaction.create(self.project_key)
+            with self.app.suspend():
+                self.candidates = self.transaction.prepare_updates()
+            self.selected_paths = {
+                candidate.relative_path
+                for candidate in self.candidates
+                if candidate.available
+            }
+            self.reload_candidates()
+            if not self.selected_paths:
+                self.app.notify("No MOD updates are available")
+        except Exception as error:
+            if self.transaction is not None:
+                self.transaction.discard()
+                self.transaction = None
+            self.app.notify(str(error), severity="error")
         table.focus()
 
-    def select_option(self) -> None:
+    def reload_candidates(self) -> None:
         table = self.query_one("#update-options", DataTable)
-        index = self.current_index(table, len(self.OPTIONS))
-        if index == 0:
-            self.app.push_screen(
-                ConfirmModal(
-                    "Update all installed MODs?",
-                    [
-                        "Packwiz will check and update all unpinned MODs.",
-                        "The operation runs directly against the selected project.",
-                    ],
-                ),
-                self.update_confirmed,
+        table.clear()
+        for candidate in self.candidates:
+            table.add_row(
+                "[*]" if candidate.relative_path in self.selected_paths else "[ ]",
+                candidate.name,
+                candidate.provider,
+                candidate.current_version,
+                candidate.new_version,
+                candidate.status,
             )
+
+    def toggle_candidate(self) -> None:
+        table = self.query_one("#update-options", DataTable)
+        index = self.current_index(table, len(self.candidates))
+        if index is None:
+            return
+        candidate = self.candidates[index]
+        if not candidate.available:
+            self.app.notify(
+                f"{candidate.name} is {candidate.status} and cannot be selected",
+                severity="warning",
+            )
+            return
+        if candidate.relative_path in self.selected_paths:
+            self.selected_paths.remove(candidate.relative_path)
         else:
-            self.app.open_project(self.project_key)
+            self.selected_paths.add(candidate.relative_path)
+        self.reload_candidates()
+
+    def request_update(self) -> None:
+        selected = [
+            candidate
+            for candidate in self.candidates
+            if candidate.relative_path in self.selected_paths
+        ]
+        if not selected:
+            self.app.notify("Select at least one available update", severity="warning")
+            return
+        self.app.push_screen(
+            ConfirmModal(
+                f"Apply {len(selected)} MOD update(s)?",
+                [
+                    *(
+                        f"{item.name} [{item.provider}] "
+                        f"{item.current_version} -> {item.new_version}"
+                        for item in selected
+                    ),
+                    "",
+                    "The real source will change only if every step succeeds.",
+                ],
+            ),
+            self.update_confirmed,
+        )
 
     def update_confirmed(self, confirmed: bool | None) -> None:
         if not confirmed:
             return
-        with self.app.suspend():
-            result = core.update_all(self.project_key)
-        if result == 0:
-            self.app.notify("All MOD updates completed")
-        else:
-            self.app.notify("Packwiz update failed", severity="error")
+        if self.transaction is None:
+            return
+        try:
+            self.transaction.select_updates(self.selected_paths)
+            with self.app.suspend():
+                self.transaction.apply()
+            self.app.notify(f"Applied {len(self.selected_paths)} MOD update(s)")
+            self.transaction = None
+            self.app.open_list(self.project_key)
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+
+    def discard_and_leave(self) -> None:
+        if self.transaction is not None:
+            self.transaction.discard()
+            self.transaction = None
+        self.app.open_project(self.project_key)
+
+    def on_unmount(self) -> None:
+        if self.transaction is not None:
+            self.transaction.discard()
+            self.transaction = None
 
     def on_key(self, event: events.Key) -> None:
         table = self.query_one("#update-options", DataTable)
         key = event.key
         if key == "j":
-            self.move_table(table, len(self.OPTIONS), 1)
+            self.move_table(table, len(self.candidates), 1)
         elif key == "k":
-            self.move_table(table, len(self.OPTIONS), -1)
+            self.move_table(table, len(self.candidates), -1)
+        elif key == "space":
+            self.toggle_candidate()
         elif key == "enter":
-            self.select_option()
+            self.request_update()
         elif key == "i":
             self.app.open_install(self.project_key)
         elif key == "l":
@@ -1986,7 +2065,7 @@ class UpdateScreen(BaseScreen):
         elif key == "p":
             self.app.open_project(self.project_key)
         elif key == "escape":
-            self.app.go_main()
+            self.discard_and_leave()
         else:
             return
         event.stop()

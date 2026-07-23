@@ -947,9 +947,26 @@ def cmd_migrate_template(args: argparse.Namespace) -> int:
 
 
 def cmd_remove(args: argparse.Namespace) -> int:
-    source = get_pack_root(args.pack) / "source"
-    run(["packwiz", "remove", args.mod], cwd=source)
-    return 0
+    import huroshiki_core
+
+    try:
+        return huroshiki_core.remove_installed_mods(
+            huroshiki_core.project_key("pack", args.pack),
+            args.mods,
+        )
+    except huroshiki_core.HuroshikiError as error:
+        raise ConfigError(str(error)) from error
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    import huroshiki_core
+
+    try:
+        return huroshiki_core.update_all(
+            huroshiki_core.project_key("pack", args.pack)
+        )
+    except huroshiki_core.HuroshikiError as error:
+        raise ConfigError(str(error)) from error
 
 
 def cmd_side(args: argparse.Namespace) -> int:
@@ -2014,8 +2031,11 @@ def parser() -> argparse.ArgumentParser:
     item.set_defaults(func=cmd_add)
     item = sub.add_parser("remove")
     item.add_argument("pack")
-    item.add_argument("mod")
+    item.add_argument("mods", nargs="+")
     item.set_defaults(func=cmd_remove)
+    item = sub.add_parser("update")
+    item.add_argument("pack")
+    item.set_defaults(func=cmd_update)
     item = sub.add_parser("side")
     item.add_argument("pack")
     item.add_argument("metadata_file")
