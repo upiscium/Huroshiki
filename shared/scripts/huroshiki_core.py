@@ -64,6 +64,46 @@ def split_project_key(key: str) -> tuple[str, str]:
     return kind, project_id
 
 
+@dataclass(frozen=True)
+class ProjectDeployPreview:
+    project_key: str
+    action: str
+    target: str
+    dist_digest: str
+    changes: tuple[packctl.RsyncChange, ...]
+    raw_lines: tuple[str, ...]
+    restart_target: tuple[str, str, str] | None = None
+
+    @property
+    def confirmation_lines(self) -> tuple[str, ...]:
+        counts = {
+            category: sum(change.category == category for change in self.changes)
+            for category in ("added", "updated", "deleted")
+        }
+        lines = [
+            f"Pack: {split_project_key(self.project_key)[1]}",
+            f"Action: {self.action}",
+            f"Rsync target: {self.target}",
+            "Changes: "
+            f"{counts['added']} added, {counts['updated']} updated, "
+            f"{counts['deleted']} deleted",
+        ]
+        if self.restart_target is not None:
+            host, stack, service = self.restart_target
+            lines.extend(
+                (
+                    f"SSH target: {host}",
+                    f"Stack directory: {stack}",
+                    f"Compose service: {service}",
+                )
+            )
+        if self.raw_lines:
+            lines.extend(("", "Rsync detail:", *self.raw_lines))
+        else:
+            lines.append("No rsync changes.")
+        return tuple(lines)
+
+
 def project_root(key: str) -> Path:
     kind, project_id = split_project_key(key)
     return packctl.get_project_root(kind, project_id)
@@ -1732,10 +1772,38 @@ def project_action_confirmation(
     return tuple(lines)
 
 
+def prepare_deploy_preview(
+    project_key_value: str,
+    action: str,
+) -> ProjectDeployPreview:
+    kind, project_id = split_project_key(project_key_value)
+    if kind != "pack" or action not in {"deploy", "publish"}:
+        raise HuroshikiError(f"Deploy preview is not available for {action}")
+    ctl = [sys.executable, str(SCRIPTS / "packctl.py")]
+    result = subprocess.run(
+        ctl + ["build", project_id], cwd=ROOT, text=True, check=False
+    )
+    if result.returncode != 0:
+        raise HuroshikiError("Build failed; deploy preview was not created")
+    preview = packctl.deploy_preview(project_id)
+    restart_target = (
+        packctl.minecraft_server_target(project_id) if action == "publish" else None
+    )
+    return ProjectDeployPreview(
+        project_key_value,
+        action,
+        preview.target,
+        preview.dist_digest,
+        preview.changes,
+        preview.raw_lines,
+        restart_target,
+    )
+
+
 def run_project_action(
     project_key_value: str,
     action: str,
-    confirmation: tuple[str, ...] | None = None,
+    confirmation: tuple[str, ...] | ProjectDeployPreview | None = None,
 ) -> int:
     kind, project_id = split_project_key(project_key_value)
     ctl = [sys.executable, str(SCRIPTS / "packctl.py")]
@@ -1753,16 +1821,25 @@ def run_project_action(
             check=False,
         ).returncode
 
+    deploy_confirmation = (
+        confirmation if isinstance(confirmation, ProjectDeployPreview) else None
+    )
+    deploy_command = ctl + ["deploy", project_id]
+    if deploy_confirmation is not None:
+        deploy_command.extend(
+            (
+                "--expected-target",
+                deploy_confirmation.target,
+                "--expected-dist-digest",
+                deploy_confirmation.dist_digest,
+            )
+        )
     commands: dict[str, list[tuple[list[str], bool]]] = {
         "build": [(ctl + ["build", project_id], False)],
-        "deploy": [
-            (ctl + ["build", project_id], False),
-            (ctl + ["deploy", project_id], True),
-        ],
+        "deploy": [(deploy_command, True)],
         "restart": [(ctl + ["restart", project_id], True)],
         "publish": [
-            (ctl + ["build", project_id], False),
-            (ctl + ["deploy", project_id], True),
+            (deploy_command, True),
             (ctl + ["restart", project_id], True),
         ],
     }
@@ -1772,7 +1849,25 @@ def run_project_action(
         raise HuroshikiError(f"Unknown project action: {action}") from error
 
     for command, remote in selected:
-        if remote and project_action_confirmation(project_key_value, action) != confirmation:
+        if action in {"deploy", "publish"} and remote:
+            if (
+                deploy_confirmation is None
+                or deploy_confirmation.project_key != project_key_value
+                or deploy_confirmation.action != action
+                or packctl.distribution_target(project_id)
+                != deploy_confirmation.target
+                or packctl.distribution_digest(packctl.distribution_root(project_id))
+                != deploy_confirmation.dist_digest
+                or (
+                    action == "publish"
+                    and packctl.minecraft_server_target(project_id)
+                    != deploy_confirmation.restart_target
+                )
+            ):
+                raise HuroshikiError(
+                    "Deploy target or distribution changed after preview; action aborted"
+                )
+        elif remote and project_action_confirmation(project_key_value, action) != confirmation:
             raise HuroshikiError(
                 "Remote configuration changed after confirmation; action aborted"
             )

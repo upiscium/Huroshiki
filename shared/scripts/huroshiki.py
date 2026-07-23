@@ -801,6 +801,21 @@ class ProjectScreen(BaseScreen):
                 self.create_from_selected_template,
             )
             return
+        if action in {"deploy", "publish"}:
+            try:
+                with self.app.suspend():
+                    preview = core.prepare_deploy_preview(self.project_key, action)
+            except Exception as error:
+                self.app.notify(str(error), severity="error")
+                return
+            self.app.push_screen(
+                ConfirmModal(
+                    "Confirm deploy preview?",
+                    preview.confirmation_lines,
+                ),
+                lambda confirmed: self.run_confirmed(action, preview, confirmed),
+            )
+            return
         try:
             confirmation = core.project_action_confirmation(
                 self.project_key,
@@ -822,7 +837,7 @@ class ProjectScreen(BaseScreen):
     def run_confirmed(
         self,
         action: str,
-        confirmation: tuple[str, ...],
+        confirmation: tuple[str, ...] | core.ProjectDeployPreview,
         confirmed: bool | None,
     ) -> None:
         if confirmed:
@@ -831,7 +846,7 @@ class ProjectScreen(BaseScreen):
     def run_action(
         self,
         action: str,
-        confirmation: tuple[str, ...] | None = None,
+        confirmation: tuple[str, ...] | core.ProjectDeployPreview | None = None,
     ) -> None:
         try:
             with self.app.suspend():

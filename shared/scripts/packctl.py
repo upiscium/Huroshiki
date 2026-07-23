@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -1513,6 +1514,100 @@ def distribution_target(pack_id: str) -> str:
     )
 
 
+@dataclass(frozen=True)
+class RsyncChange:
+    category: str
+    path: str
+    raw: str
+
+
+@dataclass(frozen=True)
+class DeployPreview:
+    target: str
+    dist_digest: str
+    changes: tuple[RsyncChange, ...]
+    raw_lines: tuple[str, ...]
+
+
+def distribution_root(pack_id: str) -> Path:
+    dist = get_pack_root(pack_id) / "dist"
+    for side in ("client", "server"):
+        if not (dist / side / "pack.toml").is_file():
+            raise ConfigError(f"{side} distribution is not built for {pack_id}")
+    return dist
+
+
+def distribution_digest(dist: Path) -> str:
+    digest = hashlib.sha256()
+    paths = (dist, *sorted(dist.rglob("*"), key=lambda item: item.as_posix()))
+    for path in paths:
+        relative = path.relative_to(dist).as_posix() or "."
+        stat = path.lstat()
+        digest.update(relative.encode("utf-8"))
+        digest.update(
+            f"\0{stat.st_mode}\0{stat.st_uid}\0{stat.st_gid}"
+            f"\0{stat.st_mtime_ns}\0".encode("ascii")
+        )
+        if path.is_symlink():
+            digest.update(os.readlink(path).encode("utf-8"))
+        elif path.is_file():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def rsync_deploy_command(dist: Path, target: str, *, dry_run: bool) -> list[str]:
+    command = ["rsync", "-av", "--delete"]
+    if dry_run:
+        command.extend(("--dry-run", "--itemize-changes"))
+    command.extend((f"{dist}/", target.rstrip("/") + "/"))
+    return command
+
+
+def parse_rsync_changes(output: str) -> tuple[RsyncChange, ...]:
+    changes: list[RsyncChange] = []
+    for line in output.splitlines():
+        if line.startswith("*deleting   "):
+            changes.append(RsyncChange("deleted", line[12:], line))
+            continue
+        if len(line) < 13 or line[11] != " ":
+            continue
+        itemized = line[:11]
+        if itemized[0] not in "<>ch.":
+            continue
+        category = "added" if itemized[2:] == "+++++++++" else "updated"
+        changes.append(RsyncChange(category, line[12:], line))
+    return tuple(changes)
+
+
+def deploy_preview(pack_id: str) -> DeployPreview:
+    dist = distribution_root(pack_id)
+    target = distribution_target(pack_id)
+    before = distribution_digest(dist)
+    command = rsync_deploy_command(dist, target, dry_run=True)
+    print("+", " ".join(shlex.quote(part) for part in command))
+    result = subprocess.run(command, check=True, text=True, capture_output=True)
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+    if result.stderr:
+        print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+    if distribution_target(pack_id) != target or distribution_digest(dist) != before:
+        raise ConfigError("Deploy target or distribution changed during preview")
+    raw_lines = tuple(line for line in result.stdout.splitlines() if line.strip())
+    return DeployPreview(target, before, parse_rsync_changes(result.stdout), raw_lines)
+
+
+def print_deploy_preview(pack_id: str, preview: DeployPreview) -> None:
+    counts = {
+        category: sum(change.category == category for change in preview.changes)
+        for category in ("added", "updated", "deleted")
+    }
+    print(
+        f"Preview for {pack_id} -> {preview.target}: "
+        f"{counts['added']} added, {counts['updated']} updated, "
+        f"{counts['deleted']} deleted"
+    )
+
+
 def minecraft_server_target(pack_id: str) -> tuple[str, str, str]:
     config = load_pack_config(pack_id)
     server = require_mapping(config, "minecraft_server", pack_id)
@@ -1523,22 +1618,41 @@ def minecraft_server_target(pack_id: str) -> tuple[str, str, str]:
     )
 
 
-def deploy_pack(pack_id: str, *, build: bool = False) -> int:
+def deploy_pack(
+    pack_id: str,
+    *,
+    build: bool = False,
+    expected_target: str | None = None,
+    expected_dist_digest: str | None = None,
+) -> int:
     if build and build_pack(pack_id) != 0:
         return 1
-    root = get_pack_root(pack_id)
     target = distribution_target(pack_id)
-    dist = root / "dist"
-    for side in ("client", "server"):
-        if not (dist / side / "pack.toml").is_file():
-            raise ConfigError(f"{side} distribution is not built for {pack_id}")
-    run(["rsync", "-av", "--delete", f"{dist}/", target.rstrip("/") + "/"])
+    dist = distribution_root(pack_id)
+    if expected_target is not None and target != expected_target:
+        raise ConfigError("Deploy target changed after preview; deployment aborted")
+    if (
+        expected_dist_digest is not None
+        and distribution_digest(dist) != expected_dist_digest
+    ):
+        raise ConfigError("Distribution changed after preview; deployment aborted")
+    run(rsync_deploy_command(dist, target, dry_run=False))
     print(f"Deployed {pack_id} to {target}")
     return 0
 
 
 def cmd_deploy(args: argparse.Namespace) -> int:
-    return deploy_pack(args.pack)
+    return deploy_pack(
+        args.pack,
+        expected_target=args.expected_target,
+        expected_dist_digest=args.expected_dist_digest,
+    )
+
+
+def cmd_deploy_dry_run(args: argparse.Namespace) -> int:
+    preview = deploy_preview(args.pack)
+    print_deploy_preview(args.pack, preview)
+    return 0
 
 
 def cmd_restart(args: argparse.Namespace) -> int:
@@ -1918,7 +2032,12 @@ def parser() -> argparse.ArgumentParser:
     item.set_defaults(func=cmd_build_all)
     item = sub.add_parser("deploy")
     item.add_argument("pack")
+    item.add_argument("--expected-target")
+    item.add_argument("--expected-dist-digest")
     item.set_defaults(func=cmd_deploy)
+    item = sub.add_parser("deploy-dry-run")
+    item.add_argument("pack")
+    item.set_defaults(func=cmd_deploy_dry_run)
     item = sub.add_parser("restart")
     item.add_argument("pack")
     item.set_defaults(func=cmd_restart)

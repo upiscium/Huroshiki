@@ -103,66 +103,68 @@ minecraft_server:
                 encoding="utf-8",
             )
 
-            def run(command, **kwargs):
-                (pack / "pack.local.yaml").write_text(
-                    "distribution:\n  rsync_target: new:/demo\n",
-                    encoding="utf-8",
-                )
-                return core.subprocess.CompletedProcess(command, 0)
-
             with patch.object(packctl, "PACKS", packs), patch.object(
-                core.subprocess, "run", side_effect=run
+                core.subprocess, "run"
             ) as subprocess_run:
                 confirmation = core.project_action_confirmation("pack:demo", "deploy")
                 with self.assertRaisesRegex(
-                    core.HuroshikiError, "changed after confirmation"
+                    core.HuroshikiError, "changed after preview"
                 ):
                     core.run_project_action("pack:demo", "deploy", confirmation)
 
-            self.assertEqual(subprocess_run.call_count, 1)
-            self.assertEqual(subprocess_run.call_args.args[0][-2:], ["build", "demo"])
+            subprocess_run.assert_not_called()
 
 
 class ProjectScreenActionTest(unittest.IsolatedAsyncioTestCase):
     async def test_publish_confirmation_contents_and_cancel(self) -> None:
-        lines = (
-            "Pack: demo",
-            "Action: publish",
-            "Rsync target: [deploy]@remote:/packs/demo",
-            "SSH target: ops@remote",
+        preview = core.ProjectDeployPreview(
+            "pack:demo",
+            "publish",
+            "[deploy]@remote:/packs/demo",
+            "digest",
+            (packctl.RsyncChange("deleted", "old.jar", "*deleting   old.jar"),),
+            ("*deleting   old.jar",),
+            ("ops@remote", "/srv/demo", "minecraft"),
         )
         with (
             patch.object(huroshiki.core, "project_info", return_value=PROJECT),
             patch.object(
                 huroshiki.core,
-                "project_action_confirmation",
-                return_value=lines,
+                "prepare_deploy_preview",
+                return_value=preview,
             ),
             patch.object(huroshiki.core, "run_project_action") as run_action,
         ):
             app = _ProjectTestApp()
-            async with app.run_test() as pilot:
-                await pilot.press("j", "enter")
-                await pilot.pause()
+            with patch.object(app, "suspend", return_value=nullcontext()):
+                async with app.run_test() as pilot:
+                    await pilot.press("j", "enter")
+                    await pilot.pause()
 
-                modal = app.screen
-                self.assertIsInstance(modal, huroshiki.ConfirmModal)
-                self.assertEqual(modal.lines, list(lines))
-                message = modal.query_one("#modal-message", Static)
-                self.assertEqual(message.content, "\n".join(lines))
-                self.assertIn("[deploy]", str(message.render()))
+                    modal = app.screen
+                    self.assertIsInstance(modal, huroshiki.ConfirmModal)
+                    self.assertEqual(modal.lines, list(preview.confirmation_lines))
+                    message = modal.query_one("#modal-message", Static)
+                    self.assertEqual(
+                        message.content, "\n".join(preview.confirmation_lines)
+                    )
+                    self.assertIn("[deploy]", str(message.render()))
+                    self.assertIn("1 deleted", str(message.render()))
 
-                await pilot.press("escape")
-                await pilot.pause()
-                run_action.assert_not_called()
+                    await pilot.press("escape")
+                    await pilot.pause()
+                    run_action.assert_not_called()
 
     async def test_confirmed_deploy_runs_action(self) -> None:
+        preview = core.ProjectDeployPreview(
+            "pack:demo", "deploy", "host:/demo", "digest", (), ()
+        )
         with (
             patch.object(huroshiki.core, "project_info", return_value=PROJECT),
             patch.object(
                 huroshiki.core,
-                "project_action_confirmation",
-                return_value=("Pack: demo", "Action: deploy"),
+                "prepare_deploy_preview",
+                return_value=preview,
             ),
             patch.object(
                 huroshiki.core,
@@ -182,7 +184,7 @@ class ProjectScreenActionTest(unittest.IsolatedAsyncioTestCase):
                     run_action.assert_called_once_with(
                         "pack:demo",
                         "deploy",
-                        ("Pack: demo", "Action: deploy"),
+                        preview,
                     )
 
     async def test_build_runs_immediately(self) -> None:

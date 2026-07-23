@@ -168,6 +168,14 @@ deploy: build
 deploy-for pack: (build-for pack)
     {{ctl}} deploy "{{pack}}"
 
+# Build and preview rsync changes for the selected pack.
+deploy-dry-run: build
+    {{ctl}} deploy-dry-run "${MODPACK:?No active MODPACK. Run: just use <MODPACK>}"
+
+# Build and preview rsync changes for an explicitly named pack.
+deploy-dry-run-for pack: (build-for pack)
+    {{ctl}} deploy-dry-run "{{pack}}"
+
 # Restart the selected pack's Compose service.
 restart:
     {{ctl}} restart "${MODPACK:?No active MODPACK. Run: just use <MODPACK>}"
