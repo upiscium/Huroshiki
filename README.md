@@ -204,6 +204,7 @@ restart
 
 テンプレートは作成時にMODをコピーするレシピであり、ビルド時の継承・重ね合わせは行いません。
 作成後のMODPACKは独立したPackwizプロジェクトになります。
+将来の任意比較・差分適用については、[Template-to-pack comparison design](docs/template-comparison.md)を参照してください。
 
 ## セルフホストURL MOD
 
