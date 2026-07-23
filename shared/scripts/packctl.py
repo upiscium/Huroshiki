@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -914,34 +915,75 @@ def copy_metadata(source: Path, destination: Path) -> None:
         shutil.copy2(metadata, output)
 
 
-def build_target(root: Path, target: str) -> list[str]:
+def swap_directory(staged: Path, destination: Path, backup: Path) -> None:
+    had_destination = destination.exists()
+    if had_destination:
+        destination.replace(backup)
+    try:
+        staged.replace(destination)
+    except OSError as swap_error:
+        if had_destination:
+            try:
+                backup.replace(destination)
+            except OSError as rollback_error:
+                raise ConfigError(
+                    f"Failed to replace {destination} and restore the previous build; "
+                    f"it remains at {backup}: {rollback_error}"
+                ) from swap_error
+        raise
+
+
+def build_target(
+    root: Path,
+    target: str,
+    destination: Path | None = None,
+) -> list[str]:
     source = root / "source"
-    destination = root / "dist" / target
-    if destination.exists():
-        shutil.rmtree(destination)
-    destination.mkdir(parents=True)
-    shutil.copy2(source / "pack.toml", destination / "pack.toml")
-    (destination / "index.toml").write_text(
-        'hash-format = "sha256"\n',
-        encoding="utf-8",
-    )
-    copy_metadata(source, destination)
+    workspace: Path | None = None
+    if destination is None:
+        workspace = Path(tempfile.mkdtemp(prefix=".build-target-", dir=root))
+        destination = workspace / target
 
-    errors: list[str] = []
-    for metadata in metadata_files(destination):
-        side = read_toml(metadata).get("side")
-        if side not in VALID_SIDES:
-            errors.append(f"{metadata.relative_to(ROOT)} has no valid side")
-            continue
-        if side not in TARGET_SIDES[target]:
-            metadata.unlink()
+    preserve_workspace = False
+    try:
+        destination.mkdir(parents=True)
+        shutil.copy2(source / "pack.toml", destination / "pack.toml")
+        (destination / "index.toml").write_text(
+            'hash-format = "sha256"\n',
+            encoding="utf-8",
+        )
+        copy_metadata(source, destination)
 
-    copy_tree(root / "content" / "common", destination)
-    copy_tree(root / "content" / target, destination)
+        errors: list[str] = []
+        for metadata in metadata_files(destination):
+            side = read_toml(metadata).get("side")
+            if side not in VALID_SIDES:
+                errors.append(
+                    f"{metadata.relative_to(destination)} has no valid side"
+                )
+                continue
+            if side not in TARGET_SIDES[target]:
+                metadata.unlink()
 
-    if not errors:
+        copy_tree(root / "content" / "common", destination)
+        copy_tree(root / "content" / target, destination)
+
+        if errors:
+            return errors
         run(["packwiz", "refresh"], cwd=destination)
-    return errors
+
+        if workspace is not None:
+            live_target = root / "dist" / target
+            live_target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                swap_directory(destination, live_target, workspace / "previous")
+            except ConfigError:
+                preserve_workspace = True
+                raise
+        return []
+    finally:
+        if workspace is not None and not preserve_workspace:
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 def build_pack(pack_id: str) -> int:
@@ -949,18 +991,35 @@ def build_pack(pack_id: str) -> int:
     for required in (root / "source" / "pack.toml", root / "source" / "index.toml"):
         if not required.is_file():
             raise ConfigError(f"Missing required file: {required}")
-    errors = build_target(root, "client") + build_target(root, "server")
-    if errors:
-        print(
-            "Build stopped because side classification is incomplete:", file=sys.stderr
-        )
-        for error in errors:
-            print(f"  - {error}", file=sys.stderr)
-        print(
-            f"Use: just side {pack_id} mods/<name>.pw.toml client|server|both",
-            file=sys.stderr,
-        )
-        return 1
+    workspace = Path(tempfile.mkdtemp(prefix=".build-dist-", dir=root))
+    staged_dist = workspace / "dist"
+    preserve_workspace = False
+    try:
+        errors = build_target(root, "client", staged_dist / "client")
+        errors += build_target(root, "server", staged_dist / "server")
+        errors = list(dict.fromkeys(errors))
+        if errors:
+            print(
+                "Build stopped because side classification is incomplete:",
+                file=sys.stderr,
+            )
+            for error in errors:
+                print(f"  - {error}", file=sys.stderr)
+            print(
+                f"Use: just side-for {pack_id} "
+                "mods/<name>.pw.toml client|server|both",
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            swap_directory(staged_dist, root / "dist", workspace / "previous-dist")
+        except ConfigError:
+            preserve_workspace = True
+            raise
+    finally:
+        if not preserve_workspace:
+            shutil.rmtree(workspace, ignore_errors=True)
     print(f"Built {pack_id}: packs/{pack_id}/dist/client and server")
     return 0
 
