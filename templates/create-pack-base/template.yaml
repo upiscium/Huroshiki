@@ -1,0 +1,175 @@
+id: create-pack-base
+display_name: Create pack base
+enabled: true
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+- name: 'Create: Misc and Things'
+  provider: modrinth
+  project_id: uWrs8XlB
+  side: both
+- name: 'Create: New Age'
+  provider: modrinth
+  project_id: FTeXqI9v
+  side: both
+- name: Steam 'n' Rails Neoforge
+  provider: modrinth
+  project_id: L3Jv0QZI
+  side: both
+- name: Create Ultimine
+  provider: modrinth
+  project_id: vUE54e5E
+  side: both
+- name: Create
+  provider: modrinth
+  project_id: LNytGWDc
+  side: both
+- name: Kotlin for Forge
+  provider: modrinth
+  project_id: ordsPcFz
+  side: both
+- name: 'Create: Copycats+'
+  provider: modrinth
+  project_id: UT2M39wf
+  side: both
+- name: Create Aeronautics
+  provider: modrinth
+  project_id: oWaK0Q19
+  side: both
+- name: 'Create: Central Kitchen'
+  provider: modrinth
+  project_id: btq68HMO
+  side: both
+- name: 'Create: Dragons Plus'
+  provider: modrinth
+  project_id: dzb1a5WV
+  side: both
+- name: Sable
+  provider: modrinth
+  project_id: T9PomCSv
+  side: both
+- name: 'Aeronautics: simulated copycats'
+  provider: modrinth
+  project_id: NYBH9vVY
+  side: both
+- name: 'Create: Big Contraptions'
+  provider: modrinth
+  project_id: jv0UKGOX
+  side: server
+- name: Create Big Cannons
+  provider: modrinth
+  project_id: GWp4jCJj
+  side: both
+- name: 'Create: Enchantment Industry'
+  provider: modrinth
+  project_id: JWGBpFUP
+  side: both
+- name: Ritchie's Projectile Library
+  provider: modrinth
+  project_id: B3pb093D
+  side: both
+- name: Create Deco
+  provider: modrinth
+  project_id: sMvUb4Rb
+  side: both
+- name: 'Create: Trading floor'
+  provider: modrinth
+  project_id: WROfLLvn
+  side: both
+- name: KubeJS Create
+  provider: modrinth
+  project_id: T38eAZQC
+  side: both
+- name: KubeJS
+  provider: modrinth
+  project_id: umyGl7zF
+  side: both
+- name: Azimuth API
+  provider: modrinth
+  project_id: RpH8tmT1
+  side: both
+- name: 'Create: Bits ''n'' Bobs'
+  provider: modrinth
+  project_id: T8bvmqVZ
+  side: both
+- name: Petrolpark's Library
+  provider: modrinth
+  project_id: ik2WZkTZ
+  side: both
+- name: Petrol's Parts
+  provider: modrinth
+  project_id: AN0CZD9P
+  side: both
+- name: Strut Your Stuff
+  provider: modrinth
+  project_id: sHO3MhQx
+  side: both
+- name: 'Create: The Factory Must Grow'
+  provider: modrinth
+  project_id: USgVjXsk
+  side: both
+- name: Climbable Ropes for Create Aeronautics
+  provider: modrinth
+  project_id: jImqv1M5
+  side: both
+- name: playerAnimator
+  provider: modrinth
+  project_id: gedNE4y2
+  side: both
+- name: 'Create: Liquid Fuel'
+  provider: modrinth
+  project_id: sH9tXU9f
+  side: both
+- name: Create Compressed
+  provider: modrinth
+  project_id: Sy4Box1J
+  side: both
+- name: Create Factory Logistics
+  provider: modrinth
+  project_id: QMGO17gm
+  side: both
+- name: 'EMI: Create Schematics'
+  provider: modrinth
+  project_id: 5bgqgixq
+  side: both
+- name: EMI
+  provider: modrinth
+  project_id: fRiHVvU7
+  side: both
+- name: 'Create: Compatible Storage'
+  provider: modrinth
+  project_id: 5ofroZ5W
+  side: both
+- name: Create Stuff 'N Additions
+  provider: modrinth
+  project_id: aq9qUUQG
+  side: both
+- name: 'Create: Stuff ''N Additions - Tank Fix (Spout, Curios & Upgrade)'
+  provider: modrinth
+  project_id: LANuxfjR
+  side: both
+- name: Create Stuff 'N Additions x Sable & Aeronautics Compat
+  provider: modrinth
+  project_id: gsAqDfOu
+  side: both
+- name: 'Create: Redstone Link GUI'
+  provider: modrinth
+  project_id: GhtD1QcW
+  side: both
+- name: Almost Unified
+  provider: modrinth
+  project_id: sdaSaQEz
+  side: both
+- name: 'Create: Integrated Farming'
+  provider: modrinth
+  project_id: 9k1pAsfR
+  side: both
+- name: 'Create: Addon Compatibility'
+  provider: modrinth
+  project_id: QgrK9rtJ
+  side: both
+- name: 'Create: Escalated'
+  provider: modrinth
+  project_id: LyOBYG8Q
+  side: both
