@@ -1,0 +1,10 @@
+id: the-fungal-infection
+display_name: The fungal infection
+enabled: true
+distribution:
+  rsync_target: dockge:/opt/stacks/packwiz-web/packs/the-fungal-infection
+
+minecraft_server:
+  ssh_host: minecraft
+  stack_dir: /opt/stacks/the-fungal-infection
+  service: the-fungal-infection

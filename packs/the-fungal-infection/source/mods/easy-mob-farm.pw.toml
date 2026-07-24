@@ -1,0 +1,13 @@
+name = "Easy Mob Farm"
+filename = "easy_mob_farm-neoforge-1.21.1-10.10.0.jar"
+side = "both"
+
+[download]
+url = "https://cdn.modrinth.com/data/crxsDbEo/versions/SzSApC7o/easy_mob_farm-neoforge-1.21.1-10.10.0.jar"
+hash-format = "sha512"
+hash = "4c98c43e47303c018a7a015b7a792bdac6c7043cc535d46f08c5da1623f900783af848de146791d1921811512baf8f9e8a8f4dc79db7b592b043a69f00c22a15"
+
+[update]
+[update.modrinth]
+mod-id = "crxsDbEo"
+version = "SzSApC7o"

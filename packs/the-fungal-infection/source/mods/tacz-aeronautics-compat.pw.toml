@@ -1,0 +1,13 @@
+name = "TACZ Aeronautics compat"
+filename = "tacz_aero_compat-1.8.0.jar"
+side = "both"
+
+[download]
+hash-format = "sha1"
+hash = "119204f6baf382da70903db2c16d7ddde4adbe69"
+mode = "metadata:curseforge"
+
+[update]
+[update.curseforge]
+file-id = 8195668
+project-id = 1530288
