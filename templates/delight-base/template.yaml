@@ -1,0 +1,47 @@
+id: delight-base
+display_name: Delight base
+enabled: true
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+- name: 'Cozy Foods: Milk Tea'
+  provider: curseforge
+  project_id: '888480'
+  side: both
+- name: Display Delight
+  provider: curseforge
+  project_id: '1144296'
+  side: both
+- name: Farmer's Delight
+  provider: curseforge
+  project_id: '398521'
+  side: both
+- name: Large Meals for Farmer's Delight
+  provider: curseforge
+  project_id: '1479383'
+  side: both
+- name: Pehkui
+  provider: curseforge
+  project_id: '319596'
+  side: both
+- name: Croptopia Delight
+  provider: curseforge
+  project_id: '932098'
+  side: both
+- name: Croptopia
+  provider: curseforge
+  project_id: '415438'
+  side: both
+- name: End's Delight
+  provider: curseforge
+  project_id: '662675'
+  side: both
+- name: EpheroLib
+  provider: curseforge
+  project_id: '885449'
+  side: both
+- name: Ocean's Delight
+  provider: modrinth
+  project_id: DGiq4ZSW
+  side: both
