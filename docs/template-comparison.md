@@ -10,7 +10,7 @@ Tracks: [GitHub Issue #18](https://github.com/upiscium/Huroshiki/issues/18)
 - Comparison is three-way: the accepted template baseline, the current template, and the current pack. Nothing is applied automatically.
 - Only template manifest entries are considered explicit template MODs. Pack-only metadata is unmanaged because current Packwiz metadata cannot reliably distinguish a direct install from a dependency.
 - Every proposed operation starts unselected. Applying selected operations uses the existing staged-copy model and is all-or-nothing.
-- Multiple-template composition and automatic dependency cleanup are outside the first implementation.
+- Creation-time multiple-template composition is implemented independently of this optional comparison model. Automatic dependency cleanup remains outside the first comparison implementation.
 
 ## Relationship and persisted state
 
@@ -37,7 +37,17 @@ baseline:
 
 Keeping this state separate from `pack.yaml` avoids interaction with recursive `pack.local.yaml` overrides and avoids rewriting operational configuration merely to acknowledge a comparison. Missing state is schema version 0 and requires no migration. Unknown schema versions must fail comparison with a clear upgrade error while leaving normal pack actions available.
 
-Only one template may be associated with a pack. Comparing another template is allowed as a read-only, baseline-free preview. Replacing the association requires confirmation and creates a fresh baseline; v1 does not merge templates because overlapping identities and contradictory sides need an explicit composition model.
+Only one template may be associated with a pack for this comparison schema. Comparing another template is allowed as a read-only, baseline-free preview, and replacing the association requires confirmation and creates a fresh baseline. This does not limit creation: a pack may be created from an ordered list of templates using the composition rules below; comparison v1 simply does not persist or synchronize that ordered origin list.
+
+## Creation-time composition
+
+Before creating a destination, every selected template is validated against the requested Minecraft version and loader. Input order is preserved and duplicate or empty selections are rejected.
+
+- Exact normalized `(provider, project_id)` identities merge at their first position and union sides; `client + server`, `client + both`, and `server + both` become `both`.
+- Names are compared after trimming and Unicode case folding. A normalized name with distinct source identities forms one conflict group, including groups with three or more candidates.
+- URL entries use `project_id` as the logical MOD ID. Equal IDs and URLs merge; differing URLs for one logical ID require explicit conflict resolution even if the display names differ.
+- Every conflict resolution retains a non-empty candidate subset. Retaining multiple sources requires duplicate-risk acknowledgement and emits a warning. Missing conflicts and unknown, stale, duplicate, or empty candidate selections abort before project creation.
+- Resolved candidates keep their original global order. Installation remains best-effort per explicit MOD and preserves Packwiz dependency handling. The report records ordered templates, conflict selections and warnings, installed entries, and failures.
 
 ## Identity and inputs
 
@@ -117,7 +127,7 @@ Creation is similar: write comparison state only after the destination pack tran
 1. Add schema parsing/validation, creation provenance, baseline-free read-only comparison, and adoption. No apply action.
 2. Add transactional application for additions, side changes, and explicit conflict resolutions, with dependency-aware staged review.
 3. Add template-removal and URL-selector replacement operations after rollback and provenance behavior have integration coverage.
-4. Evaluate, in a separate design, whether users need orphan dependency cleanup, multiple-template composition, or an opt-in authoritative policy. None should be inferred from this optional model.
+4. Evaluate, in a separate design, whether users need orphan dependency cleanup or an opt-in authoritative policy. Neither should be inferred from this optional model; creation-time composition does not imply ongoing inheritance.
 
 Each stage must leave packs with no comparison state untouched and keep comparison unavailable rather than partially enabled when its schema cannot be read.
 
@@ -138,5 +148,4 @@ These do not block the optional single-template model:
 
 - Should a retained template removal later be labelable as a known pack-local direct MOD, rather than the conservative `unmanaged` label?
 - Should orphan dependency reporting be a separate read-only diagnostic before any cleanup feature is considered?
-- If multiple-template composition is requested, should precedence be ordered or should every overlapping identity require an explicit merged manifest?
 - Is there demand for a separately designed authoritative mode with policy suitable for non-interactive automation?

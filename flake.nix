@@ -55,6 +55,7 @@
             test "$(${huroshiki}/bin/packctl --root "$root" complete packs)" = example
             test -f ${huroshiki}/lib/huroshiki/huroshiki.tcss
             test -f ${huroshiki}/lib/huroshiki/huroshiki_core.py
+            test -f ${huroshiki}/lib/huroshiki/template_merge.py
             test -f ${huroshiki}/lib/huroshiki/huroshiki-launcher.sh
             test -f ${huroshiki}/share/huroshiki/profiles.yaml
             test -f ${huroshiki}/share/zsh/site-functions/_just

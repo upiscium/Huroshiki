@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
@@ -22,6 +22,16 @@ from uuid import uuid4
 import tomlkit
 
 import packctl
+from template_merge import (
+    ConflictResolution,
+    ConflictSelection,
+    ResolvedTemplateComposition,
+    TemplateComposition,
+    TemplateMergeError,
+    TemplateModEntry,
+    compose_templates,
+    resolve_composition,
+)
 from packwiz_parser import ParserEvent
 from packwiz_pty import PackwizPtySession, PtyResult
 from url_artifacts import (
@@ -246,18 +256,31 @@ class TemplateInstallFailure:
 @dataclass(frozen=True)
 class TemplateCreationReport:
     pack_key: str
-    template_id: str
+    template_ids: tuple[str, ...]
+    conflict_selections: tuple[ConflictSelection, ...]
+    conflict_warnings: tuple[str, ...]
     installed: tuple[str, ...]
     failed: tuple[TemplateInstallFailure, ...]
 
     @property
+    def template_id(self) -> str:
+        return self.template_ids[0]
+
+    @property
     def warning_lines(self) -> list[str]:
+        lines = ["Applied templates: " + " -> ".join(self.template_ids)]
+        if self.conflict_selections:
+            lines.append("Conflict decisions:")
+            lines.extend(
+                f"- {item.name}: {', '.join(item.candidate_labels)}"
+                for item in self.conflict_selections
+            )
+        lines.extend(f"Warning: {warning}" for warning in self.conflict_warnings)
+        lines.append(f"Installed {len(self.installed)} MOD(s).")
         if not self.failed:
-            return [f"Installed {len(self.installed)} MOD(s); no failures."]
-        lines = [
-            f"Installed {len(self.installed)} MOD(s).",
-            f"Could not install {len(self.failed)} MOD(s):",
-        ]
+            lines.append("No installation failures.")
+            return lines
+        lines.append(f"Could not install {len(self.failed)} MOD(s):")
         lines.extend(
             f"- {item.name} ({item.provider}:{item.project_id}): {item.reason}"
             for item in self.failed
@@ -2006,22 +2029,66 @@ def find_installed_provider_mod(
     return None
 
 
-def _create_pack_from_template(
+def prepare_template_composition(
     *,
-    template_id: str,
+    template_ids: list[str],
+    minecraft: str,
+    loader: str,
+) -> TemplateComposition:
+    try:
+        if not template_ids:
+            raise TemplateMergeError("At least one template must be selected")
+        if len(set(template_ids)) != len(template_ids):
+            raise TemplateMergeError("Template selection contains duplicate IDs")
+        entries: list[TemplateModEntry] = []
+        for template_id in template_ids:
+            config = packctl.load_template_config(template_id)
+            template_minecraft, template_loader, _ = packctl.template_versions(template_id)
+            if template_minecraft != minecraft or template_loader != loader.strip().lower():
+                raise HuroshikiError(
+                    f"Template {template_id} must use Minecraft {minecraft} and loader {loader}"
+                )
+            raw_mods = config.get("mods", [])
+            if raw_mods is None:
+                raw_mods = []
+            if not isinstance(raw_mods, list):
+                raise packctl.ConfigError(
+                    f"templates/{template_id}/template.yaml mods must be a list"
+                )
+            entries.extend(
+                TemplateModEntry(
+                    template_id=template_id,
+                    name=entry["name"],
+                    provider=entry["provider"],
+                    project_id=entry["project_id"],
+                    url=entry.get("url"),
+                    side=entry["side"],
+                )
+                for index, raw_entry in enumerate(raw_mods)
+                for entry in (
+                    packctl.normalize_template_mod(
+                        raw_entry,
+                        f"templates/{template_id}/mods[{index}]",
+                    ),
+                )
+            )
+        return compose_templates(template_ids, entries)
+    except TemplateMergeError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def _create_pack_from_templates(
+    *,
+    resolved: ResolvedTemplateComposition,
     project_id: str,
     display_name: str,
     minecraft: str,
     loader: str,
     loader_version: str,
 ) -> TemplateCreationReport:
-    if template_id not in packctl.compatible_template_ids(minecraft, loader):
-        raise HuroshikiError(
-            "The template must use the same Minecraft version and loader as the new MODPACK"
-        )
-    mods = packctl.template_mods(template_id)
-    max_url_jar_size_bytes = url_max_jar_size_bytes(
-        packctl.load_template_config(template_id)
+    max_url_jar_size_bytes = max(
+        url_max_jar_size_bytes(packctl.load_template_config(template_id))
+        for template_id in resolved.template_ids
     )
     destination = packctl.get_pack_root(project_id, must_exist=False)
     destination_existed = destination.exists()
@@ -2044,14 +2111,14 @@ def _create_pack_from_template(
     failures: list[TemplateInstallFailure] = []
 
     try:
-        for entry in mods:
-            name = entry["name"]
-            provider = entry["provider"]
-            remote_id = entry["project_id"]
+        for entry in resolved.mods:
+            name = entry.name
+            provider = entry.provider
+            remote_id = entry.project_id
             print(f"== Installing {name} ({provider}:{remote_id}) ==", flush=True)
             existing = find_installed_provider_mod(source, provider, remote_id)
             if existing is not None:
-                packctl.set_side_file(source / existing.relative_path, entry["side"])
+                packctl.set_side_file(source / existing.relative_path, entry.side)
                 installed.append(name)
                 print(f"already installed as dependency: {name}", flush=True)
                 continue
@@ -2071,7 +2138,7 @@ def _create_pack_from_template(
                         repository_root=ROOT,
                     )
                     artifact = download_url_artifact(
-                        entry["url"],
+                        entry.url or "",
                         threading.Event(),
                         log_dir,
                         loader,
@@ -2085,7 +2152,7 @@ def _create_pack_from_template(
                         source,
                         Path("mods") / f"{remote_id}.pw.toml",
                         artifact,
-                        entry["side"],
+                        entry.side,
                     )
                     process = subprocess.CompletedProcess(
                         ["huroshiki", "url", "add"], 0, "", ""
@@ -2119,7 +2186,7 @@ def _create_pack_from_template(
                 )
                 continue
 
-            side = entry["side"]
+            side = entry.side
             for relative in changed:
                 metadata = source / relative
                 if metadata.is_file() and metadata.name.endswith(".pw.toml"):
@@ -2139,7 +2206,9 @@ def _create_pack_from_template(
 
         return TemplateCreationReport(
             pack_key=pack_key,
-            template_id=template_id,
+            template_ids=resolved.template_ids,
+            conflict_selections=resolved.conflict_selections,
+            conflict_warnings=resolved.warnings,
             installed=tuple(installed),
             failed=tuple(failures),
         )
@@ -2155,14 +2224,15 @@ def _create_pack_from_template(
         raise
 
 
-def create_pack_from_template(
+def create_pack_from_templates(
     *,
-    template_id: str,
+    template_ids: list[str],
     project_id: str,
     display_name: str,
     minecraft: str,
     loader: str,
     loader_version: str,
+    conflict_resolutions: Mapping[str, ConflictResolution] | None = None,
 ) -> TemplateCreationReport:
     try:
         packctl.validate_project_creation_fields(
@@ -2174,11 +2244,39 @@ def create_pack_from_template(
         raise HuroshikiError(str(error)) from error
     pack_key = project_key("pack", project_id)
     with packctl.ProjectLock(pack_key, "create project"):
-        return _create_pack_from_template(
-            template_id=template_id,
+        composition = prepare_template_composition(
+            template_ids=template_ids,
+            minecraft=minecraft,
+            loader=loader,
+        )
+        try:
+            resolved = resolve_composition(composition, conflict_resolutions)
+        except TemplateMergeError as error:
+            raise HuroshikiError(str(error)) from error
+        return _create_pack_from_templates(
+            resolved=resolved,
             project_id=project_id,
             display_name=display_name,
             minecraft=minecraft,
             loader=loader,
             loader_version=loader_version,
         )
+
+
+def create_pack_from_template(
+    *,
+    template_id: str,
+    project_id: str,
+    display_name: str,
+    minecraft: str,
+    loader: str,
+    loader_version: str,
+) -> TemplateCreationReport:
+    return create_pack_from_templates(
+        template_ids=[template_id],
+        project_id=project_id,
+        display_name=display_name,
+        minecraft=minecraft,
+        loader=loader,
+        loader_version=loader_version,
+    )

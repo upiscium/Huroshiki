@@ -28,6 +28,7 @@ minecraft-modpacks-monorepo/
 │       ├── packctl.py
 │       ├── huroshiki.py
 │       ├── huroshiki_core.py
+│       ├── template_merge.py
 │       ├── deploy_support.py
 │       ├── packctl_errors.py
 │       ├── project_locks.py
@@ -169,6 +170,8 @@ Loader version
 
 その後、**Minecraftバージョンとローダ種類が一致するテンプレートだけ**を候補表示します。
 テンプレートの`reference_loader_version`と新規MODPACKのローダバージョンが違っていても候補から除外しません。
+`Space`で複数のテンプレートを選択し、`Enter`で選択順どおりに合成します。`q`は選択を全解除します。
+選択した全テンプレートは、作成先を作る前にMinecraftバージョンとローダ種類を再検証します。
 
 ## テンプレートプロジェクト
 
@@ -198,7 +201,15 @@ validate
 
 ## テンプレートからの作成
 
-作成処理はテンプレートの各MODをproject IDで順番に導入します。
+作成処理は選択したテンプレートと各MODの順番を保って合成し、project IDで順番に導入します。
+
+合成規則は次のとおりです。
+
+- 同じ`(provider, project_id)`は最初の位置に1件だけ残し、sideを和集合にします。`client`と`server`、またはいずれかと`both`は`both`になります。
+- MOD名は前後空白を除き、Unicode casefoldした値で比較します。同名でsourceが異なる候補は作成前の競合画面で解決します。
+- URL MODの論理IDは`project_id`です。同じ論理IDでURLが異なる場合も明示的な競合になり、後のURLで暗黙に上書きしません。
+- 競合では1件以上の任意の候補集合を残せます。複数候補を残す場合はduplicate MODの危険を警告し、明示確認を要求します。
+- 未解決、空、重複、または古い候補を含む競合解決では、MODPACKの作成を開始しません。
 
 ```text
 新規Packwizプロジェクト作成
@@ -206,7 +217,7 @@ validate
 → MOD 2を導入
 → ...
 → packwiz refresh
-→ 成功・失敗一覧を表示
+→ 適用テンプレート・競合判断・警告・成功・失敗一覧を表示
 ```
 
 あるMODに対象ローダバージョン向けファイルがない場合や、その他の理由でPackwiz追加に失敗した場合も、

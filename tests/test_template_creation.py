@@ -25,6 +25,116 @@ neoforge = "21.1.999"
 
 
 class TemplateCreationTest(unittest.TestCase):
+    def test_singular_api_delegates_to_plural_api(self) -> None:
+        expected = object()
+        with patch.object(core, "create_pack_from_templates", return_value=expected) as plural:
+            report = core.create_pack_from_template(
+                template_id="base",
+                project_id="generated",
+                display_name="Generated",
+                minecraft="1.21.1",
+                loader="neoforge",
+                loader_version="21.1.999",
+            )
+        self.assertIs(report, expected)
+        self.assertEqual(plural.call_args.kwargs["template_ids"], ["base"])
+
+    def test_all_templates_and_conflicts_are_validated_before_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            for template_id, minecraft, provider, remote_id in (
+                ("first", "1.21.1", "modrinth", "one"),
+                ("second", "1.20.1", "curseforge", "2"),
+            ):
+                template = templates / template_id
+                template.mkdir(parents=True)
+                (template / "template.yaml").write_text(
+                    f'''id: {template_id}
+display_name: {template_id}
+enabled: true
+minecraft: {minecraft}
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+  - name: Conflict
+    provider: {provider}
+    project_id: "{remote_id}"
+    side: both
+''',
+                    encoding="utf-8",
+                )
+            with (
+                patch.object(core, "PACKS", packs),
+                patch.object(core, "TEMPLATES", templates),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+                patch.object(core, "create_project") as create,
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, "second must use Minecraft"):
+                    core.create_pack_from_templates(
+                        template_ids=["first", "second"],
+                        project_id="generated",
+                        display_name="Generated",
+                        minecraft="1.21.1",
+                        loader="neoforge",
+                        loader_version="21.1.999",
+                    )
+            create.assert_not_called()
+
+    def test_unresolved_and_stale_conflicts_fail_before_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            for template_id, provider, remote_id in (
+                ("first", "modrinth", "one"),
+                ("second", "curseforge", "2"),
+            ):
+                template = templates / template_id
+                template.mkdir(parents=True)
+                (template / "template.yaml").write_text(
+                    f'''id: {template_id}
+display_name: {template_id}
+enabled: true
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+  - name: Conflict
+    provider: {provider}
+    project_id: "{remote_id}"
+    side: both
+''',
+                    encoding="utf-8",
+                )
+            arguments = dict(
+                template_ids=["first", "second"],
+                project_id="generated",
+                display_name="Generated",
+                minecraft="1.21.1",
+                loader="neoforge",
+                loader_version="21.1.999",
+            )
+            with (
+                patch.object(core, "PACKS", packs),
+                patch.object(core, "TEMPLATES", templates),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+                patch.object(core, "create_project") as create,
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, "Unresolved"):
+                    core.create_pack_from_templates(**arguments)
+                with self.assertRaisesRegex(core.HuroshikiError, "Unknown or stale"):
+                    core.create_pack_from_templates(
+                        **arguments,
+                        conflict_resolutions={
+                            "stale": core.ConflictResolution(("modrinth:one",))
+                        },
+                    )
+            create.assert_not_called()
+
     def test_creation_uses_already_held_lock_without_self_deadlock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -342,10 +452,27 @@ mods:
   - name: Works
     provider: modrinth
     project_id: works
-    side: both
+    side: client
   - name: Wrong loader version
     provider: curseforge
     project_id: "404"
+    side: server
+''',
+                encoding="utf-8",
+            )
+            addon_root = templates / "addon"
+            addon_root.mkdir(parents=True)
+            (addon_root / "template.yaml").write_text(
+                '''id: addon
+display_name: Addon
+enabled: true
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+  - name: Works from addon
+    provider: modrinth
+    project_id: works
     side: server
 ''',
                 encoding="utf-8",
@@ -407,8 +534,8 @@ mods:
                 with patch.object(core, "create_project", side_effect=fake_create), patch.object(
                     core.subprocess, "run", side_effect=fake_run
                 ):
-                    report = core.create_pack_from_template(
-                        template_id="base",
+                    report = core.create_pack_from_templates(
+                        template_ids=["base", "addon"],
                         project_id="generated",
                         display_name="Generated",
                         minecraft="1.21.1",
@@ -416,10 +543,18 @@ mods:
                         loader_version="21.1.999",
                     )
                 self.assertEqual(report.installed, ("Works",))
+                self.assertEqual(report.template_ids, ("base", "addon"))
                 self.assertEqual(len(report.failed), 1)
                 self.assertIn("No compatible files", report.failed[0].reason)
+                self.assertIn("Applied templates: base -> addon", report.warning_lines)
                 self.assertTrue(
                     (packs / "generated" / "source" / "mods" / "works.pw.toml").exists()
+                )
+                self.assertEqual(
+                    packctl.read_toml(
+                        packs / "generated" / "source" / "mods" / "works.pw.toml"
+                    )["side"],
+                    "both",
                 )
             finally:
                 for item in reversed(patches):

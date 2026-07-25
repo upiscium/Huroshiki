@@ -977,9 +977,11 @@ class ProjectScreen(BaseScreen):
     ) -> None:
         if values is None:
             return
+        arguments = dict(values)
+        arguments["template_ids"] = [arguments.pop("template_id")]
         try:
             with self.app.suspend():
-                report = core.create_pack_from_template(**values)
+                report = core.create_pack_from_templates(**arguments)
             self.app.push_screen(
                 MessageModal(
                     "Template creation result",
@@ -1270,13 +1272,14 @@ class TemplateScreen(FilterListScreen):
 
 
 class TemplateCandidateScreen(BaseScreen):
-    help_text = "j/k: move  Enter: create  Esc: main"
+    help_text = "j/k: move  Space: select  q: clear  Enter: create  Esc: main"
 
     def __init__(self, values: dict[str, str]) -> None:
         super().__init__()
         self.values = values
         self.screen_title = "Create MODPACK / Select template"
         self.templates: list[core.ProjectInfo] = []
+        self.selected_template_ids: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -1285,6 +1288,7 @@ class TemplateCandidateScreen(BaseScreen):
             "The reference loader version is informational only.",
             id="template-apply-message",
         )
+        yield Static("Selected: 0", id="template-selected-count")
         yield DataTable(id="template-candidate-table")
         yield from self.compose_footer()
 
@@ -1292,7 +1296,7 @@ class TemplateCandidateScreen(BaseScreen):
         table = self.query_one("#template-candidate-table", DataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        table.add_columns("Template", "ID", "Minecraft", "Loader", "Reference", "MODs")
+        table.add_columns("Selected", "Template", "ID", "Minecraft", "Loader", "Reference", "MODs")
         try:
             self.templates = core.compatible_templates(
                 self.values["minecraft"],
@@ -1301,15 +1305,7 @@ class TemplateCandidateScreen(BaseScreen):
         except Exception as error:
             self.app.notify(str(error), severity="error")
             self.templates = []
-        for template in self.templates:
-            table.add_row(
-                template.display_name,
-                template.project_id,
-                template.minecraft,
-                template.loader,
-                template.loader_version,
-                str(template.mod_count or 0),
-            )
+        self.reload_rows()
         if not self.templates:
             self.app.notify(
                 "No template matches the selected Minecraft version and loader",
@@ -1317,22 +1313,64 @@ class TemplateCandidateScreen(BaseScreen):
             )
         table.focus()
 
-    def create_selected(self) -> None:
+    def reload_rows(self) -> None:
+        table = self.query_one("#template-candidate-table", DataTable)
+        cursor = table.cursor_row
+        table.clear()
+        for template in self.templates:
+            table.add_row(
+                "[x]" if template.project_id in self.selected_template_ids else "[ ]",
+                template.display_name,
+                template.project_id,
+                template.minecraft,
+                template.loader,
+                template.loader_version,
+                str(template.mod_count or 0),
+            )
+        self.query_one("#template-selected-count", Static).update(
+            f"Selected: {len(self.selected_template_ids)}"
+        )
+        if table.row_count:
+            table.move_cursor(row=min(cursor, table.row_count - 1))
+
+    def toggle_selected(self) -> None:
         table = self.query_one("#template-candidate-table", DataTable)
         index = self.current_index(table, len(self.templates))
         if index is None:
             return
-        template = self.templates[index]
+        template_id = self.templates[index].project_id
+        if template_id in self.selected_template_ids:
+            self.selected_template_ids.remove(template_id)
+        else:
+            self.selected_template_ids.append(template_id)
+        self.reload_rows()
+
+    def create_selected(self) -> None:
+        if not self.selected_template_ids:
+            self.app.notify("Select at least one template", severity="warning")
+            return
         arguments = dict(self.values)
-        arguments["template_id"] = template.project_id
+        arguments["template_ids"] = list(self.selected_template_ids)
+        try:
+            composition = core.prepare_template_composition(
+                template_ids=arguments["template_ids"],
+                minecraft=arguments["minecraft"],
+                loader=arguments["loader"],
+            )
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+            return
+        if composition.conflicts:
+            self.app.push_screen(TemplateConflictScreen(arguments, composition))
+            return
+        self.finish_creation(arguments)
+
+    def finish_creation(self, arguments: dict[str, object]) -> None:
         try:
             with self.app.suspend():
-                report = core.create_pack_from_template(**arguments)
+                report = core.create_pack_from_templates(**arguments)
             self.app.push_screen(
-                MessageModal(
-                    "Template creation result",
-                    report.warning_lines,
-                ),
+                MessageModal("Template creation result", report.warning_lines),
                 lambda _: self.app.open_project(report.pack_key),
             )
         except Exception as error:
@@ -1344,10 +1382,156 @@ class TemplateCandidateScreen(BaseScreen):
             self.move_table(table, len(self.templates), 1)
         elif event.key == "k":
             self.move_table(table, len(self.templates), -1)
+        elif event.key == "space":
+            self.toggle_selected()
+        elif event.key == "q":
+            self.selected_template_ids.clear()
+            self.reload_rows()
         elif event.key == "enter":
             self.create_selected()
         elif event.key == "escape":
             self.app.go_main()
+        else:
+            return
+        event.stop()
+
+
+class TemplateConflictScreen(BaseScreen):
+    help_text = "j/k: move  Space: toggle  Enter: create  Esc: templates"
+
+    def __init__(
+        self,
+        values: dict[str, object],
+        composition: core.TemplateComposition,
+    ) -> None:
+        super().__init__()
+        self.values = values
+        self.composition = composition
+        self.screen_title = "Create MODPACK / Resolve conflicts"
+        self.rows = [
+            (conflict, candidate)
+            for conflict in composition.conflicts
+            for candidate in conflict.candidates
+        ]
+        self.selected: dict[str, list[str]] = {
+            conflict.key: [conflict.candidates[0].candidate_key]
+            for conflict in composition.conflicts
+        }
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        yield Static("Each conflict must retain at least one source.", id="conflict-message")
+        yield Static("", id="conflict-warning")
+        yield DataTable(id="template-conflict-table")
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#template-conflict-table", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns(
+            "Selected", "MOD", "Templates", "Provider", "Project ID", "URL", "Side"
+        )
+        self.reload_rows()
+        table.focus()
+
+    def reload_rows(self) -> None:
+        table = self.query_one("#template-conflict-table", DataTable)
+        cursor = table.cursor_row
+        table.clear()
+        for conflict, candidate in self.rows:
+            table.add_row(
+                "[x]" if candidate.candidate_key in self.selected[conflict.key] else "[ ]",
+                candidate.name,
+                " -> ".join(candidate.template_ids),
+                candidate.provider,
+                candidate.project_id,
+                candidate.url or "-",
+                candidate.side,
+            )
+        multiple = [
+            conflict.name
+            for conflict in self.composition.conflicts
+            if len(self.selected[conflict.key]) > 1
+        ]
+        warning = ""
+        if multiple:
+            warning = (
+                "WARNING: multiple sources selected for " + ", ".join(multiple)
+                + "; duplicate MOD IDs or functionality may prevent startup."
+            )
+        self.query_one("#conflict-warning", Static).update(warning)
+        if table.row_count:
+            table.move_cursor(row=min(cursor, table.row_count - 1))
+
+    def toggle_selected(self) -> None:
+        table = self.query_one("#template-conflict-table", DataTable)
+        index = self.current_index(table, len(self.rows))
+        if index is None:
+            return
+        conflict, candidate = self.rows[index]
+        selected = self.selected[conflict.key]
+        if candidate.candidate_key in selected:
+            if len(selected) == 1:
+                self.app.notify(
+                    f"{conflict.name} must retain at least one source",
+                    severity="warning",
+                )
+                return
+            selected.remove(candidate.candidate_key)
+        else:
+            selected.append(candidate.candidate_key)
+        self.reload_rows()
+
+    def create_resolved(self, acknowledged: bool = False) -> None:
+        has_multiple = any(len(keys) > 1 for keys in self.selected.values())
+        if has_multiple and not acknowledged:
+            self.app.push_screen(
+                ConfirmModal(
+                    "Retain multiple MOD sources?",
+                    [
+                        "Duplicate MOD IDs or overlapping functionality may prevent startup.",
+                        "Enter explicitly acknowledges this risk.",
+                    ],
+                ),
+                lambda confirmed: self.create_resolved(True) if confirmed else None,
+            )
+            return
+        resolutions = {
+            conflict.key: core.ConflictResolution(
+                tuple(
+                    candidate.candidate_key
+                    for candidate in conflict.candidates
+                    if candidate.candidate_key in self.selected[conflict.key]
+                ),
+                acknowledge_duplicate_risk=has_multiple,
+            )
+            for conflict in self.composition.conflicts
+        }
+        arguments = dict(self.values)
+        arguments["conflict_resolutions"] = resolutions
+        try:
+            with self.app.suspend():
+                report = core.create_pack_from_templates(**arguments)
+            self.app.push_screen(
+                MessageModal("Template creation result", report.warning_lines),
+                lambda _: self.app.open_project(report.pack_key),
+            )
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+
+    def on_key(self, event: events.Key) -> None:
+        table = self.query_one("#template-conflict-table", DataTable)
+        if event.key == "j":
+            self.move_table(table, len(self.rows), 1)
+        elif event.key == "k":
+            self.move_table(table, len(self.rows), -1)
+        elif event.key == "space":
+            self.toggle_selected()
+        elif event.key == "enter":
+            self.create_resolved()
+        elif event.key == "escape":
+            self.app.pop_screen()
         else:
             return
         event.stop()
