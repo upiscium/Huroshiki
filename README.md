@@ -132,6 +132,22 @@ directoryから起動した場合にancestorを管理rootとして検出しま�
 この検出結果や`HUROSHIKI_ROOT`より優先されます。root解決のためにprocessのworking
 directoryを変更することはありません。
 
+### Zsh補完
+
+packageは`_just`を標準の`share/zsh/site-functions`へ配置します。NixOSまたはHome
+ManagerでZsh補完を有効にしてpackageを導入した場合は、その標準探索パスから読み込まれます。
+手動でflake出力を使う場合は、Zshの既存`fpath`を保持したまま次のように追加できます。
+
+```zsh
+package="$(nix build --no-link --print-out-paths .#huroshiki)"
+fpath=("$package/share/zsh/site-functions" $fpath)
+autoload -Uz compinit && compinit
+```
+
+`.envrc`と`devShell`は`FPATH`をexportしません。古い環境でHuroshikiのdirectoryだけが
+`$FPATH`に残っている場合は、更新後に`direnv reload`して新しいZshを起動してください。
+復旧しない場合は`unset FPATH; exec zsh`でZsh本来の`fpath`を再構築できます。
+
 ## huroshiki
 
 ```bash

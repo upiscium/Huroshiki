@@ -112,18 +112,12 @@
             ];
 
             shellHook = ''
-              completion_dir="${huroshiki}/share/zsh/site-functions"
-              case ":''${FPATH-}:" in
-                *":$completion_dir:"*) ;;
-                *) export FPATH="$completion_dir''${FPATH:+:$FPATH}" ;;
-              esac
-
               echo "Minecraft modpack monorepo"
               echo "  packwiz: $(packwiz --version 2>/dev/null || echo available)"
               echo "  java:    $(java -version 2>&1 | head -n 1)"
               echo "  TUI:     huroshiki"
               echo "  recipes: just --list"
-              echo "  zsh completion: packs, profiles, metadata and side"
+              echo "  zsh completion: installed in share/zsh/site-functions"
             '';
           };
         }
