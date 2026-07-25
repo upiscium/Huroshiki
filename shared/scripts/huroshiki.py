@@ -2193,7 +2193,12 @@ class InstalledModsScreen(FilterListScreen):
             with self.app.suspend():
                 result = core.remove_installed_mods(
                     self.project_key,
-                    [mod.slug for mod in selected],
+                    [
+                        str(mod.relative_path)
+                        if core.split_project_key(self.project_key)[0] == "template"
+                        else mod.slug
+                        for mod in selected
+                    ],
                 )
         except Exception as error:
             self.reload_mods()

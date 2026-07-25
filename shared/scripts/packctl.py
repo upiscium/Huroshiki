@@ -625,6 +625,34 @@ def template_mods(
     return result
 
 
+def template_mods_indexed(
+    template_id: str,
+    *,
+    allow_invalid_sides: bool = False,
+    deduplicate: bool = True,
+) -> list[tuple[int, dict[str, str]]]:
+    config = load_yaml(get_template_root(template_id) / "template.yaml")
+    value = config.get("mods", [])
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ConfigError(f"templates/{template_id}/template.yaml mods must be a list")
+    result: list[tuple[int, dict[str, str]]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, entry in enumerate(value):
+        normalized = normalize_template_mod(
+            entry,
+            f"mods[{index}]",
+            allow_invalid_side=allow_invalid_sides,
+        )
+        key = (normalized["provider"], normalized["project_id"])
+        if deduplicate and key in seen:
+            continue
+        result.append((index, normalized))
+        seen.add(key)
+    return result
+
+
 def set_template_mod_side(
     template_id: str,
     provider: str,
@@ -648,13 +676,48 @@ def set_template_mod_side(
         if (entry["provider"], entry["project_id"]) != (provider, project_id):
             continue
         if matched == occurrence:
-            raw_entry["side"] = normalize_side(side)
-            break
+            set_template_mod_side_at_index(template_id, index, side)
+            return
         matched += 1
     else:
         raise ConfigError(
             f"Unknown template MOD: {provider}:{project_id} occurrence {occurrence + 1}"
         )
+
+
+def set_template_mod_side_at_index(
+    template_id: str,
+    index: int,
+    side: str,
+) -> None:
+    root = get_template_root(template_id)
+    config_path = root / "template.yaml"
+    config = load_yaml(config_path)
+    mods = config.get("mods")
+    if not isinstance(mods, list):
+        raise ConfigError(f"templates/{template_id}/template.yaml mods must be a list")
+    if index < 0 or index >= len(mods):
+        raise ConfigError(f"Unknown template MOD list index: {index}")
+    raw_entry = mods[index]
+    normalize_template_mod(
+        raw_entry,
+        f"mods[{index}]",
+        allow_invalid_side=True,
+    )
+    raw_entry["side"] = normalize_side(side)
+    temporary = config_path.with_name(".template.yaml.huroshiki-tmp")
+    temporary.write_text(
+        yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    temporary.replace(config_path)
+
+
+def save_template_mods_raw(template_id: str, mods: list[object]) -> None:
+    root = get_template_root(template_id)
+    config_path = root / "template.yaml"
+    config = load_yaml(config_path)
+    config["mods"] = mods
     temporary = config_path.with_name(".template.yaml.huroshiki-tmp")
     temporary.write_text(
         yaml.safe_dump(config, sort_keys=False, allow_unicode=True),

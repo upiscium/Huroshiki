@@ -265,7 +265,7 @@ mods:
         key = core.project_key("template", "base")
         with patch.object(
             packctl,
-            "save_template_mods",
+            "save_template_mods_raw",
             side_effect=packctl.ConfigError("write failed"),
         ):
             with self.assertRaisesRegex(packctl.ConfigError, "write failed"):

@@ -675,7 +675,7 @@ mods:
                 for item in reversed(patches):
                     item.stop()
 
-    def test_shared_dependency_from_client_and_server_roots_remains_both(self) -> None:
+    def test_changed_shared_dependency_unions_client_and_server_roots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             packs = root / "packs"
@@ -748,6 +748,76 @@ mods:
             self.assertEqual(packctl.read_toml(mods / "client-root.pw.toml")["side"], "client")
             self.assertEqual(packctl.read_toml(mods / "server-root.pw.toml")["side"], "server")
             self.assertEqual(packctl.read_toml(mods / "shared.pw.toml")["side"], "both")
+
+    def test_new_client_dependency_stays_out_of_server_distribution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            template = templates / "base"
+            template.mkdir(parents=True)
+            (template / "template.yaml").write_text(
+                """id: base
+display_name: Base
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+  - name: Client Root
+    provider: modrinth
+    project_id: client-root
+    side: client
+""",
+                encoding="utf-8",
+            )
+
+            def fake_create(*args):
+                source = packs / "generated" / "source"
+                (source / "mods").mkdir(parents=True)
+                (source / "pack.toml").write_text(PACK_TOML, encoding="utf-8")
+                (source / "index.toml").write_text("index\n", encoding="utf-8")
+                return 0
+
+            def write_metadata(path: Path, mod_id: str) -> None:
+                path.write_text(
+                    f'name = "{mod_id}"\nfilename = "{mod_id}.jar"\n'
+                    f'side = "both"\n[update.modrinth]\nmod-id = "{mod_id}"\n',
+                    encoding="utf-8",
+                )
+
+            def fake_run(command, *, cwd=None, **kwargs):
+                if command[-1] != "refresh":
+                    source = Path(cwd)
+                    write_metadata(source / "mods" / "client-root.pw.toml", "client-root")
+                    write_metadata(source / "mods" / "client-dependency.pw.toml", "client-dependency")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                patch.object(core, "ROOT", root),
+                patch.object(core, "PACKS", packs),
+                patch.object(core, "TEMPLATES", templates),
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+                patch.object(core, "create_project", side_effect=fake_create),
+                patch.object(core.subprocess, "run", side_effect=fake_run),
+            ):
+                core.create_pack_from_template(
+                    template_id="base",
+                    project_id="generated",
+                    display_name="Generated",
+                    minecraft="1.21.1",
+                    loader="neoforge",
+                    loader_version="21.1.999",
+                )
+
+            pack_root = packs / "generated"
+            dependency = pack_root / "source" / "mods" / "client-dependency.pw.toml"
+            self.assertEqual(packctl.read_toml(dependency)["side"], "client")
+            server = pack_root / "server-test"
+            with patch.object(packctl, "run"):
+                self.assertEqual(packctl.build_target(pack_root, "server", server), [])
+            self.assertFalse((server / "mods" / dependency.name).exists())
 
 
 if __name__ == "__main__":

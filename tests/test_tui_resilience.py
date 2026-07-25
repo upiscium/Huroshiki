@@ -269,6 +269,88 @@ mods:
         self.assertEqual([entry["custom"] for entry in raw], ["keep-first", "keep-second"])
         self.assertEqual([entry["side"] for entry in raw], ["client", "server"])
 
+    def test_template_paths_distinguish_duplicate_foo_from_real_foo_2(self) -> None:
+        template = self.templates / "collisions"
+        template.mkdir()
+        manifest = template / "template.yaml"
+        manifest.write_text(
+            """id: collisions
+display_name: Collisions
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+  - name: Foo First
+    provider: modrinth
+    project_id: foo
+    side: client
+  - name: Foo Duplicate
+    provider: modrinth
+    project_id: foo
+    side: invalid
+  - name: Foo Dash Two
+    provider: modrinth
+    project_id: foo-2
+    side: server
+""",
+            encoding="utf-8",
+        )
+
+        listed = core.list_mods("template:collisions")
+        self.assertEqual(len({item.relative_path for item in listed}), 3)
+        self.assertEqual(
+            [item.name for item in core.filter_mods(listed, "foo-2")],
+            ["Foo Dash Two"],
+        )
+
+        core.set_installed_mod_side(
+            "template:collisions", listed[1].relative_path, False, True
+        )
+        raw = packctl.load_yaml(manifest)["mods"]
+        self.assertEqual([entry["side"] for entry in raw], ["client", "server", "server"])
+
+    def test_template_deletion_selects_exact_raw_duplicate(self) -> None:
+        template = self.templates / "delete-duplicate"
+        template.mkdir()
+        manifest = template / "template.yaml"
+        manifest.write_text(
+            """id: delete-duplicate
+display_name: Delete Duplicate
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+  - name: First
+    provider: modrinth
+    project_id: foo
+    side: client
+    custom: keep-first
+  - name: Selected
+    provider: modrinth
+    project_id: foo
+    side: server
+    custom: remove
+  - name: Last
+    provider: modrinth
+    project_id: foo-2
+    side: both
+    custom: keep-last
+""",
+            encoding="utf-8",
+        )
+
+        listed = core.list_mods("template:delete-duplicate")
+        self.assertEqual(
+            core.remove_installed_mods(
+                "template:delete-duplicate", [str(listed[1].relative_path)]
+            ),
+            0,
+        )
+
+        raw = packctl.load_yaml(manifest)["mods"]
+        self.assertEqual([entry["name"] for entry in raw], ["First", "Last"])
+        self.assertEqual([entry["custom"] for entry in raw], ["keep-first", "keep-last"])
+
 
 class _MainTestApp(App[None]):
     CSS_PATH = str(Path(huroshiki.__file__).with_name("huroshiki.tcss"))

@@ -404,7 +404,7 @@ class PackTransaction:
     baseline_contents: dict[Path, bytes] = field(default_factory=dict)
     real_source_baseline: dict[Path, str] = field(default_factory=dict)
     template_config_baseline: str = ""
-    template_manifest: list[dict[str, str]] | None = None
+    template_manifest: list[object] | None = None
     batches: list[TransactionBatch] = field(default_factory=list)
     active: bool = True
     _project_lock: packctl.ProjectLock | None = field(default=None, init=False, repr=False)
@@ -832,11 +832,34 @@ class PackTransaction:
         selected = set(slugs)
         kind, project_id = split_project_key(self.project_key)
         if kind == "template":
+            config = packctl.load_yaml(project_root(self.project_key) / "template.yaml")
+            raw_mods = config.get("mods", [])
+            if not isinstance(raw_mods, list):
+                raise HuroshikiError(
+                    f"templates/{project_id}/template.yaml mods must be a list"
+                )
+            selected_indexes = {
+                index
+                for value in selected
+                if (index := template_mod_raw_index(Path(value))) is not None
+            }
+            legacy_slugs = {
+                value
+                for value in selected
+                if template_mod_raw_index(Path(value)) is None
+            }
+            for index, entry in packctl.template_mods_indexed(
+                project_id,
+                allow_invalid_sides=True,
+                deduplicate=False,
+            ):
+                slug = f"{canonical_provider(entry['provider'])}-{entry['project_id']}"
+                if slug in legacy_slugs:
+                    selected_indexes.add(index)
             self.template_manifest = [
                 entry
-                for entry in packctl.template_mods(project_id)
-                if f"{canonical_provider(entry['provider'])}-{entry['project_id']}"
-                not in selected
+                for index, entry in enumerate(raw_mods)
+                if index not in selected_indexes
             ]
             return 0
 
@@ -865,11 +888,13 @@ class PackTransaction:
                     "The template manifest changed while this transaction was open. "
                     "Discard the staged transaction and retry."
                 )
-            existing = (
-                self.template_manifest
-                if self.template_manifest is not None
-                else packctl.template_mods(project_id)
-            )
+            if self.template_manifest is not None:
+                packctl.save_template_mods_raw(project_id, self.template_manifest)
+                self._finish_state()
+                shutil.rmtree(self.root, ignore_errors=True)
+                self.active = False
+                return
+            existing = packctl.template_mods(project_id)
             merged: dict[tuple[str, str], dict[str, str]] = {
                 (item["provider"], item["project_id"]): dict(item)
                 for item in existing
@@ -1574,7 +1599,28 @@ def template_mod_relative(
     return Path("mods") / f"{safe_provider}-{safe_id}{suffix}.pw.toml"
 
 
-def template_mod_info(entry: dict[str, str], occurrence: int = 0) -> ModInfo:
+TEMPLATE_MOD_PATH_ROOT = Path(".huroshiki-template-manifest") / "mods"
+
+
+def template_mod_index_relative(index: int) -> Path:
+    if index < 0:
+        raise HuroshikiError(f"Invalid template MOD list index: {index}")
+    return TEMPLATE_MOD_PATH_ROOT / str(index)
+
+
+def template_mod_raw_index(relative_path: Path) -> int | None:
+    try:
+        relative = relative_path.relative_to(TEMPLATE_MOD_PATH_ROOT)
+    except ValueError:
+        return None
+    if len(relative.parts) != 1 or not relative.name.isdecimal():
+        return None
+    return int(relative.name)
+
+
+def template_mod_info(
+    entry: dict[str, str], occurrence: int = 0, *, raw_index: int | None = None
+) -> ModInfo:
     side = entry.get("side")
     side_error = packctl.side_validation_error(side)
     client, server = flags_from_side(side)
@@ -1582,7 +1628,11 @@ def template_mod_info(entry: dict[str, str], occurrence: int = 0) -> ModInfo:
     project_id = entry["project_id"]
     source_url = entry.get("url", "")
     return ModInfo(
-        relative_path=template_mod_relative(provider, project_id, occurrence),
+        relative_path=(
+            template_mod_relative(provider, project_id, occurrence)
+            if raw_index is None
+            else template_mod_index_relative(raw_index)
+        ),
         slug=f"{provider}-{project_id}",
         name=entry["name"],
         provider={"modrinth": "MR", "curseforge": "CF", "url": "URL"}[provider],
@@ -1602,18 +1652,14 @@ def template_mod_info(entry: dict[str, str], occurrence: int = 0) -> ModInfo:
 def list_mods(project_key_value: str) -> list[ModInfo]:
     kind, project_id = split_project_key(project_key_value)
     if kind == "template":
-        occurrences: dict[tuple[str, str], int] = {}
-        result: list[ModInfo] = []
-        for entry in packctl.template_mods(
-            project_id,
-            allow_invalid_sides=True,
-            deduplicate=False,
-        ):
-            identity = (entry["provider"], entry["project_id"])
-            occurrence = occurrences.get(identity, 0)
-            result.append(template_mod_info(entry, occurrence))
-            occurrences[identity] = occurrence + 1
-        return result
+        return [
+            template_mod_info(entry, raw_index=index)
+            for index, entry in packctl.template_mods_indexed(
+                project_id,
+                allow_invalid_sides=True,
+                deduplicate=False,
+            )
+        ]
     source = project_source(project_key_value)
     return [
         read_mod(source, path.relative_to(source))
@@ -1655,24 +1701,11 @@ def set_installed_mod_side(
             kind, project_id = split_project_key(project_key_value)
             side = side_from_flags(client, server)
             if kind == "template":
-                mods = packctl.template_mods(
-                    project_id,
-                    allow_invalid_sides=True,
-                    deduplicate=False,
-                )
-                target = str(relative_path)
-                occurrences: dict[tuple[str, str], int] = {}
-                for entry in mods:
-                    identity = (entry["provider"], entry["project_id"])
-                    occurrence = occurrences.get(identity, 0)
-                    candidate = template_mod_relative(*identity, occurrence)
-                    if str(candidate) == target:
-                        packctl.set_template_mod_side(
-                            project_id, *identity, occurrence, side
-                        )
-                        return
-                    occurrences[identity] = occurrence + 1
-                raise HuroshikiError(f"Unknown template MOD: {relative_path}")
+                raw_index = template_mod_raw_index(relative_path)
+                if raw_index is None:
+                    raise HuroshikiError(f"Unknown template MOD: {relative_path}")
+                packctl.set_template_mod_side_at_index(project_id, raw_index, side)
+                return
 
             source = project_source(project_key_value)
             path = safe_child(source, relative_path)
@@ -2135,7 +2168,11 @@ def _create_pack_from_templates(
                 continue
             checkpoint = source.parent / f".template-checkpoint-{uuid4().hex}"
             shutil.copytree(source, checkpoint, symlinks=True)
-            before = metadata_digest_snapshot(source)
+            before_contents = metadata_content_snapshot(source)
+            before = {
+                path: hashlib.sha256(contents).hexdigest()
+                for path, contents in before_contents.items()
+            }
             if canonical_provider(provider) == "url":
                 try:
                     log_dir = (
@@ -2202,12 +2239,15 @@ def _create_pack_from_templates(
             for relative in changed:
                 metadata = source / relative
                 if metadata.is_file() and metadata.name.endswith(".pw.toml"):
-                    required_side = (
-                        entry.side
-                        if requested is not None
-                        and requested.relative_path == relative
-                        else "both"
-                    )
+                    required_side = entry.side
+                    if requested is None or requested.relative_path != relative:
+                        original = before_contents.get(relative)
+                        if original is not None:
+                            original_data = tomllib.loads(original.decode("utf-8"))
+                            original_side = original_data.get("side")
+                            if packctl.side_validation_error(original_side) is not None:
+                                original_side = "both"
+                            required_side = union_side(str(original_side), entry.side)
                     packctl.set_side_file(
                         metadata,
                         required_side,
