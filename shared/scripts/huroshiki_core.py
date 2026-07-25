@@ -1617,6 +1617,14 @@ def create_project(
     loader_version: str,
     lock_held: bool = False,
 ) -> int:
+    try:
+        packctl.validate_project_creation_fields(
+            display_name=display_name,
+            minecraft=minecraft,
+            loader_version=loader_version,
+        )
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
     if kind == "pack":
         command_name = "new"
     elif kind == "template":
@@ -2098,6 +2106,14 @@ def create_pack_from_template(
     loader: str,
     loader_version: str,
 ) -> TemplateCreationReport:
+    try:
+        packctl.validate_project_creation_fields(
+            display_name=display_name,
+            minecraft=minecraft,
+            loader_version=loader_version,
+        )
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
     pack_key = project_key("pack", project_id)
     with packctl.ProjectLock(pack_key, "create project"):
         return _create_pack_from_template(

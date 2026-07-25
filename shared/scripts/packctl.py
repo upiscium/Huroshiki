@@ -16,6 +16,7 @@ import sys
 import tempfile
 import tomllib
 from typing import Any
+import unicodedata
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
@@ -232,6 +233,24 @@ def validate_project_id(project_id: str) -> None:
 
 def validate_pack_id(pack_id: str) -> None:
     validate_project_id(pack_id)
+
+
+def validate_project_text(field: str, value: str) -> None:
+    if not value.strip():
+        raise ConfigError(f"{field} must be a non-empty string")
+    if any(
+        unicodedata.category(character) in {"Cc", "Zl", "Zp"}
+        for character in value
+    ):
+        raise ConfigError(f"{field} must not contain control characters or newlines")
+
+
+def validate_project_creation_fields(
+    *, display_name: str, minecraft: str, loader_version: str
+) -> None:
+    validate_project_text("Display name", display_name)
+    validate_project_text("Minecraft version", minecraft)
+    validate_project_text("Loader version", loader_version)
 
 
 def get_pack_root(pack_id: str, *, must_exist: bool = True) -> Path:
@@ -980,6 +999,11 @@ def init_packwiz_project(
 
 
 def _new_pack(args: argparse.Namespace) -> int:
+    validate_project_creation_fields(
+        display_name=args.display_name,
+        minecraft=args.minecraft,
+        loader_version=args.loader_version,
+    )
     root = get_pack_root(args.pack, must_exist=False)
     if root.exists():
         raise ConfigError(f"Pack already exists: {args.pack}")
@@ -991,18 +1015,23 @@ def _new_pack(args: argparse.Namespace) -> int:
             loader=args.loader,
             loader_version=args.loader_version,
         )
-        pack_yaml = (
-            f"id: {args.pack}\n"
-            f"display_name: {args.display_name}\n"
-            "enabled: true\n"
-            "distribution:\n"
-            f"  rsync_target: dockge:/opt/stacks/packwiz-web/packs/{args.pack}\n\n"
-            "minecraft_server:\n"
-            "  ssh_host: minecraft\n"
-            f"  stack_dir: /opt/stacks/{args.pack}\n"
-            f"  service: {args.pack}\n"
+        pack_yaml = {
+            "id": args.pack,
+            "display_name": args.display_name,
+            "enabled": True,
+            "distribution": {
+                "rsync_target": f"dockge:/opt/stacks/packwiz-web/packs/{args.pack}"
+            },
+            "minecraft_server": {
+                "ssh_host": "minecraft",
+                "stack_dir": f"/opt/stacks/{args.pack}",
+                "service": args.pack,
+            },
+        }
+        (root / "pack.yaml").write_text(
+            yaml.safe_dump(pack_yaml, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
         )
-        (root / "pack.yaml").write_text(pack_yaml, encoding="utf-8")
         (root / "pack.local.yaml.example").write_text(
             "# Copy to pack.local.yaml for machine-local overrides.\n",
             encoding="utf-8",
@@ -1016,11 +1045,21 @@ def _new_pack(args: argparse.Namespace) -> int:
 
 
 def cmd_new(args: argparse.Namespace) -> int:
+    validate_project_creation_fields(
+        display_name=args.display_name,
+        minecraft=args.minecraft,
+        loader_version=args.loader_version,
+    )
     with ProjectLock(f"pack:{args.pack}", "create project"):
         return _new_pack(args)
 
 
 def _new_template(args: argparse.Namespace) -> int:
+    validate_project_creation_fields(
+        display_name=args.display_name,
+        minecraft=args.minecraft,
+        loader_version=args.loader_version,
+    )
     root = get_template_root(args.template, must_exist=False)
     if root.exists():
         raise ConfigError(f"Template already exists: {args.template}")
@@ -1047,6 +1086,11 @@ def _new_template(args: argparse.Namespace) -> int:
 
 
 def cmd_new_template(args: argparse.Namespace) -> int:
+    validate_project_creation_fields(
+        display_name=args.display_name,
+        minecraft=args.minecraft,
+        loader_version=args.loader_version,
+    )
     with ProjectLock(f"template:{args.template}", "create project"):
         return _new_template(args)
 
