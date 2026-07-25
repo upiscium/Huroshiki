@@ -46,9 +46,7 @@ class FilterInput(Input):
     ]
 
     def action_clear_screen_filter(self) -> None:
-        action = getattr(self.screen, "action_clear_filter_or_fallback", None)
-        if action is not None:
-            action()
+        self.insert_text_at_cursor("q")
 
 
 class HuroshikiApp(App[None]):
@@ -477,6 +475,9 @@ class FilterListScreen(BaseScreen):
 
     def action_clear_filter_or_fallback(self) -> None:
         search = self.query_one(f"#{self.filter_input_id}", Input)
+        if self.focused is search and not search.value:
+            search.insert_text_at_cursor("q")
+            return
         if not search.value:
             self.filter_fallback()
             return
@@ -597,6 +598,7 @@ class MainMenuScreen(FilterListScreen):
                     project.error or "Unknown project loading error",
                     "",
                     "Repair the files externally, close this detail, then press r to reload.",
+                    "For a broken MODPACK, close this detail and press t to inspect content files.",
                     "The project can also be deleted from the project list with d.",
                 ],
             )
@@ -695,6 +697,12 @@ class MainMenuScreen(FilterListScreen):
                 )
             elif event.key == "x":
                 self.app.open_state()
+            elif event.key == "t":
+                project = self.selected_project_info()
+                if project is None or project.kind != "pack":
+                    self.app.notify("Select a MODPACK to inspect files", severity="warning")
+                else:
+                    self.app.switch_screen(TemplateScreen(project.key))
             else:
                 return
             event.stop()
@@ -980,13 +988,26 @@ class ProjectScreen(BaseScreen):
         arguments = dict(values)
         arguments["template_ids"] = [arguments.pop("template_id")]
         try:
+            composition = core.prepare_template_composition(
+                template_ids=arguments["template_ids"],
+                minecraft=arguments["minecraft"],
+                loader=arguments["loader"],
+            )
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+            return
+        arguments["expected_composition"] = composition
+        if composition.conflicts:
+            self.app.push_screen(TemplateConflictScreen(arguments, composition))
+            return
+        self.finish_template_creation(arguments)
+
+    def finish_template_creation(self, arguments: dict[str, object]) -> None:
+        try:
             with self.app.suspend():
                 report = core.create_pack_from_templates(**arguments)
             self.app.push_screen(
-                MessageModal(
-                    "Template creation result",
-                    report.warning_lines,
-                ),
+                MessageModal("Template creation result", report.warning_lines),
                 lambda _: self.app.open_project(report.pack_key),
             )
         except Exception as error:
@@ -1361,8 +1382,10 @@ class TemplateCandidateScreen(BaseScreen):
             self.app.notify(str(error), severity="error")
             return
         if composition.conflicts:
+            arguments["expected_composition"] = composition
             self.app.push_screen(TemplateConflictScreen(arguments, composition))
             return
+        arguments["expected_composition"] = composition
         self.finish_creation(arguments)
 
     def finish_creation(self, arguments: dict[str, object]) -> None:
@@ -1414,7 +1437,7 @@ class TemplateConflictScreen(BaseScreen):
             for candidate in conflict.candidates
         ]
         self.selected: dict[str, list[str]] = {
-            conflict.key: [conflict.candidates[0].candidate_key]
+            conflict.key: []
             for conflict in composition.conflicts
         }
 
@@ -1484,6 +1507,17 @@ class TemplateConflictScreen(BaseScreen):
         self.reload_rows()
 
     def create_resolved(self, acknowledged: bool = False) -> None:
+        unresolved = [
+            conflict.name
+            for conflict in self.composition.conflicts
+            if not self.selected[conflict.key]
+        ]
+        if unresolved:
+            self.app.notify(
+                "Select at least one source for: " + ", ".join(unresolved),
+                severity="warning",
+            )
+            return
         has_multiple = any(len(keys) > 1 for keys in self.selected.values())
         if has_multiple and not acknowledged:
             self.app.push_screen(

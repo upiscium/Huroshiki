@@ -35,13 +35,16 @@
               runHook preInstall
               mkdir -p "$out/lib/huroshiki" "$out/bin" "$out/share/huroshiki" "$out/share/zsh/site-functions"
               cp scripts/*.py scripts/*.tcss scripts/huroshiki-launcher.sh "$out/lib/huroshiki/"
+              chmod 0755 "$out/lib/huroshiki/huroshiki-launcher.sh"
               cp profiles.yaml "$out/share/huroshiki/profiles.yaml"
               cp completions/zsh/_just "$out/share/zsh/site-functions/_just"
               makeWrapper ${python}/bin/python "$out/bin/huroshiki" \
                 --add-flags "$out/lib/huroshiki/huroshiki.py" \
+                --set HUROSHIKI_DATA_DIR "$out/share/huroshiki" \
                 --prefix PATH : ${pkgs.lib.makeBinPath runtimeInputs}
               makeWrapper ${python}/bin/python "$out/bin/packctl" \
                 --add-flags "$out/lib/huroshiki/packctl.py" \
+                --set HUROSHIKI_DATA_DIR "$out/share/huroshiki" \
                 --prefix PATH : ${pkgs.lib.makeBinPath runtimeInputs}
               runHook postInstall
             '';
@@ -53,10 +56,14 @@
             ${huroshiki}/bin/huroshiki --root "$root" --help > /dev/null
             ${huroshiki}/bin/packctl --root "$root" --help > /dev/null
             test "$(${huroshiki}/bin/packctl --root "$root" complete packs)" = example
+            test "$(${huroshiki}/bin/packctl --root "$root" complete profiles example | grep -c '^base$')" = 1
+            HUROSHIKI_PYTHON=${python}/bin/python \
+              ${huroshiki}/lib/huroshiki/huroshiki-launcher.sh --root "$root" --help > /dev/null
             test -f ${huroshiki}/lib/huroshiki/huroshiki.tcss
             test -f ${huroshiki}/lib/huroshiki/huroshiki_core.py
             test -f ${huroshiki}/lib/huroshiki/template_merge.py
             test -f ${huroshiki}/lib/huroshiki/huroshiki-launcher.sh
+            test -x ${huroshiki}/lib/huroshiki/huroshiki-launcher.sh
             test -f ${huroshiki}/share/huroshiki/profiles.yaml
             test -f ${huroshiki}/share/zsh/site-functions/_just
             touch "$out"

@@ -233,6 +233,42 @@ mods:
         self.assertIsNone(repaired[0].side_error)
         self.assertEqual(repaired[0].side, "client")
 
+    def test_template_side_repair_preserves_duplicate_raw_entries_and_extra_fields(self) -> None:
+        template = self.templates / "duplicates"
+        template.mkdir()
+        manifest = template / "template.yaml"
+        manifest.write_text(
+            """id: duplicates
+display_name: Duplicates
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+  - name: First
+    provider: modrinth
+    project_id: same
+    side: client
+    custom: keep-first
+  - name: Second
+    provider: modrinth
+    project_id: same
+    side: invalid
+    custom: keep-second
+""",
+            encoding="utf-8",
+        )
+
+        listed = core.list_mods("template:duplicates")
+        self.assertEqual([item.name for item in listed], ["First", "Second"])
+        core.set_installed_mod_side(
+            "template:duplicates", listed[1].relative_path, False, True
+        )
+
+        raw = packctl.load_yaml(manifest)["mods"]
+        self.assertEqual([entry["name"] for entry in raw], ["First", "Second"])
+        self.assertEqual([entry["custom"] for entry in raw], ["keep-first", "keep-second"])
+        self.assertEqual([entry["side"] for entry in raw], ["client", "server"])
+
 
 class _MainTestApp(App[None]):
     CSS_PATH = str(Path(huroshiki.__file__).with_name("huroshiki.tcss"))
@@ -263,7 +299,7 @@ class _FilesTestApp(App[None]):
 
 
 class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
-    async def test_main_q_clears_from_input_and_without_filter_quits(self) -> None:
+    async def test_main_q_types_in_input_then_clears_from_list_and_quits(self) -> None:
         projects = [project("alpha"), project("beta")]
         with patch.object(huroshiki.core, "list_projects", return_value=projects):
             app = _MainTestApp()
@@ -276,11 +312,15 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                     screen.reload_projects("alpha")
                     search.focus()
 
-                    await pilot.press("q")
+                    await pilot.press("q", "u", "e", "r", "y")
                     await pilot.pause()
 
+                    self.assertEqual(search.value, "alphaquery")
+                    self.assertIs(screen.focused, search)
+                    table.focus()
+                    await pilot.press("q")
+                    await pilot.pause()
                     self.assertEqual(search.value, "")
-                    self.assertEqual(len(screen.visible_projects), 2)
                     self.assertIs(screen.focused, table)
                     self.assertLess(table.cursor_row, table.row_count)
                     exit_app.assert_not_called()
@@ -289,7 +329,7 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause()
                     exit_app.assert_called_once()
 
-    async def test_installed_q_preserves_delete_selection(self) -> None:
+    async def test_installed_q_types_then_list_clear_preserves_delete_selection(self) -> None:
         mods = [mod("Alpha"), mod("Beta")]
         with (
             patch.object(
@@ -309,9 +349,13 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                 screen.reload_mods("alpha")
                 search.focus()
 
-                await pilot.press("q")
+                await pilot.press("q", "u", "i", "l", "t")
                 await pilot.pause()
 
+                self.assertEqual(search.value, "alphaquilt")
+                screen.query_one("#installed-table", DataTable).focus()
+                await pilot.press("q")
+                await pilot.pause()
                 self.assertEqual(search.value, "")
                 self.assertEqual(len(screen.visible_mods), 2)
                 self.assertIn(selected, screen.selected_paths)
@@ -352,7 +396,7 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                     [(True, False), (False, True), (True, True)],
                 )
 
-    async def test_project_files_q_clears_filter_from_input(self) -> None:
+    async def test_project_files_q_types_then_clears_filter_from_list(self) -> None:
         files = [
             core.TemplateInfo("common", Path("a.toml"), Path("/a.toml"), 1),
             core.TemplateInfo("server", Path("b.toml"), Path("/b.toml"), 2),
@@ -369,9 +413,13 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                 screen.reload_templates("server")
                 search.focus()
 
-                await pilot.press("q")
+                await pilot.press("q", "u", "e", "r", "y")
                 await pilot.pause()
 
+                self.assertEqual(search.value, "serverquery")
+                screen.query_one("#template-table", DataTable).focus()
+                await pilot.press("q")
+                await pilot.pause()
                 self.assertEqual(search.value, "")
                 self.assertEqual(len(screen.visible_templates), 2)
                 self.assertIs(
@@ -403,6 +451,21 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
 
                 await pilot.press("enter")
                 self.assertEqual(app.opened, "pack:broken")
+
+    async def test_error_pack_row_can_open_recovery_safe_content_files(self) -> None:
+        broken = project("broken", error="pack.yaml: invalid YAML")
+        files = [core.TemplateInfo("common", Path("notes.txt"), Path("/notes.txt"), 4)]
+        with (
+            patch.object(huroshiki.core, "list_projects", return_value=[broken]),
+            patch.object(huroshiki.core, "project_info", return_value=broken),
+            patch.object(huroshiki.core, "list_templates", return_value=files),
+        ):
+            app = _MainTestApp()
+            async with app.run_test() as pilot:
+                await pilot.press("t")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, huroshiki.TemplateScreen)
+                self.assertEqual(app.screen.visible_templates, files)
 
 
 if __name__ == "__main__":

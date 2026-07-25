@@ -6,20 +6,23 @@ from typing import Mapping, Sequence
 
 
 def root_argument(arguments: Sequence[str]) -> str | None:
-    """Return the last --root value without changing the argument list."""
-    value: str | None = None
+    """Return the first valid global --root value without changing arguments."""
     index = 0
     while index < len(arguments):
         argument = arguments[index]
+        if argument == "--":
+            break
         if argument == "--root":
-            if index + 1 < len(arguments):
-                value = arguments[index + 1]
+            if index + 1 < len(arguments) and not arguments[index + 1].startswith("-"):
+                return arguments[index + 1]
             index += 2
             continue
         if argument.startswith("--root="):
-            value = argument.partition("=")[2]
+            return argument.partition("=")[2]
+        if not argument.startswith("-"):
+            break
         index += 1
-    return value
+    return None
 
 
 def resolve_root(

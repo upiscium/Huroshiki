@@ -31,6 +31,7 @@ from template_merge import (
     TemplateModEntry,
     compose_templates,
     resolve_composition,
+    union_side,
 )
 from packwiz_parser import ParserEvent
 from packwiz_pty import PackwizPtySession, PtyResult
@@ -257,10 +258,10 @@ class TemplateInstallFailure:
 class TemplateCreationReport:
     pack_key: str
     template_ids: tuple[str, ...]
-    conflict_selections: tuple[ConflictSelection, ...]
-    conflict_warnings: tuple[str, ...]
-    installed: tuple[str, ...]
-    failed: tuple[TemplateInstallFailure, ...]
+    conflict_selections: tuple[ConflictSelection, ...] = field(default_factory=tuple)
+    conflict_warnings: tuple[str, ...] = field(default_factory=tuple)
+    installed: tuple[str, ...] = field(default_factory=tuple)
+    failed: tuple[TemplateInstallFailure, ...] = field(default_factory=tuple)
 
     @property
     def template_id(self) -> str:
@@ -1561,16 +1562,19 @@ def read_mod_data(relative_path: Path, data: dict[str, object]) -> ModInfo:
     )
 
 
-def template_mod_relative(provider: str, project_id: str) -> Path:
+def template_mod_relative(
+    provider: str, project_id: str, occurrence: int = 0
+) -> Path:
     safe_provider = canonical_provider(provider)
     safe_id = "".join(
         character if character.isalnum() or character in "._-" else "_"
         for character in project_id
     )
-    return Path("mods") / f"{safe_provider}-{safe_id}.pw.toml"
+    suffix = "" if occurrence == 0 else f"-{occurrence + 1}"
+    return Path("mods") / f"{safe_provider}-{safe_id}{suffix}.pw.toml"
 
 
-def template_mod_info(entry: dict[str, str]) -> ModInfo:
+def template_mod_info(entry: dict[str, str], occurrence: int = 0) -> ModInfo:
     side = entry.get("side")
     side_error = packctl.side_validation_error(side)
     client, server = flags_from_side(side)
@@ -1578,7 +1582,7 @@ def template_mod_info(entry: dict[str, str]) -> ModInfo:
     project_id = entry["project_id"]
     source_url = entry.get("url", "")
     return ModInfo(
-        relative_path=template_mod_relative(provider, project_id),
+        relative_path=template_mod_relative(provider, project_id, occurrence),
         slug=f"{provider}-{project_id}",
         name=entry["name"],
         provider={"modrinth": "MR", "curseforge": "CF", "url": "URL"}[provider],
@@ -1598,13 +1602,18 @@ def template_mod_info(entry: dict[str, str]) -> ModInfo:
 def list_mods(project_key_value: str) -> list[ModInfo]:
     kind, project_id = split_project_key(project_key_value)
     if kind == "template":
-        return [
-            template_mod_info(entry)
-            for entry in packctl.template_mods(
-                project_id,
-                allow_invalid_sides=True,
-            )
-        ]
+        occurrences: dict[tuple[str, str], int] = {}
+        result: list[ModInfo] = []
+        for entry in packctl.template_mods(
+            project_id,
+            allow_invalid_sides=True,
+            deduplicate=False,
+        ):
+            identity = (entry["provider"], entry["project_id"])
+            occurrence = occurrences.get(identity, 0)
+            result.append(template_mod_info(entry, occurrence))
+            occurrences[identity] = occurrence + 1
+        return result
     source = project_source(project_key_value)
     return [
         read_mod(source, path.relative_to(source))
@@ -1646,22 +1655,24 @@ def set_installed_mod_side(
             kind, project_id = split_project_key(project_key_value)
             side = side_from_flags(client, server)
             if kind == "template":
-                mods = packctl.template_mods(project_id, allow_invalid_sides=True)
-                target = str(relative_path)
-                found = False
-                for entry in mods:
-                    if str(template_mod_relative(entry["provider"], entry["project_id"])) == target:
-                        entry["side"] = side
-                        found = True
-                        break
-                if not found:
-                    raise HuroshikiError(f"Unknown template MOD: {relative_path}")
-                packctl.save_template_mods(
+                mods = packctl.template_mods(
                     project_id,
-                    mods,
                     allow_invalid_sides=True,
+                    deduplicate=False,
                 )
-                return
+                target = str(relative_path)
+                occurrences: dict[tuple[str, str], int] = {}
+                for entry in mods:
+                    identity = (entry["provider"], entry["project_id"])
+                    occurrence = occurrences.get(identity, 0)
+                    candidate = template_mod_relative(*identity, occurrence)
+                    if str(candidate) == target:
+                        packctl.set_template_mod_side(
+                            project_id, *identity, occurrence, side
+                        )
+                        return
+                    occurrences[identity] = occurrence + 1
+                raise HuroshikiError(f"Unknown template MOD: {relative_path}")
 
             source = project_source(project_key_value)
             path = safe_child(source, relative_path)
@@ -2043,6 +2054,7 @@ def prepare_template_composition(
         entries: list[TemplateModEntry] = []
         for template_id in template_ids:
             config = packctl.load_template_config(template_id)
+            max_url_size = url_max_jar_size_bytes(config)
             template_minecraft, template_loader, _ = packctl.template_versions(template_id)
             if template_minecraft != minecraft or template_loader != loader.strip().lower():
                 raise HuroshikiError(
@@ -2063,6 +2075,7 @@ def prepare_template_composition(
                     project_id=entry["project_id"],
                     url=entry.get("url"),
                     side=entry["side"],
+                    max_url_jar_size_bytes=max_url_size,
                 )
                 for index, raw_entry in enumerate(raw_mods)
                 for entry in (
@@ -2086,10 +2099,6 @@ def _create_pack_from_templates(
     loader: str,
     loader_version: str,
 ) -> TemplateCreationReport:
-    max_url_jar_size_bytes = max(
-        url_max_jar_size_bytes(packctl.load_template_config(template_id))
-        for template_id in resolved.template_ids
-    )
     destination = packctl.get_pack_root(project_id, must_exist=False)
     destination_existed = destination.exists()
     result = create_project(
@@ -2104,13 +2113,11 @@ def _create_pack_from_templates(
     if result != 0:
         raise HuroshikiError("Failed to create the destination MODPACK")
     owns_destination = not destination_existed
-
-    pack_key = project_key("pack", project_id)
-    source = project_source(pack_key)
-    installed: list[str] = []
-    failures: list[TemplateInstallFailure] = []
-
     try:
+        pack_key = project_key("pack", project_id)
+        source = project_source(pack_key)
+        installed: list[str] = []
+        failures: list[TemplateInstallFailure] = []
         for entry in resolved.mods:
             name = entry.name
             provider = entry.provider
@@ -2118,7 +2125,11 @@ def _create_pack_from_templates(
             print(f"== Installing {name} ({provider}:{remote_id}) ==", flush=True)
             existing = find_installed_provider_mod(source, provider, remote_id)
             if existing is not None:
-                packctl.set_side_file(source / existing.relative_path, entry.side)
+                existing_side = "both" if existing.side_error else existing.side
+                packctl.set_side_file(
+                    source / existing.relative_path,
+                    union_side(existing_side, entry.side),
+                )
                 installed.append(name)
                 print(f"already installed as dependency: {name}", flush=True)
                 continue
@@ -2142,7 +2153,8 @@ def _create_pack_from_templates(
                         threading.Event(),
                         log_dir,
                         loader,
-                        max_url_jar_size_bytes,
+                        entry.max_url_jar_size_bytes
+                        or DEFAULT_URL_MAX_JAR_SIZE_BYTES,
                     )
                     if artifact.mod_id != remote_id:
                         raise HuroshikiError(
@@ -2186,11 +2198,20 @@ def _create_pack_from_templates(
                 )
                 continue
 
-            side = entry.side
+            requested = find_installed_provider_mod(source, provider, remote_id)
             for relative in changed:
                 metadata = source / relative
                 if metadata.is_file() and metadata.name.endswith(".pw.toml"):
-                    packctl.set_side_file(metadata, side)
+                    required_side = (
+                        entry.side
+                        if requested is not None
+                        and requested.relative_path == relative
+                        else "both"
+                    )
+                    packctl.set_side_file(
+                        metadata,
+                        required_side,
+                    )
             shutil.rmtree(checkpoint, ignore_errors=True)
             installed.append(name)
 
@@ -2233,6 +2254,7 @@ def create_pack_from_templates(
     loader: str,
     loader_version: str,
     conflict_resolutions: Mapping[str, ConflictResolution] | None = None,
+    expected_composition: TemplateComposition | None = None,
 ) -> TemplateCreationReport:
     try:
         packctl.validate_project_creation_fields(
@@ -2249,6 +2271,10 @@ def create_pack_from_templates(
             minecraft=minecraft,
             loader=loader,
         )
+        if expected_composition is not None and composition != expected_composition:
+            raise HuroshikiError(
+                "Template composition changed after preview; review candidates again"
+            )
         try:
             resolved = resolve_composition(composition, conflict_resolutions)
         except TemplateMergeError as error:

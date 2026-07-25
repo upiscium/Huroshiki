@@ -71,7 +71,37 @@ class RootResolutionTest(unittest.TestCase):
         resolved = resolve_root("relative-root", cwd=before)
         self.assertEqual(Path.cwd(), before)
         self.assertEqual(resolved, before / "relative-root")
-        self.assertEqual(root_argument(["--root", "first", "--root=second"]), "second")
+        self.assertEqual(root_argument(["--root", "first", "--root=second"]), "first")
+
+    def test_bootstrap_scans_only_valid_global_root_arguments(self) -> None:
+        self.assertIsNone(root_argument(["complete", "--root", "positional"]))
+        self.assertIsNone(root_argument(["--", "--root", "positional"]))
+        self.assertIsNone(root_argument(["--root", "--help"]))
+        self.assertEqual(root_argument(["--help", "--root=selected"]), "selected")
+
+    def test_positional_option_looking_value_cannot_redirect_mutation_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            managed = temporary / "managed"
+            attacker = temporary / "attacker"
+            managed.mkdir()
+            result = self.run_packctl(
+                [
+                    "new",
+                    "demo",
+                    "Demo",
+                    "1.21.1",
+                    "neoforge",
+                    "21.1.1",
+                    f"--root={attacker}",
+                ],
+                cwd=temporary,
+                environment_root=managed,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(attacker.exists())
+            self.assertFalse((managed / "packs" / "demo").exists())
 
     def test_huroshiki_imports_share_cli_selected_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

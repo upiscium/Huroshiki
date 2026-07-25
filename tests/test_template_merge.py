@@ -43,6 +43,46 @@ class TemplateMergeTest(unittest.TestCase):
         self.assertEqual(composition.mods[1].template_ids, ("base", "addon"))
         self.assertEqual(composition.conflicts, ())
 
+    def test_exact_identity_retains_renamed_alias_for_transitive_conflict(self) -> None:
+        composition = compose_templates(
+            ["first", "rename", "other"],
+            [
+                entry("first", "Foo", "modrinth", "same"),
+                entry("rename", "Bar", "modrinth", "same"),
+                entry("other", "Bar", "curseforge", "42"),
+            ],
+        )
+
+        self.assertEqual(composition.mods[0].name, "Foo")
+        self.assertEqual(composition.mods[0].name_aliases, ("foo", "bar"))
+        self.assertEqual(len(composition.conflicts), 1)
+        self.assertEqual(
+            [candidate.project_id for candidate in composition.conflicts[0].candidates],
+            ["same", "42"],
+        )
+
+    def test_merged_url_uses_strictest_origin_limit_only(self) -> None:
+        composition = compose_templates(
+            ["large", "strict", "unrelated"],
+            [
+                TemplateModEntry(
+                    "large", "Private", "url", "private", "both",
+                    "https://example.test/private.jar", 100,
+                ),
+                TemplateModEntry(
+                    "strict", "Renamed", "url", "private", "both",
+                    "https://example.test/private.jar", 10,
+                ),
+                TemplateModEntry(
+                    "unrelated", "Other", "url", "other", "both",
+                    "https://example.test/other.jar", 1,
+                ),
+            ],
+        )
+
+        self.assertEqual(composition.mods[0].max_url_jar_size_bytes, 10)
+        self.assertEqual(composition.mods[1].max_url_jar_size_bytes, 1)
+
     def test_architectury_moonlight_and_three_candidate_conflicts(self) -> None:
         composition = compose_templates(
             ["curse", "modrinth", "mirror"],

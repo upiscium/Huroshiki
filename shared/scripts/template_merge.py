@@ -19,6 +19,7 @@ class TemplateModEntry:
     project_id: str
     side: str
     url: str | None = None
+    max_url_jar_size_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,8 @@ class MergedTemplateMod:
     template_ids: tuple[str, ...]
     url: str | None = None
     order: int = 0
+    name_aliases: tuple[str, ...] = ()
+    max_url_jar_size_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -122,10 +125,24 @@ def compose_templates(
             origins = existing.template_ids
             if entry.template_id not in origins:
                 origins += (entry.template_id,)
+            alias = normalize_name(entry.name)
+            aliases = existing.name_aliases
+            if alias not in aliases:
+                aliases += (alias,)
+            limits = tuple(
+                limit
+                for limit in (
+                    existing.max_url_jar_size_bytes,
+                    entry.max_url_jar_size_bytes,
+                )
+                if limit is not None
+            )
             merged[existing_index] = replace(
                 existing,
                 side=union_side(existing.side, entry.side),
                 template_ids=origins,
+                name_aliases=aliases,
+                max_url_jar_size_bytes=min(limits) if limits else None,
             )
             continue
         identity_indexes[identity] = len(merged)
@@ -139,6 +156,8 @@ def compose_templates(
                 side=entry.side,
                 template_ids=(entry.template_id,),
                 order=len(merged),
+                name_aliases=(normalize_name(entry.name),),
+                max_url_jar_size_bytes=entry.max_url_jar_size_bytes,
             )
         )
 
@@ -159,11 +178,11 @@ def compose_templates(
     name_indexes: dict[str, int] = {}
     url_indexes: dict[tuple[str, str], int] = {}
     for index, mod in enumerate(merged):
-        normalized_name = normalize_name(mod.name)
-        if normalized_name in name_indexes:
-            join(name_indexes[normalized_name], index)
-        else:
-            name_indexes[normalized_name] = index
+        for normalized_name in mod.name_aliases:
+            if normalized_name in name_indexes:
+                join(name_indexes[normalized_name], index)
+            else:
+                name_indexes[normalized_name] = index
         if mod.provider == "url":
             logical_id = (mod.provider, mod.project_id)
             if logical_id in url_indexes:

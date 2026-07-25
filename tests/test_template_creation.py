@@ -25,6 +25,11 @@ neoforge = "21.1.999"
 
 
 class TemplateCreationTest(unittest.TestCase):
+    def test_report_optional_collections_default_to_empty(self) -> None:
+        report = core.TemplateCreationReport("pack:generated", ("base",))
+        self.assertEqual(report.installed, ())
+        self.assertEqual(report.failed, ())
+
     def test_singular_api_delegates_to_plural_api(self) -> None:
         expected = object()
         with patch.object(core, "create_pack_from_templates", return_value=expected) as plural:
@@ -134,6 +139,80 @@ mods:
                         },
                     )
             create.assert_not_called()
+
+    def test_third_candidate_added_after_preview_aborts_before_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            for template_id, provider, remote_id in (
+                ("first", "modrinth", "one"),
+                ("second", "curseforge", "2"),
+            ):
+                template_root = templates / template_id
+                template_root.mkdir(parents=True)
+                (template_root / "template.yaml").write_text(
+                    f"""id: {template_id}
+display_name: {template_id}
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+  - name: Conflict
+    provider: {provider}
+    project_id: \"{remote_id}\"
+    side: both
+""",
+                    encoding="utf-8",
+                )
+            patches = (
+                patch.object(core, "PACKS", packs),
+                patch.object(core, "TEMPLATES", templates),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+            )
+            for item in patches:
+                item.start()
+            try:
+                preview = core.prepare_template_composition(
+                    template_ids=["first", "second"],
+                    minecraft="1.21.1",
+                    loader="neoforge",
+                )
+                with (templates / "second" / "template.yaml").open(
+                    "a", encoding="utf-8"
+                ) as manifest:
+                    manifest.write(
+                        "  - name: Conflict\n"
+                        "    provider: url\n"
+                        "    project_id: three\n"
+                        "    url: https://example.test/three.jar\n"
+                        "    side: both\n"
+                    )
+                conflict = preview.conflicts[0]
+                resolutions = {
+                    conflict.key: core.ConflictResolution(
+                        (conflict.candidates[0].candidate_key,)
+                    )
+                }
+                with patch.object(core, "create_project") as create:
+                    with self.assertRaisesRegex(
+                        core.HuroshikiError, "changed after preview"
+                    ):
+                        core.create_pack_from_templates(
+                            template_ids=["first", "second"],
+                            project_id="generated",
+                            display_name="Generated",
+                            minecraft="1.21.1",
+                            loader="neoforge",
+                            loader_version="21.1.999",
+                            conflict_resolutions=resolutions,
+                            expected_composition=preview,
+                        )
+                create.assert_not_called()
+            finally:
+                for item in reversed(patches):
+                    item.stop()
 
     def test_creation_uses_already_held_lock_without_self_deadlock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -327,6 +406,42 @@ mods:
             finally:
                 for item in reversed(patches):
                     item.stop()
+
+    def test_source_initialization_failure_removes_owned_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            template = templates / "base"
+            template.mkdir(parents=True)
+            (template / "template.yaml").write_text(
+                "id: base\ndisplay_name: Base\nminecraft: 1.21.1\n"
+                "loader: neoforge\nreference_loader_version: 21.1.234\nmods: []\n",
+                encoding="utf-8",
+            )
+
+            def fake_create(*args):
+                (packs / "generated").mkdir(parents=True)
+                return 0
+
+            with (
+                patch.object(core, "PACKS", packs),
+                patch.object(core, "TEMPLATES", templates),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+                patch.object(core, "create_project", side_effect=fake_create),
+                patch.object(core, "project_source", side_effect=OSError("source failed")),
+            ):
+                with self.assertRaisesRegex(OSError, "source failed"):
+                    core.create_pack_from_template(
+                        template_id="base",
+                        project_id="generated",
+                        display_name="Generated",
+                        minecraft="1.21.1",
+                        loader="neoforge",
+                        loader_version="21.1.999",
+                    )
+            self.assertFalse((packs / "generated").exists())
 
     def test_fatal_error_reports_destination_rollback_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -559,6 +674,80 @@ mods:
             finally:
                 for item in reversed(patches):
                     item.stop()
+
+    def test_shared_dependency_from_client_and_server_roots_remains_both(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            template = templates / "base"
+            template.mkdir(parents=True)
+            (template / "template.yaml").write_text(
+                """id: base
+display_name: Base
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+  - name: Client Root
+    provider: modrinth
+    project_id: client-root
+    side: client
+  - name: Server Root
+    provider: modrinth
+    project_id: server-root
+    side: server
+""",
+                encoding="utf-8",
+            )
+
+            def fake_create(*args):
+                source = packs / "generated" / "source"
+                (source / "mods").mkdir(parents=True)
+                (source / "pack.toml").write_text(PACK_TOML, encoding="utf-8")
+                (source / "index.toml").write_text("index\n", encoding="utf-8")
+                return 0
+
+            def write_metadata(path: Path, mod_id: str, side: str) -> None:
+                path.write_text(
+                    f'name = "{mod_id}"\nfilename = "{mod_id}.jar"\n'
+                    f'side = "{side}"\n[update.modrinth]\nmod-id = "{mod_id}"\n',
+                    encoding="utf-8",
+                )
+
+            def fake_run(command, *, cwd=None, **kwargs):
+                source = Path(cwd)
+                if command[-1] == "refresh":
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                root_id = command[-1]
+                root_side = "client" if root_id == "client-root" else "server"
+                write_metadata(source / "mods" / f"{root_id}.pw.toml", root_id, "both")
+                write_metadata(source / "mods" / "shared.pw.toml", "shared", root_side)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                patch.object(core, "ROOT", root),
+                patch.object(core, "PACKS", packs),
+                patch.object(core, "TEMPLATES", templates),
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+                patch.object(core, "create_project", side_effect=fake_create),
+                patch.object(core.subprocess, "run", side_effect=fake_run),
+            ):
+                core.create_pack_from_template(
+                    template_id="base",
+                    project_id="generated",
+                    display_name="Generated",
+                    minecraft="1.21.1",
+                    loader="neoforge",
+                    loader_version="21.1.999",
+                )
+
+            mods = packs / "generated" / "source" / "mods"
+            self.assertEqual(packctl.read_toml(mods / "client-root.pw.toml")["side"], "client")
+            self.assertEqual(packctl.read_toml(mods / "server-root.pw.toml")["side"], "server")
+            self.assertEqual(packctl.read_toml(mods / "shared.pw.toml")["side"], "both")
 
 
 if __name__ == "__main__":

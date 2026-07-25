@@ -42,6 +42,9 @@ ROOT = resolve_root(root_argument(sys.argv[1:]))
 PACKS = ROOT / "packs"
 TEMPLATES = ROOT / "templates"
 SHARED = ROOT / "shared"
+PACKAGE_DATA = Path(
+    os.environ.get("HUROSHIKI_DATA_DIR", Path(__file__).resolve().parents[1])
+)
 STATE_ROOT = ROOT / ".huroshiki"
 TRANSACTION_ROOT = STATE_ROOT / "transactions"
 LOG_ROOT = STATE_ROOT / "logs"
@@ -598,6 +601,7 @@ def template_mods(
     template_id: str,
     *,
     allow_invalid_sides: bool = False,
+    deduplicate: bool = True,
 ) -> list[dict[str, str]]:
     config = load_template_config(template_id)
     value = config.get("mods", [])
@@ -614,11 +618,49 @@ def template_mods(
             allow_invalid_side=allow_invalid_sides,
         )
         key = (normalized["provider"], normalized["project_id"])
-        if key in seen:
+        if deduplicate and key in seen:
             continue
         result.append(normalized)
         seen.add(key)
     return result
+
+
+def set_template_mod_side(
+    template_id: str,
+    provider: str,
+    project_id: str,
+    occurrence: int,
+    side: str,
+) -> None:
+    root = get_template_root(template_id)
+    config_path = root / "template.yaml"
+    config = load_yaml(config_path)
+    mods = config.get("mods")
+    if not isinstance(mods, list):
+        raise ConfigError(f"templates/{template_id}/template.yaml mods must be a list")
+    matched = 0
+    for index, raw_entry in enumerate(mods):
+        entry = normalize_template_mod(
+            raw_entry,
+            f"mods[{index}]",
+            allow_invalid_side=True,
+        )
+        if (entry["provider"], entry["project_id"]) != (provider, project_id):
+            continue
+        if matched == occurrence:
+            raw_entry["side"] = normalize_side(side)
+            break
+        matched += 1
+    else:
+        raise ConfigError(
+            f"Unknown template MOD: {provider}:{project_id} occurrence {occurrence + 1}"
+        )
+    temporary = config_path.with_name(".template.yaml.huroshiki-tmp")
+    temporary.write_text(
+        yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    temporary.replace(config_path)
 
 
 def save_template_mods(
@@ -1265,15 +1307,23 @@ def apply_profile_entry(source: Path, entry: dict[str, Any]) -> None:
     print(f"  {metadata.relative_to(source)} -> {side}")
 
 
+def load_profiles(pack_root: Path) -> dict[str, Any]:
+    profiles = load_yaml(PACKAGE_DATA / "profiles.yaml")
+    managed_profiles = SHARED / "profiles.yaml"
+    if managed_profiles != PACKAGE_DATA / "profiles.yaml":
+        profiles = merge(profiles, load_yaml(managed_profiles))
+    profiles = merge(profiles, load_yaml(pack_root / "profiles.yaml")).get(
+        "profiles", {}
+    )
+    if not isinstance(profiles, dict):
+        raise ConfigError("Merged profiles must be a mapping")
+    return profiles
+
+
 def cmd_profile(args: argparse.Namespace) -> int:
     with ProjectLock(f"pack:{args.pack}", "profile"):
         root = get_pack_root(args.pack)
-        profiles = merge(
-            load_yaml(SHARED / "profiles.yaml"),
-            load_yaml(root / "profiles.yaml"),
-        ).get("profiles", {})
-        if not isinstance(profiles, dict):
-            raise ConfigError("Merged profiles must be a mapping")
+        profiles = load_profiles(root)
         source = root / "source"
         for name in args.names:
             if name not in profiles:
@@ -1996,13 +2046,7 @@ def cmd_complete(args: argparse.Namespace) -> int:
         return 0
 
     if args.kind == "profiles":
-        profiles = merge(
-            load_yaml(SHARED / "profiles.yaml"),
-            load_yaml(root / "profiles.yaml"),
-        ).get("profiles", {})
-
-        if not isinstance(profiles, dict):
-            raise ConfigError("Merged profiles must be a mapping")
+        profiles = load_profiles(root)
 
         for name in sorted(profiles):
             print(name)

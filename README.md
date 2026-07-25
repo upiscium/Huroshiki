@@ -154,8 +154,9 @@ j / k     一覧移動
 n         空のMODPACKまたはTEMPLATEを新規作成
 f         テンプレートからMODPACKを作成
 d         選択プロジェクトの削除確認
-q         huroshiki終了
-r         Trash・ログ・transaction状態の管理
+r         一覧を再読み込み
+x         Trash・ログ・transaction状態の管理
+q         filterがあれば解除、一覧focusでfilterが空ならhuroshiki終了
 ```
 
 `f`では先に新規MODPACKの以下を入力します。

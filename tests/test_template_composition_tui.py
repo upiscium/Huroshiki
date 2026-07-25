@@ -53,7 +53,53 @@ class _CandidateApp(App[None]):
         self.went_main = True
 
 
+class _TemplateProjectApp(App[None]):
+    CSS_PATH = str(Path(huroshiki.__file__).with_name("huroshiki.tcss"))
+
+    def on_mount(self) -> None:
+        self.push_screen(huroshiki.ProjectScreen("template:one"))
+
+    def open_project(self, project_key: str) -> None:
+        pass
+
+
 class TemplateCompositionInteractionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_template_project_create_uses_preview_and_conflict_flow(self) -> None:
+        composition = compose_templates(
+            ["one"],
+            [
+                TemplateModEntry("one", "Same", "modrinth", "one", "both"),
+                TemplateModEntry("one", "Same", "curseforge", "2", "both"),
+            ],
+        )
+        project = template("one")
+        with (
+            patch.object(huroshiki.core, "project_info", return_value=project),
+            patch.object(
+                huroshiki.core,
+                "prepare_template_composition",
+                return_value=composition,
+            ) as prepare,
+            patch.object(huroshiki.core, "create_pack_from_templates") as create,
+        ):
+            app = _TemplateProjectApp()
+            async with app.run_test() as pilot:
+                screen = app.screen
+                screen.create_from_selected_template(
+                    {**VALUES, "template_id": "one"}
+                )
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, huroshiki.TemplateConflictScreen)
+                prepare.assert_called_once_with(
+                    template_ids=["one"],
+                    minecraft="1.21.1",
+                    loader="neoforge",
+                )
+                self.assertEqual(app.screen.values["template_ids"], ["one"])
+                self.assertIs(app.screen.values["expected_composition"], composition)
+                create.assert_not_called()
+
     async def test_candidate_selection_count_clear_and_stable_order(self) -> None:
         candidates = [template("alpha"), template("beta"), template("gamma")]
         composition = compose_templates(["gamma", "beta"], [])
@@ -122,6 +168,11 @@ class TemplateCompositionInteractionTest(unittest.IsolatedAsyncioTestCase):
                     self.assertIsInstance(app.screen, huroshiki.TemplateConflictScreen)
                     create.assert_not_called()
                     screen = app.screen
+
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    self.assertIs(app.screen, screen)
+                    create.assert_not_called()
 
                     await pilot.press("space")
                     await pilot.pause()

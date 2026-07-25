@@ -15,6 +15,18 @@ LAUNCHER = SCRIPTS / "huroshiki-launcher.sh"
 
 
 class LauncherTest(unittest.TestCase):
+    def test_launcher_is_directly_executable(self) -> None:
+        self.assertTrue(os.access(LAUNCHER, os.X_OK))
+        result = subprocess.run(
+            [str(LAUNCHER), "--help"],
+            cwd=REPOSITORY_ROOT,
+            env={**os.environ, "HUROSHIKI_PYTHON": sys.executable},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_source_launcher_discovers_repository_but_uses_its_own_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary = Path(temporary_directory)
