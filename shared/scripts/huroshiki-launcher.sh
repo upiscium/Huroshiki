@@ -1,18 +1,16 @@
-root="${HUROSHIKI_ROOT-}"
-if [[ -z "$root" ]]; then
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+script="$script_dir/huroshiki.py"
+
+# Preserve source-tree ancestor discovery without coupling installed code to data.
+if [[ -z "${HUROSHIKI_ROOT-}" ]]; then
   root="$PWD"
   while [[ "$root" != "/" ]]; do
     if [[ -f "$root/flake.nix" && -f "$root/shared/scripts/huroshiki.py" ]]; then
+      export HUROSHIKI_ROOT="$root"
       break
     fi
-    root="$(dirname "$root")"
+    root="$(dirname -- "$root")"
   done
-fi
-
-script="$root/shared/scripts/huroshiki.py"
-if [[ ! -f "$script" ]]; then
-  echo "huroshiki: not inside the MODPACK monorepo" >&2
-  exit 1
 fi
 
 exec "${HUROSHIKI_PYTHON-python}" "$script" "$@"

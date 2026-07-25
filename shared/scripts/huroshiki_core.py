@@ -43,7 +43,7 @@ from url_artifacts import (
 ROOT = packctl.ROOT
 PACKS = packctl.PACKS
 TEMPLATES = packctl.TEMPLATES
-SCRIPTS = ROOT / "shared" / "scripts"
+SCRIPTS = Path(__file__).resolve().parent
 STATE_ROOT = ROOT / ".huroshiki"
 TRANSACTION_ROOT = STATE_ROOT / "transactions"
 LOG_ROOT = STATE_ROOT / "logs"

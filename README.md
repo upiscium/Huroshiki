@@ -105,6 +105,32 @@ direnv allow
 nix develop
 ```
 
+## Nix package
+
+Huroshikiはflake package／appとして、開発shellへ入らずに実行・導入できます。
+
+```bash
+nix run github:upiscium/Huroshiki -- --help
+nix profile install github:upiscium/Huroshiki#huroshiki
+huroshiki --help
+packctl --help
+```
+
+管理対象リポジトリのrootは、`--root PATH`、`HUROSHIKI_ROOT`、起動時のcurrent working
+directoryの順で決まります。package内のPython moduleやCSSの場所は管理rootには使いません。
+そのため、任意の外部リポジトリをどのdirectoryからでも管理できます。
+
+```bash
+nix run .#huroshiki -- --root /srv/modpacks
+HUROSHIKI_ROOT=/srv/modpacks huroshiki
+packctl --root /srv/modpacks validate
+```
+
+source treeの`shared/scripts/huroshiki-launcher.sh`は従来どおり、リポジトリ内のnested
+directoryから起動した場合にancestorを管理rootとして検出します。明示した`--root`は
+この検出結果や`HUROSHIKI_ROOT`より優先されます。root解決のためにprocessのworking
+directoryを変更することはありません。
+
 ## huroshiki
 
 ```bash
@@ -341,6 +367,9 @@ packs/<pack>/dist/server/
 
 ```bash
 just test-huroshiki
+nix flake check
+nix build .
+nix build .#huroshiki
 ```
 
 テスト対象：

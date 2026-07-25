@@ -7,6 +7,11 @@ import sys
 import threading
 from typing import Iterable
 
+from huroshiki_paths import resolve_root, root_argument
+
+# Resolve the managed repository before importing modules with root-derived globals.
+ROOT = resolve_root(root_argument(sys.argv[1:]))
+
 try:
     from textual import events, on
     from textual.app import App, ComposeResult
@@ -2079,6 +2084,11 @@ class UpdateScreen(BaseScreen):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Packwiz project TUI")
+    parser.add_argument(
+        "--root",
+        metavar="PATH",
+        help="managed repository root (default: HUROSHIKI_ROOT, then current directory)",
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--pack",

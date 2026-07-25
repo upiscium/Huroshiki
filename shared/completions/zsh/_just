@@ -19,7 +19,7 @@ _minecraft_modpack_root() {
 _minecraft_modpack_candidates() {
   local root="$1"
   shift
-  command python "$root/shared/scripts/packctl.py" complete "$@" 2>/dev/null
+  command packctl --root "$root" complete "$@" 2>/dev/null
 }
 
 _just() {

@@ -34,10 +34,11 @@ from deploy_support import (
     validate_rsync_target,
 )
 from packctl_errors import ConfigError
+from huroshiki_paths import resolve_root, root_argument
 import project_locks
 from project_locks import ProjectLockMetadata, process_start_identity
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = resolve_root(root_argument(sys.argv[1:]))
 PACKS = ROOT / "packs"
 TEMPLATES = ROOT / "templates"
 SHARED = ROOT / "shared"
@@ -2263,6 +2264,11 @@ def cmd_clean_state(args: argparse.Namespace) -> int:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Manage multiple Packwiz projects")
+    root.add_argument(
+        "--root",
+        metavar="PATH",
+        help="managed repository root (default: HUROSHIKI_ROOT, then current directory)",
+    )
     sub = root.add_subparsers(dest="command", required=True)
 
     item = sub.add_parser("complete")
