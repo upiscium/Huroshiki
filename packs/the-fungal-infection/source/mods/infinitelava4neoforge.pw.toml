@@ -1,0 +1,13 @@
+name = "InfiniteLava"
+filename = "infinitelava4neoforge-1.0.0.jar"
+side = "server"
+
+[download]
+url = "https://cdn.modrinth.com/data/CzIwnB7z/versions/yBbwwviF/infinitelava4neoforge-1.0.0.jar"
+hash-format = "sha512"
+hash = "3aeecfa94312b5d6f32bc22affcbeb8951e4496ed2251db5fa11543470e64ece85eb9b965037d4b30f8ac18254391af9ce449e24e2cae2d721057fd5eb591a4c"
+
+[update]
+[update.modrinth]
+mod-id = "CzIwnB7z"
+version = "yBbwwviF"

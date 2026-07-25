@@ -1,0 +1,47 @@
+id: hard-pack-base
+display_name: Hard pack base
+enabled: true
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+- name: Thirst Was Taken
+  provider: curseforge
+  project_id: '679270'
+  side: both
+- name: Architectury API
+  provider: curseforge
+  project_id: '419699'
+  side: both
+- name: 'Spice of Life: Classic Edition'
+  provider: curseforge
+  project_id: '1109288'
+  side: both
+- name: Bloodmoon Rebrushed
+  provider: modrinth
+  project_id: S1p8KXtM
+  side: both
+- name: Enhanced AI
+  provider: modrinth
+  project_id: TDdoftI1
+  side: server
+- name: InsaneLib
+  provider: modrinth
+  project_id: USZyvOJq
+  side: server
+- name: Lost Cities Modern Tweaks
+  provider: modrinth
+  project_id: HdIQwHGq
+  side: server
+- name: The Lost Cities Autoloader
+  provider: curseforge
+  project_id: '1312837'
+  side: server
+- name: The Lost Cities
+  provider: modrinth
+  project_id: 8VDCUS3b
+  side: server
+- name: Dynamic Difficulty (Neoforge/Fabric)
+  provider: curseforge
+  project_id: '1272655'
+  side: both

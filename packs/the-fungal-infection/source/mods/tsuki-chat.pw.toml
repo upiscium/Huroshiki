@@ -1,0 +1,13 @@
+name = "Tsuki Chat"
+filename = "tsukichat-neo-1.21.1-v1.4.0-alpha.6.jar"
+side = "server"
+
+[download]
+hash-format = "sha1"
+hash = "06bef8134e7dc65d146272e328cad8d84e20d907"
+mode = "metadata:curseforge"
+
+[update]
+[update.curseforge]
+file-id = 6879180
+project-id = 1029553

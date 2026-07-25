@@ -1,0 +1,419 @@
+id: neoforge-1.21.1-base
+display_name: Neoforge 1.21.1 Base
+enabled: true
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+- name: AllTheLeaks (Memory Leak Fix)
+  provider: curseforge
+  project_id: '1091339'
+  side: both
+- name: AppleSkin
+  provider: modrinth
+  project_id: EsAfCjCV
+  side: client
+- name: Architectury API
+  provider: curseforge
+  project_id: '419699'
+  side: both
+- name: BadOptimizations
+  provider: curseforge
+  project_id: '949555'
+  side: client
+- name: BaguetteLib
+  provider: modrinth
+  project_id: OfKzpbRU
+  side: both
+- name: Balm
+  provider: modrinth
+  project_id: MBAkmtvl
+  side: both
+- name: BetterF3
+  provider: modrinth
+  project_id: 8shC1gFX
+  side: client
+- name: Building Wands
+  provider: modrinth
+  project_id: XkisZUfp
+  side: both
+- name: caramelChat
+  provider: modrinth
+  project_id: M4vJe1FJ
+  side: both
+- name: Chunky
+  provider: modrinth
+  project_id: fALzjamp
+  side: server
+- name: Cloth Config API
+  provider: modrinth
+  project_id: 9s6osm5g
+  side: both
+- name: Clumps
+  provider: modrinth
+  project_id: Wnxd13zP
+  side: server
+- name: Configurable
+  provider: modrinth
+  project_id: lGffrQ3O
+  side: both
+- name: Configured
+  provider: curseforge
+  project_id: '457570'
+  side: client
+- name: Controlling
+  provider: modrinth
+  project_id: xv94TkTM
+  side: client
+- name: Corpse x Curios API Compat
+  provider: modrinth
+  project_id: pJGcKPh1
+  side: both
+- name: Corpse
+  provider: modrinth
+  project_id: WrpuIfhw
+  side: both
+- name: Crafting Tweaks
+  provider: modrinth
+  project_id: DMu0oBKf
+  side: both
+- name: Crash Assistant
+  provider: modrinth
+  project_id: ix1qq8Ux
+  side: client
+- name: Cupboard
+  provider: curseforge
+  project_id: '326652'
+  side: client
+- name: Curios API
+  provider: modrinth
+  project_id: vvuO3ImH
+  side: both
+- name: Discord & Chat Images
+  provider: modrinth
+  project_id: yIWYj2mo
+  side: both
+- name: Easy CraftTweaker
+  provider: modrinth
+  project_id: uFnl8Tqw
+  side: both
+- name: EMI
+  provider: modrinth
+  project_id: fRiHVvU7
+  side: both
+- name: '[EMF] Entity Model Features'
+  provider: modrinth
+  project_id: 4I1XuqiY
+  side: client
+- name: '[ETF] Entity Texture Features'
+  provider: modrinth
+  project_id: BVzZfTc1
+  side: client
+- name: Extreme sound muffler
+  provider: modrinth
+  project_id: 5IIKsxiL
+  side: client
+- name: Fast Async World Save[Forge/Neo/Fabric]
+  provider: curseforge
+  project_id: '951499'
+  side: server
+- name: Fast Leaf Decay
+  provider: curseforge
+  project_id: '230976'
+  side: server
+- name: FTB Library (NeoForge)
+  provider: curseforge
+  project_id: '404465'
+  side: both
+- name: FTB Ultimine (NeoForge)
+  provider: curseforge
+  project_id: '386134'
+  side: both
+- name: ImmediatelyFast
+  provider: modrinth
+  project_id: 5ZwdcRci
+  side: client
+- name: Jade Addons (Neo/Forge)
+  provider: modrinth
+  project_id: xuDOzCLy
+  side: both
+- name: Jade 🔍
+  provider: modrinth
+  project_id: nvQzSEkH
+  side: both
+- name: Just Enough Items (JEI)
+  provider: modrinth
+  project_id: u6dRKJwZ
+  side: both
+- name: Just Enough Professions (JEP)
+  provider: modrinth
+  project_id: kB56GtWA
+  side: both
+- name: Just Enough Resources (JER)
+  provider: modrinth
+  project_id: uEfK2CXF
+  side: both
+- name: Kotlin for Forge
+  provider: modrinth
+  project_id: ordsPcFz
+  side: server
+- name: KubeJS
+  provider: modrinth
+  project_id: umyGl7zF
+  side: both
+- name: Lithium
+  provider: modrinth
+  project_id: gvQqBUqZ
+  side: both
+- name: Lootr
+  provider: modrinth
+  project_id: EltpO5cN
+  side: both
+- name: ModernFix
+  provider: modrinth
+  project_id: nmDcB62a
+  side: both
+- name: Mouse Tweaks
+  provider: modrinth
+  project_id: aC3cM3Vq
+  side: client
+- name: Neat
+  provider: modrinth
+  project_id: Ins7SzzR
+  side: client
+- name: Neruina - Ticking Entity Fixer
+  provider: modrinth
+  project_id: 1s5x833P
+  side: both
+- name: Overflowing Bars
+  provider: modrinth
+  project_id: XD7XOrAF
+  side: client
+- name: Packet Fixer
+  provider: modrinth
+  project_id: c7m1mi73
+  side: both
+- name: Pick Up Notifier
+  provider: modrinth
+  project_id: ZX66K16c
+  side: client
+- name: Polymorph
+  provider: modrinth
+  project_id: tagwiZkJ
+  side: both
+- name: Puzzles Lib
+  provider: modrinth
+  project_id: QAGBst4M
+  side: both
+- name: Quark
+  provider: modrinth
+  project_id: qnQsVE2z
+  side: both
+- name: Resourcify
+  provider: modrinth
+  project_id: RLzHAoZe
+  side: client
+- name: Rhino
+  provider: modrinth
+  project_id: sk9knFPE
+  side: both
+- name: Saturn
+  provider: modrinth
+  project_id: 2eT495vq
+  side: both
+- name: Searchables
+  provider: modrinth
+  project_id: fuuu3xnx
+  side: client
+- name: Simple Backups
+  provider: modrinth
+  project_id: fzSKSXVK
+  side: server
+- name: Sodium Extra
+  provider: modrinth
+  project_id: PtjYWJkn
+  side: client
+- name: Sodium
+  provider: modrinth
+  project_id: AANobbMI
+  side: client
+- name: spark
+  provider: modrinth
+  project_id: l6YH9Als
+  side: server
+- name: Stylish Effects
+  provider: modrinth
+  project_id: onDuQF5e
+  side: both
+- name: SuperMartijn642's Config Lib
+  provider: modrinth
+  project_id: LN9BxssP
+  side: both
+- name: SuperMartijn642's Core Lib
+  provider: modrinth
+  project_id: rOUBggPv
+  side: both
+- name: Too Fast
+  provider: modrinth
+  project_id: w6JSkKSH
+  side: server
+- name: Trash Cans
+  provider: modrinth
+  project_id: 4QrnfueM
+  side: both
+- name: Tsuki Chat
+  provider: curseforge
+  project_id: '1029553'
+  side: server
+- name: Visual Workbench
+  provider: modrinth
+  project_id: kfqD1JRw
+  side: client
+- name: Xaero's Minimap
+  provider: modrinth
+  project_id: 1bokaNcj
+  side: client
+- name: Xaero's World Map
+  provider: modrinth
+  project_id: NcUtCpym
+  side: client
+- name: Zeta
+  provider: modrinth
+  project_id: MVARlG2f
+  side: both
+- name: Better Advancements
+  provider: modrinth
+  project_id: Q2OqKxDG
+  side: client
+- name: Chunk Loaders
+  provider: modrinth
+  project_id: t1VgucWo
+  side: both
+- name: ChoiceTheorem's Overhauled Village
+  provider: modrinth
+  project_id: fgmhI8kH
+  side: server
+- name: FerriteCore
+  provider: modrinth
+  project_id: uXXizFIs
+  side: both
+- name: Lithostitched
+  provider: modrinth
+  project_id: XaDC71GB
+  side: server
+- name: Sophisticated Backpacks
+  provider: modrinth
+  project_id: TyCTlI4b
+  side: both
+- name: Sophisticated Core
+  provider: modrinth
+  project_id: nmoqTijg
+  side: both
+- name: Architectury API
+  provider: modrinth
+  project_id: lhGA9TYQ
+  side: server
+- name: Chat Heads
+  provider: modrinth
+  project_id: Wb5oqrBJ
+  side: client
+- name: EMI Enchanting
+  provider: modrinth
+  project_id: wbWoo11W
+  side: both
+- name: EMI Loot
+  provider: modrinth
+  project_id: qbbO7Jns
+  side: both
+- name: EMI Ores
+  provider: modrinth
+  project_id: sG4TqDb8
+  side: both
+- name: EMI++ Forked
+  provider: modrinth
+  project_id: N9WucjHL
+  side: both
+- name: Fzzy Config
+  provider: modrinth
+  project_id: hYykXjDp
+  side: both
+- name: More Overlays Updated
+  provider: modrinth
+  project_id: Thy5Pqut
+  side: client
+- name: Observable
+  provider: modrinth
+  project_id: VYRu7qmG
+  side: server
+- name: FastFurnace
+  provider: modrinth
+  project_id: 9X0318ev
+  side: server
+- name: FastSuite
+  provider: modrinth
+  project_id: roccmqou
+  side: server
+- name: FastWorkbench
+  provider: modrinth
+  project_id: 5NYPwQRn
+  side: server
+- name: Placebo
+  provider: modrinth
+  project_id: tCkE8p2N
+  side: server
+- name: ServerCore
+  provider: modrinth
+  project_id: 4WWQxlQP
+  side: server
+- name: fix GPU memory leak
+  provider: curseforge
+  project_id: '882495'
+  side: client
+- name: GpuShift
+  provider: modrinth
+  project_id: BpmMSdoc
+  side: client
+- name: Smooth Boot
+  provider: modrinth
+  project_id: gk3B4zrk
+  side: both
+- name: FramedBlocks
+  provider: curseforge
+  project_id: '441647'
+  side: both
+- name: Moonlight Lib
+  provider: curseforge
+  project_id: '499980'
+  side: both
+- name: Vista Aeronautics Fix
+  provider: curseforge
+  project_id: '1521989'
+  side: both
+- name: Vista
+  provider: curseforge
+  project_id: '1368607'
+  side: both
+- name: MmmMmmMmmMmm
+  provider: modrinth
+  project_id: Adega8YN
+  side: both
+- name: Moonlight Lib
+  provider: modrinth
+  project_id: twkfQtEc
+  side: both
+- name: 'Inventory Tweaks: ReFoxed'
+  provider: modrinth
+  project_id: uqnMI1kq
+  side: both
+- name: Glowing Emissive Ores Definitive Edition
+  provider: modrinth
+  project_id: U8Iw4AfP
+  side: client
+- name: Plonk
+  provider: modrinth
+  project_id: EUmBPkQn
+  side: both
+- name: WI Zoom
+  provider: modrinth
+  project_id: o7DitHWP
+  side: client
