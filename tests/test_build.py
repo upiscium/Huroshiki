@@ -77,6 +77,20 @@ class TransactionalBuildTest(unittest.TestCase):
         self.assertEqual(self.dist_snapshot(), before)
         run.assert_not_called()
 
+    def test_missing_and_empty_sides_use_the_same_validation_as_unknown(self) -> None:
+        metadata = self.pack_root / "source" / "mods" / "demo.pw.toml"
+        for side_line in ("", 'side = ""\n'):
+            metadata.write_text(
+                'name = "Demo MOD"\nfilename = "demo.jar"\n' + side_line,
+                encoding="utf-8",
+            )
+            before = self.dist_snapshot()
+            with patch.object(packctl, "run") as run:
+                result = packctl.build_pack("demo")
+            self.assertEqual(result, 1)
+            self.assertEqual(self.dist_snapshot(), before)
+            run.assert_not_called()
+
     def test_refresh_failure_preserves_entire_dist(self) -> None:
         self.write_metadata("both")
         before = self.dist_snapshot()

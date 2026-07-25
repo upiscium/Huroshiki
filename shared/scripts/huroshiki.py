@@ -36,6 +36,21 @@ def enabled_marker(enabled: bool) -> str:
     return "+" if enabled else "-"
 
 
+def mod_side_marker(mod: core.ModInfo, enabled: bool) -> str:
+    return "?" if mod.side_error is not None else enabled_marker(enabled)
+
+
+class FilterInput(Input):
+    BINDINGS = [
+        Binding("q", "clear_screen_filter", "Clear filter", priority=True),
+    ]
+
+    def action_clear_screen_filter(self) -> None:
+        action = getattr(self.screen, "action_clear_filter_or_fallback", None)
+        if action is not None:
+            action()
+
+
 class HuroshikiApp(App[None]):
     TITLE = "huroshiki"
     CSS_PATH = "huroshiki.tcss"
@@ -49,7 +64,9 @@ class HuroshikiApp(App[None]):
 
     def on_mount(self) -> None:
         if self.initial_project:
-            core.project_info(self.initial_project)
+            project = core.project_info(self.initial_project)
+            if project.error is not None:
+                raise core.HuroshikiError(project.error)
             self.selected_project = self.initial_project
             self.push_screen(ProjectScreen(self.initial_project))
         else:
@@ -64,24 +81,40 @@ class HuroshikiApp(App[None]):
         self.selected_project = None
         self.switch_screen(MainMenuScreen())
 
+    def project_is_usable(self, project_key: str) -> bool:
+        project = core.project_info(project_key)
+        if project.error is None:
+            return True
+        self.notify(project.error, severity="error")
+        return False
+
     def open_project(self, project_key: str) -> None:
-        core.project_info(project_key)
+        if not self.project_is_usable(project_key):
+            return
         self.selected_project = project_key
         self.switch_screen(ProjectScreen(project_key))
 
     def open_install(self, project_key: str) -> None:
+        if not self.project_is_usable(project_key):
+            return
         self.selected_project = project_key
         self.switch_screen(InstallScreen(project_key))
 
     def open_list(self, project_key: str) -> None:
+        if not self.project_is_usable(project_key):
+            return
         self.selected_project = project_key
         self.switch_screen(InstalledModsScreen(project_key))
 
     def open_update(self, project_key: str) -> None:
+        if not self.project_is_usable(project_key):
+            return
         self.selected_project = project_key
         self.switch_screen(UpdateScreen(project_key))
 
     def open_templates(self, project_key: str) -> None:
+        if not self.project_is_usable(project_key):
+            return
         self.selected_project = project_key
         self.switch_screen(TemplateScreen(project_key))
 
@@ -426,12 +459,46 @@ class BaseScreen(Screen[None]):
         table.move_cursor(row=row)
 
 
-class MainMenuScreen(BaseScreen):
+class FilterListScreen(BaseScreen):
+    BINDINGS = [
+        Binding("q", "clear_filter_or_fallback", "Clear filter", priority=True),
+    ]
+    filter_input_id = ""
+    filter_table_id = ""
+
+    def reload_filter_rows(self, query: str) -> None:
+        raise NotImplementedError
+
+    def filter_row_count(self) -> int:
+        raise NotImplementedError
+
+    def filter_fallback(self) -> None:
+        pass
+
+    def action_clear_filter_or_fallback(self) -> None:
+        search = self.query_one(f"#{self.filter_input_id}", Input)
+        if not search.value:
+            self.filter_fallback()
+            return
+        table = self.query_one(f"#{self.filter_table_id}", DataTable)
+        cursor_row = table.cursor_row
+        search.value = ""
+        self.reload_filter_rows("")
+        row_count = self.filter_row_count()
+        if row_count:
+            table.move_cursor(row=max(0, min(cursor_row, row_count - 1)))
+        table.focus()
+
+
+class MainMenuScreen(FilterListScreen):
+    BINDINGS = FilterListScreen.BINDINGS
     screen_title = "huroshiki / Projects"
     help_text = (
         "Tab: focus  Enter: search/open  j/k: move  p: project  "
-        "n: new  f: from template  d: delete  r: state  q: quit"
+        "n: new  f: from template  d: delete  r: reload  x: state  q: clear/quit"
     )
+    filter_input_id = "pack-search"
+    filter_table_id = "pack-table"
 
     def __init__(self) -> None:
         super().__init__()
@@ -440,7 +507,7 @@ class MainMenuScreen(BaseScreen):
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
-        yield Input(placeholder="Search projects", id="pack-search")
+        yield FilterInput(placeholder="Search projects", id="pack-search")
         yield DataTable(id="pack-table")
         yield from self.compose_footer()
 
@@ -484,9 +551,18 @@ class MainMenuScreen(BaseScreen):
                 project.project_id,
                 project.minecraft,
                 loader,
-                str(len(core.list_mods(project.key))),
-                "yes" if project.enabled else "no",
+                str(project.mod_count) if project.mod_count is not None else "-",
+                "ERROR" if project.error else ("yes" if project.enabled else "no"),
             )
+
+    def reload_filter_rows(self, query: str) -> None:
+        self.reload_projects(query)
+
+    def filter_row_count(self) -> int:
+        return len(self.visible_projects)
+
+    def filter_fallback(self) -> None:
+        self.app.exit()
 
     @on(Input.Submitted, "#pack-search")
     def search(self, event: Input.Submitted) -> None:
@@ -505,7 +581,26 @@ class MainMenuScreen(BaseScreen):
         if project is None:
             self.app.notify("No project is selected", severity="warning")
             return
+        if project.error is not None:
+            self.show_project_error(project)
+            return
         self.app.open_project(project.key)
+
+    def show_project_error(self, project: core.ProjectInfo) -> None:
+        self.app.push_screen(
+            MessageModal(
+                f"{project.type_label} ERROR",
+                [
+                    f"Project: {project.key}",
+                    f"Path: {project.manifest_path}",
+                    "",
+                    project.error or "Unknown project loading error",
+                    "",
+                    "Repair the files externally, close this detail, then press r to reload.",
+                    "The project can also be deleted from the project list with d.",
+                ],
+            )
+        )
 
     def request_delete(self) -> None:
         project = self.selected_project_info()
@@ -595,9 +690,11 @@ class MainMenuScreen(BaseScreen):
             elif event.key == "d":
                 self.request_delete()
             elif event.key == "r":
+                self.reload_projects(
+                    self.query_one("#pack-search", Input).value
+                )
+            elif event.key == "x":
                 self.app.open_state()
-            elif event.key == "q":
-                self.app.exit()
             else:
                 return
             event.stop()
@@ -767,6 +864,8 @@ class ProjectScreen(BaseScreen):
         super().__init__()
         self.project_key = project_key
         self.project = core.project_info(project_key)
+        if self.project.error is not None:
+            raise core.HuroshikiError(self.project.error)
         self.display_name = self.project.display_name
         self.screen_title = (
             f"{self.project.type_label} / {self.display_name}"
@@ -998,11 +1097,14 @@ class TemplateEditorScreen(BaseScreen):
             self.app.open_templates(self.project_key)
 
 
-class TemplateScreen(BaseScreen):
+class TemplateScreen(FilterListScreen):
+    BINDINGS = FilterListScreen.BINDINGS
     help_text = (
         "Tab: focus  Enter/e: edit  j/k: move  n: new  "
-        "d: delete  r: reload  p: project  Esc: main"
+        "d: delete  r: reload  q: clear filter  p: project  Esc: main"
     )
+    filter_input_id = "template-search"
+    filter_table_id = "template-table"
 
     def __init__(self, project_key: str) -> None:
         super().__init__()
@@ -1014,7 +1116,7 @@ class TemplateScreen(BaseScreen):
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
-        yield Input(
+        yield FilterInput(
             placeholder="Filter project files by target or path",
             id="template-search",
         )
@@ -1051,6 +1153,12 @@ class TemplateScreen(BaseScreen):
                 str(template.relative_path),
                 str(template.size),
             )
+
+    def reload_filter_rows(self, query: str) -> None:
+        self.reload_templates(query)
+
+    def filter_row_count(self) -> int:
+        return len(self.visible_templates)
 
     @on(Input.Submitted, "#template-search")
     def filter_template_list(self, event: Input.Submitted) -> None:
@@ -1200,7 +1308,7 @@ class TemplateCandidateScreen(BaseScreen):
                 template.minecraft,
                 template.loader,
                 template.loader_version,
-                str(len(core.list_mods(template.key))),
+                str(template.mod_count or 0),
             )
         if not self.templates:
             self.app.notify(
@@ -1716,11 +1824,15 @@ class InstallScreen(BaseScreen):
         event.stop()
 
 
-class InstalledModsScreen(BaseScreen):
+class InstalledModsScreen(FilterListScreen):
+    BINDINGS = FilterListScreen.BINDINGS
     help_text = (
         "Tab: focus  Enter: filter  j/k: move  Space: select  c/s: toggle side  "
-        "b: both  d: delete  i: install  u: update  m: help  p: project  Esc: main"
+        "b: both  d: delete  q: clear filter  i: install  u: update  "
+        "m: help  p: project  Esc: main"
     )
+    filter_input_id = "installed-search"
+    filter_table_id = "installed-table"
 
     def __init__(self, project_key: str) -> None:
         super().__init__()
@@ -1734,7 +1846,7 @@ class InstalledModsScreen(BaseScreen):
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
-        yield Input(placeholder="Filter installed MODs", id="installed-search")
+        yield FilterInput(placeholder="Filter installed MODs", id="installed-search")
         yield DataTable(id="installed-table")
         yield from self.compose_footer()
 
@@ -1765,11 +1877,17 @@ class InstalledModsScreen(BaseScreen):
             table.add_row(
                 "[*]" if mod.selected else "[ ]",
                 mod.name,
-                enabled_marker(mod.client),
-                enabled_marker(mod.server),
+                mod_side_marker(mod, mod.client),
+                mod_side_marker(mod, mod.server),
                 mod.provider,
                 str(mod.relative_path),
             )
+
+    def reload_filter_rows(self, query: str) -> None:
+        self.reload_mods(query)
+
+    def filter_row_count(self) -> int:
+        return len(self.visible_mods)
 
     @on(Input.Submitted, "#installed-search")
     def filter_installed(self, event: Input.Submitted) -> None:

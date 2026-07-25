@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 from pathlib import Path
 import re
@@ -145,6 +145,8 @@ class ProjectInfo:
     loader: str
     loader_version: str
     enabled: bool
+    error: str | None = None
+    mod_count: int | None = None
 
     @property
     def key(self) -> str:
@@ -153,6 +155,12 @@ class ProjectInfo:
     @property
     def type_label(self) -> str:
         return "MODPACK" if self.kind == "pack" else "TEMPLATE"
+
+    @property
+    def manifest_path(self) -> Path:
+        name = "pack.yaml" if self.kind == "pack" else "template.yaml"
+        parent = PACKS if self.kind == "pack" else TEMPLATES
+        return parent / self.project_id / name
 
 
 @dataclass
@@ -167,13 +175,18 @@ class ModInfo:
     server: bool
     source_url: str = ""
     selected: bool = False
+    side_error: str | None = None
 
     @property
     def side(self) -> str:
+        if self.side_error is not None:
+            return "invalid"
         return side_from_flags(self.client, self.server)
 
     @property
     def side_label(self) -> str:
+        if self.side_error is not None:
+            return "[?] [?]"
         return f"[{'x' if self.client else ' '}] [{'x' if self.server else ' '}]"
 
 
@@ -1280,22 +1293,24 @@ def side_from_flags(client: bool, server: bool) -> str:
     raise HuroshikiError("A mod must be enabled on the client, server, or both")
 
 
-def flags_from_side(side: str) -> tuple[bool, bool]:
-    normalized = (side or "both").lower()
-    if normalized in {"", "both"}:
+def flags_from_side(side: object) -> tuple[bool, bool]:
+    if side == "both":
         return True, True
-    if normalized == "client":
+    if side == "client":
         return True, False
-    if normalized == "server":
+    if side == "server":
         return False, True
-    return True, True
+    return False, False
 
 
 def pack_versions(source: Path) -> tuple[str, str, str]:
     pack_file = source / "pack.toml"
     if not pack_file.exists():
         return "", "", ""
-    data = tomllib.loads(pack_file.read_text(encoding="utf-8"))
+    try:
+        data = tomllib.loads(pack_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise HuroshikiError(f"{pack_file}: {error}") from error
     versions = data.get("versions", {})
     if not isinstance(versions, dict):
         return "", "", ""
@@ -1309,22 +1324,42 @@ def pack_versions(source: Path) -> tuple[str, str, str]:
 
 def project_info(project_key_value: str) -> ProjectInfo:
     kind, project_id = split_project_key(project_key_value)
-    config = packctl.load_project_config(kind, project_id)
-    if kind == "pack":
-        minecraft, loader, loader_version = pack_versions(
-            packctl.get_pack_root(project_id) / "source"
-        )
-    else:
-        minecraft, loader, loader_version = packctl.template_versions(project_id)
-    return ProjectInfo(
+    parent = PACKS if kind == "pack" else TEMPLATES
+    manifest = parent / project_id / (
+        "pack.yaml" if kind == "pack" else "template.yaml"
+    )
+    fallback = ProjectInfo(
         kind=kind,
         project_id=project_id,
-        display_name=str(config.get("display_name", project_id)),
-        minecraft=minecraft,
-        loader=loader,
-        loader_version=loader_version,
-        enabled=bool(config.get("enabled", True)),
+        display_name=project_id,
+        minecraft="",
+        loader="",
+        loader_version="",
+        enabled=False,
     )
+    try:
+        config = packctl.load_project_config(kind, project_id)
+        if kind == "pack":
+            minecraft, loader, loader_version = pack_versions(
+                packctl.get_pack_root(project_id) / "source"
+            )
+        else:
+            minecraft, loader, loader_version = packctl.template_versions(project_id)
+        info = replace(
+            fallback,
+            display_name=str(config.get("display_name", project_id)),
+            minecraft=minecraft,
+            loader=loader,
+            loader_version=loader_version,
+            enabled=bool(config.get("enabled", True)),
+        )
+    except Exception as error:
+        return replace(fallback, error=f"{manifest}: {error}")
+
+    try:
+        return replace(info, mod_count=len(list_mods(project_key_value)))
+    except Exception as error:
+        return replace(info, error=str(error))
 
 
 def list_projects() -> list[ProjectInfo]:
@@ -1398,7 +1433,10 @@ def extract_project_id(value: object) -> str:
 
 def read_mod(source: Path, relative_path: Path) -> ModInfo:
     path = safe_child(source, relative_path)
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise HuroshikiError(f"{path}: {error}") from error
     return read_mod_data(relative_path, data)
 
 
@@ -1473,7 +1511,9 @@ def update_candidates(
 
 
 def read_mod_data(relative_path: Path, data: dict[str, object]) -> ModInfo:
-    client, server = flags_from_side(str(data.get("side", "both")))
+    side = data.get("side")
+    side_error = packctl.side_validation_error(side)
+    client, server = flags_from_side(side)
     provider, project_id = provider_from_metadata(data)
     slug = relative_path.name.removesuffix(".pw.toml")
     download = data.get("download", {})
@@ -1494,6 +1534,7 @@ def read_mod_data(relative_path: Path, data: dict[str, object]) -> ModInfo:
         client=client,
         server=server,
         source_url=source_url,
+        side_error=side_error,
     )
 
 
@@ -1507,7 +1548,9 @@ def template_mod_relative(provider: str, project_id: str) -> Path:
 
 
 def template_mod_info(entry: dict[str, str]) -> ModInfo:
-    client, server = flags_from_side(entry["side"])
+    side = entry.get("side")
+    side_error = packctl.side_validation_error(side)
+    client, server = flags_from_side(side)
     provider = canonical_provider(entry["provider"])
     project_id = entry["project_id"]
     source_url = entry.get("url", "")
@@ -1525,13 +1568,20 @@ def template_mod_info(entry: dict[str, str]) -> ModInfo:
         client=client,
         server=server,
         source_url=source_url,
+        side_error=side_error,
     )
 
 
 def list_mods(project_key_value: str) -> list[ModInfo]:
     kind, project_id = split_project_key(project_key_value)
     if kind == "template":
-        return [template_mod_info(entry) for entry in packctl.template_mods(project_id)]
+        return [
+            template_mod_info(entry)
+            for entry in packctl.template_mods(
+                project_id,
+                allow_invalid_sides=True,
+            )
+        ]
     source = project_source(project_key_value)
     return [
         read_mod(source, path.relative_to(source))
@@ -1573,7 +1623,7 @@ def set_installed_mod_side(
             kind, project_id = split_project_key(project_key_value)
             side = side_from_flags(client, server)
             if kind == "template":
-                mods = packctl.template_mods(project_id)
+                mods = packctl.template_mods(project_id, allow_invalid_sides=True)
                 target = str(relative_path)
                 found = False
                 for entry in mods:
@@ -1583,7 +1633,11 @@ def set_installed_mod_side(
                         break
                 if not found:
                     raise HuroshikiError(f"Unknown template MOD: {relative_path}")
-                packctl.save_template_mods(project_id, mods)
+                packctl.save_template_mods(
+                    project_id,
+                    mods,
+                    allow_invalid_sides=True,
+                )
                 return
 
             source = project_source(project_key_value)
@@ -1910,7 +1964,11 @@ def update_all(project_key_value: str) -> int:
 
 def compatible_templates(minecraft: str, loader: str) -> list[ProjectInfo]:
     ids = packctl.compatible_template_ids(minecraft, loader)
-    return [project_info(project_key("template", template_id)) for template_id in ids]
+    return [
+        info
+        for template_id in ids
+        if not (info := project_info(project_key("template", template_id))).error
+    ]
 
 
 def template_install_command(provider: str, project_id: str) -> list[str]:

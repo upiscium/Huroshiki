@@ -321,9 +321,8 @@ def legacy_template_mods(source: Path) -> list[dict[str, str]]:
                 project_id = metadata.stem
             else:
                 continue
-        side = str(data.get("side", "both")).lower()
-        if side not in VALID_SIDES:
-            side = "both"
+        raw_side = data.get("side")
+        side = raw_side if isinstance(raw_side, str) else ""
         item = {
             "name": str(data.get("name", metadata.stem)),
             "provider": provider,
@@ -552,7 +551,18 @@ def template_ids() -> list[str]:
     )
 
 
-def normalize_template_mod(entry: object, context: str) -> dict[str, str]:
+def side_validation_error(side: object) -> str | None:
+    if isinstance(side, str) and side in VALID_SIDES:
+        return None
+    return f"side must be client, server, or both; got {side!r}"
+
+
+def normalize_template_mod(
+    entry: object,
+    context: str,
+    *,
+    allow_invalid_side: bool = False,
+) -> dict[str, str]:
     if not isinstance(entry, dict):
         raise ConfigError(f"{context} must be a mapping")
     provider = str(entry.get("provider", "")).strip().lower()
@@ -562,9 +572,11 @@ def normalize_template_mod(entry: object, context: str) -> dict[str, str]:
     if not project_id:
         raise ConfigError(f"{context}.project_id must be a non-empty string")
     name = str(entry.get("name", project_id)).strip() or project_id
-    side = str(entry.get("side", "both")).strip().lower()
-    if side not in VALID_SIDES:
-        raise ConfigError(f"{context}.side must be client, server, or both")
+    raw_side = entry.get("side")
+    side_error = side_validation_error(raw_side)
+    if side_error is not None and not allow_invalid_side:
+        raise ConfigError(f"{context}.{side_error}")
+    side = raw_side if isinstance(raw_side, str) else ""
     result = {
         "name": name,
         "provider": provider,
@@ -582,7 +594,11 @@ def normalize_template_mod(entry: object, context: str) -> dict[str, str]:
     return result
 
 
-def template_mods(template_id: str) -> list[dict[str, str]]:
+def template_mods(
+    template_id: str,
+    *,
+    allow_invalid_sides: bool = False,
+) -> list[dict[str, str]]:
     config = load_template_config(template_id)
     value = config.get("mods", [])
     if value is None:
@@ -592,7 +608,11 @@ def template_mods(template_id: str) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for index, entry in enumerate(value):
-        normalized = normalize_template_mod(entry, f"mods[{index}]")
+        normalized = normalize_template_mod(
+            entry,
+            f"mods[{index}]",
+            allow_invalid_side=allow_invalid_sides,
+        )
         key = (normalized["provider"], normalized["project_id"])
         if key in seen:
             continue
@@ -601,12 +621,21 @@ def template_mods(template_id: str) -> list[dict[str, str]]:
     return result
 
 
-def save_template_mods(template_id: str, mods: list[dict[str, str]]) -> None:
+def save_template_mods(
+    template_id: str,
+    mods: list[dict[str, str]],
+    *,
+    allow_invalid_sides: bool = False,
+) -> None:
     root = get_template_root(template_id)
     config_path = root / "template.yaml"
     config = load_yaml(config_path)
     normalized = [
-        normalize_template_mod(entry, f"mods[{index}]")
+        normalize_template_mod(
+            entry,
+            f"mods[{index}]",
+            allow_invalid_side=allow_invalid_sides,
+        )
         for index, entry in enumerate(mods)
     ]
     deduplicated: list[dict[str, str]] = []
@@ -1454,7 +1483,7 @@ def validate_pack_directory(root: Path) -> list[str]:
         for metadata in metadata_files(source):
             try:
                 side = read_toml(metadata).get("side")
-                if side not in VALID_SIDES:
+                if side_validation_error(side) is not None:
                     errors.append(
                         f"{display_path(metadata)}: side must be client, server, or both"
                     )
@@ -1512,8 +1541,8 @@ def validate_template_directory(root: Path) -> list[str]:
                 f"{display_path(manifest)}: {context}.project_id must be a "
                 "non-empty string"
             )
-        side = str(entry.get("side", "both")).strip().lower()
-        if side not in VALID_SIDES:
+        side = entry.get("side")
+        if side_validation_error(side) is not None:
             errors.append(
                 f"{display_path(manifest)}: {context}.side must be client, server, "
                 "or both"
@@ -1613,7 +1642,7 @@ def build_target(
         errors: list[str] = []
         for metadata in metadata_files(destination):
             side = read_toml(metadata).get("side")
-            if side not in VALID_SIDES:
+            if side_validation_error(side) is not None:
                 errors.append(
                     f"{metadata.relative_to(destination)} has no valid side"
                 )
