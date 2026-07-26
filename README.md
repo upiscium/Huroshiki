@@ -71,6 +71,36 @@ sides and content overlays, builds, previews deployments, publishes, and manages
 Template composition matches Minecraft and loader type, resolves current compatible files for the
 new pack's loader version, preserves template order, and unions sides for identical provider IDs.
 
+### Navigation
+
+The Project screen is the hub for an opened pack or template. `Esc` from Install, Installed MODs,
+Update, or Project files returns to that Project screen. `Esc` from the Project screen returns to
+the Main Menu. A file editor returns to Project files; unsaved edits require discard confirmation.
+Creation candidate and conflict screens remain inside their creation flow. Project files opened as
+a recovery action for a broken pack return to the Main Menu because that Project cannot be opened.
+
+Running Packwiz work is cancelled before leaving its screen. Previously staged Install changes are
+kept in the project transaction until they are applied or explicitly discarded.
+
+### Side Controls
+
+Use these keys where side editing is available, including Install defaults, staged changes,
+Installed MODs, Template MODs, and invalid-side repair:
+
+```text
+Ctrl+C    toggle client
+Ctrl+S    toggle server
+b         enable both client and server
+```
+
+Bare `c` and `s` do not change sides. Side shortcuts do not run while an Input or TextArea owns
+focus, so copy, save, and text editing keep their widget behavior.
+
+Textual 8 enters raw terminal mode and disables `ISIG`, `IXON`, and `IXOFF` while the application is
+active, allowing `Ctrl+C` and `Ctrl+S` to arrive as key events. It restores the original termios
+state when the application exits. If `TEXTUAL_ALLOW_SIGNALS` is set, or a terminal multiplexer
+intercepts control characters first, `Ctrl+C` may remain SIGINT and `Ctrl+S` may remain XOFF.
+
 ## Packctl
 
 List and inspect projects:
@@ -187,18 +217,16 @@ All former user-facing recipes were removed immediately. Use these replacements:
 | `just packs` | `packctl list` |
 | `just use <pack>` | Removed; pass `<pack>` explicitly to every `packctl` command |
 | `just current` | Removed; there is no selected pack context |
-| `just show` | `packctl show <pack>` |
-| `just show-for <pack>` | `packctl show <pack>` |
+| `just show` / `just show-for <pack>` | `packctl show <pack>` |
 | `just huroshiki` | `huroshiki` |
-| `just huroshiki-for <pack>` | `huroshiki --pack <pack>` |
+| `just huroshiki-for <pack>` / `just tui-for <pack>` | `huroshiki --pack <pack>` |
 | `just huroshiki-template <template>` | `huroshiki --template <template>` |
+| `just tui` | `huroshiki --pack <pack>` |
 | `just trash-list` | `packctl trash-list` |
 | `just trash-restore <entry>` | `packctl trash-restore <entry>` |
 | `just trash-purge <entry>` | `packctl trash-purge <entry>` |
 | `just clean-huroshiki-state ...` | `packctl clean-huroshiki-state ...` |
 | `just purge-huroshiki-state ...` | `packctl clean-huroshiki-state --apply ...` |
-| `just tui` | `huroshiki --pack <pack>` |
-| `just tui-for <pack>` | `huroshiki --pack <pack>` |
 | `just test-huroshiki` | Unchanged development task |
 | `just new <pack> ...` | `packctl new <pack> ...` |
 | `just new-template <template> ...` | `packctl new-template <template> ...` |
@@ -206,30 +234,19 @@ All former user-facing recipes were removed immediately. Use these replacements:
 | `just validate-template <template>` | `packctl validate-template <template>` |
 | `just validate` | `packctl validate` |
 | `just validate-for <pack>` | `packctl validate-for <pack>` |
-| `just migrate-template <template>` | Manually complete `template.yaml`, remove `source/`, then run `packctl validate-template <template>` |
-| `just add <query> <side>` | `packctl add <pack> <query> <side>` |
-| `just add-for <pack> <query> <side>` | `packctl add <pack> <query> <side>` |
-| `just remove <mod>` | `packctl remove <pack> <mod>` |
-| `just remove-for <pack> <mod>` | `packctl remove <pack> <mod>` |
-| `just side <path> <side>` | `packctl side <pack> <path> <side>` |
-| `just side-for <pack> <path> <side>` | `packctl side <pack> <path> <side>` |
-| `just profile <names...>` | `packctl profile <pack> <names...>` |
-| `just profile-for <pack> <names...>` | `packctl profile <pack> <names...>` |
-| `just update` | `packctl update <pack> --build` |
-| `just update-for <pack>` | `packctl update <pack> --build` |
-| `just build` | `packctl build <pack>` |
-| `just build-for <pack>` | `packctl build <pack>` |
+| `just migrate-template <template>` | Complete `template.yaml`, remove `source/`, then validate |
+| `just add` / `just add-for` | `packctl add <pack> <query> <side>` |
+| `just remove` / `just remove-for` | `packctl remove <pack> <mod>` |
+| `just side` / `just side-for` | `packctl side <pack> <path> <side>` |
+| `just profile` / `just profile-for` | `packctl profile <pack> <names...>` |
+| `just update` / `just update-for` | `packctl update <pack> --build` |
+| `just build` / `just build-for` | `packctl build <pack>` |
 | `just build-all` | `packctl build-all` |
-| `just serve [port]` | `packctl serve <pack> --port <port>` |
-| `just serve-for <pack> [port]` | `packctl serve <pack> --port <port>` |
-| `just deploy` | `packctl deploy <pack>` |
-| `just deploy-for <pack>` | `packctl deploy <pack>` |
-| `just deploy-dry-run` | `packctl deploy-dry-run <pack>` |
-| `just deploy-dry-run-for <pack>` | `packctl deploy-dry-run <pack>` |
-| `just restart` | `packctl restart <pack>` |
-| `just restart-for <pack>` | `packctl restart <pack>` |
-| `just publish` | `packctl publish <pack>` |
-| `just publish-for <pack>` | `packctl publish <pack>` |
+| `just serve` / `just serve-for` | `packctl serve <pack> --port <port>` |
+| `just deploy` / `just deploy-for` | `packctl deploy <pack>` |
+| `just deploy-dry-run` / `just deploy-dry-run-for` | `packctl deploy-dry-run <pack>` |
+| `just restart` / `just restart-for` | `packctl restart <pack>` |
+| `just publish` / `just publish-for` | `packctl publish <pack>` |
 | `just deploy-all` | `packctl deploy-all` |
 
 ## Development Checks

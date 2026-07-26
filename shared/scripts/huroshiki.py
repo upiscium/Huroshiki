@@ -49,6 +49,19 @@ class FilterInput(Input):
         self.insert_text_at_cursor("q")
 
 
+class SideDataTable(DataTable):
+    BINDINGS = [
+        Binding("ctrl+c", "toggle_client_side", "Client side", priority=True),
+        Binding("ctrl+s", "toggle_server_side", "Server side", priority=True),
+    ]
+
+    def action_toggle_client_side(self) -> None:
+        self.screen.action_toggle_client_side()
+
+    def action_toggle_server_side(self) -> None:
+        self.screen.action_toggle_server_side()
+
+
 class HuroshikiApp(App[None]):
     TITLE = "huroshiki"
     CSS_PATH = "huroshiki.tcss"
@@ -491,6 +504,25 @@ class FilterListScreen(BaseScreen):
         table.focus()
 
 
+class ProjectChildScreen:
+    project_key: str
+    recovery_parent_main: bool = False
+
+    def return_to_project(self) -> None:
+        if self.recovery_parent_main:
+            self.app.go_main()
+        else:
+            self.app.open_project(self.project_key)
+
+    def return_to_project_files(self) -> None:
+        self.app.switch_screen(
+            TemplateScreen(
+                self.project_key,
+                recovery_parent_main=self.recovery_parent_main,
+            )
+        )
+
+
 class MainMenuScreen(FilterListScreen):
     BINDINGS = FilterListScreen.BINDINGS
     screen_title = "huroshiki / Projects"
@@ -702,7 +734,9 @@ class MainMenuScreen(FilterListScreen):
                 if project is None or project.kind != "pack":
                     self.app.notify("Select a MODPACK to inspect files", severity="warning")
                 else:
-                    self.app.switch_screen(TemplateScreen(project.key))
+                    self.app.switch_screen(
+                        TemplateScreen(project.key, recovery_parent_main=True)
+                    )
             else:
                 return
             event.stop()
@@ -1049,7 +1083,7 @@ class ProjectScreen(BaseScreen):
         event.stop()
 
 
-class TemplateEditorScreen(BaseScreen):
+class TemplateEditorScreen(ProjectChildScreen, BaseScreen):
     BINDINGS = [
         Binding("ctrl+s", "save", "Save", priority=True),
         Binding("escape", "back", "Back", priority=True),
@@ -1059,10 +1093,13 @@ class TemplateEditorScreen(BaseScreen):
         self,
         project_key: str,
         template: core.TemplateInfo,
+        *,
+        recovery_parent_main: bool = False,
     ) -> None:
         super().__init__()
         self.project_key = project_key
         self.template = template
+        self.recovery_parent_main = recovery_parent_main
         self.initial_text = core.read_template_text(
             project_key,
             template.target,
@@ -1102,7 +1139,7 @@ class TemplateEditorScreen(BaseScreen):
 
     def action_back(self) -> None:
         if self.current_text() == self.initial_text:
-            self.app.open_templates(self.project_key)
+            self.return_to_project_files()
             return
         self.app.push_screen(
             ConfirmModal(
@@ -1117,21 +1154,27 @@ class TemplateEditorScreen(BaseScreen):
 
     def discard_confirmed(self, confirmed: bool | None) -> None:
         if confirmed:
-            self.app.open_templates(self.project_key)
+            self.return_to_project_files()
 
 
-class TemplateScreen(FilterListScreen):
+class TemplateScreen(ProjectChildScreen, FilterListScreen):
     BINDINGS = FilterListScreen.BINDINGS
     help_text = (
         "Tab: focus  Enter/e: edit  j/k: move  n: new  "
-        "d: delete  r: reload  q: clear filter  p: project  Esc: main"
+        "d: delete  r: reload  q: clear filter  p: project  Esc: back"
     )
     filter_input_id = "template-search"
     filter_table_id = "template-table"
 
-    def __init__(self, project_key: str) -> None:
+    def __init__(
+        self,
+        project_key: str,
+        *,
+        recovery_parent_main: bool = False,
+    ) -> None:
         super().__init__()
         self.project_key = project_key
+        self.recovery_parent_main = recovery_parent_main
         project = core.project_info(project_key)
         self.screen_title = f"{project.display_name} / Files"
         self.all_templates: list[core.TemplateInfo] = []
@@ -1202,7 +1245,13 @@ class TemplateScreen(FilterListScreen):
             self.app.notify("No file is selected", severity="warning")
             return
         try:
-            self.app.open_template_editor(self.project_key, template)
+            self.app.switch_screen(
+                TemplateEditorScreen(
+                    self.project_key,
+                    template,
+                    recovery_parent_main=self.recovery_parent_main,
+                )
+            )
         except Exception as error:
             self.app.notify(str(error), severity="error")
 
@@ -1222,7 +1271,13 @@ class TemplateScreen(FilterListScreen):
                 values["relative_path"],
             )
             self.reload_templates()
-            self.app.open_template_editor(self.project_key, template)
+            self.app.switch_screen(
+                TemplateEditorScreen(
+                    self.project_key,
+                    template,
+                    recovery_parent_main=self.recovery_parent_main,
+                )
+            )
         except Exception as error:
             self.app.notify(str(error), severity="error")
 
@@ -1266,7 +1321,7 @@ class TemplateScreen(FilterListScreen):
         table = self.query_one("#template-table", DataTable)
         if isinstance(focused, Input):
             if event.key == "escape":
-                self.app.go_main()
+                self.return_to_project()
                 event.stop()
             return
 
@@ -1284,9 +1339,9 @@ class TemplateScreen(FilterListScreen):
         elif key == "r":
             self.reload_templates()
         elif key == "p":
-            self.app.open_project(self.project_key)
+            self.return_to_project()
         elif key == "escape":
-            self.app.go_main()
+            self.return_to_project()
         else:
             return
         event.stop()
@@ -1571,7 +1626,7 @@ class TemplateConflictScreen(BaseScreen):
         event.stop()
 
 
-class InstallScreen(BaseScreen):
+class InstallScreen(ProjectChildScreen, BaseScreen):
     BINDINGS = [
         Binding(
             "ctrl+t",
@@ -1583,8 +1638,8 @@ class InstallScreen(BaseScreen):
 
     help_text = (
         "Tab: focus  Ctrl+t: provider  Enter: search/select/review  "
-        "q: discard results  j/k: move  c/s: toggle side  b: both  "
-        "d: unstage  l: list  u: update  p: project  Esc: main"
+        "q: discard results  j/k: move  Ctrl+c/Ctrl+s: toggle side  b: both  "
+        "d: unstage  l: list  u: update  p: project  Esc: project"
     )
 
     def __init__(self, project_key: str) -> None:
@@ -1613,9 +1668,9 @@ class InstallScreen(BaseScreen):
         yield Static("Install side: C +  S +", id="install-side-label")
         yield Static("Enter a search term", id="packwiz-status")
         yield Static("Search results", classes="section-label")
-        yield DataTable(id="search-results-table")
+        yield SideDataTable(id="search-results-table")
         yield Static("Staged changes", classes="section-label")
-        yield DataTable(id="staged-table")
+        yield SideDataTable(id="staged-table")
         yield from self.compose_footer()
 
     def on_mount(self) -> None:
@@ -1712,6 +1767,24 @@ class InstallScreen(BaseScreen):
 
     def action_toggle_provider(self) -> None:
         self.toggle_provider()
+
+    def action_toggle_client_side(self) -> None:
+        focused = self.focused
+        staged = self.query_one("#staged-table", DataTable)
+        self.toggle_client(staged=focused is staged)
+
+    def action_toggle_server_side(self) -> None:
+        focused = self.focused
+        staged = self.query_one("#staged-table", DataTable)
+        self.toggle_server(staged=focused is staged)
+
+    def cancel_operation(self) -> None:
+        if self.operation is not None and not self.operation.done.is_set():
+            self.operation.cancel()
+
+    def cancel_and_return_to_project(self) -> None:
+        self.cancel_operation()
+        self.return_to_project()
 
     def discard_search_results(self) -> None:
         if not self.search_results:
@@ -1992,9 +2065,7 @@ class InstallScreen(BaseScreen):
 
         if isinstance(focused, Input):
             if event.key == "escape":
-                if self.operation is not None and not self.operation.done.is_set():
-                    self.operation.cancel()
-                self.app.go_main()
+                self.cancel_and_return_to_project()
                 event.stop()
             return
 
@@ -2011,10 +2082,6 @@ class InstallScreen(BaseScreen):
             self.move_table(staged, len(self.staged), 1)
         elif focused is staged and key == "k":
             self.move_table(staged, len(self.staged), -1)
-        elif key == "c":
-            self.toggle_client(staged=focused is staged)
-        elif key == "s":
-            self.toggle_server(staged=focused is staged)
         elif key == "b":
             self.enable_both(staged=focused is staged)
         elif focused is staged and key == "d":
@@ -2022,9 +2089,11 @@ class InstallScreen(BaseScreen):
         elif focused is staged and key == "enter":
             self.review()
         elif key == "l":
+            self.cancel_operation()
             self.app.open_list(self.project_key)
         elif key == "u":
             if core.split_project_key(self.project_key)[0] == "pack":
+                self.cancel_operation()
                 self.app.open_update(self.project_key)
             else:
                 self.app.notify(
@@ -2032,22 +2101,20 @@ class InstallScreen(BaseScreen):
                     severity="warning",
                 )
         elif key == "p":
-            self.app.open_project(self.project_key)
+            self.cancel_and_return_to_project()
         elif key == "escape":
-            if self.operation is not None and not self.operation.done.is_set():
-                self.operation.cancel()
-            self.app.go_main()
+            self.cancel_and_return_to_project()
         else:
             return
         event.stop()
 
 
-class InstalledModsScreen(FilterListScreen):
+class InstalledModsScreen(ProjectChildScreen, FilterListScreen):
     BINDINGS = FilterListScreen.BINDINGS
     help_text = (
-        "Tab: focus  Enter: filter  j/k: move  Space: select  c/s: toggle side  "
+        "Tab: focus  Enter: filter  j/k: move  Space: select  Ctrl+c/Ctrl+s: toggle side  "
         "b: both  d: delete  q: clear filter  i: install  u: update  "
-        "m: help  p: project  Esc: main"
+        "m: help  p: project  Esc: project"
     )
     filter_input_id = "installed-search"
     filter_table_id = "installed-table"
@@ -2065,7 +2132,7 @@ class InstalledModsScreen(FilterListScreen):
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
         yield FilterInput(placeholder="Filter installed MODs", id="installed-search")
-        yield DataTable(id="installed-table")
+        yield SideDataTable(id="installed-table")
         yield from self.compose_footer()
 
     def on_mount(self) -> None:
@@ -2163,6 +2230,14 @@ class InstalledModsScreen(FilterListScreen):
             return
         self.set_side(mod.client, server)
 
+    def action_toggle_client_side(self) -> None:
+        if self.focused is self.query_one("#installed-table", DataTable):
+            self.toggle_client()
+
+    def action_toggle_server_side(self) -> None:
+        if self.focused is self.query_one("#installed-table", DataTable):
+            self.toggle_server()
+
     def request_delete(self) -> None:
         selected = [
             mod for mod in self.all_mods if mod.relative_path in self.selected_paths
@@ -2218,7 +2293,7 @@ class InstalledModsScreen(FilterListScreen):
                 "Installed MODs",
                 [
                     "Space toggles the deletion mark.",
-                    "c and s toggle client/server deployment for the highlighted MOD.",
+                    "Ctrl+C and Ctrl+S toggle client/server deployment for the highlighted MOD.",
                     "b enables both client and server.",
                     "At least one side must remain enabled.",
                     "d reviews and deletes all marked MODs.",
@@ -2231,7 +2306,7 @@ class InstalledModsScreen(FilterListScreen):
         table = self.query_one("#installed-table", DataTable)
         if isinstance(focused, Input):
             if event.key == "escape":
-                self.app.go_main()
+                self.return_to_project()
                 event.stop()
             return
 
@@ -2242,10 +2317,6 @@ class InstalledModsScreen(FilterListScreen):
             self.move_table(table, len(self.visible_mods), -1)
         elif focused is table and key == "space":
             self.toggle_selected()
-        elif focused is table and key == "c":
-            self.toggle_client()
-        elif focused is table and key == "s":
-            self.toggle_server()
         elif focused is table and key == "b":
             self.set_side(True, True)
         elif key == "d":
@@ -2263,16 +2334,16 @@ class InstalledModsScreen(FilterListScreen):
         elif key == "m":
             self.show_help()
         elif key == "p":
-            self.app.open_project(self.project_key)
+            self.return_to_project()
         elif key == "escape":
-            self.app.go_main()
+            self.return_to_project()
         else:
             return
         event.stop()
 
 
-class UpdateScreen(BaseScreen):
-    help_text = "j/k: move  Space: toggle  Enter: apply  i: install  l: list  Esc: discard"
+class UpdateScreen(ProjectChildScreen, BaseScreen):
+    help_text = "j/k: move  Space: toggle  Enter: apply  i: install  l: list  Esc: project"
 
     def __init__(self, project_key: str) -> None:
         super().__init__()
@@ -2392,7 +2463,7 @@ class UpdateScreen(BaseScreen):
         if self.transaction is not None:
             self.transaction.discard()
             self.transaction = None
-        self.app.open_project(self.project_key)
+        self.return_to_project()
 
     def on_unmount(self) -> None:
         if self.transaction is not None:

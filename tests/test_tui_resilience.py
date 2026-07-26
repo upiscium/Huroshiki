@@ -448,7 +448,7 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                     screen.focused, screen.query_one("#installed-table", DataTable)
                 )
 
-    async def test_invalid_side_row_stays_visible_and_all_side_keys_repair_it(self) -> None:
+    async def test_invalid_side_row_stays_visible_and_ctrl_side_keys_repair_it(self) -> None:
         invalid = mod("Broken", "unknown")
         invalid.side_error = "side must be client, server, or both; got 'unknown'"
         valid = mod("Valid", "server")
@@ -470,7 +470,11 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((row[2], row[3]), ("?", "?"))
                 self.assertEqual(row[5], "mods/broken.pw.toml")
 
-                await pilot.press("c", "s", "b")
+                await pilot.press("c", "s")
+                await pilot.pause()
+                set_side.assert_not_called()
+
+                await pilot.press("ctrl+c", "ctrl+s", "b")
                 await pilot.pause()
 
                 self.assertEqual(
