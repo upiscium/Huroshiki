@@ -63,6 +63,19 @@ class _TemplateProjectApp(App[None]):
         pass
 
 
+class _ConflictApp(App[None]):
+    CSS_PATH = str(Path(huroshiki.__file__).with_name("huroshiki.tcss"))
+
+    def __init__(self, composition: core.TemplateComposition) -> None:
+        super().__init__()
+        self.composition = composition
+
+    def on_mount(self) -> None:
+        self.push_screen(
+            huroshiki.TemplateConflictScreen(dict(VALUES), self.composition)
+        )
+
+
 class TemplateCompositionInteractionTest(unittest.IsolatedAsyncioTestCase):
     async def test_template_project_create_uses_preview_and_conflict_flow(self) -> None:
         composition = compose_templates(
@@ -206,6 +219,39 @@ class TemplateCompositionInteractionTest(unittest.IsolatedAsyncioTestCase):
                     resolution = create.call_args.kwargs["conflict_resolutions"]["moonlight lib"]
                     self.assertEqual(len(resolution.candidate_keys), 2)
                     self.assertTrue(resolution.acknowledge_duplicate_risk)
+
+    async def test_conflict_screen_refuses_impossible_dual_url_identity(self) -> None:
+        composition = compose_templates(
+            ["one"],
+            [
+                TemplateModEntry(
+                    "one",
+                    "Same URL Root",
+                    "url",
+                    "same-id",
+                    "both",
+                    "https://example.test/a.jar",
+                ),
+                TemplateModEntry(
+                    "one",
+                    "Same URL Root",
+                    "url",
+                    "same-id",
+                    "both",
+                    "https://example.test/b.jar",
+                ),
+            ],
+        )
+        app = _ConflictApp(composition)
+        async with app.run_test() as pilot:
+            screen = app.screen
+            await pilot.press("space", "j", "space")
+            await pilot.pause()
+            self.assertEqual(len(screen.selected["same url root"]), 1)
+            self.assertIn(
+                "Re-select A or B",
+                str(screen.query_one("#conflict-warning", Static).content),
+            )
 
 
 if __name__ == "__main__":

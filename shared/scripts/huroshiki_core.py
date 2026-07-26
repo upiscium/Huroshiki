@@ -33,8 +33,10 @@ from overlay_policy import (
 from template_merge import (
     ConflictResolution,
     ConflictSelection,
+    MergedTemplateMod,
     ResolvedTemplateComposition,
     TemplateComposition,
+    TemplateConflict,
     TemplateMergeError,
     TemplateModEntry,
     compose_templates,
@@ -264,6 +266,18 @@ class TemplateInstallFailure:
 
 
 @dataclass(frozen=True)
+class RetainedTemplateCandidate:
+    candidate_key: str
+    name: str
+    requested_provider: str
+    requested_project_id: str
+    actual_provider: str
+    actual_project_id: str
+    relative_path: Path
+    filename: str
+
+
+@dataclass(frozen=True)
 class TemplateCreationReport:
     pack_key: str
     template_ids: tuple[str, ...]
@@ -271,6 +285,7 @@ class TemplateCreationReport:
     conflict_warnings: tuple[str, ...] = field(default_factory=tuple)
     installed: tuple[str, ...] = field(default_factory=tuple)
     failed: tuple[TemplateInstallFailure, ...] = field(default_factory=tuple)
+    retained: tuple[RetainedTemplateCandidate, ...] = field(default_factory=tuple)
 
     @property
     def template_id(self) -> str:
@@ -287,6 +302,13 @@ class TemplateCreationReport:
             )
         lines.extend(f"Warning: {warning}" for warning in self.conflict_warnings)
         lines.append(f"Installed {len(self.installed)} MOD(s).")
+        if self.retained:
+            lines.append("Retained template candidates:")
+            lines.extend(
+                f"- {item.name}: {item.actual_provider}:{item.actual_project_id} "
+                f"at {item.relative_path} ({item.filename})"
+                for item in self.retained
+            )
         if not self.failed:
             lines.append("No installation failures.")
             return lines
@@ -2209,22 +2231,263 @@ def concise_process_error(result: subprocess.CompletedProcess[str]) -> str:
     return lines[-1][:240] if lines else f"exit code {result.returncode}"
 
 
-def find_installed_provider_mod(
+TEMPLATE_RESOLVER_TIMEOUT_SECONDS = 120
+
+
+@dataclass(frozen=True)
+class _ResolvedTemplateMetadata:
+    relative_path: Path
+    provider: str
+    project_id: str
+    filename: str
+    contents: bytes
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return self.provider, self.project_id
+
+
+@dataclass(frozen=True)
+class _ResolvedTemplateRoot:
+    entry: MergedTemplateMod
+    metadata: tuple[_ResolvedTemplateMetadata, ...]
+    root_identity: tuple[str, str]
+
+
+def _metadata_contents_with_side(contents: bytes, side: str) -> bytes:
+    document = tomlkit.parse(contents.decode("utf-8"))
+    document["side"] = packctl.normalize_side(side)
+    return tomlkit.dumps(document).encode("utf-8")
+
+
+def _read_resolver_metadata(
     source: Path,
-    provider: str,
-    project_id: str,
-) -> ModInfo | None:
-    normalized = canonical_provider(provider)
-    for metadata in sorted(source.rglob("*.pw.toml")):
-        if not metadata.is_file():
+    side: str,
+) -> tuple[_ResolvedTemplateMetadata, ...]:
+    records: list[_ResolvedTemplateMetadata] = []
+    identities: dict[tuple[str, str], Path] = {}
+    filenames: dict[str, tuple[str, str]] = {}
+    for path in sorted(source.rglob("*.pw.toml")):
+        relative = path.relative_to(source)
+        mod = read_mod(source, relative)
+        provider = canonical_provider(mod.provider)
+        identity = (provider, mod.project_id)
+        if provider not in {"modrinth", "curseforge", "url"} or not mod.project_id:
+            raise HuroshikiError(
+                f"Resolver metadata {relative} has no stable provider/project identity"
+            )
+        if not mod.filename:
+            raise HuroshikiError(f"Resolver metadata {relative} has no filename")
+        previous_path = identities.get(identity)
+        if previous_path is not None:
+            raise HuroshikiError(
+                f"Resolver produced identity {provider}:{mod.project_id} at both "
+                f"{previous_path} and {relative}"
+            )
+        filename_owner = filenames.get(mod.filename)
+        if filename_owner is not None and filename_owner != identity:
+            raise HuroshikiError(
+                f"Resolver produced filename collision {mod.filename!r} for "
+                f"{filename_owner[0]}:{filename_owner[1]} and {provider}:{mod.project_id}"
+            )
+        identities[identity] = relative
+        filenames[mod.filename] = identity
+        records.append(
+            _ResolvedTemplateMetadata(
+                relative,
+                provider,
+                mod.project_id,
+                mod.filename,
+                _metadata_contents_with_side(path.read_bytes(), side),
+            )
+        )
+    if not records:
+        raise HuroshikiError("No metadata changes were produced")
+    return tuple(records)
+
+
+def _resolve_template_root(
+    entry: MergedTemplateMod,
+    *,
+    minecraft: str,
+    loader: str,
+    loader_version: str,
+) -> _ResolvedTemplateRoot:
+    state_root = ROOT / ".huroshiki"
+    transaction_root = state_root / "transactions"
+    packctl.make_state_directory(
+        transaction_root,
+        state_root=state_root,
+        repository_root=ROOT,
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="template-resolver-", dir=transaction_root
+    ) as directory:
+        source = Path(directory) / "source"
+        create_resolver_source(
+            source,
+            display_name=f"Resolve {entry.name}",
+            minecraft=minecraft,
+            loader=loader,
+            loader_version=loader_version,
+        )
+        expected_identity = (
+            canonical_provider(entry.provider),
+            entry.project_id,
+        )
+        if expected_identity[0] == "url":
+            log_dir = (
+                state_root
+                / "logs"
+                / "template-create"
+                / f"resolver-{uuid4().hex[:8]}"
+            )
+            packctl.ensure_safe_state_path(
+                log_dir,
+                state_root=state_root,
+                repository_root=ROOT,
+            )
+            artifact = download_url_artifact(
+                entry.url or "",
+                threading.Event(),
+                log_dir,
+                loader,
+                entry.max_url_jar_size_bytes or DEFAULT_URL_MAX_JAR_SIZE_BYTES,
+            )
+            if artifact.mod_id != entry.project_id:
+                raise HuroshikiError(
+                    f"URL now contains MOD ID {artifact.mod_id}, expected {entry.project_id}"
+                )
+            write_url_metadata(
+                source,
+                Path("mods") / f"{entry.project_id}.pw.toml",
+                artifact,
+                entry.side,
+            )
+        else:
+            command = template_install_command(entry.provider, entry.project_id)
+            try:
+                process = subprocess.run(
+                    command,
+                    cwd=source,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=TEMPLATE_RESOLVER_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise HuroshikiError(
+                    f"Packwiz resolver deadline exceeded after "
+                    f"{TEMPLATE_RESOLVER_TIMEOUT_SECONDS} seconds"
+                ) from error
+            if process.returncode != 0:
+                raise HuroshikiError(concise_process_error(process))
+
+        metadata = _read_resolver_metadata(source, entry.side)
+        matching_roots = [item for item in metadata if item.identity == expected_identity]
+        if len(matching_roots) != 1:
+            found = ", ".join(
+                f"{item.provider}:{item.project_id}" for item in metadata
+            )
+            raise HuroshikiError(
+                f"Requested root identity {expected_identity[0]}:{expected_identity[1]} "
+                f"was not independently resolved (resolver produced: {found or 'none'})"
+            )
+        return _ResolvedTemplateRoot(entry, metadata, expected_identity)
+
+
+def _merge_resolved_template_roots(
+    roots: Iterable[_ResolvedTemplateRoot],
+) -> tuple[
+    tuple[_ResolvedTemplateMetadata, ...],
+    tuple[RetainedTemplateCandidate, ...],
+    tuple[TemplateInstallFailure, ...],
+]:
+    merged: dict[tuple[str, str], _ResolvedTemplateMetadata] = {}
+    path_owners: dict[Path, tuple[str, str]] = {}
+    filename_owners: dict[str, tuple[str, str]] = {}
+    url_root_owners: dict[tuple[str, str], str] = {}
+    retained: list[RetainedTemplateCandidate] = []
+    failures: list[TemplateInstallFailure] = []
+
+    for root in roots:
+        entry = root.entry
+        reason: str | None = None
+        if root.root_identity[0] == "url":
+            previous = url_root_owners.get(root.root_identity)
+            if previous is not None and previous != entry.candidate_key:
+                reason = (
+                    f"URL MOD ID/path collision for {root.root_identity[1]!r}; "
+                    "the selected URLs cannot both be represented"
+                )
+
+        pending_paths = dict(path_owners)
+        pending_filenames = dict(filename_owners)
+        if reason is None:
+            for item in root.metadata:
+                if item.identity in merged:
+                    continue
+                path_owner = pending_paths.get(item.relative_path)
+                if path_owner is not None and path_owner != item.identity:
+                    reason = (
+                        f"metadata path collision at {item.relative_path}: "
+                        f"{path_owner[0]}:{path_owner[1]} vs "
+                        f"{item.provider}:{item.project_id}"
+                    )
+                    break
+                filename_owner = pending_filenames.get(item.filename)
+                if filename_owner is not None and filename_owner != item.identity:
+                    reason = (
+                        f"filename collision for {item.filename!r}: "
+                        f"{filename_owner[0]}:{filename_owner[1]} vs "
+                        f"{item.provider}:{item.project_id}"
+                    )
+                    break
+                pending_paths[item.relative_path] = item.identity
+                pending_filenames[item.filename] = item.identity
+
+        if reason is not None:
+            failures.append(
+                TemplateInstallFailure(
+                    entry.name, entry.provider, entry.project_id, reason
+                )
+            )
             continue
-        mod = read_mod(source, metadata.relative_to(source))
-        if (
-            canonical_provider(mod.provider) == normalized
-            and mod.project_id == project_id
-        ):
-            return mod
-    return None
+
+        path_owners = pending_paths
+        filename_owners = pending_filenames
+        if root.root_identity[0] == "url":
+            url_root_owners[root.root_identity] = entry.candidate_key
+        for item in root.metadata:
+            existing = merged.get(item.identity)
+            if existing is None:
+                merged[item.identity] = item
+                continue
+            existing_mod = read_mod_data(
+                existing.relative_path,
+                tomllib.loads(existing.contents.decode("utf-8")),
+            )
+            side = union_side(existing_mod.side, entry.side)
+            merged[item.identity] = replace(
+                existing,
+                contents=_metadata_contents_with_side(existing.contents, side),
+            )
+
+        actual = merged[root.root_identity]
+        retained.append(
+            RetainedTemplateCandidate(
+                entry.candidate_key,
+                entry.name,
+                canonical_provider(entry.provider),
+                entry.project_id,
+                actual.provider,
+                actual.project_id,
+                actual.relative_path,
+                actual.filename,
+            )
+        )
+
+    return tuple(merged.values()), tuple(retained), tuple(failures)
 
 
 def prepare_template_composition(
@@ -2277,8 +2540,33 @@ def prepare_template_composition(
         raise HuroshikiError(str(error)) from error
 
 
+def conflict_multi_selection_error(
+    conflict: TemplateConflict,
+    candidate_keys: Iterable[str],
+) -> str | None:
+    requested = set(candidate_keys)
+    selected = [
+        candidate
+        for candidate in conflict.candidates
+        if candidate.candidate_key in requested
+    ]
+    identities: dict[tuple[str, str], MergedTemplateMod] = {}
+    for candidate in selected:
+        identity = (canonical_provider(candidate.provider), candidate.project_id)
+        previous = identities.get(identity)
+        if previous is not None:
+            return (
+                f"Cannot retain both {previous.provider}:{previous.project_id} (A) and "
+                f"{candidate.provider}:{candidate.project_id} (B): they resolve to the "
+                "same metadata identity/path. Re-select A or B."
+            )
+        identities[identity] = candidate
+    return None
+
+
 def _create_pack_from_templates(
     *,
+    composition: TemplateComposition,
     resolved: ResolvedTemplateComposition,
     project_id: str,
     display_name: str,
@@ -2286,6 +2574,71 @@ def _create_pack_from_templates(
     loader: str,
     loader_version: str,
 ) -> TemplateCreationReport:
+    resolved_roots: list[_ResolvedTemplateRoot] = []
+    resolution_failures: list[TemplateInstallFailure] = []
+    for entry in resolved.mods:
+        print(
+            f"== Resolving {entry.name} ({entry.provider}:{entry.project_id}) ==",
+            flush=True,
+        )
+        try:
+            resolved_roots.append(
+                _resolve_template_root(
+                    entry,
+                    minecraft=minecraft,
+                    loader=loader,
+                    loader_version=loader_version,
+                )
+            )
+        except (HuroshikiError, OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+            reason = str(error)
+            print(f"warning: {entry.name}: {reason}", file=sys.stderr, flush=True)
+            resolution_failures.append(
+                TemplateInstallFailure(
+                    entry.name, entry.provider, entry.project_id, reason
+                )
+            )
+
+    metadata, retained, merge_failures = _merge_resolved_template_roots(resolved_roots)
+    failures = [*resolution_failures, *merge_failures]
+    multi_selected = {
+        candidate_key
+        for selection in resolved.conflict_selections
+        if len(selection.candidate_keys) > 1
+        for candidate_key in selection.candidate_keys
+    }
+    blocking = [
+        failure
+        for failure in failures
+        if next(
+            (
+                entry.candidate_key
+                for entry in resolved.mods
+                if entry.provider == failure.provider
+                and entry.project_id == failure.project_id
+            ),
+            None,
+        )
+        in multi_selected
+    ]
+    if blocking:
+        detail = "; ".join(f"{item.name}: {item.reason}" for item in blocking)
+        raise HuroshikiError(
+            "Selected conflict candidates cannot all be retained: "
+            f"{detail}. Re-select candidate A or B and retry."
+        )
+
+    current_composition = prepare_template_composition(
+        template_ids=list(composition.template_ids),
+        minecraft=minecraft,
+        loader=loader,
+    )
+    if current_composition != composition:
+        raise HuroshikiError(
+            "Template composition changed during resolver preflight; "
+            "review candidates again"
+        )
+
     destination = packctl.get_pack_root(project_id, must_exist=False)
     destination_existed = destination.exists()
     result = create_project(
@@ -2303,111 +2656,14 @@ def _create_pack_from_templates(
     try:
         pack_key = project_key("pack", project_id)
         source = project_source(pack_key)
-        installed: list[str] = []
-        failures: list[TemplateInstallFailure] = []
-        for entry in resolved.mods:
-            name = entry.name
-            provider = entry.provider
-            remote_id = entry.project_id
-            print(f"== Installing {name} ({provider}:{remote_id}) ==", flush=True)
-            existing = find_installed_provider_mod(source, provider, remote_id)
-            if existing is not None:
-                existing_side = "both" if existing.side_error else existing.side
-                packctl.set_side_file(
-                    source / existing.relative_path,
-                    union_side(existing_side, entry.side),
+        for item in metadata:
+            path = safe_child(source, item.relative_path)
+            if path.exists():
+                raise HuroshikiError(
+                    f"Destination metadata path unexpectedly exists: {item.relative_path}"
                 )
-                installed.append(name)
-                print(f"already installed as dependency: {name}", flush=True)
-                continue
-            checkpoint = source.parent / f".template-checkpoint-{uuid4().hex}"
-            shutil.copytree(source, checkpoint, symlinks=True)
-            before_contents = metadata_content_snapshot(source)
-            before = {
-                path: hashlib.sha256(contents).hexdigest()
-                for path, contents in before_contents.items()
-            }
-            if canonical_provider(provider) == "url":
-                try:
-                    log_dir = (
-                        ROOT / ".huroshiki" / "logs"
-                        / "template-create"
-                        / f"{project_id}-{uuid4().hex[:8]}"
-                    )
-                    packctl.ensure_safe_state_path(
-                        log_dir,
-                        state_root=ROOT / ".huroshiki",
-                        repository_root=ROOT,
-                    )
-                    artifact = download_url_artifact(
-                        entry.url or "",
-                        threading.Event(),
-                        log_dir,
-                        loader,
-                        entry.max_url_jar_size_bytes
-                        or DEFAULT_URL_MAX_JAR_SIZE_BYTES,
-                    )
-                    if artifact.mod_id != remote_id:
-                        raise HuroshikiError(
-                            f"URL now contains MOD ID {artifact.mod_id}, expected {remote_id}"
-                        )
-                    write_url_metadata(
-                        source,
-                        Path("mods") / f"{remote_id}.pw.toml",
-                        artifact,
-                        entry.side,
-                    )
-                    process = subprocess.CompletedProcess(
-                        ["huroshiki", "url", "add"], 0, "", ""
-                    )
-                except HuroshikiError as error:
-                    process = subprocess.CompletedProcess(
-                        ["huroshiki", "url", "add"], 1, "", str(error)
-                    )
-            else:
-                command = template_install_command(provider, remote_id)
-                process = subprocess.run(
-                    command,
-                    cwd=source,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                )
-            after = metadata_digest_snapshot(source)
-            changed = sorted(changed_paths(before, after))
-            if process.returncode != 0 or not changed:
-                shutil.rmtree(source, ignore_errors=True)
-                checkpoint.rename(source)
-                reason = (
-                    concise_process_error(process)
-                    if process.returncode != 0
-                    else "No metadata changes were produced"
-                )
-                print(f"warning: {name}: {reason}", file=sys.stderr, flush=True)
-                failures.append(
-                    TemplateInstallFailure(name, provider, remote_id, reason)
-                )
-                continue
-
-            requested = find_installed_provider_mod(source, provider, remote_id)
-            for relative in changed:
-                metadata = source / relative
-                if metadata.is_file() and metadata.name.endswith(".pw.toml"):
-                    required_side = entry.side
-                    if requested is None or requested.relative_path != relative:
-                        original = before_contents.get(relative)
-                        if original is not None:
-                            original_data = tomllib.loads(original.decode("utf-8"))
-                            original_side = original_data.get("side")
-                            if packctl.side_validation_error(original_side) is not None:
-                                original_side = "both"
-                            required_side = union_side(str(original_side), entry.side)
-                    packctl.set_side_file(
-                        metadata,
-                        required_side,
-                    )
-            shutil.rmtree(checkpoint, ignore_errors=True)
-            installed.append(name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(item.contents)
 
         refresh = subprocess.run(
             ["packwiz", "refresh"],
@@ -2424,8 +2680,9 @@ def _create_pack_from_templates(
             template_ids=resolved.template_ids,
             conflict_selections=resolved.conflict_selections,
             conflict_warnings=resolved.warnings,
-            installed=tuple(installed),
+            installed=tuple(item.name for item in retained),
             failed=tuple(failures),
+            retained=retained,
         )
     except BaseException as error:
         if owns_destination:
@@ -2474,6 +2731,7 @@ def create_pack_from_templates(
         except TemplateMergeError as error:
             raise HuroshikiError(str(error)) from error
         return _create_pack_from_templates(
+            composition=composition,
             resolved=resolved,
             project_id=project_id,
             display_name=display_name,

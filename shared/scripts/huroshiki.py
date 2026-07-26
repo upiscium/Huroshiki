@@ -1567,6 +1567,12 @@ class TemplateConflictScreen(BaseScreen):
                 return
             selected.remove(candidate.candidate_key)
         else:
+            proposed = [*selected, candidate.candidate_key]
+            error = core.conflict_multi_selection_error(conflict, proposed)
+            if error is not None:
+                self.app.notify(error, severity="error")
+                self.query_one("#conflict-warning", Static).update(error)
+                return
             selected.append(candidate.candidate_key)
         self.reload_rows()
 

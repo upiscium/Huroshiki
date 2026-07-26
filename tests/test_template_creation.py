@@ -621,7 +621,15 @@ mods:
 
             real_run = subprocess.run
 
-            def fake_run(command, *, cwd=None, text=None, capture_output=False, check=False):
+            def fake_run(
+                command,
+                *,
+                cwd=None,
+                text=None,
+                capture_output=False,
+                check=False,
+                timeout=None,
+            ):
                 if command[-1] == "works":
                     (Path(cwd) / "mods" / "works.pw.toml").write_text(
                         '''name = "Works"\nfilename = "works.jar"\nside = "both"\n[download]\nhash-format = "sha256"\nhash = "00"\nurl = "https://example.invalid"\n[update.modrinth]\nmod-id = "works"\nversion = "v"\n''',
