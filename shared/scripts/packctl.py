@@ -36,13 +36,13 @@ from deploy_support import (
     validate_rsync_target,
 )
 from packctl_errors import ConfigError
-from huroshiki_paths import resolve_root, root_argument
+from huroshiki_paths import import_root_argument, resolve_root
 from overlay_policy import copy_content_overlays, scan_content_overlays
 from portable_paths import PortablePathError, portable_basename_key
 import project_locks
 from project_locks import ProjectLockMetadata, process_start_identity
 
-ROOT = resolve_root(root_argument(sys.argv[1:]))
+ROOT = resolve_root(import_root_argument(sys.argv[1:]))
 PACKS = ROOT / "packs"
 TEMPLATES = ROOT / "templates"
 SHARED = ROOT / "shared"

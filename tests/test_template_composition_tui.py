@@ -220,6 +220,36 @@ class TemplateCompositionInteractionTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(len(resolution.candidate_keys), 2)
                     self.assertTrue(resolution.acknowledge_duplicate_risk)
 
+    async def test_unicode_conflict_uses_stable_key_for_tui_selection_group(self) -> None:
+        composition = compose_templates(
+            ["one", "two"],
+            [
+                TemplateModEntry(
+                    "one",
+                    "Cafe\N{COMBINING ACUTE ACCENT}",
+                    "modrinth",
+                    "one",
+                    "both",
+                ),
+                TemplateModEntry(
+                    "two",
+                    "CAF\N{LATIN SMALL LETTER E WITH ACUTE}",
+                    "curseforge",
+                    "2",
+                    "both",
+                ),
+            ],
+        )
+        app = _ConflictApp(composition)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            self.assertEqual(
+                list(app.screen.selected),
+                ["caf\N{LATIN SMALL LETTER E WITH ACUTE}"],
+            )
+            self.assertEqual(len(app.screen.rows), 2)
+
     async def test_conflict_screen_refuses_impossible_dual_url_identity(self) -> None:
         composition = compose_templates(
             ["one"],

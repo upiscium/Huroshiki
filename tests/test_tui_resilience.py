@@ -390,15 +390,16 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                     screen = app.screen
                     search = screen.query_one("#pack-search", Input)
                     table = screen.query_one("#pack-table", DataTable)
-                    search.value = "alpha"
-                    screen.reload_projects("alpha")
                     search.focus()
 
-                    await pilot.press("q", "u", "e", "r", "y")
+                    await pilot.press("q")
                     await pilot.pause()
 
-                    self.assertEqual(search.value, "alphaquery")
+                    self.assertEqual(search.value, "q")
                     self.assertIs(screen.focused, search)
+                    search.value = "missing"
+                    screen.reload_projects("missing")
+                    self.assertEqual(table.row_count, 0)
                     table.focus()
                     await pilot.press("q")
                     await pilot.pause()
@@ -411,7 +412,7 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause()
                     exit_app.assert_called_once()
 
-    async def test_installed_q_types_then_list_clear_preserves_delete_selection(self) -> None:
+    async def test_installed_q_clears_zero_results_and_preserves_delete_selection(self) -> None:
         mods = [mod("Alpha"), mod("Beta")]
         with (
             patch.object(
@@ -427,15 +428,14 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                 selected = mods[1].relative_path
                 screen.selected_paths.add(selected)
                 search = screen.query_one("#installed-search", Input)
-                search.value = "alpha"
-                screen.reload_mods("alpha")
+                search.value = "missing"
+                screen.reload_mods("missing")
                 search.focus()
 
-                await pilot.press("q", "u", "i", "l", "t")
-                await pilot.pause()
-
-                self.assertEqual(search.value, "alphaquilt")
-                screen.query_one("#installed-table", DataTable).focus()
+                self.assertEqual(
+                    screen.query_one("#installed-table", DataTable).row_count,
+                    0,
+                )
                 await pilot.press("q")
                 await pilot.pause()
                 self.assertEqual(search.value, "")
@@ -446,6 +446,10 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIs(
                     screen.focused, screen.query_one("#installed-table", DataTable)
+                )
+                self.assertLess(
+                    screen.query_one("#installed-table", DataTable).cursor_row,
+                    screen.query_one("#installed-table", DataTable).row_count,
                 )
 
     async def test_invalid_side_row_stays_visible_and_ctrl_side_keys_repair_it(self) -> None:
@@ -482,7 +486,7 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                     [(True, False), (False, True), (True, True)],
                 )
 
-    async def test_project_files_q_types_then_clears_filter_from_list(self) -> None:
+    async def test_project_files_q_clears_zero_result_filter_from_input(self) -> None:
         files = [
             core.TemplateInfo("common", Path("a.toml"), Path("/a.toml"), 1),
             core.TemplateInfo("server", Path("b.toml"), Path("/b.toml"), 2),
@@ -495,21 +499,24 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
             async with app.run_test() as pilot:
                 screen = app.screen
                 search = screen.query_one("#template-search", Input)
-                search.value = "server"
-                screen.reload_templates("server")
+                search.value = "missing"
+                screen.reload_templates("missing")
                 search.focus()
 
-                await pilot.press("q", "u", "e", "r", "y")
-                await pilot.pause()
-
-                self.assertEqual(search.value, "serverquery")
-                screen.query_one("#template-table", DataTable).focus()
+                self.assertEqual(
+                    screen.query_one("#template-table", DataTable).row_count,
+                    0,
+                )
                 await pilot.press("q")
                 await pilot.pause()
                 self.assertEqual(search.value, "")
                 self.assertEqual(len(screen.visible_templates), 2)
                 self.assertIs(
                     screen.focused, screen.query_one("#template-table", DataTable)
+                )
+                self.assertLess(
+                    screen.query_one("#template-table", DataTable).cursor_row,
+                    screen.query_one("#template-table", DataTable).row_count,
                 )
 
     async def test_error_row_shows_details_and_reloads_repaired_project(self) -> None:

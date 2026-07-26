@@ -23,6 +23,41 @@ def entry(
 
 
 class TemplateMergeTest(unittest.TestCase):
+    def test_unicode_normalization_and_casefold_produce_stable_conflict_keys(self) -> None:
+        cases = [
+            (
+                " Cafe\N{COMBINING ACUTE ACCENT} ",
+                "CAF\N{LATIN SMALL LETTER E WITH ACUTE}",
+                "caf\N{LATIN SMALL LETTER E WITH ACUTE}",
+            ),
+            ("Stra\N{LATIN SMALL LETTER SHARP S}e", "STRASSE", "strasse"),
+        ]
+        for first, second, expected_key in cases:
+            with self.subTest(first=first, second=second):
+                composition = compose_templates(
+                    ["a", "b"],
+                    [
+                        entry("a", first, "modrinth", "a"),
+                        entry("b", second, "curseforge", "2"),
+                    ],
+                )
+
+                self.assertEqual(len(composition.conflicts), 1)
+                self.assertEqual(composition.conflicts[0].key, expected_key)
+
+    def test_distinct_unicode_and_internal_whitespace_remain_distinct(self) -> None:
+        composition = compose_templates(
+            ["a", "b", "c", "d"],
+            [
+                entry("a", "Sm\N{LATIN SMALL LETTER O WITH STROKE}r", "modrinth", "a"),
+                entry("b", "Smor", "curseforge", "2"),
+                entry("c", "Moonlight Lib", "modrinth", "c"),
+                entry("d", "Moonlight  Lib", "curseforge", "4"),
+            ],
+        )
+
+        self.assertEqual(composition.conflicts, ())
+
     def test_exact_identity_preserves_first_order_and_unions_sides(self) -> None:
         composition = compose_templates(
             ["base", "addon"],

@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 
+_IMPORT_ROOT: Path | None = None
+
+
 def root_argument(arguments: Sequence[str]) -> str | None:
     """Return the first valid global --root value without changing arguments."""
     index = 0
@@ -23,6 +26,18 @@ def root_argument(arguments: Sequence[str]) -> str | None:
             break
         index += 1
     return None
+
+
+def set_import_root(root: Path) -> None:
+    """Keep root-derived globals consistent across the TUI module tree."""
+    global _IMPORT_ROOT
+    _IMPORT_ROOT = root
+
+
+def import_root_argument(arguments: Sequence[str]) -> str | os.PathLike[str] | None:
+    if _IMPORT_ROOT is not None:
+        return _IMPORT_ROOT
+    return root_argument(arguments)
 
 
 def resolve_root(

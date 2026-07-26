@@ -22,7 +22,9 @@ packctl --help
 ```
 
 The managed repository is selected by `--root PATH`, then `HUROSHIKI_ROOT`, then the current
-working directory. The installed program location is never used as the managed data root.
+working directory. `huroshiki` accepts `--root` before or after `--pack`/`--template`; `packctl`
+requires global options before its subcommand. The installed program location is never used as the
+managed data root.
 
 ```bash
 huroshiki --root /srv/modpacks

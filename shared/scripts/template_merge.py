@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, replace
 from typing import Iterable, Mapping, Sequence
 
@@ -75,7 +76,7 @@ class ResolvedTemplateComposition:
 
 
 def normalize_name(name: str) -> str:
-    return name.strip().casefold()
+    return unicodedata.normalize("NFC", name.strip()).casefold()
 
 
 def union_side(first: str, second: str) -> str:

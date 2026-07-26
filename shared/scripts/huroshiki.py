@@ -7,10 +7,34 @@ import sys
 import threading
 from typing import Callable, Iterable
 
-from huroshiki_paths import resolve_root, root_argument
+from huroshiki_paths import resolve_root, set_import_root
+
+
+def argument_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Packwiz project TUI",
+        add_help=add_help,
+    )
+    parser.add_argument(
+        "--root",
+        metavar="PATH",
+        help="managed repository root (default: HUROSHIKI_ROOT, then current directory)",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--pack",
+        help="Open this MODPACK project immediately",
+    )
+    group.add_argument(
+        "--template",
+        help="Open this template project immediately",
+    )
+    return parser
 
 # Resolve the managed repository before importing modules with root-derived globals.
-ROOT = resolve_root(root_argument(sys.argv[1:]))
+_bootstrap_args, _ = argument_parser(add_help=False).parse_known_args(sys.argv[1:])
+ROOT = resolve_root(_bootstrap_args.root)
+set_import_root(ROOT)
 
 try:
     from textual import events, on
@@ -47,7 +71,9 @@ class FilterInput(Input):
     ]
 
     def action_clear_screen_filter(self) -> None:
-        self.insert_text_at_cursor("q")
+        screen = self.screen
+        if not isinstance(screen, FilterListScreen) or not screen.clear_filter():
+            self.insert_text_at_cursor("q")
 
 
 class SideDataTable(DataTable):
@@ -488,14 +514,10 @@ class FilterListScreen(BaseScreen):
     def filter_fallback(self) -> None:
         pass
 
-    def action_clear_filter_or_fallback(self) -> None:
+    def clear_filter(self) -> bool:
         search = self.query_one(f"#{self.filter_input_id}", Input)
-        if self.focused is search and not search.value:
-            search.insert_text_at_cursor("q")
-            return
         if not search.value:
-            self.filter_fallback()
-            return
+            return False
         table = self.query_one(f"#{self.filter_table_id}", DataTable)
         cursor_row = table.cursor_row
         search.value = ""
@@ -504,6 +526,11 @@ class FilterListScreen(BaseScreen):
         if row_count:
             table.move_cursor(row=max(0, min(cursor_row, row_count - 1)))
         table.focus()
+        return True
+
+    def action_clear_filter_or_fallback(self) -> None:
+        if not self.clear_filter():
+            self.filter_fallback()
 
 
 class ProjectChildScreen:
@@ -2565,22 +2592,7 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Packwiz project TUI")
-    parser.add_argument(
-        "--root",
-        metavar="PATH",
-        help="managed repository root (default: HUROSHIKI_ROOT, then current directory)",
-    )
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--pack",
-        help="Open this MODPACK project immediately",
-    )
-    group.add_argument(
-        "--template",
-        help="Open this template project immediately",
-    )
-    return parser.parse_args()
+    return argument_parser().parse_args()
 
 
 def main() -> int:

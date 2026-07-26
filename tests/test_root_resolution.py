@@ -42,6 +42,38 @@ class RootResolutionTest(unittest.TestCase):
             check=False,
         )
 
+    def probe_huroshiki_roots(
+        self,
+        arguments: list[str],
+        *,
+        cwd: Path,
+        environment_root: Path | None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = {**os.environ, "PYTHONPATH": str(SCRIPTS)}
+        if environment_root is None:
+            env.pop("HUROSHIKI_ROOT", None)
+        else:
+            env["HUROSHIKI_ROOT"] = str(environment_root)
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    f"sys.argv = ['huroshiki', *{arguments!r}]; "
+                    "import huroshiki, huroshiki_core, packctl; "
+                    "args = huroshiki.parse_args(); "
+                    "print(args.root); print(huroshiki.ROOT); "
+                    "print(huroshiki_core.ROOT); print(packctl.ROOT)"
+                ),
+            ],
+            cwd=cwd,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
     def test_root_priority_is_cli_then_environment_then_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary = Path(temporary_directory)
@@ -106,17 +138,103 @@ class RootResolutionTest(unittest.TestCase):
     def test_huroshiki_imports_share_cli_selected_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
+            cases = [
+                ["--root", str(root), "--pack", "demo"],
+                ["--pack", "demo", "--root", str(root)],
+                ["--root=" + str(root), "--template=demo"],
+                ["--template=demo", "--root=" + str(root)],
+            ]
+            for arguments in cases:
+                with self.subTest(arguments=arguments):
+                    probe = self.probe_huroshiki_roots(
+                        arguments,
+                        cwd=Path("/"),
+                        environment_root=None,
+                    )
+
+                    self.assertEqual(probe.returncode, 0, probe.stderr)
+                    self.assertEqual(probe.stdout.splitlines(), [str(root)] * 4)
+
+    def test_huroshiki_root_priority_is_cli_then_environment_then_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            cwd_root = temporary / "cwd"
+            env_root = temporary / "environment"
+            cli_root = temporary / "command-line"
+            cwd_root.mkdir()
+            cases = [
+                (["--pack", "demo", "--root", str(cli_root)], env_root, cli_root),
+                (["--pack", "demo"], env_root, env_root),
+                (["--pack", "demo"], None, cwd_root),
+            ]
+            for arguments, environment_root, expected in cases:
+                with self.subTest(arguments=arguments, expected=expected):
+                    probe = self.probe_huroshiki_roots(
+                        arguments,
+                        cwd=cwd_root,
+                        environment_root=environment_root,
+                    )
+
+                    self.assertEqual(probe.returncode, 0, probe.stderr)
+                    self.assertEqual(probe.stdout.splitlines()[1:], [str(expected)] * 3)
+
+    def test_huroshiki_selector_value_cannot_inject_root_option(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            environment_root = temporary / "managed"
+            attacker = temporary / "attacker"
+            probe = self.probe_huroshiki_roots(
+                ["--pack=--root=" + str(attacker)],
+                cwd=temporary,
+                environment_root=environment_root,
+            )
+
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            self.assertEqual(probe.stdout.splitlines()[0], "None")
+            self.assertEqual(probe.stdout.splitlines()[1:], [str(environment_root)] * 3)
+
+    def test_huroshiki_bootstrap_stops_at_double_dash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            environment_root = temporary / "managed"
+            attacker = temporary / "attacker"
+            env = {
+                **os.environ,
+                "HUROSHIKI_ROOT": str(environment_root),
+                "PYTHONPATH": str(SCRIPTS),
+            }
             probe = subprocess.run(
                 [
                     sys.executable,
                     "-c",
                     (
                         "import sys; "
-                        f"sys.argv = ['huroshiki', '--root', {str(root)!r}]; "
+                        "sys.argv = ['huroshiki', '--pack', 'demo', '--', "
+                        f"'--root={attacker}']; "
                         "import huroshiki, huroshiki_core, packctl; "
                         "print(huroshiki.ROOT); print(huroshiki_core.ROOT); "
                         "print(packctl.ROOT)"
                     ),
+                ],
+                cwd=temporary,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            self.assertEqual(probe.stdout.splitlines(), [str(environment_root)] * 3)
+
+    def test_huroshiki_help_accepts_root_after_selector(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HUROSHIKI),
+                    "--template=demo",
+                    "--root=" + temporary_directory,
+                    "--help",
                 ],
                 cwd="/",
                 env={**os.environ, "PYTHONPATH": str(SCRIPTS)},
@@ -125,8 +243,8 @@ class RootResolutionTest(unittest.TestCase):
                 check=False,
             )
 
-            self.assertEqual(probe.returncode, 0, probe.stderr)
-            self.assertEqual(probe.stdout.splitlines(), [str(root)] * 3)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--root PATH", result.stdout)
 
     def test_installed_style_module_tree_runs_outside_source_repository(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
