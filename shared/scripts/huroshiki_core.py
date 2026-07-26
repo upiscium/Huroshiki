@@ -997,7 +997,7 @@ class PackTransaction:
 
         real_root = project_root(self.project_key)
         real_source = real_root / "source"
-        backup = real_root / f".source.huroshiki-backup-{uuid4().hex}"
+        backup = self.root / "replaced-source"
         if backup.exists():
             raise HuroshikiError(f"Backup path already exists: {backup}")
 
@@ -1022,10 +1022,8 @@ class PackTransaction:
                     raise rollback_error from swap_error
             raise
 
-        shutil.rmtree(backup)
-        self._finish_state()
-        shutil.rmtree(self.root, ignore_errors=True)
         self.active = False
+        self._finish_state()
 
     def discard(self) -> None:
         with self._lock:
@@ -1051,7 +1049,8 @@ class PackTransaction:
 
     def _finish_discard(self) -> None:
         self._finish_state()
-        shutil.rmtree(self.root, ignore_errors=True)
+        if not (self.root / "replaced-source").exists():
+            shutil.rmtree(self.root, ignore_errors=True)
 
 
 def create_resolver_source(

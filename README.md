@@ -168,7 +168,8 @@ packctl clean-huroshiki-state --apply --older-than 14 --project pack:example
 ```
 
 State cleanup is a dry run unless `--apply` is supplied. Active transactions and locks are never
-selected for deletion.
+selected for deletion. A successful pack transaction retains its replaced source as a rollback
+snapshot under the completed transaction; normal completed-state retention removes that snapshot.
 
 ## Local Configuration
 

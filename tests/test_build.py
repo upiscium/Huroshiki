@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 from io import StringIO
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -187,6 +188,69 @@ class TransactionalBuildTest(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(self.dist_snapshot(), before)
         self.assertNotIn(b"private data", self.dist_snapshot().values())
+        run.assert_not_called()
+
+    def test_destination_directory_replacement_never_writes_external(self) -> None:
+        self.write_metadata("both")
+        overlay = self.pack_root / "content" / "common" / "mods" / "overlay.txt"
+        overlay.parent.mkdir(parents=True)
+        overlay.write_text("overlay data", encoding="utf-8")
+        external = self.root / "external-destination"
+        external.mkdir()
+        marker = external / "keep.txt"
+        marker.write_text("unchanged", encoding="utf-8")
+        before = self.dist_snapshot()
+        original_open = overlay_policy._open_destination_directory
+        replaced = False
+
+        def replace_after_open(name, destination_fd, relative, issues):
+            nonlocal replaced
+            opened_fd = original_open(name, destination_fd, relative, issues)
+            if name == "mods" and opened_fd is not None and not replaced:
+                replaced = True
+                destination = Path(os.readlink(f"/proc/self/fd/{destination_fd}"))
+                child = destination / name
+                child.rename(destination / "mods-parked")
+                child.symlink_to(external, target_is_directory=True)
+            return opened_fd
+
+        with patch.object(
+            overlay_policy,
+            "_open_destination_directory",
+            side_effect=replace_after_open,
+        ), patch.object(packctl, "run") as run:
+            result = packctl.build_pack("demo")
+
+        self.assertEqual(result, 1)
+        self.assertEqual(self.dist_snapshot(), before)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "unchanged")
+        self.assertFalse((external / "overlay.txt").exists())
+        run.assert_not_called()
+
+    def test_preexisting_destination_symlink_never_writes_external(self) -> None:
+        self.write_metadata("both")
+        overlay = self.pack_root / "content" / "common" / "config" / "settings.txt"
+        overlay.parent.mkdir(parents=True)
+        overlay.write_text("overlay data", encoding="utf-8")
+        external = self.root / "external-config"
+        external.mkdir()
+        settings = external / "settings.txt"
+        settings.write_text("unchanged", encoding="utf-8")
+        before = self.dist_snapshot()
+        original_copy = packctl.copy_metadata
+
+        def copy_with_packwiz_symlink(source: Path, destination: Path) -> None:
+            original_copy(source, destination)
+            (destination / "config").symlink_to(external, target_is_directory=True)
+
+        with patch.object(
+            packctl, "copy_metadata", side_effect=copy_with_packwiz_symlink
+        ), patch.object(packctl, "run") as run:
+            result = packctl.build_pack("demo")
+
+        self.assertEqual(result, 1)
+        self.assertEqual(self.dist_snapshot(), before)
+        self.assertEqual(settings.read_text(encoding="utf-8"), "unchanged")
         run.assert_not_called()
 
     def test_keyboard_interrupt_during_swap_restores_dist(self) -> None:

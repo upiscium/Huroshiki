@@ -14,6 +14,8 @@
   enables intentional internal access; composed URL candidates require every origin to opt in.
 - Transaction swaps now park and verify the exact live source before installation, overlay edits and
   builds use no-follow directory descriptors, and URL cancellation/deadlines shut down live sockets.
+  Replaced pack sources remain in completed transaction state until normal retention cleanup, and
+  build overlay destinations are pinned and traversed descriptor-relative.
 - NAT64/special-use address policy, Windows device aliases, and portable metadata filename collision
   checks now cover direct URL additions and repository validation.
 

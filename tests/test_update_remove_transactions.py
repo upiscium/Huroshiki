@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 import unittest
@@ -51,6 +52,19 @@ class TransactionTestCase(unittest.TestCase):
             patch.object(packctl, "ROOT", self.root),
             patch.object(packctl, "PACKS", self.packs),
             patch.object(packctl, "TEMPLATES", self.templates),
+            patch.object(packctl, "STATE_ROOT", self.root / ".huroshiki"),
+            patch.object(
+                packctl,
+                "TRANSACTION_ROOT",
+                self.root / ".huroshiki" / "transactions",
+            ),
+            patch.object(packctl, "LOG_ROOT", self.root / ".huroshiki" / "logs"),
+            patch.object(packctl, "TRASH_ROOT", self.root / ".huroshiki" / "trash"),
+            patch.object(
+                packctl,
+                "DEPLOY_SNAPSHOT_ROOT",
+                self.root / ".huroshiki" / "deploy-snapshots",
+            ),
         ]
         for item in self.patches:
             item.start()
@@ -254,6 +268,60 @@ url = "https://example.invalid/manual.jar"
         self.assertFalse(list(self.source.parent.glob(".source.huroshiki-backup-*")))
         transaction.discard()
 
+    def test_late_old_inode_write_is_retained_until_completed_state_cleanup(self) -> None:
+        target = self.write_mod("first")
+        transaction = core.PackTransaction.create(self.key)
+        staged = transaction.source / "mods" / "first.pw.toml"
+        staged.write_text(metadata("First", "first", "v2"), encoding="utf-8")
+        replaced = transaction.root / "replaced-source"
+        held_fd = os.open(target, os.O_WRONLY | os.O_APPEND)
+        original_snapshot = core.tree_digest_snapshot
+        wrote_late = False
+
+        def snapshot_then_write(path: Path):
+            nonlocal wrote_late
+            snapshot = original_snapshot(path)
+            if path == replaced and not wrote_late:
+                wrote_late = True
+                os.write(held_fd, b"\nlate old-fd write\n")
+            return snapshot
+
+        try:
+            with patch.object(
+                core.subprocess,
+                "run",
+                side_effect=lambda command, **_: self.completed(command),
+            ), patch.object(core, "tree_digest_snapshot", side_effect=snapshot_then_write):
+                transaction.apply()
+        finally:
+            os.close(held_fd)
+
+        self.assertFalse(transaction.active)
+        self.assertTrue((transaction.root / ".completed").is_file())
+        self.assertIn(
+            "late old-fd write",
+            (replaced / "mods" / "first.pw.toml").read_text(encoding="utf-8"),
+        )
+        self.assertIn('version = "v2"', target.read_text(encoding="utf-8"))
+        self.assertFalse(packctl.project_lock_is_active(self.key))
+        self.assertFalse(list(self.source.parent.glob(".source.huroshiki-backup-*")))
+
+        now = transaction.root.stat().st_mtime + 1
+        preview = packctl.clean_state(older_than_days=0, now=now)
+        retained = next(item for item in preview.selected if item.path == transaction.root)
+        self.assertEqual(retained.category, "completed_transaction")
+        self.assertGreaterEqual(retained.bytes, len(b"late old-fd write"))
+
+        report = packctl.clean_state(
+            apply=True,
+            older_than_days=0,
+            now=now,
+            expected=preview.selected,
+        )
+        self.assertEqual(report.removed_count, 1)
+        self.assertGreaterEqual(report.removed_bytes, retained.bytes)
+        self.assertFalse(transaction.root.exists())
+
     def test_recreated_source_is_preserved_when_staged_install_fails(self) -> None:
         self.write_mod("first")
         transaction = core.PackTransaction.create(self.key)
@@ -273,8 +341,12 @@ url = "https://example.invalid/manual.jar"
                 transaction.apply()
 
         self.assertEqual((self.source / "external.txt").read_text(encoding="utf-8"), "keep")
-        self.assertEqual(len(list(self.source.parent.glob(".source.huroshiki-backup-*"))), 1)
+        replaced = transaction.root / "replaced-source"
+        self.assertTrue(replaced.is_dir())
+        self.assertFalse(list(self.source.parent.glob(".source.huroshiki-backup-*")))
         transaction.discard()
+        self.assertTrue(replaced.is_dir())
+        self.assertTrue((transaction.root / ".completed").is_file())
 
 
 class RemoveTransactionTest(TransactionTestCase):

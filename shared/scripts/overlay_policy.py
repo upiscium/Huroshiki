@@ -345,9 +345,127 @@ def _readlink_at(name: str, directory_fd: int) -> str:
         return f"<unreadable: {error}>"
 
 
+def _destination_entry_issue(
+    name: str,
+    destination_fd: int,
+    relative: Path,
+) -> OverlayIssue:
+    try:
+        metadata = os.stat(name, dir_fd=destination_fd, follow_symlinks=False)
+    except OSError as error:
+        return OverlayIssue(relative, f"cannot inspect destination entry: {error}")
+    if stat.S_ISLNK(metadata.st_mode):
+        return OverlayIssue(
+            relative,
+            f"destination symlink is not allowed -> {_readlink_at(name, destination_fd)}",
+        )
+    return OverlayIssue(relative, "destination special filesystem entry is not allowed")
+
+
+def _open_destination_directory(
+    name: str,
+    destination_fd: int,
+    relative: Path,
+    issues: list[OverlayIssue],
+) -> int | None:
+    try:
+        os.mkdir(name, dir_fd=destination_fd)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        issues.append(OverlayIssue(relative, f"cannot create destination directory: {error}"))
+        return None
+    try:
+        return _open_directory(name, destination_fd)
+    except OSError:
+        issues.append(_destination_entry_issue(name, destination_fd, relative))
+        return None
+
+
+def _destination_directory_replaced(
+    name: str,
+    destination_fd: int,
+    opened_fd: int,
+    relative: Path,
+    issues: list[OverlayIssue],
+) -> None:
+    opened = os.fstat(opened_fd)
+    try:
+        current = os.stat(name, dir_fd=destination_fd, follow_symlinks=False)
+    except OSError as error:
+        issues.append(OverlayIssue(relative, f"destination directory was replaced: {error}"))
+        return
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+    ):
+        issues.append(_destination_entry_issue(name, destination_fd, relative))
+
+
+def _open_destination_file(
+    name: str,
+    destination_fd: int,
+    relative: Path,
+    issues: list[OverlayIssue],
+) -> int | None:
+    flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    for attempt in range(2):
+        try:
+            file_fd = os.open(name, flags, dir_fd=destination_fd)
+            break
+        except FileNotFoundError:
+            try:
+                file_fd = os.open(
+                    name,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o666,
+                    dir_fd=destination_fd,
+                )
+                break
+            except FileExistsError:
+                if attempt == 0:
+                    continue
+                issues.append(
+                    OverlayIssue(relative, "destination entry changed while opening")
+                )
+                return None
+            except OSError:
+                issues.append(_destination_entry_issue(name, destination_fd, relative))
+                return None
+        except OSError:
+            issues.append(_destination_entry_issue(name, destination_fd, relative))
+            return None
+    if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+        os.close(file_fd)
+        issues.append(_destination_entry_issue(name, destination_fd, relative))
+        return None
+    os.ftruncate(file_fd, 0)
+    return file_fd
+
+
+def _destination_file_replaced(
+    name: str,
+    destination_fd: int,
+    opened_fd: int,
+    relative: Path,
+    issues: list[OverlayIssue],
+) -> None:
+    opened = os.fstat(opened_fd)
+    try:
+        current = os.stat(name, dir_fd=destination_fd, follow_symlinks=False)
+    except OSError as error:
+        issues.append(OverlayIssue(relative, f"destination file was replaced: {error}"))
+        return
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+    ):
+        issues.append(_destination_entry_issue(name, destination_fd, relative))
+
+
 def _copy_overlay_directory(
     source_fd: int,
-    destination: Path,
+    destination_fd: int,
     relative: Path,
     entries: list[OverlayEntry],
     issues: list[OverlayIssue],
@@ -379,6 +497,7 @@ def _copy_overlay_directory(
         if child.name == ".gitkeep":
             continue
         if stat.S_ISDIR(metadata.st_mode):
+            output_fd: int | None = None
             try:
                 child_fd = _open_directory(child.name, source_fd)
             except OSError as error:
@@ -396,12 +515,24 @@ def _copy_overlay_directory(
                     )
                 continue
             try:
-                output = destination / child.name
-                output.mkdir(exist_ok=True)
+                output_fd = _open_destination_directory(
+                    child.name, destination_fd, child_relative, issues
+                )
+                if output_fd is None:
+                    continue
                 _copy_overlay_directory(
-                    child_fd, output, child_relative, entries, issues
+                    child_fd, output_fd, child_relative, entries, issues
+                )
+                _destination_directory_replaced(
+                    child.name,
+                    destination_fd,
+                    output_fd,
+                    child_relative,
+                    issues,
                 )
             finally:
+                if output_fd is not None:
+                    os.close(output_fd)
                 os.close(child_fd)
             continue
         if not stat.S_ISREG(metadata.st_mode):
@@ -411,6 +542,7 @@ def _copy_overlay_directory(
             )
             continue
 
+        output_fd = -1
         try:
             file_fd = os.open(
                 child.name,
@@ -436,10 +568,26 @@ def _copy_overlay_directory(
                 )
                 continue
             entries.append(OverlayEntry(child_relative, "file", opened_metadata.st_size))
-            output = destination / child.name
-            with os.fdopen(os.dup(file_fd), "rb") as source, output.open("wb") as target:
+            output_fd = _open_destination_file(
+                child.name, destination_fd, child_relative, issues
+            )
+            if output_fd is None:
+                continue
+            with os.fdopen(os.dup(file_fd), "rb") as source, os.fdopen(
+                output_fd, "wb"
+            ) as target:
+                output_fd = -1
                 shutil.copyfileobj(source, target)
+                _destination_file_replaced(
+                    child.name,
+                    destination_fd,
+                    target.fileno(),
+                    child_relative,
+                    issues,
+                )
         finally:
+            if output_fd >= 0:
+                os.close(output_fd)
             os.close(file_fd)
 
 
@@ -450,6 +598,8 @@ def copy_content_overlays(
 ) -> OverlayScan:
     entries: list[OverlayEntry] = []
     issues: list[OverlayIssue] = []
+    destination_parent_fd = -1
+    destination_fd = -1
     try:
         content_fd = os.open(content_root, _DIRECTORY_FLAGS)
     except FileNotFoundError:
@@ -457,6 +607,15 @@ def copy_content_overlays(
     except OSError as error:
         return OverlayScan((), (OverlayIssue(Path("."), f"cannot open content root: {error}"),))
     try:
+        try:
+            destination_parent_fd = os.open(destination.parent, _DIRECTORY_FLAGS)
+            destination_fd = _open_directory(destination.name, destination_parent_fd)
+        except OSError as error:
+            issues.append(
+                OverlayIssue(Path("."), f"cannot open destination directory: {error}")
+            )
+            return OverlayScan(tuple(entries), tuple(issues))
+        destination_metadata = os.fstat(destination_fd)
         for target in targets:
             if target not in OVERLAY_TARGETS:
                 raise OverlayPolicyError(
@@ -483,11 +642,36 @@ def copy_content_overlays(
                 continue
             try:
                 _copy_overlay_directory(
-                    target_fd, destination, Path(target), entries, issues
+                    target_fd, destination_fd, Path(target), entries, issues
                 )
             finally:
                 os.close(target_fd)
+        try:
+            current_destination = os.stat(
+                destination.name,
+                dir_fd=destination_parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            issues.append(
+                OverlayIssue(Path("."), f"destination directory was replaced: {error}")
+            )
+        else:
+            if (
+                not stat.S_ISDIR(current_destination.st_mode)
+                or (current_destination.st_dev, current_destination.st_ino)
+                != (destination_metadata.st_dev, destination_metadata.st_ino)
+            ):
+                issues.append(
+                    _destination_entry_issue(
+                        destination.name, destination_parent_fd, Path(".")
+                    )
+                )
     finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+        if destination_parent_fd >= 0:
+            os.close(destination_parent_fd)
         os.close(content_fd)
     return OverlayScan(tuple(entries), tuple(issues))
 
