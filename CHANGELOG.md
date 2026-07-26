@@ -8,6 +8,19 @@
 - Content overlays reject every symlink and every Packwiz-owned `pack.toml`, `index.toml`, or
   `*.pw.toml` path. Builds preserve the previous distribution when an invalid overlay is found.
 
+### Template Resolver Integrity (#34, #35)
+
+- Template roots are resolved in isolated temporary Packwiz projects so each root's complete
+  dependency closure receives its requested side before closures are merged.
+- Shared dependencies union sides across roots. Metadata path, provider identity, and JAR filename
+  collisions fail closed when selected candidates cannot all be represented independently.
+
+### Transactional Profiles (#36)
+
+- Multiple profiles now apply in declared order under one project lock and one staged transaction.
+- Install, refresh, interruption, or concurrent-source-change failures leave the real pack source
+  unchanged; existing provider identities retain the union of their current and requested sides.
+
 ### Breaking: Public CLI Boundary (#30)
 
 - `huroshiki` is the interactive interface, `packctl` is the noninteractive interface, and Just is

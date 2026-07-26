@@ -61,6 +61,7 @@
               ${huroshiki}/lib/huroshiki/huroshiki-launcher.sh --root "$root" --help > /dev/null
             test -f ${huroshiki}/lib/huroshiki/huroshiki.tcss
             test -f ${huroshiki}/lib/huroshiki/huroshiki_core.py
+            test -f ${huroshiki}/lib/huroshiki/overlay_policy.py
             test -f ${huroshiki}/lib/huroshiki/template_merge.py
             test -f ${huroshiki}/lib/huroshiki/huroshiki-launcher.sh
             test -x ${huroshiki}/lib/huroshiki/huroshiki-launcher.sh
