@@ -1,7 +1,0 @@
-*.log
-*.gitkeep
-/crash-reports/
-/logs/
-/saves/
-/screenshots/
-/world/

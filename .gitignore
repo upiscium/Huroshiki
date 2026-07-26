@@ -1,5 +1,6 @@
 /.direnv/
 /.packwiz-cache/
+/packs/
 **/dist/
 **/pack.local.yaml
 **/template.local.yaml
