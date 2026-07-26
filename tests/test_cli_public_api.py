@@ -12,6 +12,59 @@ import packctl
 
 
 class PublicCliTest(unittest.TestCase):
+    def test_add_direct_query_forms_preserve_provider_and_selector(self) -> None:
+        cases = (
+            ("mr:example", ("modrinth", "example")),
+            ("cf:123", ("curseforge", "123")),
+            (
+                "https://modrinth.com/mod/example",
+                ("modrinth", "https://modrinth.com/mod/example"),
+            ),
+            (
+                "https://www.curseforge.com/minecraft/mc-mods/example",
+                (
+                    "curseforge",
+                    "https://www.curseforge.com/minecraft/mc-mods/example",
+                ),
+            ),
+        )
+        for query, expected in cases:
+            with self.subTest(query=query):
+                self.assertEqual(packctl.direct_project_selector(query), expected)
+
+    def test_add_uses_lazy_transaction_api_without_an_outer_lock(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {"pack": "demo", "query": "mr:example", "side": "client"},
+        )()
+        with patch(
+            "huroshiki_core.add_mod_transactionally", return_value=7
+        ) as add, patch.object(packctl, "ProjectLock") as project_lock:
+            self.assertEqual(packctl.cmd_add(args), 7)
+
+        add.assert_called_once_with("pack:demo", "modrinth", "example", "client")
+        project_lock.assert_not_called()
+
+    def test_add_preserves_tty_provider_selection_and_reports_core_errors(self) -> None:
+        import huroshiki_core
+
+        args = type(
+            "Args",
+            (),
+            {"pack": "demo", "query": "search words", "side": "both"},
+        )()
+        with patch.object(packctl, "choose_provider", return_value="curseforge"), patch(
+            "huroshiki_core.add_mod_transactionally",
+            side_effect=huroshiki_core.HuroshikiError("refresh failed"),
+        ) as add:
+            with self.assertRaisesRegex(packctl.ConfigError, "refresh failed"):
+                packctl.cmd_add(args)
+
+        add.assert_called_once_with(
+            "pack:demo", "curseforge", "search words", "both"
+        )
+
     def test_help_exposes_public_commands_and_omits_removed_commands(self) -> None:
         help_text = packctl.parser().format_help()
 

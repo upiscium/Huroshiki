@@ -913,27 +913,6 @@ def set_side_and_refresh(source: Path, path: Path, side: str) -> None:
         raise
 
 
-def metadata_snapshot(source: Path) -> dict[Path, bytes]:
-    return {path.resolve(): path.read_bytes() for path in metadata_files(source)}
-
-
-def changed_metadata_files(
-    before: dict[Path, bytes],
-    source: Path,
-) -> list[Path]:
-    changed: list[Path] = []
-
-    for path in metadata_files(source):
-        resolved = path.resolve()
-        previous = before.get(resolved)
-        current = path.read_bytes()
-
-        if previous is None or previous != current:
-            changed.append(path)
-
-    return sorted(changed)
-
-
 def direct_project_selector(query: str) -> tuple[str, str] | None:
     lowered = query.lower()
 
@@ -983,52 +962,9 @@ def choose_provider() -> str | None:
         print("Enter 1, 2, or q.")
 
 
-def install_and_classify(
-    pack_id: str,
-    provider: str,
-    selector: str,
-    side: str,
-) -> int:
-    normalized_side = normalize_side(side)
-    source = get_pack_root(pack_id) / "source"
-    before = metadata_snapshot(source)
-
-    if provider == "modrinth":
-        command = ["packwiz", "modrinth", "add", selector]
-    elif provider == "curseforge":
-        if selector.isdecimal():
-            command = [
-                "packwiz",
-                "curseforge",
-                "add",
-                "--addon-id",
-                selector,
-            ]
-        else:
-            command = ["packwiz", "curseforge", "add", selector]
-    else:
-        raise ConfigError(f"Unsupported provider: {provider}")
-
-    run(command, cwd=source)
-
-    changed = changed_metadata_files(before, source)
-    if not changed:
-        raise ConfigError(
-            "Packwiz did not create or modify any .pw.toml files. "
-            f"The project may already be installed; use `packctl side {pack_id} "
-            "<metadata-file> <side>` to change its side."
-        )
-
-    print(f"Assigning side = {normalized_side}:")
-    for metadata in changed:
-        set_side_file(metadata, normalized_side)
-        print(f"  {metadata.relative_to(source)}")
-
-    run(["packwiz", "refresh"], cwd=source)
-    return 0
-
-
 def cmd_add(args: argparse.Namespace) -> int:
+    import huroshiki_core
+
     direct = direct_project_selector(args.query)
 
     if direct is not None:
@@ -1041,13 +977,15 @@ def cmd_add(args: argparse.Namespace) -> int:
         selector = args.query
 
     print(f"Using Packwiz {provider} search/install.")
-    with ProjectLock(f"pack:{args.pack}", "add"):
-        return install_and_classify(
-            args.pack,
+    try:
+        return huroshiki_core.add_mod_transactionally(
+            huroshiki_core.project_key("pack", args.pack),
             provider,
             selector,
             args.side,
         )
+    except huroshiki_core.HuroshikiError as error:
+        raise ConfigError(str(error)) from error
 
 
 def cmd_list(_: argparse.Namespace) -> int:

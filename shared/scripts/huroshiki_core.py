@@ -644,6 +644,81 @@ class PackTransaction:
         shutil.rmtree(checkpoint, ignore_errors=True)
         return result
 
+    def add_mod_transactionally(self, provider: str, selector: str, side: str) -> int:
+        """Run one synchronous add entirely in staging, then atomically apply it."""
+        self.ensure_active()
+        kind, _ = split_project_key(self.project_key)
+        if kind != "pack":
+            raise HuroshikiError("Synchronous add can only modify MODPACK projects")
+        try:
+            normalized_side = packctl.normalize_side(side)
+        except packctl.ConfigError as error:
+            raise HuroshikiError(str(error)) from error
+        provider, selector = normalize_add_selector(provider, selector)
+        before = metadata_digest_snapshot(self.source)
+
+        if provider == "url":
+            client, server = flags_from_side(normalized_side)
+            result = self.begin_add(
+                provider,
+                selector,
+                client=client,
+                server=server,
+            ).run()
+            if not result.success:
+                if result.returncode == 0:
+                    raise HuroshikiError(result.message)
+                return result.returncode or 1
+        else:
+            command = build_add_command(provider, selector)
+            result = subprocess.run(
+                command,
+                cwd=self.source,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                return result.returncode
+            changed = self._classify_add_changes(before, normalized_side)
+            self.batches.append(
+                TransactionBatch(
+                    provider=provider,
+                    query=selector,
+                    changed_files=changed,
+                )
+            )
+
+        self.apply()
+        return 0
+
+    def _classify_add_changes(
+        self,
+        before: dict[Path, str],
+        side: str,
+    ) -> tuple[Path, ...]:
+        changed = tuple(
+            sorted(changed_paths(before, metadata_digest_snapshot(self.source)))
+        )
+        metadata_paths = tuple(
+            relative_path
+            for relative_path in changed
+            if (self.source / relative_path).is_file()
+            and relative_path.name.endswith(".pw.toml")
+        )
+        if not metadata_paths:
+            raise HuroshikiError(
+                "Packwiz did not create or modify any .pw.toml files. "
+                "The project may already be installed."
+            )
+        for relative_path in metadata_paths:
+            try:
+                packctl.set_side_file(self.source / relative_path, side)
+            except Exception as error:
+                raise HuroshikiError(
+                    f"Could not assign side to {relative_path}: {error}"
+                ) from error
+        return metadata_paths
+
     def _finish_add(
         self,
         operation: PackwizAddOperation,
@@ -662,8 +737,14 @@ class PackTransaction:
                     cancelled=True,
                 )
 
-            after = metadata_digest_snapshot(self.source)
-            changed = tuple(sorted(changed_paths(operation.before, after)))
+            changed = tuple(
+                sorted(
+                    changed_paths(
+                        operation.before,
+                        metadata_digest_snapshot(self.source),
+                    )
+                )
+            )
             if pty_result.returncode != 0 or not changed:
                 self._rollback_add(operation)
                 reason = (
@@ -681,11 +762,10 @@ class PackTransaction:
                     cancelled=operation.cancelled,
                 )
 
-            side = side_from_flags(operation.client, operation.server)
-            for relative_path in changed:
-                metadata = self.source / relative_path
-                if metadata.is_file() and metadata.name.endswith(".pw.toml"):
-                    packctl.set_side_file(metadata, side)
+            changed = self._classify_add_changes(
+                operation.before,
+                side_from_flags(operation.client, operation.server),
+            )
 
             self.batches.append(
                 TransactionBatch(
@@ -2290,6 +2370,20 @@ def apply_profiles(
             raise HuroshikiError(
                 f"Profiles {profile_list} could not be applied: {error}"
             ) from error
+    finally:
+        transaction.discard()
+
+
+def add_mod_transactionally(
+    project_key_value: str,
+    provider: str,
+    selector: str,
+    side: str,
+) -> int:
+    """Add a mod on a disposable source copy and atomically publish on success."""
+    transaction = PackTransaction.create(project_key_value)
+    try:
+        return transaction.add_mod_transactionally(provider, selector, side)
     finally:
         transaction.discard()
 
