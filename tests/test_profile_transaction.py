@@ -189,6 +189,26 @@ class ProfileTransactionTest(unittest.TestCase):
         install.assert_not_called()
         self.assertEqual(self.snapshot(), original)
 
+    def test_template_project_is_rejected_before_transaction_creation(self) -> None:
+        with patch.object(core.PackTransaction, "create") as create:
+            with self.assertRaisesRegex(core.HuroshikiError, "only.*MODPACK"):
+                core.apply_profiles("template:base", {}, [])
+        create.assert_not_called()
+
+    def test_pack_local_change_during_transaction_copy_aborts_profile_and_persists(self) -> None:
+        original_copy = core.copy_transaction_source
+        local = self.packs / "demo" / "pack.local.yaml"
+
+        def racing_copy(source, destination):
+            result = original_copy(source, destination)
+            local.write_text("url_max_jar_size_bytes: 1024\n", encoding="utf-8")
+            return result
+
+        with patch.object(core, "copy_transaction_source", side_effect=racing_copy):
+            with self.assertRaisesRegex(core.HuroshikiError, "while.*copy"):
+                core.apply_profiles(self.key, self.profiles(), ["base"])
+        self.assertEqual(local.read_text(encoding="utf-8"), "url_max_jar_size_bytes: 1024\n")
+
     def test_existing_identity_is_not_reinstalled_and_side_is_union(self) -> None:
         target = self.source / "mods/existing.pw.toml"
         target.write_text(metadata("curseforge", "101", "client"), encoding="utf-8")

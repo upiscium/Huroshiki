@@ -20,6 +20,7 @@ class TemplateModEntry:
     side: str
     url: str | None = None
     max_url_jar_size_bytes: int | None = None
+    url_allow_private_networks: bool = False
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class MergedTemplateMod:
     order: int = 0
     name_aliases: tuple[str, ...] = ()
     max_url_jar_size_bytes: int | None = None
+    url_allow_private_networks: bool = False
 
 
 @dataclass(frozen=True)
@@ -143,6 +145,10 @@ def compose_templates(
                 template_ids=origins,
                 name_aliases=aliases,
                 max_url_jar_size_bytes=min(limits) if limits else None,
+                url_allow_private_networks=(
+                    existing.url_allow_private_networks
+                    and entry.url_allow_private_networks
+                ),
             )
             continue
         identity_indexes[identity] = len(merged)
@@ -158,6 +164,7 @@ def compose_templates(
                 order=len(merged),
                 name_aliases=(normalize_name(entry.name),),
                 max_url_jar_size_bytes=entry.max_url_jar_size_bytes,
+                url_allow_private_networks=entry.url_allow_private_networks,
             )
         )
 

@@ -186,10 +186,12 @@ minecraft_server:
   stack_dir: /srv/demo
   service: demo
 url_max_jar_size_bytes: 268435456
+url_allow_private_networks: false
 ```
 
 The exact allowed paths are `distribution.rsync_target`, `minecraft_server.ssh_host`,
-`minecraft_server.stack_dir`, `minecraft_server.service`, and `url_max_jar_size_bytes`. Identity,
+`minecraft_server.stack_dir`, `minecraft_server.service`, `url_max_jar_size_bytes`, and
+`url_allow_private_networks`. Identity,
 display, enablement, Minecraft/loader versions, MOD data, and every unknown top-level or nested key
 are prohibited in `pack.local.yaml`.
 
@@ -216,11 +218,12 @@ mods:
 ```
 
 Every field shown above, including `mods`, is required in committed `template.yaml`.
-`template.local.yaml` permits exactly one operational key: a positive integer
-`url_max_jar_size_bytes`. It cannot define `id`, `display_name`, `enabled`, `minecraft`, `loader`,
+`template.local.yaml` permits two operational keys: a positive integer
+`url_max_jar_size_bytes` and boolean `url_allow_private_networks`. It cannot define `id`,
+`display_name`, `enabled`, `minecraft`, `loader`,
 `reference_loader_version`, `mods`, or any unknown key. Template listing, composition, side changes,
-and deletion always use and update committed semantic data in `template.yaml`; the local URL limit is
-used only for bounded URL downloads. Changing either template configuration file while a staged
+and deletion always use and update committed semantic data in `template.yaml`; the local URL policy
+is used only for bounded downloads. Changing either template configuration file while a staged
 template transaction is open prevents that transaction from being applied.
 
 Any `templates/<id>/source` entry, including a symlink, is a validation error. Legacy Packwiz
@@ -230,7 +233,15 @@ then run `packctl validate-template <id>`.
 
 URL entries use `provider: url`, a stable logical `project_id`, and a public `.jar` URL. Downloads
 default to 256 MiB; set `url_max_jar_size_bytes` in the committed manifest or its permitted local
-configuration to change the limit.
+configuration to change the limit. Every URL and redirect rejects non-public literal or resolved
+addresses by default, and each connection is pinned to the approved DNS result. Internal/self-hosted
+networks require `url_allow_private_networks: true` in the ignored `pack.local.yaml` or
+`template.local.yaml`; this key is rejected in committed manifests. When templates share one URL
+candidate, private access is allowed only if every origin template opts in.
+
+Generated Packwiz metadata paths and JAR filenames must also be portable across case-insensitive
+filesystems: traversal, absolute/drive/UNC paths, control characters, Windows device names, trailing
+dots/spaces, and Unicode/case-folded collisions are rejected.
 
 ## Zsh Completion
 

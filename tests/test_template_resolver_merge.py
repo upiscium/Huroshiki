@@ -25,13 +25,20 @@ neoforge = "21.1.999"
 '''
 
 
-def metadata(provider: str, project_id: str, filename: str, side: str = "both") -> str:
+def metadata(
+    provider: str,
+    project_id: str,
+    filename: str,
+    side: str = "both",
+    version: str = "v1",
+) -> str:
     provider_table = "modrinth" if provider == "modrinth" else "curseforge"
     project_key = "mod-id" if provider == "modrinth" else "project-id"
     return (
         f'name = "{project_id}"\nfilename = "{filename}"\nside = "{side}"\n'
         f'[download]\nurl = "https://example.invalid/{filename}"\n'
         f'[update.{provider_table}]\n{project_key} = "{project_id}"\n'
+        f'version = "{version}"\n'
     )
 
 
@@ -321,6 +328,103 @@ class TemplateResolverMergeTest(unittest.TestCase):
         self.assertEqual(len(report.failed), 1)
         self.assertIn("filename collision", report.failed[0].reason)
         self.assertEqual(len(report.retained), 1)
+
+    def test_dependency_version_divergence_rejects_later_ordinary_root_in_report(self) -> None:
+        self.write_template(
+            "  - name: First\n    provider: modrinth\n"
+            "    project_id: first\n    side: both\n"
+            "  - name: Second\n    provider: modrinth\n"
+            "    project_id: second\n    side: both\n"
+        )
+
+        def fake_run(command, *, cwd=None, **kwargs):
+            if command[-1] != "refresh":
+                root_id = command[-1]
+                source = Path(cwd)
+                (source / "mods" / f"{root_id}.pw.toml").write_text(
+                    metadata("modrinth", root_id, f"{root_id}.jar"), encoding="utf-8"
+                )
+                (source / "mods" / "shared.pw.toml").write_text(
+                    metadata(
+                        "modrinth", "shared", f"shared-{root_id}.jar",
+                        version="v1" if root_id == "first" else "v2",
+                    ),
+                    encoding="utf-8",
+                )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch.object(
+            core, "create_project", side_effect=self.fake_create
+        ), patch.object(core.subprocess, "run", side_effect=fake_run):
+            report = self.create()
+        self.assertEqual(report.installed, ("First",))
+        self.assertEqual(len(report.failed), 1)
+        self.assertIn("metadata disagreement", report.failed[0].reason)
+        self.assertEqual(tuple(item.name for item in report.retained), ("First",))
+
+    def test_dependency_divergence_for_retained_conflict_requires_reselection(self) -> None:
+        self.write_template(
+            "  - name: Same\n    provider: modrinth\n"
+            "    project_id: first\n    side: both\n"
+            "  - name: Same\n    provider: curseforge\n"
+            "    project_id: '2'\n    side: both\n"
+        )
+        composition = core.prepare_template_composition(
+            template_ids=["base"], minecraft="1.21.1", loader="neoforge"
+        )
+        conflict = composition.conflicts[0]
+        resolution = {
+            conflict.key: core.ConflictResolution(
+                tuple(item.candidate_key for item in conflict.candidates), True
+            )
+        }
+
+        def fake_run(command, *, cwd=None, **kwargs):
+            source = Path(cwd)
+            root_id = command[-1]
+            provider = "modrinth" if root_id == "first" else "curseforge"
+            (source / "mods" / f"{root_id}.pw.toml").write_text(
+                metadata(provider, root_id, f"{root_id}.jar"), encoding="utf-8"
+            )
+            (source / "mods" / "shared.pw.toml").write_text(
+                metadata("modrinth", "shared", "shared.jar", version=root_id),
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch.object(core, "create_project") as create, patch.object(
+            core.subprocess, "run", side_effect=fake_run
+        ):
+            with self.assertRaisesRegex(
+                core.HuroshikiError, "metadata disagreement.*Re-select"
+            ):
+                self.create(conflict_resolutions=resolution)
+        create.assert_not_called()
+
+    def test_portable_path_and_filename_collisions_and_windows_names_fail(self) -> None:
+        cases = (
+            (("A.pw.toml", "a.pw.toml"), ("one.jar", "two.jar"), "path collision"),
+            (("one.pw.toml", "two.pw.toml"), ("Same.jar", "same.jar"), "filename collision"),
+        )
+        for paths, filenames, message in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory)
+                (source / "mods").mkdir()
+                for index, (name, filename) in enumerate(zip(paths, filenames), start=1):
+                    (source / "mods" / name).write_text(
+                        metadata("modrinth", str(index), filename), encoding="utf-8"
+                    )
+                with self.assertRaisesRegex(core.HuroshikiError, message):
+                    core._read_resolver_metadata(source, "both")
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            (source / "mods").mkdir()
+            (source / "mods" / "CON.pw.toml").write_text(
+                metadata("modrinth", "one", "valid.jar"), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(core.HuroshikiError, "reserved Windows"):
+                core._read_resolver_metadata(source, "both")
 
     def test_compatible_dual_candidates_have_final_retained_records(self) -> None:
         self.write_template(

@@ -371,6 +371,7 @@ mods: []
                 "  service: demo\n"
             ),
             "url_max_jar_size_bytes": "url_max_jar_size_bytes: 1024\n",
+            "url_allow_private_networks": "url_allow_private_networks: true\n",
         }
         local = self.pack_root / "pack.local.yaml"
         for key, text in allowed_values.items():
@@ -400,9 +401,11 @@ mods: []
         local = self.template_root / "template.local.yaml"
         cases: dict[str, tuple[str, bool]] = {
             "allowed": ("url_max_jar_size_bytes: 1024\n", True),
+            "allowed private network": ("url_allow_private_networks: true\n", True),
             "unknown": ("future_setting: true\n", False),
             "invalid value": ("url_max_jar_size_bytes: false\n", False),
             "null value": ("url_max_jar_size_bytes: null\n", False),
+            "invalid private network": ('url_allow_private_networks: "yes"\n', False),
         }
         cases.update(
             (f"semantic {key}", (f"{key}: local\n", False))
@@ -419,6 +422,19 @@ mods: []
                     self.assertEqual(result, 1)
                     with self.assertRaises(packctl.ConfigError):
                         packctl.load_template_config("base")
+
+    def test_private_network_opt_in_is_rejected_in_committed_manifests(self) -> None:
+        with (self.pack_root / "pack.yaml").open("a", encoding="utf-8") as config:
+            config.write("url_allow_private_networks: true\n")
+        with (self.template_root / "template.yaml").open("a", encoding="utf-8") as config:
+            config.write("url_allow_private_networks: true\n")
+        result, _, stderr = self.validate_all()
+        self.assertEqual(result, 1)
+        self.assertEqual(stderr.count("machine-local only"), 2)
+        with self.assertRaisesRegex(packctl.ConfigError, "machine-local only"):
+            packctl.load_pack_config("demo")
+        with self.assertRaisesRegex(packctl.ConfigError, "machine-local only"):
+            packctl.load_template_config("base")
 
     def test_aggregate_validation_reports_legacy_source_before_bad_manifest(self) -> None:
         (self.template_root / "source").mkdir()

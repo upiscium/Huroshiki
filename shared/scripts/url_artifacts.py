@@ -2,22 +2,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import http.client
+import ipaddress
 import json
 from pathlib import Path
 import queue
 import re
+import socket
+import ssl
 import struct
 import tempfile
 import threading
 import time
 import tomllib
-from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import unquote, urljoin, urlparse
 from uuid import uuid4
 import zipfile
 
 import tomlkit
+
+from portable_paths import PortablePathError, portable_basename, portable_relative_path
 
 
 class HuroshikiError(RuntimeError):
@@ -39,6 +43,7 @@ URL_USER_AGENT = "huroshiki/1 self-hosted-mod-fetcher"
 URL_CHUNK_SIZE = 1024 * 1024
 DEFAULT_URL_MAX_JAR_SIZE_BYTES = 256 * 1024 * 1024
 DEFAULT_URL_TOTAL_TIMEOUT_SECONDS = 120.0
+MAX_URL_REDIRECTS = 10
 MAX_ZIP_ENTRIES = 10_000
 MAX_METADATA_ENTRY_SIZE_BYTES = 1024 * 1024
 ZIP_EOCD_SIZE = 22
@@ -107,11 +112,139 @@ def validate_public_url(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise HuroshikiError("URL provider requires an http:// or https:// public URL")
-    filename = unquote(Path(parsed.path).name)
-    if not filename:
-        raise HuroshikiError("The public URL must end with a downloadable filename")
+    filename = unquote(parsed.path.rsplit("/", 1)[-1])
+    try:
+        filename = portable_basename(filename, context="URL filename")
+    except PortablePathError as error:
+        raise HuroshikiError(str(error)) from error
     if not filename.lower().endswith(".jar"):
         raise HuroshikiError("The self-hosted MOD URL must point to a .jar file")
+
+
+def _approved_addresses(
+    hostname: str,
+    port: int,
+    *,
+    allow_private_networks: bool,
+) -> tuple[str, ...]:
+    try:
+        addresses = tuple(
+            dict.fromkeys(
+                item[4][0]
+                for item in socket.getaddrinfo(
+                    hostname, port, type=socket.SOCK_STREAM
+                )
+            )
+        )
+    except socket.gaierror as error:
+        raise HuroshikiError(f"Could not resolve self-hosted URL host {hostname}: {error}") from error
+    if not addresses:
+        raise HuroshikiError(f"Could not resolve self-hosted URL host {hostname}")
+    if allow_private_networks:
+        return addresses
+    prohibited = [
+        address
+        for address in addresses
+        if not ipaddress.ip_address(address).is_global
+    ]
+    if prohibited:
+        raise HuroshikiError(
+            f"Self-hosted URL host {hostname} resolves to prohibited address "
+            f"{prohibited[0]}; set url_allow_private_networks: true in machine-local "
+            "configuration only when this access is intended"
+        )
+    return addresses
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, hostname: str, port: int, address: str, timeout: float) -> None:
+        super().__init__(hostname, port, timeout=timeout)
+        self._address = address
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self._address, self.port), self.timeout, self.source_address
+        )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, hostname: str, port: int, address: str, timeout: float) -> None:
+        super().__init__(
+            hostname,
+            port,
+            timeout=timeout,
+            context=ssl.create_default_context(),
+        )
+        self._address = address
+
+    def connect(self) -> None:
+        sock = socket.create_connection(
+            (self._address, self.port), self.timeout, self.source_address
+        )
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def _open_validated_url(
+    url: str,
+    *,
+    timeout: float,
+    allow_private_networks: bool,
+):
+    current = url
+    for redirect_count in range(MAX_URL_REDIRECTS + 1):
+        parsed = urlparse(current)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise HuroshikiError("Redirect target must be an http:// or https:// URL")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        address = _approved_addresses(
+            parsed.hostname,
+            port,
+            allow_private_networks=allow_private_networks,
+        )[0]
+        connection_type = (
+            _PinnedHTTPSConnection if parsed.scheme == "https" else _PinnedHTTPConnection
+        )
+        connection = connection_type(parsed.hostname, port, address, timeout)
+        target = parsed.path or "/"
+        if parsed.query:
+            target += f"?{parsed.query}"
+        host = (
+            f"[{parsed.hostname}]"
+            if ":" in parsed.hostname
+            else parsed.hostname
+        )
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        try:
+            connection.request(
+                "GET",
+                target,
+                headers={
+                    "Host": host,
+                    "User-Agent": URL_USER_AGENT,
+                    "Connection": "close",
+                },
+            )
+            response = connection.getresponse()
+        except BaseException:
+            connection.close()
+            raise
+        if response.status not in {301, 302, 303, 307, 308}:
+            if response.status >= 400:
+                response.close()
+                connection.close()
+                raise HuroshikiError(
+                    f"Self-hosted URL returned HTTP {response.status}: {current}"
+                )
+            return response
+        location = response.headers.get("Location")
+        response.close()
+        connection.close()
+        if not location:
+            raise HuroshikiError("Self-hosted URL redirect omitted Location")
+        if redirect_count == MAX_URL_REDIRECTS:
+            raise HuroshikiError("Self-hosted URL exceeded redirect limit")
+        current = urljoin(current, location)
 
 
 def sanitize_mod_id(value: str) -> str:
@@ -250,6 +383,7 @@ def download_url_artifact(
     max_size_bytes: int = DEFAULT_URL_MAX_JAR_SIZE_BYTES,
     *,
     total_timeout_seconds: float = DEFAULT_URL_TOTAL_TIMEOUT_SECONDS,
+    allow_private_networks: bool = False,
 ) -> UrlArtifact:
     validate_public_url(url)
     if (
@@ -268,12 +402,11 @@ def download_url_artifact(
         if time.monotonic() >= deadline:
             raise HuroshikiError("URL download deadline exceeded")
 
-    filename = unquote(Path(urlparse(url).path).name)
-    append_url_log(log_dir, f"Downloading {url}")
-    request = Request(
-        url,
-        headers={"User-Agent": URL_USER_AGENT, "Connection": "close"},
+    filename = portable_basename(
+        unquote(urlparse(url).path.rsplit("/", 1)[-1]),
+        context="URL filename",
     )
+    append_url_log(log_dir, f"Downloading {url}")
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -293,8 +426,10 @@ def download_url_artifact(
 
                 def open_request() -> None:
                     try:
-                        response = urlopen(
-                            request, timeout=min(60.0, total_timeout_seconds)
+                        response = _open_validated_url(
+                            url,
+                            timeout=min(60.0, total_timeout_seconds),
+                            allow_private_networks=allow_private_networks,
                         )
                     except BaseException as error:
                         if not open_abandoned.is_set():
@@ -416,13 +551,9 @@ def download_url_artifact(
                     finally:
                         watcher_stop.set()
                         watcher.join(timeout=1)
-            except HTTPError as error:
+            except (OSError, http.client.HTTPException) as error:
                 raise HuroshikiError(
-                    f"Self-hosted URL returned HTTP {error.code}: {url}"
-                ) from error
-            except URLError as error:
-                raise HuroshikiError(
-                    f"Could not download self-hosted MOD: {error.reason}"
+                    f"Could not download self-hosted MOD: {error}"
                 ) from error
 
         check_cancel_deadline()
@@ -459,6 +590,11 @@ def write_url_metadata(
     artifact: UrlArtifact,
     side: str,
 ) -> None:
+    try:
+        relative_path = portable_relative_path(relative_path)
+        portable_basename(artifact.filename, context="Metadata filename")
+    except PortablePathError as error:
+        raise HuroshikiError(str(error)) from error
     root = source.resolve()
     path = (root / relative_path).resolve()
     if path != root and root not in path.parents:

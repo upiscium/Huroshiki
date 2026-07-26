@@ -72,6 +72,20 @@ class TransactionTestCase(unittest.TestCase):
 
 
 class UpdateTransactionTest(TransactionTestCase):
+    def test_source_change_during_transaction_copy_aborts_update_and_persists(self) -> None:
+        target = self.write_mod("first")
+        original_copy = core.copy_transaction_source
+
+        def racing_copy(source, destination):
+            result = original_copy(source, destination)
+            target.write_text(metadata("First", "first", "external"), encoding="utf-8")
+            return result
+
+        with patch.object(core, "copy_transaction_source", side_effect=racing_copy):
+            with self.assertRaisesRegex(core.HuroshikiError, "while.*copy"):
+                core.update_all(self.key)
+        self.assertIn("external", target.read_text(encoding="utf-8"))
+
     def test_no_candidates_reports_current_and_pinned(self) -> None:
         self.write_mod("current")
         self.write_mod("fixed", pin=True)
@@ -200,6 +214,20 @@ url = "https://example.invalid/manual.jar"
 
 
 class RemoveTransactionTest(TransactionTestCase):
+    def test_source_change_during_transaction_copy_aborts_remove_and_persists(self) -> None:
+        target = self.write_mod("first")
+        original_copy = core.copy_transaction_source
+
+        def racing_copy(source, destination):
+            result = original_copy(source, destination)
+            target.write_text(metadata("First", "first", "external"), encoding="utf-8")
+            return result
+
+        with patch.object(core, "copy_transaction_source", side_effect=racing_copy):
+            with self.assertRaisesRegex(core.HuroshikiError, "while.*copy"):
+                core.remove_installed_mods(self.key, ["first"])
+        self.assertIn("external", target.read_text(encoding="utf-8"))
+
     def test_batch_remove_failure_leaves_every_real_mod(self) -> None:
         first = self.write_mod("first")
         second = self.write_mod("second")
@@ -274,6 +302,29 @@ mods:
                     ["modrinth-first", "curseforge-second"],
                 )
         self.assertEqual(manifest.read_bytes(), original)
+
+    def test_template_config_change_during_resolver_setup_aborts_and_persists(self) -> None:
+        template_root = self.templates / "base"
+        template_root.mkdir(parents=True)
+        manifest = template_root / "template.yaml"
+        manifest.write_text(
+            "id: base\ndisplay_name: Base\nenabled: true\n"
+            "minecraft: 1.21.1\nloader: neoforge\n"
+            "reference_loader_version: 21.1.0\nmods: []\n",
+            encoding="utf-8",
+        )
+        local = template_root / "template.local.yaml"
+        original_setup = core.create_resolver_source
+
+        def racing_setup(*args, **kwargs):
+            result = original_setup(*args, **kwargs)
+            local.write_text("url_max_jar_size_bytes: 1024\n", encoding="utf-8")
+            return result
+
+        with patch.object(core, "create_resolver_source", side_effect=racing_setup):
+            with self.assertRaisesRegex(core.HuroshikiError, "while.*resolver"):
+                core.remove_installed_mods("template:base", ["anything"])
+        self.assertEqual(local.read_text(encoding="utf-8"), "url_max_jar_size_bytes: 1024\n")
 
 
 if __name__ == "__main__":

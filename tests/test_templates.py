@@ -136,12 +136,16 @@ class TemplateManifestTest(unittest.TestCase):
                 template_ids=["base"], minecraft="1.21.1", loader="neoforge"
             )
 
-    def test_template_local_schema_allows_only_url_limit(self) -> None:
+    def test_template_local_schema_allows_only_url_policy(self) -> None:
         local = self.template_root / "template.local.yaml"
         local.write_text("url_max_jar_size_bytes: 1024\n", encoding="utf-8")
         self.assertEqual(
             packctl.load_template_config("base")["url_max_jar_size_bytes"],
             1024,
+        )
+        local.write_text("url_allow_private_networks: true\n", encoding="utf-8")
+        self.assertTrue(
+            packctl.load_template_config("base")["url_allow_private_networks"]
         )
 
         for key in sorted(packctl.TEMPLATE_COMMITTED_KEYS):
@@ -156,8 +160,8 @@ class TemplateManifestTest(unittest.TestCase):
         local.write_text("future_setting: true\n", encoding="utf-8")
         with self.assertRaisesRegex(
             packctl.ConfigError,
-            "unsupported machine-local key 'future_setting'.*allowed key: "
-            "url_max_jar_size_bytes",
+            "unsupported machine-local key 'future_setting'.*allowed keys: "
+            "url_allow_private_networks, url_max_jar_size_bytes",
         ):
             packctl.load_template_config("base")
 

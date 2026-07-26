@@ -135,6 +135,9 @@ loader_version: 21.1.234
 ''',
             encoding="utf-8",
         )
+        (self.pack_root / "pack.local.yaml").write_text(
+            "url_allow_private_networks: true\n", encoding="utf-8"
+        )
         self.patches = [
             patch.object(core, "ROOT", self.root),
             patch.object(core, "PACKS", self.packs),
@@ -187,6 +190,7 @@ loader_version: 21.1.234
                 self.root / "http-logs",
                 "neoforge",
                 limit,
+                allow_private_networks=True,
             )
 
     def assert_downloads_cleaned(self) -> None:
@@ -270,7 +274,8 @@ loader_version: 21.1.234
         with (self.pack_root / "pack.yaml").open("a", encoding="utf-8") as config:
             config.write("url_max_jar_size_bytes: 1\n")
         (self.pack_root / "pack.local.yaml").write_text(
-            f"url_max_jar_size_bytes: {len(payload)}\n",
+            f"url_max_jar_size_bytes: {len(payload)}\n"
+            "url_allow_private_networks: true\n",
             encoding="utf-8",
         )
 
@@ -298,7 +303,8 @@ loader_version: 21.1.234
             encoding="utf-8",
         )
         (template_root / "template.local.yaml").write_text(
-            f"url_max_jar_size_bytes: {len(payload)}\n",
+            f"url_max_jar_size_bytes: {len(payload)}\n"
+            "url_allow_private_networks: true\n",
             encoding="utf-8",
         )
 
@@ -392,6 +398,7 @@ loader_version: 21.1.234
                 threading.Event(),
                 self.root / "logs",
                 "fabric",
+                allow_private_networks=True,
             )
 
         self.assertEqual(artifact.mod_id, "fabric_id")
@@ -497,7 +504,9 @@ loader_version: 21.1.234
         if cancel:
             canceller.start()
         try:
-            with patch.object(url_artifacts, "urlopen", side_effect=blocked_open):
+            with patch.object(
+                url_artifacts, "_open_validated_url", side_effect=blocked_open
+            ):
                 with self.assertRaisesRegex(
                     core.HuroshikiError,
                     "cancelled" if cancel else "deadline exceeded",
@@ -535,7 +544,9 @@ loader_version: 21.1.234
 
         canceller = threading.Thread(target=cancel_after_open)
         canceller.start()
-        with patch.object(url_artifacts, "urlopen", side_effect=blocked_open):
+        with patch.object(
+            url_artifacts, "_open_validated_url", side_effect=blocked_open
+        ):
             with self.assertRaisesRegex(core.HuroshikiError, "cancelled"):
                 core.download_url_artifact(
                     "https://example.invalid/private.jar",
@@ -575,7 +586,9 @@ loader_version: 21.1.234
                 self.closed = True
 
         response = Response()
-        with patch.object(url_artifacts, "urlopen", return_value=response):
+        with patch.object(
+            url_artifacts, "_open_validated_url", return_value=response
+        ):
             artifact = core.download_url_artifact(
                 "https://example.invalid/private.jar",
                 threading.Event(),
@@ -623,7 +636,9 @@ loader_version: 21.1.234
             except BaseException as error:
                 errors.append(error)
 
-        with patch.object(url_artifacts, "urlopen", return_value=BlockingResponse()):
+        with patch.object(
+            url_artifacts, "_open_validated_url", return_value=BlockingResponse()
+        ):
             worker = threading.Thread(target=download)
             worker.start()
             self.assertTrue(entered.wait(1))
@@ -703,7 +718,8 @@ mods:
             ) as config:
                 config.write("url_max_jar_size_bytes: 1\n")
             (template_root / "template.local.yaml").write_text(
-                f"url_max_jar_size_bytes: {jar_path.stat().st_size}\n",
+                f"url_max_jar_size_bytes: {jar_path.stat().st_size}\n"
+                "url_allow_private_networks: true\n",
                 encoding="utf-8",
             )
 
@@ -769,6 +785,67 @@ mods:
             core.normalize_add_selector("url", "file:///tmp/private.jar")
         with self.assertRaises(core.HuroshikiError):
             core.normalize_add_selector("url", "https://example.invalid/private.zip")
+
+    def test_rejects_private_resolution_by_default_and_allows_explicit_opt_in(self) -> None:
+        with patch.object(
+            url_artifacts.socket,
+            "getaddrinfo",
+            return_value=[(2, 1, 6, "", ("127.0.0.1", 80))],
+        ):
+            with self.assertRaisesRegex(core.HuroshikiError, "prohibited address"):
+                url_artifacts._approved_addresses(
+                    "example.test", 80, allow_private_networks=False
+                )
+            self.assertEqual(
+                url_artifacts._approved_addresses(
+                    "example.test", 80, allow_private_networks=True
+                ),
+                ("127.0.0.1",),
+            )
+
+    def test_public_redirect_to_private_resolution_is_rejected(self) -> None:
+        class RedirectResponse:
+            status = 302
+            headers = {"Location": "http://internal.test/private.jar"}
+
+            def close(self) -> None:
+                pass
+
+        class Connection:
+            def __init__(self, *args) -> None:
+                pass
+
+            def request(self, *args, **kwargs) -> None:
+                pass
+
+            def getresponse(self):
+                return RedirectResponse()
+
+            def close(self) -> None:
+                pass
+
+        def resolve(hostname, port, *, allow_private_networks):
+            if hostname == "public.test":
+                return ("203.0.113.10",)
+            raise core.HuroshikiError("prohibited address 127.0.0.1")
+
+        with patch.object(
+            url_artifacts, "_approved_addresses", side_effect=resolve
+        ), patch.object(url_artifacts, "_PinnedHTTPConnection", Connection):
+            with self.assertRaisesRegex(core.HuroshikiError, "prohibited address"):
+                url_artifacts._open_validated_url(
+                    "http://public.test/public.jar",
+                    timeout=1,
+                    allow_private_networks=False,
+                )
+
+    def test_percent_decoded_traversal_and_windows_device_filenames_are_rejected(self) -> None:
+        for url in (
+            "https://example.test/%2e%2e%2fescape.jar",
+            "https://example.test/CON.jar",
+        ):
+            with self.subTest(url=url), self.assertRaises(core.HuroshikiError):
+                core.validate_public_url(url)
 
 
 if __name__ == "__main__":

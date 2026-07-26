@@ -83,6 +83,20 @@ class TemplateMergeTest(unittest.TestCase):
         self.assertEqual(composition.mods[0].max_url_jar_size_bytes, 10)
         self.assertEqual(composition.mods[1].max_url_jar_size_bytes, 1)
 
+    def test_merged_url_allows_private_networks_only_when_every_origin_opts_in(self) -> None:
+        entries = [
+            TemplateModEntry(
+                "a", "Private", "url", "private", "both",
+                "https://example.test/private.jar", 100, True,
+            ),
+            TemplateModEntry(
+                "b", "Private", "url", "private", "both",
+                "https://example.test/private.jar", 100, False,
+            ),
+        ]
+        composition = compose_templates(["a", "b"], entries)
+        self.assertFalse(composition.mods[0].url_allow_private_networks)
+
     def test_architectury_moonlight_and_three_candidate_conflicts(self) -> None:
         composition = compose_templates(
             ["curse", "modrinth", "mirror"],

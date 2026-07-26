@@ -84,11 +84,14 @@ TEMPLATE_COMMITTED_KEYS = frozenset(
         "mods",
     }
 )
-TEMPLATE_LOCAL_KEYS = frozenset({"url_max_jar_size_bytes"})
+TEMPLATE_LOCAL_KEYS = frozenset(
+    {"url_max_jar_size_bytes", "url_allow_private_networks"}
+)
 PACK_LOCAL_KEYS = {
     "distribution": frozenset({"rsync_target"}),
     "minecraft_server": frozenset({"ssh_host", "stack_dir", "service"}),
     "url_max_jar_size_bytes": None,
+    "url_allow_private_networks": None,
 }
 
 
@@ -207,7 +210,7 @@ def validate_local_config(kind: str, path: Path, local: dict[str, Any]) -> None:
                 )
             raise ConfigError(
                 f"{context}: unsupported machine-local key {key!r}; "
-                "allowed key: url_max_jar_size_bytes"
+                "allowed keys: url_allow_private_networks, url_max_jar_size_bytes"
             )
         value = local.get("url_max_jar_size_bytes")
         if "url_max_jar_size_bytes" in local and (
@@ -215,6 +218,13 @@ def validate_local_config(kind: str, path: Path, local: dict[str, Any]) -> None:
         ):
             raise ConfigError(
                 f"{context}: url_max_jar_size_bytes must be a positive integer"
+            )
+        allow_private = local.get("url_allow_private_networks")
+        if "url_allow_private_networks" in local and not isinstance(
+            allow_private, bool
+        ):
+            raise ConfigError(
+                f"{context}: url_allow_private_networks must be a boolean"
             )
         return
 
@@ -255,6 +265,9 @@ def validate_local_config(kind: str, path: Path, local: dict[str, Any]) -> None:
         raise ConfigError(
             f"{context}: url_max_jar_size_bytes must be a positive integer"
         )
+    allow_private = local.get("url_allow_private_networks")
+    if "url_allow_private_networks" in local and not isinstance(allow_private, bool):
+        raise ConfigError(f"{context}: url_allow_private_networks must be a boolean")
 
 
 def ensure_safe_state_path(
@@ -352,10 +365,16 @@ def get_pack_root(pack_id: str, *, must_exist: bool = True) -> Path:
 
 def load_pack_config(pack_id: str) -> dict[str, Any]:
     root = get_pack_root(pack_id)
+    committed = load_yaml(root / "pack.yaml")
+    if "url_allow_private_networks" in committed:
+        raise ConfigError(
+            f"{display_path(root / 'pack.yaml')}: url_allow_private_networks is "
+            "machine-local only; move it to pack.local.yaml"
+        )
     local_path = root / "pack.local.yaml"
     local = load_yaml(local_path)
     validate_local_config("pack", local_path, local)
-    config = merge(load_yaml(root / "pack.yaml"), local)
+    config = merge(committed, local)
     if config.get("id") != pack_id:
         raise ConfigError(f"packs/{pack_id}/pack.yaml must contain id: {pack_id}")
     return config
@@ -384,6 +403,11 @@ def load_template_config(template_id: str) -> dict[str, Any]:
     root = get_template_root(template_id)
     reject_legacy_template_source(root)
     config = load_yaml(root / "template.yaml")
+    if "url_allow_private_networks" in config:
+        raise ConfigError(
+            f"{display_path(root / 'template.yaml')}: url_allow_private_networks is "
+            "machine-local only; move it to template.local.yaml"
+        )
     local_path = root / "template.local.yaml"
     local = load_yaml(local_path)
     validate_local_config("template", local_path, local)
@@ -1497,6 +1521,11 @@ def validate_pack_directory(root: Path) -> list[str]:
         errors.append(f"{display_path(root)}: invalid directory name: {error}")
 
     if config is not None:
+        if "url_allow_private_networks" in config:
+            errors.append(
+                f"{display_path(manifest)}: url_allow_private_networks is "
+                "machine-local only; move it to pack.local.yaml"
+            )
         effective = merge(
             config, local if local_is_valid and local is not None else {}
         )
@@ -1562,6 +1591,11 @@ def validate_template_directory(root: Path) -> list[str]:
     if config is None:
         return errors
     committed = config
+    if "url_allow_private_networks" in committed:
+        errors.append(
+            f"{display_path(manifest)}: url_allow_private_networks is machine-local "
+            "only; move it to template.local.yaml"
+        )
     config = merge(
         committed, local if local_is_valid and local is not None else {}
     )

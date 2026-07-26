@@ -60,6 +60,13 @@ from url_artifacts import (
     validate_public_url,
     write_url_metadata,
 )
+from portable_paths import (
+    PortablePathError,
+    portable_basename,
+    portable_basename_key,
+    portable_relative_path,
+    portable_relative_path_key,
+)
 
 ROOT = packctl.ROOT
 PACKS = packctl.PACKS
@@ -434,6 +441,7 @@ class PackTransaction:
     baseline: dict[Path, str]
     baseline_contents: dict[Path, bytes] = field(default_factory=dict)
     real_source_baseline: dict[Path, str] = field(default_factory=dict)
+    pack_config_baseline: dict[str, str] = field(default_factory=dict)
     template_config_baseline: dict[str, str] = field(default_factory=dict)
     template_manifest: list[object] | None = None
     batches: list[TransactionBatch] = field(default_factory=list)
@@ -477,16 +485,28 @@ class PackTransaction:
                     raise HuroshikiError(
                         f"Missing Packwiz source directory: {real_source}"
                     )
-                shutil.copytree(real_source, tx_source, symlinks=True)
+                verified_config = pack_config_snapshot(real_root)
+                verified_baseline = tree_digest_snapshot(real_source)
+                copy_transaction_source(real_source, tx_source)
+                if (
+                    tree_digest_snapshot(real_source) != verified_baseline
+                    or pack_config_snapshot(real_root) != verified_config
+                ):
+                    raise HuroshikiError(
+                        "The pack source or configuration changed while the transaction "
+                        "copy was being created; retry the operation."
+                    )
                 transaction = cls(
                     project_key=project_key_value,
                     root=tx_root,
                     source=tx_source,
                     baseline=metadata_digest_snapshot(tx_source),
                     baseline_contents=metadata_content_snapshot(tx_source),
-                    real_source_baseline=tree_digest_snapshot(real_source),
+                    real_source_baseline=verified_baseline,
+                    pack_config_baseline=verified_config,
                 )
             else:
+                verified_config = template_config_snapshot(real_root)
                 config = packctl.load_template_config(project_id)
                 minecraft, loader, loader_version = packctl.template_versions(
                     project_id
@@ -498,13 +518,18 @@ class PackTransaction:
                     loader=loader,
                     loader_version=loader_version,
                 )
+                if template_config_snapshot(real_root) != verified_config:
+                    raise HuroshikiError(
+                        "The template configuration changed while the transaction "
+                        "resolver was being created; retry the operation."
+                    )
                 transaction = cls(
                     project_key=project_key_value,
                     root=tx_root,
                     source=tx_source,
                     baseline={},
                     baseline_contents={},
-                    template_config_baseline=template_config_snapshot(real_root),
+                    template_config_baseline=verified_config,
                 )
             transaction._project_lock = project_lock
             return transaction
@@ -671,6 +696,9 @@ class PackTransaction:
                 operation.log_dir,
                 project_info(self.project_key).loader,
                 project_url_max_jar_size_bytes(self.project_key),
+                allow_private_networks=project_url_allow_private_networks(
+                    self.project_key
+                ),
             )
             if operation.cancelled or operation.cancel_event.is_set():
                 raise HuroshikiError("URL addition was cancelled")
@@ -965,9 +993,13 @@ class PackTransaction:
 
         real_root = project_root(self.project_key)
         real_source = real_root / "source"
-        if tree_digest_snapshot(real_source) != self.real_source_baseline:
+        if (
+            tree_digest_snapshot(real_source) != self.real_source_baseline
+            or pack_config_snapshot(real_root) != self.pack_config_baseline
+        ):
             raise HuroshikiError(
-                "The real Packwiz source changed while this transaction was open. "
+                "The real Packwiz source changed or pack configuration changed while "
+                "this transaction was open. "
                 "Discard the staged transaction and retry to avoid overwriting external changes."
             )
 
@@ -1128,6 +1160,17 @@ def url_max_jar_size_bytes(config: dict[str, object]) -> int:
 
 def project_url_max_jar_size_bytes(project_key_value: str) -> int:
     return url_max_jar_size_bytes(project_config(project_key_value))
+
+
+def url_allow_private_networks(config: dict[str, object]) -> bool:
+    value = config.get("url_allow_private_networks", False)
+    if not isinstance(value, bool):
+        raise packctl.ConfigError("url_allow_private_networks must be a boolean")
+    return value
+
+
+def project_url_allow_private_networks(project_key_value: str) -> bool:
+    return url_allow_private_networks(project_config(project_key_value))
 
 
 def safe_child(root: Path, relative: Path) -> Path:
@@ -1356,9 +1399,21 @@ def file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+def copy_transaction_source(source: Path, destination: Path) -> None:
+    shutil.copytree(source, destination, symlinks=True)
+
+
 def template_config_snapshot(root: Path) -> dict[str, str]:
     snapshot: dict[str, str] = {}
     for name in ("template.yaml", "template.local.yaml"):
+        path = root / name
+        snapshot[name] = file_digest(path) if path.is_file() else "missing"
+    return snapshot
+
+
+def pack_config_snapshot(root: Path) -> dict[str, str]:
+    snapshot: dict[str, str] = {}
+    for name in ("pack.yaml", "pack.local.yaml"):
         path = root / name
         snapshot[name] = file_digest(path) if path.is_file() else "missing"
     return snapshot
@@ -1851,6 +1906,9 @@ def apply_profiles(
     on_entry: Callable[[str, Path, str], None] | None = None,
 ) -> None:
     """Apply selected profiles in order as one all-or-nothing pack transaction."""
+    kind, _ = split_project_key(project_key_value)
+    if kind != "pack":
+        raise HuroshikiError("Profiles can only be applied to MODPACK projects")
     selected_names = tuple(names)
     transaction = PackTransaction.create(project_key_value)
     try:
@@ -2266,9 +2324,15 @@ def _read_resolver_metadata(
 ) -> tuple[_ResolvedTemplateMetadata, ...]:
     records: list[_ResolvedTemplateMetadata] = []
     identities: dict[tuple[str, str], Path] = {}
+    paths: dict[str, tuple[str, str]] = {}
     filenames: dict[str, tuple[str, str]] = {}
     for path in sorted(source.rglob("*.pw.toml")):
         relative = path.relative_to(source)
+        try:
+            relative = portable_relative_path(relative)
+            path_key = portable_relative_path_key(relative)
+        except PortablePathError as error:
+            raise HuroshikiError(f"Resolver metadata path {relative}: {error}") from error
         mod = read_mod(source, relative)
         provider = canonical_provider(mod.provider)
         identity = (provider, mod.project_id)
@@ -2276,28 +2340,38 @@ def _read_resolver_metadata(
             raise HuroshikiError(
                 f"Resolver metadata {relative} has no stable provider/project identity"
             )
-        if not mod.filename:
-            raise HuroshikiError(f"Resolver metadata {relative} has no filename")
+        try:
+            filename = portable_basename(mod.filename, context="Metadata filename")
+            filename_key = portable_basename_key(filename)
+        except PortablePathError as error:
+            raise HuroshikiError(f"Resolver metadata {relative}: {error}") from error
         previous_path = identities.get(identity)
         if previous_path is not None:
             raise HuroshikiError(
                 f"Resolver produced identity {provider}:{mod.project_id} at both "
                 f"{previous_path} and {relative}"
             )
-        filename_owner = filenames.get(mod.filename)
+        path_owner = paths.get(path_key)
+        if path_owner is not None and path_owner != identity:
+            raise HuroshikiError(
+                f"Resolver produced portable metadata path collision at {relative} for "
+                f"{path_owner[0]}:{path_owner[1]} and {provider}:{mod.project_id}"
+            )
+        filename_owner = filenames.get(filename_key)
         if filename_owner is not None and filename_owner != identity:
             raise HuroshikiError(
-                f"Resolver produced filename collision {mod.filename!r} for "
+                f"Resolver produced portable filename collision {filename!r} for "
                 f"{filename_owner[0]}:{filename_owner[1]} and {provider}:{mod.project_id}"
             )
         identities[identity] = relative
-        filenames[mod.filename] = identity
+        paths[path_key] = identity
+        filenames[filename_key] = identity
         records.append(
             _ResolvedTemplateMetadata(
                 relative,
                 provider,
                 mod.project_id,
-                mod.filename,
+                filename,
                 _metadata_contents_with_side(path.read_bytes(), side),
             )
         )
@@ -2353,6 +2427,7 @@ def _resolve_template_root(
                 log_dir,
                 loader,
                 entry.max_url_jar_size_bytes or DEFAULT_URL_MAX_JAR_SIZE_BYTES,
+                allow_private_networks=entry.url_allow_private_networks,
             )
             if artifact.mod_id != entry.project_id:
                 raise HuroshikiError(
@@ -2404,7 +2479,7 @@ def _merge_resolved_template_roots(
     tuple[TemplateInstallFailure, ...],
 ]:
     merged: dict[tuple[str, str], _ResolvedTemplateMetadata] = {}
-    path_owners: dict[Path, tuple[str, str]] = {}
+    path_owners: dict[str, tuple[str, str]] = {}
     filename_owners: dict[str, tuple[str, str]] = {}
     url_root_owners: dict[tuple[str, str], str] = {}
     retained: list[RetainedTemplateCandidate] = []
@@ -2425,9 +2500,37 @@ def _merge_resolved_template_roots(
         pending_filenames = dict(filename_owners)
         if reason is None:
             for item in root.metadata:
-                if item.identity in merged:
+                path_key = portable_relative_path_key(item.relative_path)
+                filename_key = portable_basename_key(item.filename)
+                existing = merged.get(item.identity)
+                if existing is not None:
+                    existing_document = tomllib.loads(
+                        existing.contents.decode("utf-8")
+                    )
+                    incoming_document = tomllib.loads(item.contents.decode("utf-8"))
+                    existing_document.pop("side", None)
+                    incoming_document.pop("side", None)
+                    existing_document["filename"] = portable_basename(
+                        str(existing_document.get("filename", "")),
+                        context="Metadata filename",
+                    )
+                    incoming_document["filename"] = portable_basename(
+                        str(incoming_document.get("filename", "")),
+                        context="Metadata filename",
+                    )
+                    if (
+                        portable_relative_path_key(existing.relative_path) != path_key
+                        or portable_basename_key(existing.filename) != filename_key
+                        or existing_document != incoming_document
+                    ):
+                        reason = (
+                            "resolved metadata disagreement for shared identity "
+                            f"{item.provider}:{item.project_id}; dependency versions, "
+                            "paths, downloads, or update metadata differ"
+                        )
+                        break
                     continue
-                path_owner = pending_paths.get(item.relative_path)
+                path_owner = pending_paths.get(path_key)
                 if path_owner is not None and path_owner != item.identity:
                     reason = (
                         f"metadata path collision at {item.relative_path}: "
@@ -2435,7 +2538,7 @@ def _merge_resolved_template_roots(
                         f"{item.provider}:{item.project_id}"
                     )
                     break
-                filename_owner = pending_filenames.get(item.filename)
+                filename_owner = pending_filenames.get(filename_key)
                 if filename_owner is not None and filename_owner != item.identity:
                     reason = (
                         f"filename collision for {item.filename!r}: "
@@ -2443,8 +2546,8 @@ def _merge_resolved_template_roots(
                         f"{item.provider}:{item.project_id}"
                     )
                     break
-                pending_paths[item.relative_path] = item.identity
-                pending_filenames[item.filename] = item.identity
+                pending_paths[path_key] = item.identity
+                pending_filenames[filename_key] = item.identity
 
         if reason is not None:
             failures.append(
@@ -2505,6 +2608,7 @@ def prepare_template_composition(
         for template_id in template_ids:
             config = packctl.load_template_config(template_id)
             max_url_size = url_max_jar_size_bytes(config)
+            allow_private_networks = url_allow_private_networks(config)
             template_minecraft, template_loader, _ = packctl.template_versions(template_id)
             if template_minecraft != minecraft or template_loader != loader.strip().lower():
                 raise HuroshikiError(
@@ -2526,6 +2630,7 @@ def prepare_template_composition(
                     url=entry.get("url"),
                     side=entry["side"],
                     max_url_jar_size_bytes=max_url_size,
+                    url_allow_private_networks=allow_private_networks,
                 )
                 for index, raw_entry in enumerate(raw_mods)
                 for entry in (

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Review Safety Follow-ups (#32-#37)
+
+- Transaction creation now verifies pack source and machine-local/committed configuration before
+  and after staging, so copy/setup races abort without overwriting external changes. Profiles reject
+  template keys before opening a transaction.
+- Resolver closure merges now require semantically identical metadata except for `side`, and all
+  generated metadata paths and filenames use portable Unicode/case-insensitive collision rules.
+- URL downloads reject non-public literal/resolved addresses and redirects by default and pin each
+  connection to an approved DNS result. The machine-local-only `url_allow_private_networks` boolean
+  enables intentional internal access; composed URL candidates require every origin to opt in.
+
 ### Overlay Safety (#32, #33)
 
 - Validation, builds, and interactive content editing now share one no-follow overlay policy.
@@ -48,11 +59,14 @@
 
 ### Breaking: Machine-Local Configuration Schema (#37)
 
-- `template.local.yaml` now permits only a positive integer `url_max_jar_size_bytes`. Template
+- `template.local.yaml` now permits only a positive integer `url_max_jar_size_bytes` and the boolean
+  `url_allow_private_networks`. Template
   identity, display name, enablement, Minecraft/loader settings, reference loader version, MODs, and
   unknown keys fail closed in validation, runtime loading, and the TUI.
 - `pack.local.yaml` now permits only `distribution.rsync_target`,
-  `minecraft_server.{ssh_host,stack_dir,service}`, and `url_max_jar_size_bytes`. Identity, Packwiz
-  semantic settings, and unknown top-level or nested keys are rejected.
-- Template side/delete operations continue to write committed `template.yaml`. Template transaction
-  conflict detection now covers both committed configuration and the allowed local URL limit.
+  `minecraft_server.{ssh_host,stack_dir,service}`, `url_max_jar_size_bytes`, and
+  `url_allow_private_networks`. Identity, Packwiz
+  semantic settings, and unknown top-level or nested keys are rejected. The private-network key is
+  machine-local-only and is rejected in either committed manifest.
+- Template side/delete operations continue to write committed `template.yaml`. Transaction conflict
+  detection covers both committed configuration and allowed local URL policy.
