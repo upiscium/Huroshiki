@@ -27,6 +27,14 @@ class PublicCliTest(unittest.TestCase):
                     "https://www.curseforge.com/minecraft/mc-mods/example",
                 ),
             ),
+            (
+                "url:https://mods.example/private.jar",
+                ("url", "https://mods.example/private.jar"),
+            ),
+            (
+                "https://mods.example/private.jar",
+                ("url", "https://mods.example/private.jar"),
+            ),
         )
         for query, expected in cases:
             with self.subTest(query=query):

@@ -188,7 +188,7 @@ url = "https://example.invalid/manual.jar"
                 )
                 (cwd / "index.toml").write_text("resolver index\n", encoding="utf-8")
                 (cwd / "pack.toml").write_text("resolver pack\n", encoding="utf-8")
-            elif command == ["packwiz", "refresh"]:
+            elif command == ["packwiz", "refresh"] and cwd == transaction.source:
                 self.assertTrue((cwd / "mods" / "dependency.pw.toml").is_file())
                 (cwd / "index.toml").write_text(
                     "final index: dependency.pw.toml\n", encoding="utf-8"
@@ -374,10 +374,12 @@ url = "https://example.invalid/manual.jar"
         original = target.read_bytes()
 
         def run(command, *, cwd, **_):
-            (cwd / "mods" / "first.pw.toml").write_text(
-                metadata("First", "first", "broken"), encoding="utf-8"
-            )
-            return subprocess.CompletedProcess(command, 9, "", "network failed")
+            if command[:3] == ["packwiz", "--yes", "update"]:
+                (cwd / "mods" / "first.pw.toml").write_text(
+                    metadata("First", "first", "broken"), encoding="utf-8"
+                )
+                return subprocess.CompletedProcess(command, 9, "", "network failed")
+            return self.completed(command)
 
         transaction = core.PackTransaction.create(self.key)
         with patch.object(core.subprocess, "run", side_effect=run):
@@ -391,6 +393,79 @@ url = "https://example.invalid/manual.jar"
             original,
         )
         self.assertEqual(target.read_bytes(), original)
+        transaction.discard()
+
+    def test_duplicate_slugs_in_different_paths_are_all_unavailable(self) -> None:
+        first = self.write_mod("shared")
+        nested = self.source / "optional" / "shared.pw.toml"
+        nested.parent.mkdir()
+        nested.write_text(metadata("Other", "other", "v1"), encoding="utf-8")
+
+        transaction = core.PackTransaction.create(self.key)
+        with patch.object(core.subprocess, "run") as run:
+            candidates = transaction.prepare_updates()
+
+        self.assertEqual([item.status for item in candidates], ["unavailable", "unavailable"])
+        for candidate in candidates:
+            self.assertIn("ambiguous Packwiz update slug 'shared'", candidate.error or "")
+            self.assertIn(str(first.relative_to(self.source)), candidate.error or "")
+            self.assertIn(str(nested.relative_to(self.source)), candidate.error or "")
+        run.assert_not_called()
+        transaction.discard()
+
+    def test_disposable_normalization_indexes_untracked_metadata_before_update(self) -> None:
+        self.write_mod("first")
+        (self.source / "index.toml").write_text("stale index\n", encoding="utf-8")
+        original_index = (self.source / "index.toml").read_bytes()
+        normalization_sources: list[Path] = []
+
+        def run(command, *, cwd, **_):
+            if command == ["packwiz", "refresh"]:
+                normalization_sources.append(cwd)
+                (cwd / "index.toml").write_text(
+                    "indexed mods/first.pw.toml\n", encoding="utf-8"
+                )
+            elif command == ["packwiz", "--yes", "update", "first"]:
+                self.assertIn("mods/first.pw.toml", (cwd / "index.toml").read_text())
+                (cwd / "mods/first.pw.toml").write_text(
+                    metadata("First", "first", "v2"), encoding="utf-8"
+                )
+            return self.completed(command)
+
+        transaction = core.PackTransaction.create(self.key)
+        with patch.object(core.subprocess, "run", side_effect=run):
+            candidates = transaction.prepare_updates()
+
+        self.assertTrue(candidates[0].available)
+        self.assertEqual(len(normalization_sources), 1)
+        self.assertNotEqual(normalization_sources[0], self.source)
+        self.assertNotEqual(normalization_sources[0], transaction.source)
+        self.assertEqual((self.source / "index.toml").read_bytes(), original_index)
+        self.assertEqual((transaction.source / "index.toml").read_bytes(), original_index)
+        transaction.discard()
+
+    def test_normalization_failure_is_actionable_and_preserves_statuses_and_source(self) -> None:
+        current = self.write_mod("current")
+        self.write_mod("fixed", pin=True)
+        original = current.read_bytes()
+
+        def run(command, *, cwd, **_):
+            self.assertEqual(command, ["packwiz", "refresh"])
+            (cwd / "index.toml").write_text("partial\n", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 8, "", "bad index")
+
+        transaction = core.PackTransaction.create(self.key)
+        with patch.object(core.subprocess, "run", side_effect=run):
+            candidates = transaction.prepare_updates()
+
+        self.assertEqual(
+            [(item.slug, item.status) for item in candidates],
+            [("current", "unavailable"), ("fixed", "pinned")],
+        )
+        self.assertIn("disposable baseline normalization failed: bad index", candidates[0].error or "")
+        self.assertEqual(candidates[0].error_returncode, 8)
+        self.assertEqual(current.read_bytes(), original)
+        self.assertEqual((transaction.source / "index.toml").read_text(), 'hash-format = "sha256"\n')
         transaction.discard()
 
     def test_discard_cancels_staged_update(self) -> None:
@@ -453,6 +528,33 @@ url = "https://example.invalid/manual.jar"
 
         self.assertIn("external", target.read_text(encoding="utf-8"))
         self.assertFalse(list(self.source.parent.glob(".source.huroshiki-backup-*")))
+        transaction.discard()
+
+    def test_interrupt_after_successful_initial_rename_restores_exact_source(self) -> None:
+        target = self.write_mod("first")
+        original = target.read_bytes()
+        transaction = core.PackTransaction.create(self.key)
+        (transaction.source / "mods/first.pw.toml").write_text(
+            metadata("First", "first", "v2"), encoding="utf-8"
+        )
+        real_rename = Path.rename
+
+        def rename_then_interrupt(path: Path, destination: Path):
+            result = real_rename(path, destination)
+            if path == self.source:
+                raise KeyboardInterrupt
+            return result
+
+        with patch.object(
+            core.subprocess,
+            "run",
+            side_effect=lambda command, **_: self.completed(command),
+        ), patch.object(Path, "rename", rename_then_interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                transaction.apply()
+
+        self.assertEqual(target.read_bytes(), original)
+        self.assertFalse((transaction.root / "replaced-source").exists())
         transaction.discard()
 
     def test_late_old_inode_write_is_retained_until_completed_state_cleanup(self) -> None:

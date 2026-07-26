@@ -63,6 +63,10 @@ following them, and Packwiz-owned names (`pack.toml`, `index.toml`, and `*.pw.to
 `source/`; validation and builds reject those case-sensitive Packwiz names anywhere under
 `content/common|client|server`.
 
+Packwiz `source/` trees likewise may contain only ordinary files and directories. Validation and
+runtime transactions reject every symlink and special filesystem entry before copying or running
+Packwiz, including dangling, internal, absolute, and escaping links.
+
 ## Interactive Use
 
 Open the project browser or one project directly:
@@ -132,6 +136,7 @@ Create and modify projects:
 packctl new demo "Demo Pack" 1.21.1 neoforge 21.1.234
 packctl new-template industrial-base "Industrial Base" 1.21.1 neoforge 21.1.234
 packctl add demo mr:create both
+packctl add demo url:https://mods.example/private-mod.jar server
 packctl remove demo create
 packctl side demo mods/create.pw.toml both
 packctl profile demo base performance

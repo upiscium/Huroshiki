@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -144,6 +145,35 @@ class RepositoryValidationTest(unittest.TestCase):
         ):
             self.assertIn(expected, stderr)
         self.assertNotIn("packs/demo/source/mods/create.pw.toml: Packwiz-owned", stderr)
+
+    def test_pack_source_rejects_all_link_shapes_and_special_entries(self) -> None:
+        external = self.root / "external"
+        external.mkdir()
+        (external / "secret").write_text("keep", encoding="utf-8")
+        links = {
+            "internal": Path("create.pw.toml"),
+            "absolute": external / "secret",
+            "escaping": Path("../../../../external/secret"),
+            "dangling": self.root / "missing",
+            "directory": external,
+        }
+        for name, target in links.items():
+            (self.pack_root / "source/mods" / name).symlink_to(
+                target, target_is_directory=name == "directory"
+            )
+        fifo = self.pack_root / "source/mods/special"
+        os.mkfifo(fifo)
+
+        result, _, stderr = self.validate_all()
+
+        self.assertEqual(result, 1)
+        for name in links:
+            self.assertIn(f"packs/demo/source/mods/{name}: symlink is not allowed", stderr)
+        self.assertIn(
+            "packs/demo/source/mods/special: special filesystem entry is not allowed",
+            stderr,
+        )
+        self.assertEqual((external / "secret").read_text(), "keep")
 
     def test_portable_metadata_filename_collisions_accumulate(self) -> None:
         (self.pack_root / "source/mods/create.pw.toml").write_text(

@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -928,11 +929,20 @@ def direct_project_selector(query: str) -> tuple[str, str] | None:
             raise ConfigError("cf: requires a CurseForge project ID, slug or URL")
         return "curseforge", value
 
+    if lowered.startswith("url:"):
+        value = query[4:].strip()
+        if not value:
+            raise ConfigError("url: requires an HTTPS JAR URL")
+        return "url", value
+
     if "modrinth.com/" in lowered:
         return "modrinth", query
 
     if "curseforge.com/" in lowered:
         return "curseforge", query
+
+    if urlparse(query).scheme.lower() in {"http", "https"}:
+        return "url", query
 
     return None
 
@@ -941,25 +951,28 @@ def choose_provider() -> str | None:
     if not sys.stdin.isatty():
         raise ConfigError(
             "Provider selection requires a terminal. "
-            "Use mr:<project>, cf:<project>, or a project URL."
+            "Use mr:<project>, cf:<project>, url:<https JAR URL>, or a provider URL."
         )
 
     print("Select provider:")
     print("  1. Modrinth")
     print("  2. CurseForge")
+    print("  3. URL (self-hosted JAR)")
     print("  q. Cancel")
 
     while True:
-        answer = input("Provider [1/2/q]: ").strip().lower()
+        answer = input("Provider [1/2/3/q]: ").strip().lower()
 
         if answer in {"1", "m", "mr", "modrinth"}:
             return "modrinth"
         if answer in {"2", "c", "cf", "curseforge"}:
             return "curseforge"
+        if answer in {"3", "u", "url"}:
+            return "url"
         if answer in {"q", "quit", "cancel"}:
             return None
 
-        print("Enter 1, 2, or q.")
+        print("Enter 1, 2, 3, or q.")
 
 
 def cmd_add(args: argparse.Namespace) -> int:
@@ -976,7 +989,10 @@ def cmd_add(args: argparse.Namespace) -> int:
             return 0
         selector = args.query
 
-    print(f"Using Packwiz {provider} search/install.")
+    if provider == "url":
+        print("Using self-hosted URL download/install.")
+    else:
+        print(f"Using Packwiz {provider} search/install.")
     try:
         return huroshiki_core.add_mod_transactionally(
             huroshiki_core.project_key("pack", args.pack),
@@ -1438,6 +1454,58 @@ def validate_packwiz_versions(source: Path, errors: list[str]) -> None:
             )
 
 
+def pack_source_entry_issues(source: Path) -> list[tuple[Path, str]]:
+    """Inspect a Packwiz source without following any filesystem links."""
+    issues: list[tuple[Path, str]] = []
+    if source.is_symlink():
+        try:
+            target = source.readlink()
+        except OSError as error:
+            target = Path(f"<unreadable: {error}>")
+        return [(Path("."), f"symlink is not allowed -> {target}")]
+    if not source.exists():
+        return issues
+    try:
+        root_mode = source.stat(follow_symlinks=False).st_mode
+    except OSError as error:
+        return [(Path("."), f"could not inspect safely: {error}")]
+    if not stat.S_ISDIR(root_mode):
+        return [(Path("."), "source must be an ordinary directory")]
+
+    def scan(directory: Path, relative: Path) -> None:
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name)
+        except OSError as error:
+            issues.append((relative, f"could not inspect safely: {error}"))
+            return
+        for entry in entries:
+            item_relative = relative / entry.name
+            try:
+                mode = entry.stat(follow_symlinks=False).st_mode
+                if stat.S_ISLNK(mode):
+                    try:
+                        target = os.readlink(entry.path)
+                    except OSError as error:
+                        target = f"<unreadable: {error}>"
+                    issues.append(
+                        (item_relative, f"symlink is not allowed -> {target}")
+                    )
+                elif stat.S_ISDIR(mode):
+                    scan(Path(entry.path), item_relative)
+                elif not stat.S_ISREG(mode):
+                    issues.append(
+                        (item_relative, "special filesystem entry is not allowed")
+                    )
+            except OSError as error:
+                issues.append(
+                    (item_relative, f"could not inspect safely: {error}")
+                )
+
+    scan(source, Path("."))
+    return issues
+
+
 def validate_pack_directory(root: Path) -> list[str]:
     errors: list[str] = []
     manifest = root / "pack.yaml"
@@ -1475,16 +1543,21 @@ def validate_pack_directory(root: Path) -> list[str]:
         validate_deployment_config(effective, manifest, errors)
 
     source = root / "source"
+    source_issues = pack_source_entry_issues(source)
+    for relative, message in source_issues:
+        path = source if relative == Path(".") else source / relative
+        errors.append(f"{display_path(path)}: {message}")
+    source_is_safe = not source_issues
     pack_toml = source / "pack.toml"
     index_toml = source / "index.toml"
     for required in (pack_toml, index_toml):
-        if not required.is_file():
+        if source.is_symlink() or required.is_symlink() or not required.is_file():
             errors.append(f"{display_path(required)}: missing required file")
 
-    if pack_toml.is_file():
+    if source_is_safe and pack_toml.is_file():
         validate_packwiz_versions(source, errors)
 
-    if source.is_dir():
+    if source_is_safe and source.is_dir():
         filename_owners: dict[str, tuple[Path, str]] = {}
         for metadata in metadata_files(source):
             try:

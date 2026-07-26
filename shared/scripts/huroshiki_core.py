@@ -366,7 +366,7 @@ class PackwizAddOperation:
         self.result: AddOperationResult | None = None
 
         self.checkpoint = transaction.root / f"checkpoint-{uuid4().hex}"
-        shutil.copytree(transaction.source, self.checkpoint, symlinks=True)
+        copy_transaction_source(transaction.source, self.checkpoint)
         self.before = metadata_digest_snapshot(transaction.source)
 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
@@ -504,6 +504,7 @@ class PackTransaction:
                     raise HuroshikiError(
                         f"Missing Packwiz source directory: {real_source}"
                     )
+                ensure_safe_pack_source(real_source)
                 verified_config = pack_config_snapshot(real_root)
                 verified_baseline = tree_digest_snapshot(real_source)
                 copy_transaction_source(real_source, tx_source)
@@ -622,7 +623,7 @@ class PackTransaction:
                 "" if result.success else result.message,
             )
         checkpoint = self.root / f"checkpoint-{uuid4().hex}"
-        shutil.copytree(self.source, checkpoint, symlinks=True)
+        copy_transaction_source(self.source, checkpoint)
         before = metadata_digest_snapshot(self.source)
         result = subprocess.run(
             build_add_command(provider, query), cwd=self.source, text=True, check=False
@@ -631,6 +632,12 @@ class PackTransaction:
             shutil.rmtree(self.source, ignore_errors=True)
             checkpoint.rename(self.source)
             return result
+        try:
+            ensure_safe_pack_source(self.source)
+        except BaseException:
+            shutil.rmtree(self.source, ignore_errors=True)
+            checkpoint.rename(self.source)
+            raise
         changed = tuple(
             sorted(changed_paths(before, metadata_digest_snapshot(self.source)))
         )
@@ -655,6 +662,7 @@ class PackTransaction:
         except packctl.ConfigError as error:
             raise HuroshikiError(str(error)) from error
         provider, selector = normalize_add_selector(provider, selector)
+        ensure_safe_pack_source(self.source)
         before = metadata_digest_snapshot(self.source)
 
         if provider == "url":
@@ -679,6 +687,7 @@ class PackTransaction:
             )
             if result.returncode != 0:
                 return result.returncode
+            ensure_safe_pack_source(self.source)
             changed = self._classify_add_changes(before, normalized_side)
             self.batches.append(
                 TransactionBatch(
@@ -696,6 +705,7 @@ class PackTransaction:
         before: dict[Path, str],
         side: str,
     ) -> tuple[Path, ...]:
+        ensure_safe_pack_source(self.source)
         changed = tuple(
             sorted(changed_paths(before, metadata_digest_snapshot(self.source)))
         )
@@ -710,9 +720,44 @@ class PackTransaction:
                 "Packwiz did not create or modify any .pw.toml files. "
                 "The project may already be installed."
             )
+        baseline_by_path: dict[Path, ModInfo] = {}
+        baseline_by_identity: dict[tuple[str, str], ModInfo] = {}
+        for baseline_path, contents in self.baseline_contents.items():
+            try:
+                baseline_mod = read_mod_data(
+                    baseline_path,
+                    tomllib.loads(contents.decode("utf-8")),
+                )
+            except (UnicodeError, tomllib.TOMLDecodeError) as error:
+                raise HuroshikiError(
+                    f"Could not preserve baseline side for {baseline_path}: {error}"
+                ) from error
+            baseline_by_path[baseline_path] = baseline_mod
+            identity = (canonical_provider(baseline_mod.provider), baseline_mod.project_id)
+            if identity[0] in {"modrinth", "curseforge", "url"} and identity[1]:
+                baseline_by_identity[identity] = baseline_mod
+
         for relative_path in metadata_paths:
             try:
-                packctl.set_side_file(self.source / relative_path, side)
+                current = read_mod(self.source, relative_path)
+                baseline_mod = baseline_by_path.get(relative_path)
+                identity = (canonical_provider(current.provider), current.project_id)
+                identity_match = baseline_by_identity.get(identity)
+                if baseline_mod is None:
+                    baseline_mod = identity_match
+                elif identity_match is not None and identity_match.side != baseline_mod.side:
+                    raise HuroshikiError(
+                        f"Conflicting baseline side identity for {relative_path}"
+                    )
+                assigned_side = side
+                if baseline_mod is not None:
+                    if baseline_mod.side_error is not None:
+                        raise HuroshikiError(
+                            f"Cannot preserve invalid baseline side for "
+                            f"{baseline_mod.relative_path}: {baseline_mod.side_error}"
+                        )
+                    assigned_side = union_side(baseline_mod.side, side)
+                packctl.set_side_file(self.source / relative_path, assigned_side)
             except Exception as error:
                 raise HuroshikiError(
                     f"Could not assign side to {relative_path}: {error}"
@@ -737,6 +782,7 @@ class PackTransaction:
                     cancelled=True,
                 )
 
+            ensure_safe_pack_source(self.source)
             changed = tuple(
                 sorted(
                     changed_paths(
@@ -815,13 +861,10 @@ class PackTransaction:
                     artifact,
                     side_from_flags(operation.client, operation.server),
                 )
-                changed = tuple(
-                    sorted(
-                        changed_paths(
-                            operation.before,
-                            metadata_digest_snapshot(self.source),
-                        )
-                    )
+                ensure_safe_pack_source(self.source)
+                changed = self._classify_add_changes(
+                    operation.before,
+                    side_from_flags(operation.client, operation.server),
                 )
                 if not changed:
                     raise HuroshikiError("The URL metadata is already current")
@@ -1022,6 +1065,7 @@ class PackTransaction:
             return 0
 
         for slug in sorted(selected):
+            ensure_safe_pack_source(self.source)
             result = subprocess.run(
                 ["packwiz", "remove", slug],
                 cwd=self.source,
@@ -1030,6 +1074,7 @@ class PackTransaction:
             )
             if result.returncode != 0:
                 return result.returncode
+            ensure_safe_pack_source(self.source)
         return 0
 
     def apply(self) -> None:
@@ -1082,6 +1127,7 @@ class PackTransaction:
             self.active = False
             return
 
+        ensure_safe_pack_source(self.source)
         refresh = subprocess.run(
             ["packwiz", "refresh"],
             cwd=self.source,
@@ -1090,6 +1136,7 @@ class PackTransaction:
         )
         if refresh.returncode != 0:
             raise HuroshikiError("packwiz refresh failed; transaction was not applied")
+        ensure_safe_pack_source(self.source)
 
         real_root = project_root(self.project_key)
         real_source = real_root / "source"
@@ -1097,8 +1144,8 @@ class PackTransaction:
         if backup.exists():
             raise HuroshikiError(f"Backup path already exists: {backup}")
 
-        real_source.rename(backup)
         try:
+            real_source.rename(backup)
             if (
                 tree_digest_snapshot(backup) != self.real_source_baseline
                 or pack_config_snapshot(real_root) != self.pack_config_baseline
@@ -1467,7 +1514,20 @@ def file_digest(path: Path) -> str:
 
 
 def copy_transaction_source(source: Path, destination: Path) -> None:
+    ensure_safe_pack_source(source)
     shutil.copytree(source, destination, symlinks=True)
+    ensure_safe_pack_source(destination)
+
+
+def ensure_safe_pack_source(source: Path) -> None:
+    issues = packctl.pack_source_entry_issues(source)
+    if not issues:
+        return
+    details = "; ".join(
+        f"{source if relative == Path('.') else source / relative}: {message}"
+        for relative, message in issues
+    )
+    raise HuroshikiError(f"Unsafe Packwiz source: {details}")
 
 
 def _restore_source_backup(real_source: Path, backup: Path) -> None:
@@ -1837,14 +1897,17 @@ def _prepare_update_candidates(
     transaction_root: Path,
     baseline_contents: dict[Path, bytes],
 ) -> list[UpdateCandidate]:
-    before_files = _file_content_snapshot(source)
-    baseline_records = _update_metadata_snapshot(source)
-    resolver_root = transaction_root / "update-resolvers"
-    resolver_root.mkdir()
-    candidates: list[UpdateCandidate] = []
+    parsed: list[tuple[Path, bytes, dict[str, object], ModInfo]] = []
+    slugs: dict[str, list[Path]] = {}
     for relative_path, original in sorted(baseline_contents.items()):
         old_data = tomllib.loads(original.decode("utf-8"))
         old_mod = read_mod_data(relative_path, old_data)
+        parsed.append((relative_path, original, old_data, old_mod))
+        slugs.setdefault(old_mod.slug, []).append(relative_path)
+    ambiguous = {slug: paths for slug, paths in slugs.items() if len(paths) > 1}
+    candidates: list[UpdateCandidate] = []
+    eligible: list[tuple[Path, bytes, dict[str, object], ModInfo]] = []
+    for relative_path, original, old_data, old_mod in parsed:
         provider = canonical_provider(old_mod.provider)
         key = f"{provider}:{old_mod.project_id}"
         common = dict(
@@ -1855,6 +1918,17 @@ def _prepare_update_candidates(
             provider=old_mod.provider,
             current_version=metadata_version(old_data, old_mod.provider),
         )
+        if old_mod.slug in ambiguous:
+            paths = ", ".join(str(path) for path in ambiguous[old_mod.slug])
+            candidates.append(
+                _candidate_error(
+                    relative_path,
+                    old_mod,
+                    old_data,
+                    f"ambiguous Packwiz update slug {old_mod.slug!r}; metadata exists at {paths}",
+                )
+            )
+            continue
         if metadata_is_pinned(old_data):
             candidates.append(
                 UpdateCandidate(**common, new_version="-", status="pinned")
@@ -1865,13 +1939,80 @@ def _prepare_update_candidates(
                 UpdateCandidate(**common, new_version="-", status="unavailable")
             )
             continue
+        eligible.append((relative_path, original, old_data, old_mod))
+
+    if not eligible:
+        return sorted(candidates, key=lambda item: item.root)
+
+    resolver_root = transaction_root / "update-resolvers"
+    resolver_root.mkdir()
+    normalized = resolver_root / "normalized-source"
+    normalization_returncode: int | None = None
+    try:
+        copy_transaction_source(source, normalized)
+        try:
+            normalization = subprocess.run(
+                ["packwiz", "refresh"],
+                cwd=normalized,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=UPDATE_RESOLVER_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            normalization_error = (
+                "disposable baseline normalization deadline exceeded after "
+                f"{UPDATE_RESOLVER_TIMEOUT_SECONDS} seconds"
+            )
+        else:
+            normalization_returncode = normalization.returncode
+            normalization_error = (
+                None
+                if normalization.returncode == 0
+                else "disposable baseline normalization failed: "
+                + concise_process_error(normalization)
+            )
+        if normalization_error is not None:
+            for relative_path, _, old_data, old_mod in eligible:
+                candidates.append(
+                    _candidate_error(
+                        relative_path,
+                        old_mod,
+                        old_data,
+                        normalization_error,
+                        normalization_returncode,
+                    )
+                )
+            shutil.rmtree(resolver_root, ignore_errors=True)
+            return sorted(candidates, key=lambda item: item.root)
+        ensure_safe_pack_source(normalized)
+        before_files = _file_content_snapshot(normalized)
+        baseline_records = _update_metadata_snapshot(normalized)
+    except (OSError, HuroshikiError) as error:
+        message = f"disposable baseline normalization failed: {error}"
+        for relative_path, _, old_data, old_mod in eligible:
+            candidates.append(_candidate_error(relative_path, old_mod, old_data, message))
+        shutil.rmtree(resolver_root, ignore_errors=True)
+        return sorted(candidates, key=lambda item: item.root)
+
+    for relative_path, original, old_data, old_mod in eligible:
+        provider = canonical_provider(old_mod.provider)
+        key = f"{provider}:{old_mod.project_id}"
+        common = dict(
+            key=key,
+            root=relative_path,
+            slug=old_mod.slug,
+            name=old_mod.name,
+            provider=old_mod.provider,
+            current_version=metadata_version(old_data, old_mod.provider),
+        )
 
         try:
             with tempfile.TemporaryDirectory(
                 prefix=f"{old_mod.slug}-", dir=resolver_root
             ) as directory:
                 resolver = Path(directory) / "source"
-                copy_transaction_source(source, resolver)
+                copy_transaction_source(normalized, resolver)
                 try:
                     result = subprocess.run(
                         ["packwiz", "--yes", "update", old_mod.slug],
@@ -1903,6 +2044,7 @@ def _prepare_update_candidates(
                         )
                     )
                     continue
+                ensure_safe_pack_source(resolver)
                 resolved_records = _update_metadata_snapshot(resolver)
                 changes = _content_changes(
                     before_files,
@@ -1944,8 +2086,8 @@ def _prepare_update_candidates(
                 added_dependencies=added_dependencies,
             )
         )
-    resolver_root.rmdir()
-    return candidates
+    shutil.rmtree(resolver_root)
+    return sorted(candidates, key=lambda item: item.root)
 
 
 def _metadata_semantics(record: _UpdateMetadata) -> dict[str, object]:

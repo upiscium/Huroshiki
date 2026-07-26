@@ -10,10 +10,10 @@ import huroshiki_core as core
 import packctl
 
 
-def metadata(name: str, project_id: str) -> str:
+def metadata(name: str, project_id: str, side: str = "both") -> str:
     return f'''name = "{name}"
 filename = "{project_id}.jar"
-side = "both"
+side = "{side}"
 [download]
 hash-format = "sha256"
 hash = "00"
@@ -88,6 +88,23 @@ class AddTransactionTest(unittest.TestCase):
 
     def assert_unlocked(self) -> None:
         self.assertFalse(packctl.project_lock_is_active(self.key))
+
+    def enable_private_url_provider(self) -> None:
+        (self.packs / "demo/pack.local.yaml").write_text(
+            "url_allow_private_networks: true\n", encoding="utf-8"
+        )
+
+    @staticmethod
+    def url_artifact() -> core.UrlArtifact:
+        return core.UrlArtifact(
+            name="Private Mod",
+            mod_id="private_mod",
+            version="1.0.0",
+            filename="private-mod-1.0.0.jar",
+            url="https://127.0.0.1/private-mod-1.0.0.jar",
+            sha256="00",
+            loaders=("neoforge",),
+        )
 
     def test_success_applies_root_dependencies_and_packwiz_files_together(self) -> None:
         original = self.snapshot()
@@ -164,6 +181,177 @@ class AddTransactionTest(unittest.TestCase):
                     self.key, "modrinth", "example", "both"
                 )
         self.assertEqual(self.snapshot(), original)
+        self.assert_unlocked()
+
+    def test_changed_existing_metadata_unions_baseline_side_by_path_and_identity(self) -> None:
+        existing = self.source / "mods/existing.pw.toml"
+        existing.write_text(metadata("Existing", "existing", "client"), encoding="utf-8")
+        unchanged = self.source / "mods/unchanged.pw.toml"
+        unchanged.write_text(metadata("Unchanged", "unchanged", "client"), encoding="utf-8")
+        shared = self.source / "mods/shared.pw.toml"
+        shared.write_text(metadata("Shared", "shared", "both"), encoding="utf-8")
+
+        def run(command, *, cwd, **_):
+            if command[:3] == ["packwiz", "modrinth", "add"]:
+                (cwd / "mods/existing.pw.toml").unlink()
+                moved = cwd / "dependencies/existing-renamed.pw.toml"
+                moved.parent.mkdir()
+                moved.write_text(metadata("Existing", "existing", "server"), encoding="utf-8")
+                (cwd / "mods/root.pw.toml").write_text(
+                    metadata("Root", "root", "client"), encoding="utf-8"
+                )
+                (cwd / "mods/shared.pw.toml").write_text(
+                    metadata("Shared", "shared", "server"), encoding="utf-8"
+                )
+            return self.completed(command)
+
+        with patch.object(core.subprocess, "run", side_effect=run):
+            self.assertEqual(
+                core.add_mod_transactionally(self.key, "modrinth", "root", "server"),
+                0,
+            )
+
+        moved_text = (self.source / "dependencies/existing-renamed.pw.toml").read_text()
+        self.assertIn('side = "both"', moved_text)
+        self.assertIn('side = "server"', (self.source / "mods/root.pw.toml").read_text())
+        self.assertIn('side = "client"', unchanged.read_text())
+        self.assertIn('side = "both"', shared.read_text())
+        self.assertFalse(existing.exists())
+
+    def test_changed_invalid_baseline_side_is_not_silently_reclassified(self) -> None:
+        existing = self.source / "mods/existing.pw.toml"
+        existing.write_text(metadata("Existing", "existing", "invalid"), encoding="utf-8")
+        original = self.snapshot()
+
+        def run(command, *, cwd, **_):
+            if command[:3] == ["packwiz", "modrinth", "add"]:
+                (cwd / "mods/existing.pw.toml").write_text(
+                    metadata("Existing", "existing", "server"), encoding="utf-8"
+                )
+            return self.completed(command)
+
+        with patch.object(core.subprocess, "run", side_effect=run):
+            with self.assertRaisesRegex(core.HuroshikiError, "invalid baseline side"):
+                core.add_mod_transactionally(
+                    self.key, "modrinth", "existing", "server"
+                )
+
+        self.assertEqual(self.snapshot(), original)
+        self.assert_unlocked()
+
+    def test_provider_and_url_transactions_reject_source_symlinks_without_writes(self) -> None:
+        external = self.root / "external"
+        external.mkdir()
+        secret = external / "secret.txt"
+        secret.write_text("keep", encoding="utf-8")
+        link = self.source / "mods/linked"
+        link.symlink_to(external, target_is_directory=True)
+        original = self.snapshot()
+
+        for provider, selector in (
+            ("modrinth", "example"),
+            ("url", "https://example.invalid/private.jar"),
+        ):
+            with self.subTest(provider=provider), patch.object(core.subprocess, "run") as run, patch.object(
+                core, "download_url_artifact"
+            ) as download:
+                with self.assertRaisesRegex(core.HuroshikiError, "symlink is not allowed"):
+                    core.add_mod_transactionally(self.key, provider, selector, "both")
+                run.assert_not_called()
+                download.assert_not_called()
+                self.assertEqual(self.snapshot(), original)
+                self.assertEqual(secret.read_text(), "keep")
+                self.assert_unlocked()
+
+    def test_cli_url_add_succeeds_noninteractively_with_private_opt_in(self) -> None:
+        self.enable_private_url_provider()
+        args = type(
+            "Args",
+            (),
+            {
+                "pack": "demo",
+                "query": "url:https://127.0.0.1/private-mod-1.0.0.jar",
+                "side": "server",
+            },
+        )()
+
+        def download(*_, **kwargs):
+            self.assertTrue(kwargs["allow_private_networks"])
+            return self.url_artifact()
+
+        with patch.object(packctl, "choose_provider") as choose, patch.object(
+            core, "download_url_artifact", side_effect=download
+        ), patch.object(
+            core.subprocess,
+            "run",
+            side_effect=lambda command, **_: self.completed(command),
+        ):
+            self.assertEqual(packctl.cmd_add(args), 0)
+
+        choose.assert_not_called()
+        installed = self.source / "mods/private_mod.pw.toml"
+        self.assertIn('side = "server"', installed.read_text())
+        self.assert_unlocked()
+
+    def test_cli_url_failure_and_interrupt_preserve_source_and_unlock(self) -> None:
+        self.enable_private_url_provider()
+        args = type(
+            "Args",
+            (),
+            {
+                "pack": "demo",
+                "query": "url:https://127.0.0.1/private-mod-1.0.0.jar",
+                "side": "both",
+            },
+        )()
+        original = self.snapshot()
+
+        with patch.object(
+            core,
+            "download_url_artifact",
+            side_effect=core.HuroshikiError("download failed"),
+        ):
+            self.assertEqual(packctl.cmd_add(args), 1)
+        self.assertEqual(self.snapshot(), original)
+        self.assert_unlocked()
+
+        with patch.object(
+            core, "download_url_artifact", side_effect=KeyboardInterrupt
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                packctl.cmd_add(args)
+        self.assertEqual(self.snapshot(), original)
+        self.assert_unlocked()
+
+    def test_cli_url_external_change_is_preserved_and_unlocks(self) -> None:
+        self.enable_private_url_provider()
+        args = type(
+            "Args",
+            (),
+            {
+                "pack": "demo",
+                "query": "url:https://127.0.0.1/private-mod-1.0.0.jar",
+                "side": "both",
+            },
+        )()
+
+        def download(*_, **kwargs):
+            self.assertTrue(kwargs["allow_private_networks"])
+            (self.source / "index.toml").write_bytes(b"external index\n")
+            return self.url_artifact()
+
+        with patch.object(
+            core, "download_url_artifact", side_effect=download
+        ), patch.object(
+            core.subprocess,
+            "run",
+            side_effect=lambda command, **_: self.completed(command),
+        ):
+            with self.assertRaisesRegex(packctl.ConfigError, "changed"):
+                packctl.cmd_add(args)
+
+        self.assertEqual((self.source / "index.toml").read_bytes(), b"external index\n")
+        self.assertFalse((self.source / "mods/private_mod.pw.toml").exists())
         self.assert_unlocked()
 
     def test_keyboard_interrupt_during_add_or_refresh_discards_and_unlocks(self) -> None:
