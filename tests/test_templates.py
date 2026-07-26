@@ -119,7 +119,7 @@ class TemplateManifestTest(unittest.TestCase):
             core.compatible_templates("1.20.1", "neoforge"), []
         )
 
-    def test_legacy_packwiz_template_is_read_and_migrated(self) -> None:
+    def test_legacy_packwiz_template_is_not_loaded_as_manifest_data(self) -> None:
         legacy = self.templates / "legacy"
         (legacy / "source" / "mods").mkdir(parents=True)
         (legacy / "template.yaml").write_text(
@@ -146,19 +146,12 @@ class TemplateManifestTest(unittest.TestCase):
             legacy_metadata,
             encoding="utf-8",
         )
-        self.assertEqual(
-            packctl.template_versions("legacy"),
-            ("1.21.1", "neoforge", "21.1.999"),
-        )
-        self.assertEqual(
-            packctl.template_mods("legacy")[0]["project_id"],
-            "legacy-id",
-        )
-        args = type("Args", (), {"template": "legacy"})()
-        self.assertEqual(packctl.cmd_migrate_template(args), 0)
-        migrated = packctl.load_yaml(legacy / "template.yaml")
-        self.assertEqual(migrated["loader"], "neoforge")
-        self.assertEqual(migrated["mods"][0]["name"], "Legacy MOD")
+        with self.assertRaisesRegex(
+            packctl.ConfigError, "legacy template source is not supported"
+        ):
+            packctl.load_template_config("legacy")
+        self.assertFalse(hasattr(packctl, "legacy_template_mods"))
+        self.assertFalse(hasattr(packctl, "derive_legacy_template_config"))
 
     def test_invalid_templates_do_not_hide_valid_candidates(self) -> None:
         invalid = self.templates / "invalid"

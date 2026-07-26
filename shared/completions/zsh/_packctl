@@ -1,0 +1,115 @@
+#compdef packctl
+
+_packctl_candidates() {
+  local kind="$1" pack="${2-}"
+  local -a root_args
+  [[ -n "${_packctl_root-}" ]] && root_args=(--root "$_packctl_root")
+  if [[ -n "$pack" ]]; then
+    command packctl "${root_args[@]}" complete "$kind" "$pack" 2>/dev/null
+  else
+    command packctl "${root_args[@]}" complete "$kind" 2>/dev/null
+  fi
+}
+
+_packctl() {
+  local command="" selected_pack="" word
+  local -i command_index=0 argument_index index skip_root=0
+  local -a commands candidates sides
+
+  _packctl_root="${HUROSHIKI_ROOT-}"
+  for (( index = 2; index < CURRENT; index++ )); do
+    word="${words[index]}"
+    if (( skip_root )); then
+      _packctl_root="$word"
+      skip_root=0
+    elif [[ "$word" == --root ]]; then
+      skip_root=1
+    elif [[ "$word" == --root=* ]]; then
+      _packctl_root="${word#--root=}"
+    elif [[ -z "$command" && "$word" != -* ]]; then
+      command="$word"
+      command_index=$index
+    fi
+  done
+
+  if [[ -z "$command" ]]; then
+    if (( skip_root )) || [[ "${words[CURRENT]}" == --root=* ]]; then
+      _directories
+      return
+    fi
+    commands=(
+      'list:list managed packs'
+      'list-templates:list managed templates'
+      'show:show pack configuration'
+      'new:create a pack'
+      'new-template:create a template'
+      'validate:validate the repository'
+      'validate-for:validate one pack'
+      'validate-template:validate one template'
+      'add:add a mod'
+      'remove:remove installed mods'
+      'update:update all mods'
+      'side:set metadata side'
+      'profile:apply profiles'
+      'build:build one pack'
+      'build-all:build enabled packs'
+      'serve:build and serve one pack'
+      'deploy:build and deploy one pack'
+      'deploy-dry-run:preview one deployment'
+      'restart:restart one server'
+      'publish:build, deploy, and restart'
+      'deploy-all:build and deploy enabled packs'
+      'trash-list:list deleted projects'
+      'trash-restore:restore a deleted project'
+      'trash-purge:purge deleted projects'
+      'clean-huroshiki-state:inspect or clean retained state'
+    )
+    _describe command commands
+    return
+  fi
+
+  argument_index=$(( CURRENT - command_index ))
+  case "$command:$argument_index" in
+    (show:1|validate-for:1|add:1|remove:1|update:1|side:1|profile:1|build:1|serve:1|deploy:1|deploy-dry-run:1|restart:1|publish:1)
+      candidates=("${(@f)$(_packctl_candidates packs)}")
+      _describe pack candidates
+      ;;
+    (validate-template:1)
+      candidates=("${(@f)$(_packctl_candidates templates)}")
+      _describe template candidates
+      ;;
+    (remove:2|remove:*)
+      selected_pack="${words[command_index + 1]}"
+      candidates=("${(@f)$(_packctl_candidates mods "$selected_pack")}")
+      _describe 'installed mod' candidates
+      ;;
+    (side:2)
+      selected_pack="${words[command_index + 1]}"
+      candidates=("${(@f)$(_packctl_candidates metadata "$selected_pack")}")
+      _describe 'Packwiz metadata path' candidates
+      ;;
+    (side:3|add:3)
+      sides=(both client server)
+      _describe side sides
+      ;;
+    (profile:2|profile:*)
+      selected_pack="${words[command_index + 1]}"
+      candidates=("${(@f)$(_packctl_candidates profiles "$selected_pack")}")
+      _describe profile candidates
+      ;;
+    (new:4|new-template:4)
+      candidates=(fabric forge neoforge quilt)
+      _describe loader candidates
+      ;;
+    (*)
+      _arguments '--root=[managed repository root]:root directory:_directories' \
+        '--port=[HTTP server port]:port' \
+        '--build[build after a successful update]' \
+        '--apply[apply state cleanup]' \
+        '--project=[project key]:project key' \
+        '--older-than=[minimum age in days]:days' \
+        '--keep=[newest items to retain]:count' \
+        '*:argument:_files'
+      ;;
+  esac
+}

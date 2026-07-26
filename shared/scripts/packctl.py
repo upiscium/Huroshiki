@@ -5,6 +5,8 @@ import argparse
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -285,85 +287,18 @@ def get_template_root(template_id: str, *, must_exist: bool = True) -> Path:
     return root
 
 
-def legacy_template_mods(source: Path) -> list[dict[str, str]]:
-    mods: list[dict[str, str]] = []
-    for metadata in sorted(source.rglob("*.pw.toml")):
-        data = read_toml(metadata)
-        update = data.get("update", {})
-        if not isinstance(update, dict):
-            continue
-        provider = ""
-        project_id = ""
-        for candidate in ("modrinth", "curseforge"):
-            value = update.get(candidate)
-            if not isinstance(value, dict):
-                continue
-            for key in (
-                "mod-id",
-                "project-id",
-                "project_id",
-                "projectID",
-                "projectId",
-            ):
-                if key in value:
-                    provider = candidate
-                    project_id = str(value[key])
-                    break
-            if project_id:
-                break
-        url = ""
-        if not provider or not project_id:
-            download = data.get("download", {})
-            url = (
-                str(download.get("url", "")).strip()
-                if isinstance(download, dict)
-                else ""
-            )
-            if url:
-                provider = "url"
-                project_id = metadata.stem
-            else:
-                continue
-        raw_side = data.get("side")
-        side = raw_side if isinstance(raw_side, str) else ""
-        item = {
-            "name": str(data.get("name", metadata.stem)),
-            "provider": provider,
-            "project_id": project_id,
-            "side": side,
-        }
-        if provider == "url":
-            item["url"] = url
-        mods.append(item)
-    return mods
-
-
-def derive_legacy_template_config(
-    root: Path,
-    config: dict[str, Any],
-) -> dict[str, Any]:
+def reject_legacy_template_source(root: Path) -> None:
     source = root / "source"
-    pack_path = source / "pack.toml"
-    if not pack_path.is_file():
-        return config
-    data = read_toml(pack_path)
-    versions = data.get("versions", {})
-    if isinstance(versions, dict):
-        config.setdefault("minecraft", str(versions.get("minecraft", "")))
-        for loader in LOADER_FLAGS:
-            if loader in versions:
-                config.setdefault("loader", loader)
-                config.setdefault(
-                    "reference_loader_version",
-                    str(versions[loader]),
-                )
-                break
-    config.setdefault("mods", legacy_template_mods(source))
-    return config
+    if source.exists() or source.is_symlink():
+        raise ConfigError(
+            f"templates/{root.name}/source: legacy template source is not supported; "
+            "remove it and define the template only in template.yaml"
+        )
 
 
 def load_template_config(template_id: str) -> dict[str, Any]:
     root = get_template_root(template_id)
+    reject_legacy_template_source(root)
     config = merge(
         load_yaml(root / "template.yaml"),
         load_yaml(root / "template.local.yaml"),
@@ -372,7 +307,7 @@ def load_template_config(template_id: str) -> dict[str, Any]:
         raise ConfigError(
             f"templates/{template_id}/template.yaml must contain id: {template_id}"
         )
-    return derive_legacy_template_config(root, config)
+    return config
 
 
 def get_project_root(kind: str, project_id: str, *, must_exist: bool = True) -> Path:
@@ -967,8 +902,8 @@ def install_and_classify(
     if not changed:
         raise ConfigError(
             "Packwiz did not create or modify any .pw.toml files. "
-            "The project may already be installed; use `just side` "
-            "to change its side."
+            f"The project may already be installed; use `packctl side {pack_id} "
+            "<metadata-file> <side>` to change its side."
         )
 
     print(f"Assigning side = {normalized_side}:")
@@ -1002,55 +937,6 @@ def cmd_add(args: argparse.Namespace) -> int:
         )
 
 
-ACTIVE_PACK_ENV = "MODPACK"
-
-
-def active_pack_id() -> str:
-    pack_id = os.environ.get(ACTIVE_PACK_ENV, "").strip()
-    if not pack_id:
-        raise ConfigError(
-            "No MODPACK is selected. Run `just use <MODPACK>` first, "
-            "or use an explicit `*-for` recipe."
-        )
-
-    get_pack_root(pack_id)
-    return pack_id
-
-
-def cmd_use(args: argparse.Namespace) -> int:
-    pack_id = args.pack
-    pack_root = get_pack_root(pack_id)
-    config = load_pack_config(pack_id)
-
-    shell = os.environ.get("SHELL", "").strip()
-    if not shell:
-        shell = shutil.which("zsh") or shutil.which("bash") or "/bin/sh"
-
-    environment = os.environ.copy()
-    environment[ACTIVE_PACK_ENV] = pack_id
-    environment["MODPACK_ROOT"] = str(pack_root)
-
-    display_name = config.get("display_name", pack_id)
-    print(f"Entering MODPACK context: {pack_id} ({display_name})")
-    print("Run `exit` to leave this context.")
-    print("Use `just current` to confirm the selected pack.")
-
-    result = subprocess.run(
-        [shell, "-i"],
-        cwd=ROOT,
-        env=environment,
-        check=False,
-    )
-    return result.returncode
-
-
-def cmd_current(_: argparse.Namespace) -> int:
-    pack_id = active_pack_id()
-    config = load_pack_config(pack_id)
-    print(f"{pack_id}\t{config.get('display_name', '')}")
-    return 0
-
-
 def cmd_list(_: argparse.Namespace) -> int:
     ids = pack_ids()
     if not ids:
@@ -1062,6 +948,20 @@ def cmd_list(_: argparse.Namespace) -> int:
         config = load_pack_config(pack_id)
         enabled = "yes" if config.get("enabled", True) else "no"
         print(f"{pack_id:30} {enabled:8} {config.get('display_name', '')}")
+    return 0
+
+
+def cmd_list_templates(_: argparse.Namespace) -> int:
+    ids = template_ids()
+    if not ids:
+        print("No templates are configured")
+        return 0
+    print(f"{'TEMPLATE':30} {'ENABLED':8} DISPLAY NAME")
+    print(f"{'-' * 30} {'-' * 8} {'-' * 30}")
+    for template_id in ids:
+        config = load_template_config(template_id)
+        enabled = "yes" if config.get("enabled", True) else "no"
+        print(f"{template_id:30} {enabled:8} {config.get('display_name', '')}")
     return 0
 
 
@@ -1230,22 +1130,6 @@ def cmd_new_template(args: argparse.Namespace) -> int:
         return _new_template(args)
 
 
-def cmd_migrate_template(args: argparse.Namespace) -> int:
-    with ProjectLock(f"template:{args.template}", "migrate template"):
-        root = get_template_root(args.template)
-        config = load_template_config(args.template)
-        config_path = root / "template.yaml"
-        config_path.write_text(
-            yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
-            encoding="utf-8",
-        )
-    print(
-        f"Migrated templates/{args.template}/template.yaml to MOD-list format; "
-        "legacy source/ files were left untouched"
-    )
-    return 0
-
-
 def cmd_remove(args: argparse.Namespace) -> int:
     import huroshiki_core
 
@@ -1262,9 +1146,12 @@ def cmd_update(args: argparse.Namespace) -> int:
     import huroshiki_core
 
     try:
-        return huroshiki_core.update_all(
+        result = huroshiki_core.update_all(
             huroshiki_core.project_key("pack", args.pack)
         )
+        if result != 0 or not args.build:
+            return result
+        return build_pack(args.pack)
     except huroshiki_core.HuroshikiError as error:
         raise ConfigError(str(error)) from error
 
@@ -1607,6 +1494,12 @@ def validate_pack_directory(root: Path) -> list[str]:
 
 def validate_template_directory(root: Path) -> list[str]:
     errors: list[str] = []
+    source = root / "source"
+    if source.exists() or source.is_symlink():
+        errors.append(
+            f"{display_path(source)}: legacy template source is not supported; "
+            "remove it and define the template only in template.yaml"
+        )
     manifest = root / "template.yaml"
     config = validation_yaml(manifest, errors)
     local_path = root / "template.local.yaml"
@@ -1804,7 +1697,7 @@ def _build_pack(pack_id: str) -> int:
             for error in errors:
                 print(f"  - {error}", file=sys.stderr)
             print(
-                f"Use: just side-for {pack_id} "
+                f"Use: packctl side {pack_id} "
                 "mods/<name>.pw.toml client|server|both",
                 file=sys.stderr,
             )
@@ -1846,18 +1739,11 @@ def cmd_build_all(_: argparse.Namespace) -> int:
     return 0
 
 
-def validate_template(template_id: str) -> int:
-    minecraft, loader, loader_version = template_versions(template_id)
-    mods = template_mods(template_id)
-    print(
-        f"Validated template {template_id}: {minecraft}, {loader} "
-        f"reference {loader_version}, {len(mods)} MOD(s)"
-    )
-    return 0
-
-
 def cmd_validate_template(args: argparse.Namespace) -> int:
-    return validate_template(args.template)
+    root = get_template_root(args.template)
+    return print_validation_result(
+        validate_template_directory(root), f"template {args.template}"
+    )
 
 
 def distribution_target(pack_id: str) -> str:
@@ -2058,6 +1944,28 @@ def cmd_restart(args: argparse.Namespace) -> int:
     host, stack, service = minecraft_server_target(args.pack)
     remote = f"cd {shlex.quote(stack)} && docker compose restart {shlex.quote(service)}"
     run(["ssh", host, remote])
+    return 0
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    result = deploy_pack(args.pack, build=True)
+    if result != 0:
+        return result
+    return cmd_restart(args)
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    result = build_pack(args.pack)
+    if result != 0:
+        return result
+    directory = get_pack_root(args.pack) / "dist"
+    handler = partial(SimpleHTTPRequestHandler, directory=str(directory))
+    with ThreadingHTTPServer(("", args.port), handler) as server:
+        print(f"Serving {args.pack} at http://localhost:{args.port}/")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
     return 0
 
 
@@ -2413,13 +2321,10 @@ def parser() -> argparse.ArgumentParser:
     )
     item.add_argument("pack", nargs="?")
     item.set_defaults(func=cmd_complete)
-    item = sub.add_parser("use")
-    item.add_argument("pack")
-    item.set_defaults(func=cmd_use)
-    item = sub.add_parser("current")
-    item.set_defaults(func=cmd_current)
     item = sub.add_parser("list")
     item.set_defaults(func=cmd_list)
+    item = sub.add_parser("list-templates")
+    item.set_defaults(func=cmd_list_templates)
     item = sub.add_parser("show")
     item.add_argument("pack")
     item.set_defaults(func=cmd_show)
@@ -2445,9 +2350,6 @@ def parser() -> argparse.ArgumentParser:
     item = sub.add_parser("validate-for")
     item.add_argument("pack")
     item.set_defaults(func=cmd_validate_for)
-    item = sub.add_parser("migrate-template")
-    item.add_argument("template")
-    item.set_defaults(func=cmd_migrate_template)
     item = sub.add_parser("add")
     item.add_argument("pack")
     item.add_argument("query")
@@ -2459,6 +2361,7 @@ def parser() -> argparse.ArgumentParser:
     item.set_defaults(func=cmd_remove)
     item = sub.add_parser("update")
     item.add_argument("pack")
+    item.add_argument("--build", action="store_true")
     item.set_defaults(func=cmd_update)
     item = sub.add_parser("side")
     item.add_argument("pack")
@@ -2485,6 +2388,13 @@ def parser() -> argparse.ArgumentParser:
     item = sub.add_parser("restart")
     item.add_argument("pack")
     item.set_defaults(func=cmd_restart)
+    item = sub.add_parser("publish")
+    item.add_argument("pack")
+    item.set_defaults(func=cmd_publish)
+    item = sub.add_parser("serve")
+    item.add_argument("pack")
+    item.add_argument("--port", type=int, default=8080)
+    item.set_defaults(func=cmd_serve)
     item = sub.add_parser("deploy-all")
     item.set_defaults(func=cmd_deploy_all)
     item = sub.add_parser("trash-list")

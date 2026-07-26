@@ -306,6 +306,50 @@ minecraft_server:
         self.assertEqual(result, 1)
         self.assertIn("templates/base/template.local.yaml", stderr)
 
+    def test_template_local_yaml_can_supply_required_effective_fields(self) -> None:
+        (self.template_root / "template.yaml").write_text(
+            "id: base\n", encoding="utf-8"
+        )
+        (self.template_root / "template.local.yaml").write_text(
+            '''display_name: Local Base
+enabled: true
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods: []
+''',
+            encoding="utf-8",
+        )
+
+        result, _, stderr = self.validate_all()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+
+    def test_aggregate_validation_reports_legacy_source_before_bad_manifest(self) -> None:
+        (self.template_root / "source").mkdir()
+        (self.template_root / "template.yaml").write_text("invalid: [", encoding="utf-8")
+
+        result, _, stderr = self.validate_all()
+
+        self.assertEqual(result, 1)
+        self.assertIn("templates/base/source: legacy template source is not supported", stderr)
+        self.assertIn("templates/base/template.yaml", stderr)
+
+    def test_individual_validation_rejects_legacy_source_symlink(self) -> None:
+        (self.template_root / "source").symlink_to(
+            self.root / "missing-legacy-source", target_is_directory=True
+        )
+        args = type("Args", (), {"template": "base"})()
+        stdout = StringIO()
+        stderr = StringIO()
+
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            result = packctl.cmd_validate_template(args)
+
+        self.assertEqual(result, 1)
+        self.assertIn("templates/base/source: legacy template source is not supported", stderr.getvalue())
+
     def test_validate_for_ignores_templates_and_other_packs(self) -> None:
         (self.template_root / "template.yaml").write_text("invalid: [", encoding="utf-8")
         other = self.packs / "other"
@@ -342,6 +386,8 @@ minecraft_server:
         self.assertIs(validate_args.func, packctl.cmd_validate)
         self.assertIs(focused_args.func, packctl.cmd_validate_for)
         self.assertEqual(focused_args.pack, "demo")
+        template_args = packctl.parser().parse_args(["validate-template", "base"])
+        self.assertIs(template_args.func, packctl.cmd_validate_template)
 
 
 if __name__ == "__main__":

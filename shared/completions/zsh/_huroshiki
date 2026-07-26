@@ -1,0 +1,38 @@
+#compdef huroshiki
+
+_huroshiki_candidates() {
+  local kind="$1"
+  local -a root_args
+  [[ -n "${_huroshiki_root-}" ]] && root_args=(--root "$_huroshiki_root")
+  command packctl "${root_args[@]}" complete "$kind" 2>/dev/null
+}
+
+_huroshiki() {
+  local word
+  local -i index skip_root=0
+  local -a packs templates
+
+  _huroshiki_root="${HUROSHIKI_ROOT-}"
+  for (( index = 2; index < CURRENT; index++ )); do
+    word="${words[index]}"
+    if (( skip_root )); then
+      _huroshiki_root="$word"
+      skip_root=0
+    elif [[ "$word" == --root ]]; then
+      skip_root=1
+    elif [[ "$word" == --root=* ]]; then
+      _huroshiki_root="${word#--root=}"
+    fi
+  done
+
+  packs=("${(@f)$(_huroshiki_candidates packs)}")
+  templates=("${(@f)$(_huroshiki_candidates templates)}")
+  _arguments -C \
+    '--root=[managed repository root]:root directory:_directories' \
+    '--pack=[open a pack]:pack:->packs' \
+    '--template=[open a template]:template:->templates'
+  case "$state" in
+    (packs) _describe pack packs ;;
+    (templates) _describe template templates ;;
+  esac
+}

@@ -152,7 +152,7 @@ class TransactionalBuildTest(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIn("  - mods/demo.pw.toml has no valid side\n", stderr.getvalue())
         self.assertIn(
-            "Use: just side-for demo mods/<name>.pw.toml client|server|both\n",
+            "Use: packctl side demo mods/<name>.pw.toml client|server|both\n",
             stderr.getvalue(),
         )
 

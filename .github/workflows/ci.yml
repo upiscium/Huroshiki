@@ -32,5 +32,8 @@ jobs:
       - name: Run test suite
         run: nix develop --command just test-huroshiki
 
+      - name: Validate repository data
+        run: nix develop --command packctl validate
+
       - name: Check launcher syntax
         run: nix develop --command bash -n shared/scripts/huroshiki-launcher.sh

@@ -19,7 +19,6 @@
           ]);
           runtimeInputs = with pkgs; [
             packwiz
-            just
             jdk21_headless
             rsync
             openssh
@@ -37,7 +36,7 @@
               cp scripts/*.py scripts/*.tcss scripts/huroshiki-launcher.sh "$out/lib/huroshiki/"
               chmod 0755 "$out/lib/huroshiki/huroshiki-launcher.sh"
               cp profiles.yaml "$out/share/huroshiki/profiles.yaml"
-              cp completions/zsh/_just "$out/share/zsh/site-functions/_just"
+              cp completions/zsh/_packctl completions/zsh/_huroshiki "$out/share/zsh/site-functions/"
               makeWrapper ${python}/bin/python "$out/bin/huroshiki" \
                 --add-flags "$out/lib/huroshiki/huroshiki.py" \
                 --set HUROSHIKI_DATA_DIR "$out/share/huroshiki" \
@@ -55,6 +54,7 @@
             printf 'id: example\n' > "$root/packs/example/pack.yaml"
             ${huroshiki}/bin/huroshiki --root "$root" --help > /dev/null
             ${huroshiki}/bin/packctl --root "$root" --help > /dev/null
+            ! ${huroshiki}/bin/packctl --root "$root" --help | grep -E 'migrate-template|[,{](use|current)[,}]'
             test "$(${huroshiki}/bin/packctl --root "$root" complete packs)" = example
             test "$(${huroshiki}/bin/packctl --root "$root" complete profiles example | grep -c '^base$')" = 1
             HUROSHIKI_PYTHON=${python}/bin/python \
@@ -65,7 +65,9 @@
             test -f ${huroshiki}/lib/huroshiki/huroshiki-launcher.sh
             test -x ${huroshiki}/lib/huroshiki/huroshiki-launcher.sh
             test -f ${huroshiki}/share/huroshiki/profiles.yaml
-            test -f ${huroshiki}/share/zsh/site-functions/_just
+            test -f ${huroshiki}/share/zsh/site-functions/_packctl
+            test -f ${huroshiki}/share/zsh/site-functions/_huroshiki
+            test ! -e ${huroshiki}/share/zsh/site-functions/_just
             touch "$out"
           '';
         in
@@ -105,6 +107,8 @@
             inputsFrom = [ huroshiki ];
             packages = with pkgs; [
               git
+              actionlint
+              just
               tree
               ripgrep
               python
@@ -116,7 +120,7 @@
               echo "  packwiz: $(packwiz --version 2>/dev/null || echo available)"
               echo "  java:    $(java -version 2>&1 | head -n 1)"
               echo "  TUI:     huroshiki"
-              echo "  recipes: just --list"
+              echo "  dev tasks: just --list"
               echo "  zsh completion: installed in share/zsh/site-functions"
             '';
           };
