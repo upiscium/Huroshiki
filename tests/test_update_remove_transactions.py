@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -93,6 +94,34 @@ class TransactionTestCase(unittest.TestCase):
 
 
 class UpdateTransactionTest(TransactionTestCase):
+    def test_transaction_copy_preserves_read_only_root_mode(self) -> None:
+        self.source.chmod(0o555)
+        transaction = None
+        try:
+            transaction = core.PackTransaction.create(self.key)
+            self.assertEqual(stat.S_IMODE(transaction.source.stat().st_mode), 0o555)
+            self.assertTrue((transaction.source / "pack.toml").is_file())
+        finally:
+            self.source.chmod(0o755)
+            if transaction is not None:
+                transaction.source.chmod(0o755)
+                transaction.discard()
+
+    def test_transaction_copy_preserves_nested_read_only_directory_mode(self) -> None:
+        self.write_mod("first")
+        self.source.joinpath("mods").chmod(0o555)
+        transaction = None
+        try:
+            transaction = core.PackTransaction.create(self.key)
+            staged_mods = transaction.source / "mods"
+            self.assertEqual(stat.S_IMODE(staged_mods.stat().st_mode), 0o555)
+            self.assertTrue((staged_mods / "first.pw.toml").is_file())
+        finally:
+            self.source.joinpath("mods").chmod(0o755)
+            if transaction is not None:
+                transaction.source.joinpath("mods").chmod(0o755)
+                transaction.discard()
+
     def test_aba_source_change_during_copy_cannot_seed_staged_tree(self) -> None:
         target = self.write_mod("first")
         original = target.read_bytes()
@@ -736,6 +765,64 @@ url = "https://example.invalid/manual.jar"
                 if path.is_file()
             }
             self.assertEqual(retained, original)
+        finally:
+            transaction.discard()
+        self.assertFalse(packctl.project_lock_is_active(self.key))
+
+    def test_rollback_restores_replacement_moved_after_inode_precheck(self) -> None:
+        self.write_mod("first")
+        transaction = core.PackTransaction.create(self.key)
+        original = {
+            path.relative_to(self.source): path.read_bytes()
+            for path in self.source.rglob("*")
+            if path.is_file()
+        }
+        failed_staged = transaction.root / "failed-staged-source"
+        displaced_staged = transaction.root / "displaced-installed-staged"
+        real_rename = Path.rename
+        installed = False
+        replaced_during_rollback = False
+
+        def replace_between_check_and_rename(path: Path, destination: Path):
+            nonlocal installed, replaced_during_rollback
+            if path == transaction.source and destination == self.source and not installed:
+                installed = True
+                real_rename(path, destination)
+                raise RuntimeError("force publication rollback")
+            if (
+                path == self.source
+                and destination == failed_staged
+                and not replaced_during_rollback
+            ):
+                replaced_during_rollback = True
+                real_rename(path, displaced_staged)
+                path.mkdir()
+                (path / "external.txt").write_text("keep", encoding="utf-8")
+            return real_rename(path, destination)
+
+        try:
+            with patch.object(
+                core.subprocess,
+                "run",
+                side_effect=lambda command, **_: self.completed(command),
+            ), patch.object(Path, "rename", replace_between_check_and_rename):
+                with self.assertRaisesRegex(
+                    core.HuroshikiError, "replaced during rollback"
+                ):
+                    transaction.apply()
+
+            self.assertEqual(
+                (self.source / "external.txt").read_text(encoding="utf-8"), "keep"
+            )
+            backup = transaction.root / "replaced-source"
+            retained = {
+                path.relative_to(backup): path.read_bytes()
+                for path in backup.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(retained, original)
+            self.assertTrue(displaced_staged.is_dir())
+            self.assertFalse(failed_staged.exists())
         finally:
             transaction.discard()
         self.assertFalse(packctl.project_lock_is_active(self.key))

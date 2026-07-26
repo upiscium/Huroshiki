@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import dataclass, field, replace
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -1588,10 +1590,39 @@ _SOURCE_DIRECTORY_FLAGS = (
     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 )
 _SOURCE_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
 
 
 def _same_entry(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    if sys.platform != "linux":
+        raise OSError(errno.ENOTSUP, "collision-safe rename is unavailable")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as error:
+        raise OSError(errno.ENOTSUP, "collision-safe rename is unavailable") from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(destination),
+        _RENAME_NOREPLACE,
+    ) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), destination)
 
 
 def _open_pinned_source(source: Path) -> tuple[int, os.stat_result]:
@@ -1728,9 +1759,9 @@ def _copy_source_fd(
                     raise HuroshikiError(
                         f"Unsafe Packwiz source at {item_relative}: replaced while opening"
                     )
-                os.mkdir(name, stat.S_IMODE(opened.st_mode), dir_fd=destination_fd)
+                source_mode = stat.S_IMODE(opened.st_mode)
+                os.mkdir(name, source_mode | stat.S_IRWXU, dir_fd=destination_fd)
                 output_fd = os.open(name, _SOURCE_DIRECTORY_FLAGS, dir_fd=destination_fd)
-                os.fchmod(output_fd, stat.S_IMODE(opened.st_mode))
                 snapshot[item_relative] = "directory"
                 snapshot.update(_copy_source_fd(child_fd, output_fd, item_relative))
                 current = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
@@ -1747,6 +1778,7 @@ def _copy_source_fd(
                     raise HuroshikiError(
                         f"Transaction destination at {item_relative} was replaced"
                     )
+                os.fchmod(output_fd, source_mode)
             finally:
                 if output_fd >= 0:
                     os.close(output_fd)
@@ -1825,7 +1857,6 @@ def copy_transaction_source(source: Path, destination: Path) -> None:
         destination_fd = os.open(
             destination.name, _SOURCE_DIRECTORY_FLAGS, dir_fd=parent_fd
         )
-        os.fchmod(destination_fd, stat.S_IMODE(source_metadata.st_mode))
         copied = _copy_source_fd(source_fd, destination_fd)
         try:
             current = os.stat(source, follow_symlinks=False)
@@ -1851,6 +1882,7 @@ def copy_transaction_source(source: Path, destination: Path) -> None:
             raise HuroshikiError(
                 "The pack source changed while the transaction copy was being created"
             )
+        os.fchmod(destination_fd, stat.S_IMODE(source_metadata.st_mode))
     except BaseException:
         if destination_fd >= 0:
             os.close(destination_fd)
@@ -1915,7 +1947,7 @@ def _restore_source_backup(
 def _rollback_source_publication(
     real_source: Path,
     backup: Path,
-    staged_metadata: os.stat_result,
+    expected_installed_staged: os.stat_result,
     original_metadata: os.stat_result,
     transaction_root: Path,
 ) -> None:
@@ -1929,7 +1961,7 @@ def _rollback_source_publication(
             f"the exact original remains at {backup}."
         ) from error
 
-    if current is not None and _same_entry(current, staged_metadata):
+    if current is not None and _same_entry(current, expected_installed_staged):
         failed_staged = transaction_root / "failed-staged-source"
         try:
             os.stat(failed_staged, follow_symlinks=False)
@@ -1940,18 +1972,35 @@ def _rollback_source_publication(
                 f"Cannot retain the failed staged source because {failed_staged} exists; "
                 f"the exact original remains at {backup}."
             )
+        rename_error: BaseException | None = None
         try:
             real_source.rename(failed_staged)
         except BaseException as error:
+            rename_error = error
+        try:
+            moved = os.stat(failed_staged, follow_symlinks=False)
+        except OSError:
+            moved = None
+        if moved is None:
+            raise HuroshikiError(
+                "Failed to move the staged Packwiz source out of publication; "
+                f"the exact original remains at {backup}: {rename_error}"
+            ) from rename_error
+        if not _same_entry(moved, expected_installed_staged):
             try:
-                moved = os.stat(failed_staged, follow_symlinks=False)
-            except OSError:
-                moved = None
-            if moved is None or not _same_entry(moved, staged_metadata):
+                _rename_noreplace(failed_staged, real_source)
+            except OSError as restore_error:
                 raise HuroshikiError(
-                    "Failed to move the staged Packwiz source out of publication; "
-                    f"the exact original remains at {backup}: {error}"
-                ) from error
+                    "The installed staged Packwiz source was replaced during rollback; "
+                    f"external entries at {real_source} or {failed_staged} were "
+                    f"preserved, and the exact original remains at {backup}: "
+                    f"{restore_error}"
+                ) from restore_error
+            raise HuroshikiError(
+                "The installed staged Packwiz source was replaced during rollback; "
+                f"the moved external source was restored to {real_source}, the exact "
+                f"original remains at {backup}, and competing entries were retained."
+            ) from rename_error
         current = None
 
     if current is not None:
