@@ -126,6 +126,9 @@ packctl profile demo base performance
 packctl update demo --build
 ```
 
+Multiple profile names are applied in the declared order as one transaction. A
+failed install or refresh leaves the pack's real `source/` unchanged.
+
 Build and distribute:
 
 ```bash

@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import huroshiki_core as core
+import packctl
+
+
+def metadata(provider: str, project_id: str, side: str = "both") -> str:
+    update = (
+        f'[update.modrinth]\nmod-id = "{project_id}"\n'
+        if provider == "modrinth"
+        else f"[update.curseforge]\nproject-id = {project_id}\n"
+    )
+    return f'''name = "MOD {project_id}"
+filename = "{project_id}.jar"
+side = "{side}"
+{update}'''
+
+
+class ProfileTransactionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.packs = self.root / "packs"
+        self.source = self.packs / "demo" / "source"
+        (self.source / "mods").mkdir(parents=True)
+        (self.source / "pack.toml").write_bytes(b'name = "Demo"\n')
+        (self.source / "index.toml").write_bytes(b"original index\n")
+        (self.packs / "demo" / "pack.yaml").write_text(
+            "id: demo\ndisplay_name: Demo\nenabled: true\n", encoding="utf-8"
+        )
+        self.patches = [
+            patch.object(core, "ROOT", self.root),
+            patch.object(core, "PACKS", self.packs),
+            patch.object(core, "STATE_ROOT", self.root / ".huroshiki"),
+            patch.object(
+                core,
+                "TRANSACTION_ROOT",
+                self.root / ".huroshiki" / "transactions",
+            ),
+            patch.object(packctl, "ROOT", self.root),
+            patch.object(packctl, "PACKS", self.packs),
+            patch.object(packctl, "SHARED", self.root / "shared"),
+        ]
+        for item in self.patches:
+            item.start()
+        self.key = core.project_key("pack", "demo")
+
+    def tearDown(self) -> None:
+        for item in reversed(self.patches):
+            item.stop()
+        self.temp.cleanup()
+
+    def snapshot(self) -> dict[Path, bytes | str]:
+        result: dict[Path, bytes | str] = {}
+        for path in sorted(self.source.rglob("*")):
+            relative = path.relative_to(self.source)
+            if path.is_symlink():
+                result[relative] = f"symlink:{path.readlink()}"
+            elif path.is_file():
+                result[relative] = path.read_bytes()
+        return result
+
+    @staticmethod
+    def profiles(*entries: dict[str, object]) -> dict[str, object]:
+        return {"base": list(entries)}
+
+    def install(self, events: list[str] | None = None):
+        def run(command: list[str], *, cwd: Path | None = None) -> None:
+            assert cwd is not None
+            provider = command[2]
+            project_id = command[-1]
+            if events is not None:
+                events.append(project_id)
+            (cwd / "mods" / f"{project_id}.pw.toml").write_text(
+                metadata(provider, project_id), encoding="utf-8"
+            )
+
+        return run
+
+    @staticmethod
+    def refresh_success(command, *, cwd, **_):
+        if command == ["packwiz", "refresh"]:
+            (cwd / "index.toml").write_bytes(b"refreshed index\n")
+        return subprocess.CompletedProcess(command, 0)
+
+    def test_success_installs_only_in_copy_and_atomically_applies(self) -> None:
+        original = self.snapshot()
+        profile = self.profiles(
+            {"source": "curseforge", "project": 101, "side": "client"},
+            {"source": "curseforge", "project": 202, "side": "server"},
+        )
+        install_directories: list[Path] = []
+
+        def install(command, *, cwd=None):
+            self.assertEqual(self.snapshot(), original)
+            self.assertNotEqual(cwd, self.source)
+            install_directories.append(cwd)
+            self.install()(command, cwd=cwd)
+
+        with patch.object(packctl, "run", side_effect=install), patch.object(
+            core.subprocess, "run", side_effect=self.refresh_success
+        ) as run:
+            core.apply_profiles(self.key, profile, ["base"])
+
+        self.assertEqual(len(set(install_directories)), 1)
+        self.assertEqual(run.call_count, 1)
+        self.assertIn('side = "client"', (self.source / "mods/101.pw.toml").read_text())
+        self.assertIn('side = "server"', (self.source / "mods/202.pw.toml").read_text())
+        self.assertEqual((self.source / "index.toml").read_bytes(), b"refreshed index\n")
+
+    def test_middle_install_failure_rolls_back_every_entry(self) -> None:
+        original = self.snapshot()
+        profile = self.profiles(
+            {"source": "curseforge", "project": 101, "side": "client"},
+            {"source": "curseforge", "project": 202, "side": "server"},
+        )
+
+        def install(command, *, cwd=None):
+            if command[-1] == "202":
+                raise subprocess.CalledProcessError(7, command)
+            self.install()(command, cwd=cwd)
+
+        with patch.object(packctl, "run", side_effect=install):
+            with self.assertRaisesRegex(
+                core.HuroshikiError, r"Profile 'base' entry 2.*202"
+            ):
+                core.apply_profiles(self.key, profile, ["base"])
+        self.assertEqual(self.snapshot(), original)
+
+    def test_refresh_failure_and_interrupt_leave_source_unchanged(self) -> None:
+        profile = self.profiles(
+            {"source": "curseforge", "project": 101, "side": "client"}
+        )
+        for failure in (
+            subprocess.CompletedProcess(["packwiz", "refresh"], 9),
+            KeyboardInterrupt(),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                original = self.snapshot()
+
+                def refresh(command, *, cwd, **_):
+                    (cwd / "index.toml").write_bytes(b"partial\n")
+                    if isinstance(failure, BaseException):
+                        raise failure
+                    return failure
+
+                with patch.object(packctl, "run", side_effect=self.install()), patch.object(
+                    core.subprocess, "run", side_effect=refresh
+                ):
+                    expected = KeyboardInterrupt if isinstance(failure, KeyboardInterrupt) else core.HuroshikiError
+                    with self.assertRaises(expected):
+                        core.apply_profiles(self.key, profile, ["base"])
+                self.assertEqual(self.snapshot(), original)
+
+    def test_external_change_is_preserved_and_transaction_is_rejected(self) -> None:
+        profile = self.profiles(
+            {"source": "curseforge", "project": 101, "side": "client"}
+        )
+
+        def refresh(command, *, cwd, **_):
+            (self.source / "index.toml").write_bytes(b"external index\n")
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch.object(packctl, "run", side_effect=self.install()), patch.object(
+            core.subprocess, "run", side_effect=refresh
+        ):
+            with self.assertRaisesRegex(core.HuroshikiError, "real Packwiz source changed"):
+                core.apply_profiles(self.key, profile, ["base"])
+        self.assertEqual((self.source / "index.toml").read_bytes(), b"external index\n")
+        self.assertFalse((self.source / "mods/101.pw.toml").exists())
+
+    def test_lock_contention_does_not_run_entries(self) -> None:
+        original = self.snapshot()
+        profile = self.profiles(
+            {"source": "curseforge", "project": 101, "side": "client"}
+        )
+        with packctl.ProjectLock(self.key, "other operation"), patch.object(
+            packctl, "run"
+        ) as install:
+            with self.assertRaisesRegex(core.HuroshikiError, "Project is locked"):
+                core.apply_profiles(self.key, profile, ["base"])
+        install.assert_not_called()
+        self.assertEqual(self.snapshot(), original)
+
+    def test_existing_identity_is_not_reinstalled_and_side_is_union(self) -> None:
+        target = self.source / "mods/existing.pw.toml"
+        target.write_text(metadata("curseforge", "101", "client"), encoding="utf-8")
+        profile = self.profiles(
+            {"source": "curseforge", "project": 101, "side": "server"}
+        )
+        with patch.object(packctl, "run") as install, patch.object(
+            core.subprocess, "run", side_effect=self.refresh_success
+        ):
+            core.apply_profiles(self.key, profile, ["base"])
+        install.assert_not_called()
+        self.assertIn('side = "both"', target.read_text(encoding="utf-8"))
+
+    def test_multiple_profiles_keep_order_and_roll_back_together(self) -> None:
+        original = self.snapshot()
+        profiles = {
+            "first": [{"source": "curseforge", "project": 3, "side": "client"}],
+            "second": [
+                {"source": "curseforge", "project": 1, "side": "server"},
+                {"source": "curseforge", "project": 2, "side": "both"},
+            ],
+        }
+        events: list[str] = []
+
+        def install(command, *, cwd=None):
+            events.append(command[-1])
+            if command[-1] == "2":
+                raise subprocess.CalledProcessError(5, command)
+            self.install()(command, cwd=cwd)
+
+        with patch.object(packctl, "run", side_effect=install):
+            with self.assertRaisesRegex(core.HuroshikiError, r"Profile 'second' entry 2"):
+                core.apply_profiles(self.key, profiles, ["first", "second"])
+        self.assertEqual(events, ["3", "1", "2"])
+        self.assertEqual(self.snapshot(), original)
+
+    def test_cli_reports_profile_and_entry_context(self) -> None:
+        args = argparse.Namespace(pack="demo", names=["base"])
+        profiles = self.profiles(
+            {"source": "curseforge", "project": "invalid", "side": "client"}
+        )
+        with patch.object(packctl, "load_profiles", return_value=profiles):
+            with self.assertRaisesRegex(
+                packctl.ConfigError, r"Profile 'base' entry 1.*invalid"
+            ):
+                packctl.cmd_profile(args)
+
+
+if __name__ == "__main__":
+    unittest.main()

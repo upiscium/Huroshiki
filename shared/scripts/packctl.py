@@ -1289,61 +1289,6 @@ def find_metadata(source: Path, provider: str, project_id: str | int) -> Path | 
     return None
 
 
-def apply_profile_entry(source: Path, entry: dict[str, Any]) -> None:
-    provider = entry.get("source")
-    project = entry.get("project")
-    side = entry.get("side")
-    if provider not in {"modrinth", "curseforge"}:
-        raise ConfigError(f"Unsupported profile source: {provider!r}")
-    if project is None:
-        raise ConfigError("Profile entry is missing project")
-    if side not in VALID_SIDES:
-        raise ConfigError(f"Invalid/missing side for {project!r}: {side!r}")
-
-    if provider == "modrinth":
-        project_id: str | int = resolve_modrinth(str(project))
-        metadata = find_metadata(source, provider, project_id)
-        if metadata is None:
-            run(
-                [
-                    "packwiz",
-                    "--yes",
-                    "modrinth",
-                    "add",
-                    "--project-id",
-                    str(project_id),
-                ],
-                cwd=source,
-            )
-            metadata = find_metadata(source, provider, project_id)
-    else:
-        try:
-            project_id = int(project)
-        except (TypeError, ValueError) as error:
-            raise ConfigError(
-                "CurseForge profiles require numeric project IDs"
-            ) from error
-        metadata = find_metadata(source, provider, project_id)
-        if metadata is None:
-            run(
-                [
-                    "packwiz",
-                    "--yes",
-                    "curseforge",
-                    "add",
-                    "--addon-id",
-                    str(project_id),
-                ],
-                cwd=source,
-            )
-            metadata = find_metadata(source, provider, project_id)
-
-    if metadata is None:
-        raise ConfigError(f"Metadata not found after adding {provider}:{project}")
-    set_side_file(metadata, side)
-    print(f"  {metadata.relative_to(source)} -> {side}")
-
-
 def load_profiles(pack_root: Path) -> dict[str, Any]:
     profiles = load_yaml(PACKAGE_DATA / "profiles.yaml")
     managed_profiles = SHARED / "profiles.yaml"
@@ -1358,24 +1303,19 @@ def load_profiles(pack_root: Path) -> dict[str, Any]:
 
 
 def cmd_profile(args: argparse.Namespace) -> int:
-    with ProjectLock(f"pack:{args.pack}", "profile"):
-        root = get_pack_root(args.pack)
-        profiles = load_profiles(root)
-        source = root / "source"
-        for name in args.names:
-            if name not in profiles:
-                raise ConfigError(
-                    f"Unknown profile {name!r}; available: {', '.join(sorted(profiles))}"
-                )
-            entries = profiles[name] or []
-            if not isinstance(entries, list):
-                raise ConfigError(f"Profile {name!r} must be a list")
-            print(f"== Applying {name} to {args.pack} ==")
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    raise ConfigError(f"Invalid profile entry: {entry!r}")
-                apply_profile_entry(source, entry)
-        run(["packwiz", "refresh"], cwd=source)
+    import huroshiki_core
+
+    profiles = load_profiles(get_pack_root(args.pack))
+    try:
+        huroshiki_core.apply_profiles(
+            huroshiki_core.project_key("pack", args.pack),
+            profiles,
+            args.names,
+            on_profile=lambda name: print(f"== Applying {name} to {args.pack} =="),
+            on_entry=lambda _name, path, side: print(f"  {path} -> {side}"),
+        )
+    except huroshiki_core.HuroshikiError as error:
+        raise ConfigError(str(error)) from error
     return 0
 
 

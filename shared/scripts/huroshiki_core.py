@@ -1721,6 +1721,113 @@ def set_installed_mod_side(
         raise HuroshikiError(str(error)) from error
 
 
+def _apply_profile_entry(transaction: PackTransaction, entry: Mapping[str, object]) -> Path:
+    provider = entry.get("source")
+    project = entry.get("project")
+    requested_side = entry.get("side")
+    if provider not in {"modrinth", "curseforge"}:
+        raise HuroshikiError(f"Unsupported profile source: {provider!r}")
+    if project is None:
+        raise HuroshikiError("Profile entry is missing project")
+    if requested_side not in packctl.VALID_SIDES:
+        raise HuroshikiError(
+            f"Invalid/missing side for {project!r}: {requested_side!r}"
+        )
+
+    if provider == "modrinth":
+        project_id: str | int = packctl.resolve_modrinth(str(project))
+        add_command = [
+            "packwiz",
+            "--yes",
+            "modrinth",
+            "add",
+            "--project-id",
+            str(project_id),
+        ]
+    else:
+        try:
+            project_id = int(project)
+        except (TypeError, ValueError) as error:
+            raise HuroshikiError(
+                "CurseForge profiles require numeric project IDs"
+            ) from error
+        add_command = [
+            "packwiz",
+            "--yes",
+            "curseforge",
+            "add",
+            "--addon-id",
+            str(project_id),
+        ]
+
+    metadata = packctl.find_metadata(transaction.source, provider, project_id)
+    already_installed = metadata is not None
+    if not already_installed:
+        packctl.run(add_command, cwd=transaction.source)
+        metadata = packctl.find_metadata(transaction.source, provider, project_id)
+    if metadata is None:
+        raise HuroshikiError(
+            f"Metadata not found after adding {provider}:{project}"
+        )
+
+    current_side = packctl.read_toml(metadata).get("side")
+    side = (
+        union_side(str(current_side), str(requested_side))
+        if already_installed and current_side in packctl.VALID_SIDES
+        else str(requested_side)
+    )
+    packctl.set_side_file(metadata, side)
+    return metadata.relative_to(transaction.source)
+
+
+def apply_profiles(
+    project_key_value: str,
+    profiles: Mapping[str, object],
+    names: Iterable[str],
+    *,
+    on_profile: Callable[[str], None] | None = None,
+    on_entry: Callable[[str, Path, str], None] | None = None,
+) -> None:
+    """Apply selected profiles in order as one all-or-nothing pack transaction."""
+    selected_names = tuple(names)
+    transaction = PackTransaction.create(project_key_value)
+    try:
+        for name in selected_names:
+            if name not in profiles:
+                available = ", ".join(sorted(profiles))
+                raise HuroshikiError(
+                    f"Unknown profile {name!r}; available: {available}"
+                )
+            entries = profiles[name] or []
+            if not isinstance(entries, list):
+                raise HuroshikiError(f"Profile {name!r} must be a list")
+            if on_profile is not None:
+                on_profile(name)
+            for index, entry in enumerate(entries, start=1):
+                if not isinstance(entry, dict):
+                    raise HuroshikiError(
+                        f"Profile {name!r} entry {index} {entry!r}: expected a mapping"
+                    )
+                try:
+                    relative_path = _apply_profile_entry(transaction, entry)
+                    side = str(packctl.read_toml(transaction.source / relative_path)["side"])
+                except Exception as error:
+                    raise HuroshikiError(
+                        f"Profile {name!r} entry {index} {entry!r}: {error}"
+                    ) from error
+                if on_entry is not None:
+                    on_entry(name, relative_path, side)
+        try:
+            transaction.apply()
+        except Exception as error:
+            profile_list = ", ".join(repr(name) for name in selected_names)
+            raise HuroshikiError(
+                f"Profiles {profile_list} could not be applied: {error}"
+            ) from error
+    finally:
+        transaction.discard()
+
+
 def remove_installed_mods(project_key_value: str, slugs: Iterable[str]) -> int:
     selected = set(slugs)
     if not selected:
