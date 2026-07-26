@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 import select
@@ -64,18 +65,28 @@ finally:
         except OSError as error:
             self.skipTest(f"controlling PTY unavailable: {error}")
         if pid == 0:
-            os.execv(sys.executable, [sys.executable, "-c", script])
+            environment = os.environ.copy()
+            environment.pop("TEXTUAL_ALLOW_SIGNALS", None)
+            os.execve(sys.executable, [sys.executable, "-c", script], environment)
 
         output = bytearray()
         status: int | None = None
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 5
         try:
             while b"RAW:1" not in output and time.monotonic() < deadline:
                 ready, _, _ = select.select([master], [], [], 0.1)
                 if ready:
-                    output.extend(os.read(master, 65536))
+                    try:
+                        output.extend(os.read(master, 65536))
+                    except OSError as error:
+                        if error.errno != errno.EIO:  # Linux reports PTY EOF as EIO.
+                            raise
+                        break
             if b"RAW:1" not in output:
-                self.skipTest("Textual did not enter expected raw mode on the test PTY")
+                self.fail(
+                    "Textual did not enter expected raw mode on the test PTY: "
+                    + output.decode(errors="replace")
+                )
 
             os.write(master, b"\x13\x03")
             while time.monotonic() < deadline:
@@ -83,8 +94,9 @@ finally:
                 if ready:
                     try:
                         output.extend(os.read(master, 65536))
-                    except OSError:
-                        pass
+                    except OSError as error:
+                        if error.errno != errno.EIO:
+                            raise
                 waited, status = os.waitpid(pid, os.WNOHANG)
                 if waited == pid:
                     break

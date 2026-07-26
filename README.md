@@ -79,8 +79,8 @@ the Main Menu. A file editor returns to Project files; unsaved edits require dis
 Creation candidate and conflict screens remain inside their creation flow. Project files opened as
 a recovery action for a broken pack return to the Main Menu because that Project cannot be opened.
 
-Running Packwiz work is cancelled before leaving its screen. Previously staged Install changes are
-kept in the project transaction until they are applied or explicitly discarded.
+The Install screen remains active until cancellation and rollback of running Packwiz work completes.
+Previously staged changes are kept in the project transaction until applied or explicitly discarded.
 
 ### Side Controls
 
@@ -131,7 +131,7 @@ Build and distribute:
 ```bash
 packctl build demo
 packctl build-all
-packctl serve demo --port 8080
+packctl serve demo --port 8080  # listens on 127.0.0.1
 packctl deploy-dry-run demo
 packctl deploy demo
 packctl restart demo
@@ -141,7 +141,7 @@ packctl deploy-all
 
 `deploy` builds before uploading with remote `rsync -av --delete`. `publish` performs that same
 build/deploy operation and restarts the configured Docker Compose service only after deployment
-succeeds. `serve` builds first and serves `packs/<id>/dist/` until interrupted.
+succeeds. `serve` builds first and serves `packs/<id>/dist/` on loopback until interrupted.
 
 Trash and retained state:
 
@@ -179,10 +179,9 @@ mods:
     side: client
 ```
 
-The effective configuration is the recursive merge of `template.yaml` and ignored
-`template.local.yaml`. Validation therefore permits required fields to be supplied by the local
-file, consistent with pack configuration overrides, although committed shared fields should
-normally remain in `template.yaml`.
+Every field shown above, including `mods`, is required in committed `template.yaml`.
+`template.local.yaml` may override scalar configuration values, but must not define `mods`; MOD-list
+editing, listing, and composition always use the committed list.
 
 Any `templates/<id>/source` entry, including a symlink, is a validation error. Legacy Packwiz
 template fallback and migration commands have been removed. Before upgrading, extract required
@@ -234,7 +233,6 @@ All former user-facing recipes were removed immediately. Use these replacements:
 | `just validate-template <template>` | `packctl validate-template <template>` |
 | `just validate` | `packctl validate` |
 | `just validate-for <pack>` | `packctl validate-for <pack>` |
-| `just migrate-template <template>` | Complete `template.yaml`, remove `source/`, then validate |
 | `just add` / `just add-for` | `packctl add <pack> <query> <side>` |
 | `just remove` / `just remove-for` | `packctl remove <pack> <mod>` |
 | `just side` / `just side-for` | `packctl side <pack> <path> <side>` |

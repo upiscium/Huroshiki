@@ -299,10 +299,14 @@ def reject_legacy_template_source(root: Path) -> None:
 def load_template_config(template_id: str) -> dict[str, Any]:
     root = get_template_root(template_id)
     reject_legacy_template_source(root)
-    config = merge(
-        load_yaml(root / "template.yaml"),
-        load_yaml(root / "template.local.yaml"),
-    )
+    config = load_yaml(root / "template.yaml")
+    local = load_yaml(root / "template.local.yaml")
+    if "mods" in local:
+        raise ConfigError(
+            f"templates/{template_id}/template.local.yaml must not define mods; "
+            "edit template.yaml instead"
+        )
+    config = merge(config, local)
     if config.get("id") != template_id:
         raise ConfigError(
             f"templates/{template_id}/template.yaml must contain id: {template_id}"
@@ -566,7 +570,7 @@ def template_mods_indexed(
     allow_invalid_sides: bool = False,
     deduplicate: bool = True,
 ) -> list[tuple[int, dict[str, str]]]:
-    config = load_yaml(get_template_root(template_id) / "template.yaml")
+    config = load_template_config(template_id)
     value = config.get("mods", [])
     if value is None:
         return []
@@ -626,6 +630,7 @@ def set_template_mod_side_at_index(
     side: str,
 ) -> None:
     root = get_template_root(template_id)
+    load_template_config(template_id)
     config_path = root / "template.yaml"
     config = load_yaml(config_path)
     mods = config.get("mods")
@@ -650,6 +655,7 @@ def set_template_mod_side_at_index(
 
 def save_template_mods_raw(template_id: str, mods: list[object]) -> None:
     root = get_template_root(template_id)
+    load_template_config(template_id)
     config_path = root / "template.yaml"
     config = load_yaml(config_path)
     config["mods"] = mods
@@ -668,6 +674,7 @@ def save_template_mods(
     allow_invalid_sides: bool = False,
 ) -> None:
     root = get_template_root(template_id)
+    load_template_config(template_id)
     config_path = root / "template.yaml"
     config = load_yaml(config_path)
     normalized = [
@@ -1512,7 +1519,22 @@ def validate_template_directory(root: Path) -> list[str]:
         errors.append(f"{display_path(root)}: invalid directory name: {error}")
     if config is None:
         return errors
-    config = merge(config, local or {})
+    committed = config
+    if local is not None and "mods" in local:
+        errors.append(
+            f"{display_path(local_path)}: mods is committed structural data; "
+            "edit template.yaml instead"
+        )
+    config = merge(committed, local or {})
+
+    validate_manifest_identity(root, committed, manifest, errors)
+    validation_text(committed, "display_name", manifest, errors)
+    validate_enabled(committed, manifest, errors)
+    validation_text(committed, "minecraft", manifest, errors)
+    validation_text(committed, "loader", manifest, errors)
+    validation_text(committed, "reference_loader_version", manifest, errors)
+    if not isinstance(committed.get("mods"), list):
+        errors.append(f"{display_path(manifest)}: mods must be a list")
 
     validate_manifest_identity(root, config, manifest, errors)
     validation_text(config, "display_name", manifest, errors)
@@ -1527,9 +1549,8 @@ def validate_template_directory(root: Path) -> list[str]:
     validation_text(config, "reference_loader_version", manifest, errors)
     validate_url_size_limit(config, manifest, errors)
 
-    mods = config.get("mods")
+    mods = committed.get("mods")
     if not isinstance(mods, list):
-        errors.append(f"{display_path(manifest)}: mods must be a list")
         return errors
     for index, entry in enumerate(mods):
         context = f"mods[{index}]"
@@ -1746,8 +1767,7 @@ def cmd_validate_template(args: argparse.Namespace) -> int:
     )
 
 
-def distribution_target(pack_id: str) -> str:
-    config = load_pack_config(pack_id)
+def distribution_target_from_config(config: dict[str, Any], pack_id: str) -> str:
     distribution = require_mapping(config, "distribution", pack_id)
     target = require_text(
         distribution,
@@ -1758,6 +1778,10 @@ def distribution_target(pack_id: str) -> str:
         return validate_rsync_target(target)
     except ValueError as error:
         raise ConfigError(str(error)) from error
+
+
+def distribution_target(pack_id: str) -> str:
+    return distribution_target_from_config(load_pack_config(pack_id), pack_id)
 
 
 def distribution_root(pack_id: str) -> Path:
@@ -1857,14 +1881,19 @@ def print_deploy_preview(pack_id: str, preview: DeployPreview) -> None:
     )
 
 
-def minecraft_server_target(pack_id: str) -> tuple[str, str, str]:
-    config = load_pack_config(pack_id)
+def minecraft_server_target_from_config(
+    config: dict[str, Any], pack_id: str
+) -> tuple[str, str, str]:
     server = require_mapping(config, "minecraft_server", pack_id)
     return (
         require_text(server, "ssh_host", f"{pack_id}.minecraft_server"),
         require_text(server, "stack_dir", f"{pack_id}.minecraft_server"),
         require_text(server, "service", f"{pack_id}.minecraft_server"),
     )
+
+
+def minecraft_server_target(pack_id: str) -> tuple[str, str, str]:
+    return minecraft_server_target_from_config(load_pack_config(pack_id), pack_id)
 
 
 def _deploy_pack(
@@ -1874,10 +1903,15 @@ def _deploy_pack(
     expected_target: str | None = None,
     expected_dist_digest: str | None = None,
     snapshot: Path | None = None,
+    confirmed_target: str | None = None,
 ) -> int:
     if build and _build_pack(pack_id) != 0:
         return 1
-    target = distribution_target(pack_id)
+    target = (
+        confirmed_target
+        if confirmed_target is not None
+        else distribution_target(pack_id)
+    )
     owned_snapshot = snapshot is None
     dist = (
         _make_deploy_snapshot(pack_id, distribution_root(pack_id))
@@ -1948,10 +1982,33 @@ def cmd_restart(args: argparse.Namespace) -> int:
 
 
 def cmd_publish(args: argparse.Namespace) -> int:
-    result = deploy_pack(args.pack, build=True)
-    if result != 0:
-        return result
-    return cmd_restart(args)
+    with ProjectLock(f"pack:{args.pack}", "publish"):
+        if _build_pack(args.pack) != 0:
+            return 1
+        config = load_pack_config(args.pack)
+        deploy_target = distribution_target_from_config(config, args.pack)
+        restart_target = minecraft_server_target_from_config(config, args.pack)
+        snapshot = _make_deploy_snapshot(args.pack, distribution_root(args.pack))
+        try:
+            digest = distribution_digest(snapshot)
+            result = _deploy_pack(
+                args.pack,
+                expected_target=deploy_target,
+                expected_dist_digest=digest,
+                snapshot=snapshot,
+                confirmed_target=deploy_target,
+            )
+            if result != 0:
+                return result
+            host, stack, service = restart_target
+            remote = (
+                f"cd {shlex.quote(stack)} && docker compose restart "
+                f"{shlex.quote(service)}"
+            )
+            run(["ssh", host, remote])
+            return 0
+        finally:
+            discard_deploy_snapshot(snapshot)
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -1960,8 +2017,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return result
     directory = get_pack_root(args.pack) / "dist"
     handler = partial(SimpleHTTPRequestHandler, directory=str(directory))
-    with ThreadingHTTPServer(("", args.port), handler) as server:
-        print(f"Serving {args.pack} at http://localhost:{args.port}/")
+    with ThreadingHTTPServer(("127.0.0.1", args.port), handler) as server:
+        print(f"Serving {args.pack} at http://127.0.0.1:{args.port}/")
         try:
             server.serve_forever()
         except KeyboardInterrupt:

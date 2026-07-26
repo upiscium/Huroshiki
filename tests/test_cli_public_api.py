@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import packctl
 
@@ -70,33 +70,109 @@ class PublicCliTest(unittest.TestCase):
         args = type("Args", (), {"pack": "demo", "port": 9090})()
         server = MagicMock()
         server.__enter__.return_value = server
+        stdout = StringIO()
         with tempfile.TemporaryDirectory() as directory, patch.object(
             packctl, "build_pack", return_value=0
         ) as build, patch.object(
             packctl, "get_pack_root", return_value=Path(directory) / "demo"
         ), patch.object(
             packctl, "ThreadingHTTPServer", return_value=server
-        ) as server_type:
+        ) as server_type, redirect_stdout(stdout):
             self.assertEqual(packctl.cmd_serve(args), 0)
 
         build.assert_called_once_with("demo")
-        self.assertEqual(server_type.call_args.args[0], ("", 9090))
+        self.assertEqual(server_type.call_args.args[0], ("127.0.0.1", 9090))
+        self.assertIn("http://127.0.0.1:9090/", stdout.getvalue())
         server.serve_forever.assert_called_once_with()
 
     def test_publish_restarts_only_after_successful_deploy(self) -> None:
         args = type("Args", (), {"pack": "demo"})()
-        with patch.object(packctl, "deploy_pack", return_value=0) as deploy, patch.object(
-            packctl, "cmd_restart", return_value=0
-        ) as restart:
+        snapshot = Path("/safe/snapshot")
+        config = {
+            "distribution": {"rsync_target": "host:/demo"},
+            "minecraft_server": {
+                "ssh_host": "server",
+                "stack_dir": "/srv/demo",
+                "service": "minecraft",
+            },
+        }
+        patches = (
+            patch.object(packctl, "ProjectLock", MagicMock()),
+            patch.object(packctl, "_build_pack", return_value=0),
+            patch.object(packctl, "load_pack_config", return_value=config),
+            patch.object(packctl, "distribution_root", return_value=Path("/dist")),
+            patch.object(packctl, "_make_deploy_snapshot", return_value=snapshot),
+            patch.object(packctl, "distribution_digest", return_value="digest"),
+            patch.object(packctl, "discard_deploy_snapshot"),
+        )
+        with patches[0], patches[1] as build, patches[2], patches[3], patches[4], patches[5], patches[6], patch.object(
+            packctl, "_deploy_pack", return_value=0
+        ) as deploy, patch.object(packctl, "run") as run:
             self.assertEqual(packctl.cmd_publish(args), 0)
-        self.assertEqual(deploy.call_args, call("demo", build=True))
-        restart.assert_called_once_with(args)
+        build.assert_called_once_with("demo")
+        self.assertEqual(deploy.call_args.kwargs["confirmed_target"], "host:/demo")
+        run.assert_called_once_with(
+            ["ssh", "server", "cd /srv/demo && docker compose restart minecraft"]
+        )
 
-        with patch.object(packctl, "deploy_pack", return_value=8), patch.object(
-            packctl, "cmd_restart"
-        ) as restart:
-            self.assertEqual(packctl.cmd_publish(args), 8)
-        restart.assert_not_called()
+        with patches[0], patch.object(packctl, "_build_pack", return_value=8), patch.object(
+            packctl, "load_pack_config"
+        ) as load_config, patch.object(packctl, "run") as run:
+            self.assertEqual(packctl.cmd_publish(args), 1)
+        load_config.assert_not_called()
+        run.assert_not_called()
+
+    def test_publish_keeps_one_locked_configuration_across_deploy_and_restart(self) -> None:
+        args = type("Args", (), {"pack": "demo"})()
+        config = {
+            "distribution": {"rsync_target": "first:/demo"},
+            "minecraft_server": {
+                "ssh_host": "first-server",
+                "stack_dir": "/srv/first",
+                "service": "first-service",
+            },
+        }
+        lock = MagicMock()
+        lock.__enter__.return_value = lock
+
+        def mutate_configuration(*args, **kwargs):
+            self.assertTrue(lock.__enter__.called)
+            self.assertFalse(lock.__exit__.called)
+            config["distribution"]["rsync_target"] = "second:/demo"
+            config["minecraft_server"] = {
+                "ssh_host": "second-server",
+                "stack_dir": "/srv/second",
+                "service": "second-service",
+            }
+            return 0
+
+        with patch.object(packctl, "ProjectLock", return_value=lock) as lock_type, patch.object(
+            packctl, "_build_pack", return_value=0
+        ), patch.object(
+            packctl, "load_pack_config", return_value=config
+        ) as load_config, patch.object(
+            packctl, "distribution_root", return_value=Path("/dist")
+        ), patch.object(
+            packctl, "_make_deploy_snapshot", return_value=Path("/snapshot")
+        ), patch.object(
+            packctl, "distribution_digest", return_value="digest"
+        ), patch.object(
+            packctl, "_deploy_pack", side_effect=mutate_configuration
+        ) as deploy, patch.object(
+            packctl, "discard_deploy_snapshot"
+        ), patch.object(packctl, "run") as run:
+            self.assertEqual(packctl.cmd_publish(args), 0)
+
+        lock_type.assert_called_once_with("pack:demo", "publish")
+        load_config.assert_called_once_with("demo")
+        self.assertEqual(deploy.call_args.kwargs["confirmed_target"], "first:/demo")
+        run.assert_called_once_with(
+            [
+                "ssh",
+                "first-server",
+                "cd /srv/first && docker compose restart first-service",
+            ]
+        )
 
     def test_justfile_contains_only_development_tasks(self) -> None:
         justfile = (Path(__file__).resolve().parents[1] / "Justfile").read_text(

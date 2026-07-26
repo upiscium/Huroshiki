@@ -5,7 +5,7 @@ import argparse
 from pathlib import Path
 import sys
 import threading
-from typing import Iterable
+from typing import Callable, Iterable
 
 from huroshiki_paths import resolve_root, root_argument
 
@@ -18,6 +18,7 @@ try:
     from textual.binding import Binding
     from textual.containers import Container
     from textual.screen import ModalScreen, Screen
+    from textual.timer import Timer
     from textual.widgets import DataTable, Input, Static, TextArea
 except ModuleNotFoundError as error:
     if error.name == "textual":
@@ -99,11 +100,12 @@ class HuroshikiApp(App[None]):
         self.notify(project.error, severity="error")
         return False
 
-    def open_project(self, project_key: str) -> None:
+    def open_project(self, project_key: str) -> bool:
         if not self.project_is_usable(project_key):
-            return
+            return False
         self.selected_project = project_key
         self.switch_screen(ProjectScreen(project_key))
+        return True
 
     def open_install(self, project_key: str) -> None:
         if not self.project_is_usable(project_key):
@@ -511,8 +513,8 @@ class ProjectChildScreen:
     def return_to_project(self) -> None:
         if self.recovery_parent_main:
             self.app.go_main()
-        else:
-            self.app.open_project(self.project_key)
+        elif not self.app.open_project(self.project_key):
+            self.app.go_main()
 
     def return_to_project_files(self) -> None:
         self.app.switch_screen(
@@ -1657,6 +1659,9 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         self.operation: core.PackwizAddOperation | None = None
         self.operation_thread: threading.Thread | None = None
         self._closing = False
+        self._pending_navigation: Callable[[], None] | None = None
+        self._pending_operation: core.PackwizAddOperation | None = None
+        self._navigation_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -1739,6 +1744,8 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         self.query_one("#packwiz-status", Static).update(message)
 
     def toggle_provider(self) -> None:
+        if self._pending_navigation is not None:
+            return
         if self.operation is not None and not self.operation.done.is_set():
             self.app.notify("Wait for the active add operation", severity="warning")
             return
@@ -1769,11 +1776,15 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         self.toggle_provider()
 
     def action_toggle_client_side(self) -> None:
+        if self._pending_navigation is not None:
+            return
         focused = self.focused
         staged = self.query_one("#staged-table", DataTable)
         self.toggle_client(staged=focused is staged)
 
     def action_toggle_server_side(self) -> None:
+        if self._pending_navigation is not None:
+            return
         focused = self.focused
         staged = self.query_one("#staged-table", DataTable)
         self.toggle_server(staged=focused is staged)
@@ -1782,9 +1793,39 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         if self.operation is not None and not self.operation.done.is_set():
             self.operation.cancel()
 
-    def cancel_and_return_to_project(self) -> None:
-        self.cancel_operation()
-        self.return_to_project()
+    def navigate_after_cancellation(self, destination: Callable[[], None]) -> None:
+        if self._pending_navigation is not None:
+            return
+        operation = self.operation
+        if operation is None or operation.done.is_set():
+            destination()
+            return
+
+        self._pending_navigation = destination
+        self._pending_operation = operation
+        self.set_status("Cancelling Packwiz operation before leaving...")
+        try:
+            operation.cancel()
+        except Exception as error:
+            self._pending_navigation = None
+            self._pending_operation = None
+            self.app.notify(str(error), severity="error")
+            return
+        self._navigation_timer = self.set_interval(
+            0.05, self._complete_pending_navigation
+        )
+
+    def _complete_pending_navigation(self) -> None:
+        destination = self._pending_navigation
+        operation = self._pending_operation
+        if destination is None or operation is None or not operation.done.is_set():
+            return
+        if self._navigation_timer is not None:
+            self._navigation_timer.pause()
+            self._navigation_timer = None
+        self._pending_navigation = None
+        self._pending_operation = None
+        destination()
 
     def discard_search_results(self) -> None:
         if not self.search_results:
@@ -1805,6 +1846,8 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
 
     @on(Input.Submitted, "#mod-search")
     def start_search(self, event: Input.Submitted) -> None:
+        if self._pending_navigation is not None:
+            return
         query = event.value.strip()
         if not query:
             self.app.notify("Enter a search term", severity="warning")
@@ -2059,13 +2102,16 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             self.app.notify(str(error), severity="error")
 
     def on_key(self, event: events.Key) -> None:
+        if self._pending_navigation is not None:
+            event.stop()
+            return
         focused = self.focused
         results = self.query_one("#search-results-table", DataTable)
         staged = self.query_one("#staged-table", DataTable)
 
         if isinstance(focused, Input):
             if event.key == "escape":
-                self.cancel_and_return_to_project()
+                self.navigate_after_cancellation(self.return_to_project)
                 event.stop()
             return
 
@@ -2089,21 +2135,21 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         elif focused is staged and key == "enter":
             self.review()
         elif key == "l":
-            self.cancel_operation()
-            self.app.open_list(self.project_key)
+            self.navigate_after_cancellation(lambda: self.app.open_list(self.project_key))
         elif key == "u":
             if core.split_project_key(self.project_key)[0] == "pack":
-                self.cancel_operation()
-                self.app.open_update(self.project_key)
+                self.navigate_after_cancellation(
+                    lambda: self.app.open_update(self.project_key)
+                )
             else:
                 self.app.notify(
                     "Templates resolve compatible versions during MODPACK creation",
                     severity="warning",
                 )
         elif key == "p":
-            self.cancel_and_return_to_project()
+            self.navigate_after_cancellation(self.return_to_project)
         elif key == "escape":
-            self.cancel_and_return_to_project()
+            self.navigate_after_cancellation(self.return_to_project)
         else:
             return
         event.stop()

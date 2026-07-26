@@ -292,7 +292,7 @@ minecraft_server:
             "url_max_jar_size_bytes must be a positive integer",
             "templates/base/template.yaml: id 'other' must match directory name 'base'",
             "loader must be one of",
-            "mods must be a list",
+            "template.local.yaml: mods is committed structural data",
         ):
             self.assertIn(expected, stderr)
 
@@ -306,7 +306,7 @@ minecraft_server:
         self.assertEqual(result, 1)
         self.assertIn("templates/base/template.local.yaml", stderr)
 
-    def test_template_local_yaml_can_supply_required_effective_fields(self) -> None:
+    def test_template_local_yaml_cannot_supply_missing_committed_fields(self) -> None:
         (self.template_root / "template.yaml").write_text(
             "id: base\n", encoding="utf-8"
         )
@@ -323,8 +323,26 @@ mods: []
 
         result, _, stderr = self.validate_all()
 
-        self.assertEqual(result, 0)
-        self.assertEqual(stderr, "")
+        self.assertEqual(result, 1)
+        for field in (
+            "display_name",
+            "enabled",
+            "minecraft",
+            "loader",
+            "reference_loader_version",
+            "mods",
+        ):
+            self.assertIn(field, stderr)
+
+    def test_template_local_yaml_rejects_mods_even_when_committed_mods_exist(self) -> None:
+        (self.template_root / "template.local.yaml").write_text(
+            "display_name: Local Base\nmods: []\n", encoding="utf-8"
+        )
+
+        result, _, stderr = self.validate_all()
+
+        self.assertEqual(result, 1)
+        self.assertIn("template.local.yaml: mods is committed structural data", stderr)
 
     def test_aggregate_validation_reports_legacy_source_before_bad_manifest(self) -> None:
         (self.template_root / "source").mkdir()

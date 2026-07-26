@@ -108,6 +108,30 @@ class TemplateManifestTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual([mod.name for mod in core.list_mods(key)], ["Create"])
 
+    def test_local_mods_cannot_override_listing_or_composition_data(self) -> None:
+        (self.template_root / "template.local.yaml").write_text(
+            "display_name: Local Base\nmods: []\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(
+            packctl.ConfigError, "template.local.yaml must not define mods"
+        ):
+            packctl.load_template_config("base")
+        with self.assertRaisesRegex(
+            packctl.ConfigError, "template.local.yaml must not define mods"
+        ):
+            packctl.template_mods("base")
+        with self.assertRaisesRegex(
+            packctl.ConfigError, "template.local.yaml must not define mods"
+        ):
+            core.list_mods("template:base")
+        with self.assertRaisesRegex(
+            packctl.ConfigError, "template.local.yaml must not define mods"
+        ):
+            core.prepare_template_composition(
+                template_ids=["base"], minecraft="1.21.1", loader="neoforge"
+            )
+
     def test_candidate_matching_ignores_loader_version(self) -> None:
         candidates = core.compatible_templates("1.21.1", "neoforge")
         self.assertEqual([item.project_id for item in candidates], ["base"])

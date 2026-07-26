@@ -38,6 +38,9 @@ FILE = core.TemplateInfo("common", Path("notes.txt"), Path("/notes.txt"), 4)
 class _Transaction:
     active = True
 
+    def __init__(self) -> None:
+        self.changes: list[str] = []
+
     def staged_mods(self) -> list[core.ModInfo]:
         return []
 
@@ -74,11 +77,15 @@ class _NavigationApp(App[None]):
     def go_main(self) -> None:
         self.switch_screen(huroshiki.MainMenuScreen())
 
-    def open_project(self, project_key: str) -> None:
+    def open_project(self, project_key: str) -> bool:
         self.switch_screen(huroshiki.ProjectScreen(project_key))
+        return True
 
     def open_list(self, project_key: str) -> None:
         self.switch_screen(huroshiki.InstalledModsScreen(project_key))
+
+    def open_update(self, project_key: str) -> None:
+        self.switch_screen(huroshiki.UpdateScreen(project_key))
 
     def get_transaction(self, project_key: str):
         return self.transactions[project_key]
@@ -205,6 +212,25 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertIsInstance(app.screen, huroshiki.MainMenuScreen)
 
+    async def test_child_falls_back_to_main_if_project_becomes_invalid(self) -> None:
+        current = {"project": PROJECT}
+        with self.patches(), patch.object(
+            huroshiki.core,
+            "project_info",
+            side_effect=lambda _: current["project"],
+        ):
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test() as pilot:
+                app.switch_screen(huroshiki.InstalledModsScreen("pack:demo"))
+                await pilot.pause()
+                current["project"] = BROKEN_PROJECT
+
+                await pilot.press("escape")
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, huroshiki.MainMenuScreen)
+                self.assertIsNone(app.selected_project)
+
     async def test_install_escape_cancels_before_navigation_and_preserves_staging(self) -> None:
         with self.patches():
             transaction = _Transaction()
@@ -233,6 +259,36 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(operation.cancelled)
                 self.assertIs(app.transactions["pack:demo"], transaction)
                 self.assertIsInstance(app.screen, huroshiki.InstalledModsScreen)
+
+    async def test_install_waits_for_delayed_rollback_before_sibling_navigation(self) -> None:
+        class DelayedOperation(_Operation):
+            def cancel(self) -> None:
+                self.cancelled = True
+
+        with self.patches():
+            transaction = _Transaction()
+            operation = DelayedOperation()
+            install = huroshiki.InstallScreen("pack:demo")
+            app = _NavigationApp(install)
+            app.transactions["pack:demo"] = transaction
+            async with app.run_test() as pilot:
+                install.operation = operation
+                install.query_one("#search-results-table").focus()
+                await pilot.press("l", "p", "l")
+                await pilot.pause()
+
+                self.assertTrue(operation.cancelled)
+                self.assertIs(app.screen, install)
+                transaction.changes.append("rollback")
+                operation.done.set()
+                await pilot.pause(0.1)
+
+                self.assertIsInstance(app.screen, huroshiki.InstalledModsScreen)
+                transaction.changes.append("post-navigation edit")
+                self.assertEqual(
+                    transaction.changes,
+                    ["rollback", "post-navigation edit"],
+                )
 
 
 if __name__ == "__main__":
