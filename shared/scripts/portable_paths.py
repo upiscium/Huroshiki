@@ -9,7 +9,10 @@ class PortablePathError(ValueError):
     pass
 
 
-_WINDOWS_DEVICE = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$", re.I)
+_WINDOWS_DEVICE = re.compile(
+    r"^(con|prn|aux|nul|conin\$|conout\$|com(?:[1-9]|[¹²³])|lpt(?:[1-9]|[¹²³]))(?:\..*)?$",
+    re.I,
+)
 
 
 def _normalize_component(value: str, *, context: str) -> str:

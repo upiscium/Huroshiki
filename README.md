@@ -234,10 +234,12 @@ then run `packctl validate-template <id>`.
 URL entries use `provider: url`, a stable logical `project_id`, and a public `.jar` URL. Downloads
 default to 256 MiB; set `url_max_jar_size_bytes` in the committed manifest or its permitted local
 configuration to change the limit. Every URL and redirect rejects non-public literal or resolved
-addresses by default, and each connection is pinned to the approved DNS result. Internal/self-hosted
-networks require `url_allow_private_networks: true` in the ignored `pack.local.yaml` or
-`template.local.yaml`; this key is rejected in committed manifests. When templates share one URL
-candidate, private access is allowed only if every origin template opts in.
+addresses, including the well-known NAT64 prefixes, by default, and each connection is pinned to the
+approved DNS result. `url_allow_private_networks: true` in ignored local configuration permits
+intentional private, loopback, link-local, shared-address, and NAT64 access; unspecified, multicast,
+reserved, documentation, and benchmarking ranges remain prohibited. This key is rejected in
+committed manifests. When templates share one URL candidate, private access is allowed only if every
+origin template opts in.
 
 Generated Packwiz metadata paths and JAR filenames must also be portable across case-insensitive
 filesystems: traversal, absolute/drive/UNC paths, control characters, Windows device names, trailing

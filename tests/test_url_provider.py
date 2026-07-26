@@ -12,6 +12,7 @@ from pathlib import Path
 import struct
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -803,6 +804,39 @@ mods:
                 ("127.0.0.1",),
             )
 
+    def test_nat64_prefixes_require_private_network_opt_in(self) -> None:
+        for address in (
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::7f00:1",
+        ):
+            with self.subTest(address=address), patch.object(
+                url_artifacts.socket,
+                "getaddrinfo",
+                return_value=[(10, 1, 6, "", (address, 80, 0, 0))],
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, "prohibited address"):
+                    url_artifacts._approved_addresses(
+                        "example.test", 80, allow_private_networks=False
+                    )
+                self.assertEqual(
+                    url_artifacts._approved_addresses(
+                        "example.test", 80, allow_private_networks=True
+                    ),
+                    (address,),
+                )
+
+    def test_private_opt_in_still_rejects_non_unicast_nonsense(self) -> None:
+        for address in ("::", "ff02::1", "2001:db8::1", "240.0.0.1"):
+            with self.subTest(address=address), patch.object(
+                url_artifacts.socket,
+                "getaddrinfo",
+                return_value=[(10, 1, 6, "", (address, 80, 0, 0))],
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, "prohibited address"):
+                    url_artifacts._approved_addresses(
+                        "example.test", 80, allow_private_networks=True
+                    )
+
     def test_public_redirect_to_private_resolution_is_rejected(self) -> None:
         class RedirectResponse:
             status = 302
@@ -843,9 +877,114 @@ mods:
         for url in (
             "https://example.test/%2e%2e%2fescape.jar",
             "https://example.test/CON.jar",
+            "https://example.test/CONIN$.jar",
+            "https://example.test/conout$.JAR",
+            "https://example.test/COM%C2%B9.jar",
+            "https://example.test/LPT%C2%B3.backup.jar",
         ):
             with self.subTest(url=url), self.assertRaises(core.HuroshikiError):
                 core.validate_public_url(url)
+
+    def test_direct_url_add_rejects_portable_filename_collision(self) -> None:
+        existing = self.pack_root / "source/mods/existing.pw.toml"
+        existing.write_text(
+            'name = "Existing"\nfilename = "Same.jar"\nside = "both"\n'
+            '[download]\nurl = "https://example.test/existing.jar"\n',
+            encoding="utf-8",
+        )
+        artifact = core.UrlArtifact(
+            "Incoming",
+            "incoming",
+            "1.0",
+            "same.jar",
+            "https://example.test/same.jar",
+            "00",
+            ("neoforge",),
+        )
+
+        with self.assertRaisesRegex(core.HuroshikiError, "Portable filename collision"):
+            core.write_url_metadata(
+                self.pack_root / "source",
+                Path("mods/incoming.pw.toml"),
+                artifact,
+                "both",
+            )
+        self.assertFalse((self.pack_root / "source/mods/incoming.pw.toml").exists())
+
+    def _assert_real_stream_interrupts(self, *, trickle: bool, cancel: bool) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Length", "1000000")
+                self.end_headers()
+                entered.set()
+                try:
+                    if trickle:
+                        while not release.wait(0.05):
+                            self.wfile.write(b"x")
+                            self.wfile.flush()
+                    else:
+                        release.wait(5)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, format: str, *args) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        cancel_event = threading.Event()
+        canceller = None
+        if cancel:
+            def cancel_after_read_starts() -> None:
+                entered.wait(1)
+                cancel_event.set()
+
+            canceller = threading.Thread(target=cancel_after_read_starts)
+            canceller.start()
+        started = time.monotonic()
+        named_temporary_file = tempfile.NamedTemporaryFile
+
+        def temporary_file(**kwargs):
+            return named_temporary_file(dir=self.downloads, **kwargs)
+
+        try:
+            with patch.object(
+                core.tempfile, "NamedTemporaryFile", side_effect=temporary_file
+            ):
+                with self.assertRaisesRegex(
+                    core.HuroshikiError,
+                    "cancelled" if cancel else "deadline exceeded",
+                ):
+                    core.download_url_artifact(
+                        f"http://127.0.0.1:{server.server_port}/private.jar",
+                        cancel_event,
+                        self.root / "real-stream-logs",
+                        "neoforge",
+                        total_timeout_seconds=5 if cancel else 0.2,
+                        allow_private_networks=True,
+                    )
+            self.assertLess(time.monotonic() - started, 0.8)
+            self.assert_downloads_cleaned()
+        finally:
+            release.set()
+            server.shutdown()
+            server.server_close()
+            thread.join(1)
+            if canceller is not None:
+                canceller.join(1)
+
+    def test_real_stalled_read_is_interrupted_by_cancellation(self) -> None:
+        self._assert_real_stream_interrupts(trickle=False, cancel=True)
+
+    def test_real_trickling_read_is_interrupted_by_total_deadline(self) -> None:
+        self._assert_real_stream_interrupts(trickle=True, cancel=False)
 
 
 if __name__ == "__main__":

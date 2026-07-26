@@ -12,6 +12,10 @@
 - URL downloads reject non-public literal/resolved addresses and redirects by default and pin each
   connection to an approved DNS result. The machine-local-only `url_allow_private_networks` boolean
   enables intentional internal access; composed URL candidates require every origin to opt in.
+- Transaction swaps now park and verify the exact live source before installation, overlay edits and
+  builds use no-follow directory descriptors, and URL cancellation/deadlines shut down live sockets.
+- NAT64/special-use address policy, Windows device aliases, and portable metadata filename collision
+  checks now cover direct URL additions and repository validation.
 
 ### Overlay Safety (#32, #33)
 

@@ -72,6 +72,24 @@ class TransactionTestCase(unittest.TestCase):
 
 
 class UpdateTransactionTest(TransactionTestCase):
+    def test_aba_source_change_during_copy_cannot_seed_staged_tree(self) -> None:
+        target = self.write_mod("first")
+        original = target.read_bytes()
+        original_copy = core.copy_transaction_source
+
+        def aba_copy(source, destination):
+            original_copy(source, destination)
+            target.write_text(metadata("First", "first", "temporary"), encoding="utf-8")
+            (destination / "mods" / "first.pw.toml").write_text(
+                metadata("First", "first", "temporary"), encoding="utf-8"
+            )
+            target.write_bytes(original)
+
+        with patch.object(core, "copy_transaction_source", side_effect=aba_copy):
+            with self.assertRaisesRegex(core.HuroshikiError, "while.*copy"):
+                core.PackTransaction.create(self.key)
+        self.assertEqual(target.read_bytes(), original)
+
     def test_source_change_during_transaction_copy_aborts_update_and_persists(self) -> None:
         target = self.write_mod("first")
         original_copy = core.copy_transaction_source
@@ -210,6 +228,52 @@ url = "https://example.invalid/manual.jar"
             with self.assertRaisesRegex(core.HuroshikiError, "real Packwiz source changed"):
                 transaction.apply()
         self.assertIn("external", target.read_text(encoding="utf-8"))
+        transaction.discard()
+
+    def test_external_write_immediately_before_source_rename_is_restored_exactly(self) -> None:
+        target = self.write_mod("first")
+        transaction = core.PackTransaction.create(self.key)
+        staged = transaction.source / "mods" / "first.pw.toml"
+        staged.write_text(metadata("First", "first", "v2"), encoding="utf-8")
+        real_rename = Path.rename
+
+        def write_then_rename(path: Path, destination: Path):
+            if path == self.source:
+                target.write_text(
+                    metadata("First", "first", "external"), encoding="utf-8"
+                )
+            return real_rename(path, destination)
+
+        with patch.object(core.subprocess, "run", side_effect=lambda command, **_: self.completed(command)), patch.object(
+            Path, "rename", write_then_rename
+        ):
+            with self.assertRaisesRegex(core.HuroshikiError, "real Packwiz source changed"):
+                transaction.apply()
+
+        self.assertIn("external", target.read_text(encoding="utf-8"))
+        self.assertFalse(list(self.source.parent.glob(".source.huroshiki-backup-*")))
+        transaction.discard()
+
+    def test_recreated_source_is_preserved_when_staged_install_fails(self) -> None:
+        self.write_mod("first")
+        transaction = core.PackTransaction.create(self.key)
+        real_rename = Path.rename
+
+        def recreate_before_install(path: Path, destination: Path):
+            if path == transaction.source:
+                self.source.mkdir()
+                (self.source / "external.txt").write_text("keep", encoding="utf-8")
+                raise FileExistsError("recreated")
+            return real_rename(path, destination)
+
+        with patch.object(core.subprocess, "run", side_effect=lambda command, **_: self.completed(command)), patch.object(
+            Path, "rename", recreate_before_install
+        ):
+            with self.assertRaisesRegex(core.HuroshikiError, "recreated externally"):
+                transaction.apply()
+
+        self.assertEqual((self.source / "external.txt").read_text(encoding="utf-8"), "keep")
+        self.assertEqual(len(list(self.source.parent.glob(".source.huroshiki-backup-*"))), 1)
         transaction.discard()
 
 

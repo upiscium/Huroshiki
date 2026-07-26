@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
+import errno
 import os
 from pathlib import Path
+import shutil
 import stat
+from typing import Iterator
+from uuid import uuid4
 
 
 OVERLAY_TARGETS = ("common", "client", "server")
@@ -32,6 +37,196 @@ class OverlayIssue:
 class OverlayScan:
     entries: tuple[OverlayEntry, ...]
     issues: tuple[OverlayIssue, ...]
+
+
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+@dataclass
+class _OverlayParent:
+    fd: int
+    ancestors: list[tuple[int, str]]
+
+
+def _open_directory(name: str, parent_fd: int) -> int:
+    return os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+
+
+@contextmanager
+def _open_overlay_parent(
+    content_root: Path,
+    target: str,
+    relative: Path,
+    *,
+    create: bool,
+) -> Iterator[_OverlayParent]:
+    if target not in OVERLAY_TARGETS:
+        raise OverlayPolicyError("Overlay target must be common, client, or server")
+
+    fds: list[int] = []
+    ancestors: list[tuple[int, str]] = []
+    try:
+        root_parent_fd = os.open(content_root.parent, _DIRECTORY_FLAGS)
+        fds.append(root_parent_fd)
+        try:
+            content_fd = _open_directory(content_root.name, root_parent_fd)
+        except FileNotFoundError:
+            if not create:
+                raise
+            os.mkdir(content_root.name, dir_fd=root_parent_fd)
+            content_fd = _open_directory(content_root.name, root_parent_fd)
+        fds.append(content_fd)
+        try:
+            target_fd = _open_directory(target, content_fd)
+        except FileNotFoundError:
+            if not create:
+                raise
+            os.mkdir(target, dir_fd=content_fd)
+            target_fd = _open_directory(target, content_fd)
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise OverlayPolicyError(
+                    f"Symlink is not allowed in content overlay: {target} "
+                    f"-> {_readlink_at(target, content_fd)}"
+                ) from error
+            raise
+        fds.append(target_fd)
+        current_fd = target_fd
+        for part in relative.parts[:-1]:
+            try:
+                child_fd = _open_directory(part, current_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, dir_fd=current_fd)
+                child_fd = _open_directory(part, current_fd)
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    checked = Path(target, *relative.parts[: len(ancestors) + 1])
+                    raise OverlayPolicyError(
+                        f"Symlink is not allowed in content overlay: {checked} "
+                        f"-> {_readlink_at(part, current_fd)}"
+                    ) from error
+                raise
+            ancestors.append((current_fd, part))
+            fds.append(child_fd)
+            current_fd = child_fd
+        yield _OverlayParent(current_fd, ancestors)
+    except OSError as error:
+        raise OverlayPolicyError(
+            f"Cannot open overlay path {target}/{relative}: {error}"
+        ) from error
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def create_overlay_file(content_root: Path, target: str, relative_path: str | Path) -> None:
+    relative = normalize_overlay_relative_path(relative_path)
+    with _open_overlay_parent(content_root, target, relative, create=True) as parent:
+        try:
+            fd = os.open(
+                relative.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o666,
+                dir_fd=parent.fd,
+            )
+        except FileExistsError as error:
+            raise OverlayPolicyError(f"Overlay file already exists: {target}/{relative}") from error
+        os.close(fd)
+
+
+def read_overlay_text(content_root: Path, target: str, relative_path: str | Path) -> str:
+    relative = normalize_overlay_relative_path(relative_path)
+    with _open_overlay_parent(content_root, target, relative, create=False) as parent:
+        try:
+            fd = os.open(
+                relative.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent.fd,
+            )
+        except FileNotFoundError as error:
+            raise OverlayPolicyError(f"Overlay file does not exist: {target}/{relative}") from error
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OverlayPolicyError(f"Overlay file does not exist: {target}/{relative}")
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                fd = -1
+                return handle.read()
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+
+def write_overlay_text(
+    content_root: Path,
+    target: str,
+    relative_path: str | Path,
+    text: str,
+) -> None:
+    relative = normalize_overlay_relative_path(relative_path)
+    temporary_name = f".{relative.name}.huroshiki-tmp-{uuid4().hex}"
+    with _open_overlay_parent(content_root, target, relative, create=False) as parent:
+        existing_fd = -1
+        temporary_fd = -1
+        try:
+            existing_fd = os.open(
+                relative.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent.fd,
+            )
+            if not stat.S_ISREG(os.fstat(existing_fd).st_mode):
+                raise OverlayPolicyError(f"Overlay file does not exist: {target}/{relative}")
+            os.close(existing_fd)
+            existing_fd = -1
+            temporary_fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o666,
+                dir_fd=parent.fd,
+            )
+            with os.fdopen(temporary_fd, "w", encoding="utf-8") as handle:
+                temporary_fd = -1
+                handle.write(text)
+            os.replace(
+                temporary_name,
+                relative.name,
+                src_dir_fd=parent.fd,
+                dst_dir_fd=parent.fd,
+            )
+        finally:
+            if existing_fd >= 0:
+                os.close(existing_fd)
+            if temporary_fd >= 0:
+                os.close(temporary_fd)
+            try:
+                os.unlink(temporary_name, dir_fd=parent.fd)
+            except FileNotFoundError:
+                pass
+
+
+def delete_overlay_file(content_root: Path, target: str, relative_path: str | Path) -> None:
+    relative = normalize_overlay_relative_path(relative_path)
+    with _open_overlay_parent(content_root, target, relative, create=False) as parent:
+        fd = -1
+        try:
+            fd = os.open(
+                relative.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent.fd,
+            )
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OverlayPolicyError(f"Overlay file does not exist: {target}/{relative}")
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        os.unlink(relative.name, dir_fd=parent.fd)
+        for grandparent_fd, name in reversed(parent.ancestors):
+            try:
+                os.rmdir(name, dir_fd=grandparent_fd)
+            except OSError:
+                break
 
 
 def is_packwiz_owned_name(name: str) -> bool:
@@ -140,6 +335,160 @@ def scan_content_overlays(content_root: Path) -> OverlayScan:
             issues,
             include_entry=False,
         )
+    return OverlayScan(tuple(entries), tuple(issues))
+
+
+def _readlink_at(name: str, directory_fd: int) -> str:
+    try:
+        return os.readlink(name, dir_fd=directory_fd)
+    except OSError as error:
+        return f"<unreadable: {error}>"
+
+
+def _copy_overlay_directory(
+    source_fd: int,
+    destination: Path,
+    relative: Path,
+    entries: list[OverlayEntry],
+    issues: list[OverlayIssue],
+) -> None:
+    try:
+        with os.scandir(source_fd) as iterator:
+            children = sorted(iterator, key=lambda item: item.name)
+    except OSError as error:
+        issues.append(OverlayIssue(relative, f"cannot list directory: {error}"))
+        return
+
+    for child in children:
+        child_relative = relative / child.name
+        try:
+            metadata = child.stat(follow_symlinks=False)
+        except OSError as error:
+            issues.append(OverlayIssue(child_relative, f"cannot inspect entry: {error}"))
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
+            target = _readlink_at(child.name, source_fd)
+            entries.append(OverlayEntry(child_relative, "symlink", link_target=target))
+            issues.append(OverlayIssue(child_relative, f"symlink is not allowed -> {target}"))
+            if is_packwiz_owned_name(child.name):
+                issues.append(OverlayIssue(child_relative, "Packwiz-owned path is not allowed"))
+            continue
+        if is_packwiz_owned_name(child.name):
+            issues.append(OverlayIssue(child_relative, "Packwiz-owned path is not allowed"))
+            continue
+        if child.name == ".gitkeep":
+            continue
+        if stat.S_ISDIR(metadata.st_mode):
+            try:
+                child_fd = _open_directory(child.name, source_fd)
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    target = _readlink_at(child.name, source_fd)
+                    entries.append(
+                        OverlayEntry(child_relative, "symlink", link_target=target)
+                    )
+                    issues.append(
+                        OverlayIssue(child_relative, f"symlink is not allowed -> {target}")
+                    )
+                else:
+                    issues.append(
+                        OverlayIssue(child_relative, f"cannot open directory: {error}")
+                    )
+                continue
+            try:
+                output = destination / child.name
+                output.mkdir(exist_ok=True)
+                _copy_overlay_directory(
+                    child_fd, output, child_relative, entries, issues
+                )
+            finally:
+                os.close(child_fd)
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            entries.append(OverlayEntry(child_relative, "special"))
+            issues.append(
+                OverlayIssue(child_relative, "special filesystem entry is not allowed")
+            )
+            continue
+
+        try:
+            file_fd = os.open(
+                child.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=source_fd,
+            )
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                target = _readlink_at(child.name, source_fd)
+                entries.append(OverlayEntry(child_relative, "symlink", link_target=target))
+                issues.append(
+                    OverlayIssue(child_relative, f"symlink is not allowed -> {target}")
+                )
+            else:
+                issues.append(OverlayIssue(child_relative, f"cannot open file: {error}"))
+            continue
+        try:
+            opened_metadata = os.fstat(file_fd)
+            if not stat.S_ISREG(opened_metadata.st_mode):
+                entries.append(OverlayEntry(child_relative, "special"))
+                issues.append(
+                    OverlayIssue(child_relative, "special filesystem entry is not allowed")
+                )
+                continue
+            entries.append(OverlayEntry(child_relative, "file", opened_metadata.st_size))
+            output = destination / child.name
+            with os.fdopen(os.dup(file_fd), "rb") as source, output.open("wb") as target:
+                shutil.copyfileobj(source, target)
+        finally:
+            os.close(file_fd)
+
+
+def copy_content_overlays(
+    content_root: Path,
+    targets: tuple[str, ...],
+    destination: Path,
+) -> OverlayScan:
+    entries: list[OverlayEntry] = []
+    issues: list[OverlayIssue] = []
+    try:
+        content_fd = os.open(content_root, _DIRECTORY_FLAGS)
+    except FileNotFoundError:
+        return OverlayScan((), ())
+    except OSError as error:
+        return OverlayScan((), (OverlayIssue(Path("."), f"cannot open content root: {error}"),))
+    try:
+        for target in targets:
+            if target not in OVERLAY_TARGETS:
+                raise OverlayPolicyError(
+                    "Overlay target must be common, client, or server"
+                )
+            try:
+                target_fd = _open_directory(target, content_fd)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                relative = Path(target)
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    link_target = _readlink_at(target, content_fd)
+                    entries.append(
+                        OverlayEntry(relative, "symlink", link_target=link_target)
+                    )
+                    issues.append(
+                        OverlayIssue(relative, f"symlink is not allowed -> {link_target}")
+                    )
+                else:
+                    issues.append(
+                        OverlayIssue(relative, f"cannot open overlay target: {error}")
+                    )
+                continue
+            try:
+                _copy_overlay_directory(
+                    target_fd, destination, Path(target), entries, issues
+                )
+            finally:
+                os.close(target_fd)
+    finally:
+        os.close(content_fd)
     return OverlayScan(tuple(entries), tuple(issues))
 
 

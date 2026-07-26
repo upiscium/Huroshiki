@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from textual.widgets import DataTable
 
 import huroshiki
 import huroshiki_core as core
+import overlay_policy
 from overlay_policy import scan_content_overlays
 import packctl
 
@@ -162,6 +164,74 @@ class OverlayCoreSafetyTest(unittest.TestCase):
             core.create_template("pack:demo", "common", "nested/index.toml")
 
         self.assertFalse((self.pack / "content" / "common" / "nested").exists())
+
+    def _with_parent_replacement(self, operation):
+        parent = self.pack / "content" / "common" / "parent"
+        parent.mkdir()
+        external = self.root / "external"
+        external.mkdir()
+        parked = parent.with_name("parent-parked")
+        original_open = overlay_policy._open_overlay_parent
+
+        @contextmanager
+        def racing_open(*args, **kwargs):
+            with original_open(*args, **kwargs) as opened:
+                parent.rename(parked)
+                parent.symlink_to(external, target_is_directory=True)
+                try:
+                    yield opened
+                finally:
+                    parent.unlink()
+                    parked.rename(parent)
+
+        with patch.object(overlay_policy, "_open_overlay_parent", racing_open):
+            return operation(parent, external)
+
+    def test_create_keeps_pinned_parent_during_replacement(self) -> None:
+        def operation(parent: Path, external: Path):
+            core.create_template("pack:demo", "common", "parent/new.txt")
+            self.assertFalse((external / "new.txt").exists())
+
+        self._with_parent_replacement(operation)
+        self.assertTrue((self.pack / "content/common/parent/new.txt").is_file())
+
+    def test_read_keeps_pinned_parent_during_replacement(self) -> None:
+        def operation(parent: Path, external: Path):
+            (parent / "file.txt").write_text("internal", encoding="utf-8")
+            (external / "file.txt").write_text("secret", encoding="utf-8")
+            self.assertEqual(
+                core.read_template_text("pack:demo", "common", "parent/file.txt"),
+                "internal",
+            )
+
+        self._with_parent_replacement(operation)
+
+    def test_write_keeps_pinned_parent_during_replacement(self) -> None:
+        def operation(parent: Path, external: Path):
+            (parent / "file.txt").write_text("internal", encoding="utf-8")
+            secret = external / "file.txt"
+            secret.write_text("secret", encoding="utf-8")
+            core.write_template_text(
+                "pack:demo", "common", "parent/file.txt", "updated"
+            )
+            self.assertEqual(secret.read_text(encoding="utf-8"), "secret")
+
+        self._with_parent_replacement(operation)
+        self.assertEqual(
+            (self.pack / "content/common/parent/file.txt").read_text(encoding="utf-8"),
+            "updated",
+        )
+
+    def test_delete_keeps_pinned_parent_during_replacement(self) -> None:
+        def operation(parent: Path, external: Path):
+            (parent / "file.txt").write_text("internal", encoding="utf-8")
+            secret = external / "file.txt"
+            secret.write_text("secret", encoding="utf-8")
+            core.delete_template("pack:demo", "common", "parent/file.txt")
+            self.assertEqual(secret.read_text(encoding="utf-8"), "secret")
+
+        self._with_parent_replacement(operation)
+        self.assertFalse((self.pack / "content/common/parent/file.txt").exists())
 
 
 class _OverlayListApp(App[None]):

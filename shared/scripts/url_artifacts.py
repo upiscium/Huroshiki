@@ -22,6 +22,7 @@ import zipfile
 import tomlkit
 
 from portable_paths import PortablePathError, portable_basename, portable_relative_path
+from portable_paths import portable_basename_key, portable_relative_path_key
 
 
 class HuroshikiError(RuntimeError):
@@ -48,6 +49,17 @@ MAX_ZIP_ENTRIES = 10_000
 MAX_METADATA_ENTRY_SIZE_BYTES = 1024 * 1024
 ZIP_EOCD_SIZE = 22
 ZIP_MAX_COMMENT_SIZE = 65_535
+_ALWAYS_PROHIBITED_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in (
+        "192.0.2.0/24",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "2001:db8::/32",
+        "3fff::/20",
+    )
+)
 
 
 def _preflight_zip_entry_count(path: Path) -> None:
@@ -140,13 +152,24 @@ def _approved_addresses(
         raise HuroshikiError(f"Could not resolve self-hosted URL host {hostname}: {error}") from error
     if not addresses:
         raise HuroshikiError(f"Could not resolve self-hosted URL host {hostname}")
-    if allow_private_networks:
-        return addresses
-    prohibited = [
-        address
-        for address in addresses
-        if not ipaddress.ip_address(address).is_global
-    ]
+    nat64_networks = (
+        ipaddress.ip_network("64:ff9b::/96"),
+        ipaddress.ip_network("64:ff9b:1::/48"),
+    )
+    prohibited: list[str] = []
+    for address in addresses:
+        parsed = ipaddress.ip_address(address)
+        is_nat64 = isinstance(parsed, ipaddress.IPv6Address) and any(
+            parsed in network for network in nat64_networks
+        )
+        always_prohibited = (
+            parsed.is_unspecified
+            or parsed.is_multicast
+            or (parsed.is_reserved and not is_nat64)
+            or any(parsed in network for network in _ALWAYS_PROHIBITED_NETWORKS)
+        )
+        if always_prohibited or (not allow_private_networks and (not parsed.is_global or is_nat64)):
+            prohibited.append(address)
     if prohibited:
         raise HuroshikiError(
             f"Self-hosted URL host {hostname} resolves to prohibited address "
@@ -154,6 +177,13 @@ def _approved_addresses(
             "configuration only when this access is intended"
         )
     return addresses
+
+
+def _remaining_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise HuroshikiError("URL download deadline exceeded")
+    return remaining
 
 
 class _PinnedHTTPConnection(http.client.HTTPConnection):
@@ -181,21 +211,45 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         sock = socket.create_connection(
             (self._address, self.port), self.timeout, self.source_address
         )
-        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        try:
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        except BaseException:
+            sock.close()
+            raise
+
+
+@dataclass
+class _OpenedUrl:
+    response: object
+    transport_socket: socket.socket | None
+    connection: http.client.HTTPConnection | None = None
+
+    def close(self) -> None:
+        try:
+            self.response.close()
+        finally:
+            if self.connection is not None:
+                self.connection.close()
 
 
 def _open_validated_url(
     url: str,
     *,
-    timeout: float,
+    deadline: float | None = None,
+    timeout: float | None = None,
     allow_private_networks: bool,
-):
+) -> _OpenedUrl:
+    if deadline is None:
+        if timeout is None:
+            raise TypeError("deadline or timeout is required")
+        deadline = time.monotonic() + timeout
     current = url
     for redirect_count in range(MAX_URL_REDIRECTS + 1):
         parsed = urlparse(current)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise HuroshikiError("Redirect target must be an http:// or https:// URL")
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        _remaining_timeout(deadline)
         address = _approved_addresses(
             parsed.hostname,
             port,
@@ -204,7 +258,9 @@ def _open_validated_url(
         connection_type = (
             _PinnedHTTPSConnection if parsed.scheme == "https" else _PinnedHTTPConnection
         )
-        connection = connection_type(parsed.hostname, port, address, timeout)
+        connection = connection_type(
+            parsed.hostname, port, address, _remaining_timeout(deadline)
+        )
         target = parsed.path or "/"
         if parsed.query:
             target += f"?{parsed.query}"
@@ -216,6 +272,7 @@ def _open_validated_url(
         if parsed.port is not None:
             host = f"{host}:{parsed.port}"
         try:
+            connection.timeout = _remaining_timeout(deadline)
             connection.request(
                 "GET",
                 target,
@@ -225,9 +282,14 @@ def _open_validated_url(
                     "Connection": "close",
                 },
             )
+            transport_socket = getattr(connection, "sock", None)
+            if transport_socket is not None:
+                transport_socket.settimeout(_remaining_timeout(deadline))
             response = connection.getresponse()
         except BaseException:
             connection.close()
+            if time.monotonic() >= deadline:
+                raise HuroshikiError("URL download deadline exceeded")
             raise
         if response.status not in {301, 302, 303, 307, 308}:
             if response.status >= 400:
@@ -236,7 +298,7 @@ def _open_validated_url(
                 raise HuroshikiError(
                     f"Self-hosted URL returned HTTP {response.status}: {current}"
                 )
-            return response
+            return _OpenedUrl(response, getattr(connection, "sock", None), connection)
         location = response.headers.get("Location")
         response.close()
         connection.close()
@@ -426,9 +488,9 @@ def download_url_artifact(
 
                 def open_request() -> None:
                     try:
-                        response = _open_validated_url(
+                        opened = _open_validated_url(
                             url,
-                            timeout=min(60.0, total_timeout_seconds),
+                            deadline=deadline,
                             allow_private_networks=allow_private_networks,
                         )
                     except BaseException as error:
@@ -438,13 +500,13 @@ def download_url_artifact(
                         return
 
                     if open_abandoned.is_set():
-                        response.close()
+                        opened.close()
                         return
-                    open_results.put((response, None))
+                    open_results.put((opened, None))
                     open_ready.set()
                     while not open_claimed.wait(0.1):
                         if open_abandoned.is_set():
-                            response.close()
+                            opened.close()
                             return
 
                 opener = threading.Thread(
@@ -470,9 +532,12 @@ def download_url_artifact(
                 if open_error is not None:
                     raise open_error
                 open_claimed.set()
-                response = response_result
+                opened = response_result
+                if not isinstance(opened, _OpenedUrl):
+                    opened = _OpenedUrl(opened, None)
+                response = opened.response
 
-                with response:
+                try:
                     watcher_stop = threading.Event()
                     deadline_reached = threading.Event()
 
@@ -481,10 +546,30 @@ def download_url_artifact(
                             remaining = deadline - time.monotonic()
                             if remaining <= 0:
                                 deadline_reached.set()
-                                response.close()
+                                if opened.transport_socket is not None:
+                                    try:
+                                        opened.transport_socket.shutdown(socket.SHUT_RDWR)
+                                    except OSError:
+                                        pass
+                                else:
+                                    threading.Thread(
+                                        target=response.close,
+                                        daemon=True,
+                                        name="huroshiki-url-mock-close",
+                                    ).start()
                                 return
                             if cancel_event.wait(min(remaining, 0.1)):
-                                response.close()
+                                if opened.transport_socket is not None:
+                                    try:
+                                        opened.transport_socket.shutdown(socket.SHUT_RDWR)
+                                    except OSError:
+                                        pass
+                                else:
+                                    threading.Thread(
+                                        target=response.close,
+                                        daemon=True,
+                                        name="huroshiki-url-mock-close",
+                                    ).start()
                                 return
 
                     watcher = threading.Thread(
@@ -527,7 +612,7 @@ def download_url_artifact(
                             except (OSError, ValueError) as error:
                                 if cancel_event.is_set():
                                     raise HuroshikiError("URL download cancelled") from error
-                                if deadline_reached.is_set():
+                                if deadline_reached.is_set() or time.monotonic() >= deadline:
                                     raise HuroshikiError(
                                         "URL download deadline exceeded"
                                     ) from error
@@ -551,6 +636,8 @@ def download_url_artifact(
                     finally:
                         watcher_stop.set()
                         watcher.join(timeout=1)
+                finally:
+                    opened.close()
             except (OSError, http.client.HTTPException) as error:
                 raise HuroshikiError(
                     f"Could not download self-hosted MOD: {error}"
@@ -599,6 +686,45 @@ def write_url_metadata(
     path = (root / relative_path).resolve()
     if path != root and root not in path.parents:
         raise HuroshikiError(f"Path escaped root: {relative_path}")
+    incoming_filename_key = portable_basename_key(
+        artifact.filename, context="Metadata filename"
+    )
+    incoming_path_key = portable_relative_path_key(relative_path)
+    for existing in sorted(source.rglob("*.pw.toml")):
+        existing_relative = existing.relative_to(source)
+        try:
+            data = tomllib.loads(existing.read_text(encoding="utf-8"))
+            existing_path_key = portable_relative_path_key(existing_relative)
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError, PortablePathError) as error:
+            raise HuroshikiError(f"Cannot inspect existing metadata {existing_relative}: {error}") from error
+        update = data.get("update", {})
+        has_provider_update = isinstance(update, dict) and any(
+            isinstance(update.get(provider), dict)
+            for provider in ("modrinth", "curseforge")
+        )
+        existing_identity = (
+            "url",
+            existing_relative.name.removesuffix(".pw.toml"),
+        ) if not has_provider_update else None
+        if (
+            existing_path_key == incoming_path_key
+            and existing_identity == ("url", artifact.mod_id)
+        ):
+            continue
+        try:
+            existing_filename = str(data.get("filename", ""))
+            existing_filename_key = portable_basename_key(
+                existing_filename, context="Metadata filename"
+            )
+        except PortablePathError as error:
+            raise HuroshikiError(
+                f"Cannot inspect existing metadata {existing_relative}: {error}"
+            ) from error
+        if existing_filename_key == incoming_filename_key:
+            raise HuroshikiError(
+                f"Portable filename collision for {artifact.filename!r}: "
+                f"{existing_relative} already uses {existing_filename!r}"
+            )
     path.parent.mkdir(parents=True, exist_ok=True)
     document = tomlkit.document()
     document["name"] = artifact.name

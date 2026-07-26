@@ -37,7 +37,8 @@ from deploy_support import (
 )
 from packctl_errors import ConfigError
 from huroshiki_paths import resolve_root, root_argument
-from overlay_policy import scan_content_overlays
+from overlay_policy import copy_content_overlays, scan_content_overlays
+from portable_paths import PortablePathError, portable_basename_key
 import project_locks
 from project_locks import ProjectLockMetadata, process_start_identity
 
@@ -1546,13 +1547,31 @@ def validate_pack_directory(root: Path) -> list[str]:
         validate_packwiz_versions(source, errors)
 
     if source.is_dir():
+        filename_owners: dict[str, tuple[Path, str]] = {}
         for metadata in metadata_files(source):
             try:
-                side = read_toml(metadata).get("side")
+                document = read_toml(metadata)
+                side = document.get("side")
                 if side_validation_error(side) is not None:
                     errors.append(
                         f"{display_path(metadata)}: side must be client, server, or both"
                     )
+                filename = str(document.get("filename", ""))
+                filename_key = portable_basename_key(
+                    filename, context="Metadata filename"
+                )
+                previous = filename_owners.get(filename_key)
+                if previous is not None:
+                    previous_path, previous_filename = previous
+                    errors.append(
+                        f"{display_path(metadata)}: portable filename collision for "
+                        f"{filename!r} with {display_path(previous_path)} "
+                        f"({previous_filename!r})"
+                    )
+                else:
+                    filename_owners[filename_key] = (metadata, filename)
+            except PortablePathError as error:
+                errors.append(f"{display_path(metadata)}: {error}")
             except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
                 errors.append(f"{display_path(metadata)}: {error}")
     for issue in scan_content_overlays(root / "content").issues:
@@ -1722,6 +1741,8 @@ def build_target(
     root: Path,
     target: str,
     destination: Path | None = None,
+    *,
+    refresh: bool = True,
 ) -> list[str]:
     source = root / "source"
     workspace: Path | None = None
@@ -1750,19 +1771,20 @@ def build_target(
             if side not in TARGET_SIDES[target]:
                 metadata.unlink()
 
+        overlay_scan = copy_content_overlays(
+            root / "content", ("common", target), destination
+        )
         overlay_errors = [
             f"content/{issue.relative_path}: {issue.message}"
-            for issue in scan_content_overlays(root / "content").issues
+            for issue in overlay_scan.issues
         ]
         if overlay_errors:
             return errors + overlay_errors
 
-        copy_tree(root / "content" / "common", destination)
-        copy_tree(root / "content" / target, destination)
-
         if errors:
             return errors
-        run(["packwiz", "refresh"], cwd=destination)
+        if refresh:
+            run(["packwiz", "refresh"], cwd=destination)
 
         if workspace is not None:
             live_target = root / "dist" / target
@@ -1783,21 +1805,16 @@ def _build_pack(pack_id: str) -> int:
     for required in (root / "source" / "pack.toml", root / "source" / "index.toml"):
         if not required.is_file():
             raise ConfigError(f"Missing required file: {required}")
-    overlay_errors = [
-        f"content/{issue.relative_path}: {issue.message}"
-        for issue in scan_content_overlays(root / "content").issues
-    ]
-    if overlay_errors:
-        print("Build stopped because content overlays are invalid:", file=sys.stderr)
-        for error in overlay_errors:
-            print(f"  - {error}", file=sys.stderr)
-        return 1
     workspace = Path(tempfile.mkdtemp(prefix=".build-dist-", dir=root))
     staged_dist = workspace / "dist"
     preserve_workspace = False
     try:
-        errors = build_target(root, "client", staged_dist / "client")
-        errors += build_target(root, "server", staged_dist / "server")
+        errors = build_target(
+            root, "client", staged_dist / "client", refresh=False
+        )
+        errors += build_target(
+            root, "server", staged_dist / "server", refresh=False
+        )
         errors = list(dict.fromkeys(errors))
         if errors:
             print(
@@ -1812,6 +1829,9 @@ def _build_pack(pack_id: str) -> int:
                 file=sys.stderr,
             )
             return 1
+
+        run(["packwiz", "refresh"], cwd=staged_dist / "client")
+        run(["packwiz", "refresh"], cwd=staged_dist / "server")
 
         try:
             swap_directory(staged_dist, root / "dist", workspace / "previous-dist")

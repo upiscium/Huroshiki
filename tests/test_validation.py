@@ -145,6 +145,23 @@ class RepositoryValidationTest(unittest.TestCase):
             self.assertIn(expected, stderr)
         self.assertNotIn("packs/demo/source/mods/create.pw.toml: Packwiz-owned", stderr)
 
+    def test_portable_metadata_filename_collisions_accumulate(self) -> None:
+        (self.pack_root / "source/mods/create.pw.toml").write_text(
+            'name = "Create"\nfilename = "Same.jar"\nside = "both"\n',
+            encoding="utf-8",
+        )
+        (self.pack_root / "source/mods/other.pw.toml").write_text(
+            'name = "Other"\nfilename = "same.jar"\nside = "both"\n',
+            encoding="utf-8",
+        )
+
+        result, _, stderr = self.validate_all()
+
+        self.assertEqual(result, 1)
+        self.assertIn("portable filename collision", stderr)
+        self.assertIn("Same.jar", stderr)
+        self.assertIn("same.jar", stderr)
+
     def test_accumulates_pack_and_template_errors_with_paths(self) -> None:
         (self.pack_root / "pack.yaml").write_text(
             '''id: wrong

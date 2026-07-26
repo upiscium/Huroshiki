@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import overlay_policy
 import packctl
 
 
@@ -154,6 +155,38 @@ class TransactionalBuildTest(unittest.TestCase):
 
         self.assertEqual(result, 1)
         self.assertEqual(self.dist_snapshot(), before)
+        run.assert_not_called()
+
+    def test_directory_to_external_symlink_race_never_copies_secret(self) -> None:
+        self.write_metadata("both")
+        clean = self.pack_root / "content" / "common" / "clean"
+        clean.mkdir(parents=True)
+        (clean / "ordinary.txt").write_text("ordinary", encoding="utf-8")
+        external = self.root / "external"
+        external.mkdir()
+        secret = external / "secret.txt"
+        secret.write_text("private data", encoding="utf-8")
+        parked = clean.with_name("clean-parked")
+        before = self.dist_snapshot()
+        original_open = overlay_policy._open_directory
+        swapped = False
+
+        def racing_open(name: str, parent_fd: int) -> int:
+            nonlocal swapped
+            if name == "clean" and not swapped:
+                swapped = True
+                clean.rename(parked)
+                clean.symlink_to(external, target_is_directory=True)
+            return original_open(name, parent_fd)
+
+        with patch.object(overlay_policy, "_open_directory", side_effect=racing_open), patch.object(
+            packctl, "run"
+        ) as run:
+            result = packctl.build_pack("demo")
+
+        self.assertEqual(result, 1)
+        self.assertEqual(self.dist_snapshot(), before)
+        self.assertNotIn(b"private data", self.dist_snapshot().values())
         run.assert_not_called()
 
     def test_keyboard_interrupt_during_swap_restores_dist(self) -> None:

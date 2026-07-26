@@ -14,7 +14,6 @@ import tempfile
 import threading
 import time
 import tomllib
-import stat
 from typing import Callable, Iterable, Mapping
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
@@ -26,9 +25,13 @@ import packctl
 from overlay_policy import (
     OVERLAY_TARGETS,
     OverlayPolicyError,
+    create_overlay_file,
+    delete_overlay_file,
     normalize_overlay_relative_path,
+    read_overlay_text,
     safe_overlay_child,
     scan_content_overlays,
+    write_overlay_text,
 )
 from template_merge import (
     ConflictResolution,
@@ -490,6 +493,7 @@ class PackTransaction:
                 copy_transaction_source(real_source, tx_source)
                 if (
                     tree_digest_snapshot(real_source) != verified_baseline
+                    or tree_digest_snapshot(tx_source) != verified_baseline
                     or pack_config_snapshot(real_root) != verified_config
                 ):
                     raise HuroshikiError(
@@ -993,26 +997,29 @@ class PackTransaction:
 
         real_root = project_root(self.project_key)
         real_source = real_root / "source"
-        if (
-            tree_digest_snapshot(real_source) != self.real_source_baseline
-            or pack_config_snapshot(real_root) != self.pack_config_baseline
-        ):
-            raise HuroshikiError(
-                "The real Packwiz source changed or pack configuration changed while "
-                "this transaction was open. "
-                "Discard the staged transaction and retry to avoid overwriting external changes."
-            )
-
         backup = real_root / f".source.huroshiki-backup-{uuid4().hex}"
         if backup.exists():
             raise HuroshikiError(f"Backup path already exists: {backup}")
 
         real_source.rename(backup)
         try:
+            if (
+                tree_digest_snapshot(backup) != self.real_source_baseline
+                or pack_config_snapshot(real_root) != self.pack_config_baseline
+            ):
+                _restore_source_backup(real_source, backup)
+                raise HuroshikiError(
+                    "The real Packwiz source changed or pack configuration changed while "
+                    "this transaction was open. Discard the staged transaction and retry "
+                    "to avoid overwriting external changes."
+                )
             self.source.rename(real_source)
-        except Exception:
-            if not real_source.exists() and backup.exists():
-                backup.rename(real_source)
+        except BaseException as swap_error:
+            if backup.exists():
+                try:
+                    _restore_source_backup(real_source, backup)
+                except HuroshikiError as rollback_error:
+                    raise rollback_error from swap_error
             raise
 
         shutil.rmtree(backup)
@@ -1279,26 +1286,18 @@ def create_template(
         with packctl.ProjectLock(project_key_value, "create template file"):
             normalized_target = normalize_template_target(target)
             relative = normalize_template_relative_path(relative_path)
-            path = resolve_template_path(
-                project_key_value,
-                normalized_target,
-                relative,
-            )
             try:
-                path.lstat()
-            except FileNotFoundError:
-                pass
-            else:
-                raise HuroshikiError(
-                    f"Template file already exists: {normalized_target}/{relative}"
+                create_overlay_file(
+                    project_root(project_key_value) / "content",
+                    normalized_target,
+                    relative,
                 )
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("x", encoding="utf-8"):
-                pass
+            except OverlayPolicyError as error:
+                raise HuroshikiError(str(error)) from error
             return TemplateInfo(
                 target=normalized_target,
                 relative_path=relative,
-                full_path=path,
+                full_path=template_base(project_key_value, normalized_target) / relative,
                 size=0,
             )
     except packctl.ConfigError as error:
@@ -1310,22 +1309,17 @@ def read_template_text(
     target: str,
     relative_path: str | Path,
 ) -> str:
-    path = resolve_template_path(
-        project_key_value,
-        target,
-        relative_path,
-    )
     try:
-        metadata = path.stat(follow_symlinks=False)
-    except FileNotFoundError:
-        metadata = None
-    if metadata is None or not stat.S_ISREG(metadata.st_mode):
-        raise HuroshikiError(f"Template file does not exist: {path}")
-    try:
-        return path.read_text(encoding="utf-8")
+        return read_overlay_text(
+            project_root(project_key_value) / "content",
+            normalize_template_target(target),
+            normalize_template_relative_path(relative_path),
+        )
+    except OverlayPolicyError as error:
+        raise HuroshikiError(str(error)) from error
     except UnicodeDecodeError as error:
         raise HuroshikiError(
-            f"Template file is not UTF-8 text: {path}"
+            f"Template file is not UTF-8 text: {target}/{relative_path}"
         ) from error
 
 
@@ -1337,24 +1331,15 @@ def write_template_text(
 ) -> None:
     try:
         with packctl.ProjectLock(project_key_value, "write template file"):
-            path = resolve_template_path(
-                project_key_value,
-                target,
-                relative_path,
-            )
             try:
-                metadata = path.stat(follow_symlinks=False)
-            except FileNotFoundError:
-                metadata = None
-            if metadata is None or not stat.S_ISREG(metadata.st_mode):
-                raise HuroshikiError(f"Template file does not exist: {path}")
-            temporary = path.with_name(f".{path.name}.huroshiki-tmp-{uuid4().hex}")
-            try:
-                with temporary.open("x", encoding="utf-8") as handle:
-                    handle.write(text)
-                temporary.replace(path)
-            finally:
-                temporary.unlink(missing_ok=True)
+                write_overlay_text(
+                    project_root(project_key_value) / "content",
+                    normalize_template_target(target),
+                    normalize_template_relative_path(relative_path),
+                    text,
+                )
+            except OverlayPolicyError as error:
+                raise HuroshikiError(str(error)) from error
     except packctl.ConfigError as error:
         raise HuroshikiError(str(error)) from error
 
@@ -1366,27 +1351,14 @@ def delete_template(
 ) -> None:
     try:
         with packctl.ProjectLock(project_key_value, "delete template file"):
-            base = template_base(project_key_value, target)
-            path = resolve_template_path(
-                project_key_value,
-                target,
-                relative_path,
-            )
             try:
-                metadata = path.stat(follow_symlinks=False)
-            except FileNotFoundError:
-                metadata = None
-            if metadata is None or not stat.S_ISREG(metadata.st_mode):
-                raise HuroshikiError(f"Template file does not exist: {path}")
-            path.unlink()
-
-            current = path.parent
-            while current != base and current.is_relative_to(base):
-                try:
-                    current.rmdir()
-                except OSError:
-                    break
-                current = current.parent
+                delete_overlay_file(
+                    project_root(project_key_value) / "content",
+                    normalize_template_target(target),
+                    normalize_template_relative_path(relative_path),
+                )
+            except OverlayPolicyError as error:
+                raise HuroshikiError(str(error)) from error
     except packctl.ConfigError as error:
         raise HuroshikiError(str(error)) from error
 
@@ -1401,6 +1373,21 @@ def file_digest(path: Path) -> str:
 
 def copy_transaction_source(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, symlinks=True)
+
+
+def _restore_source_backup(real_source: Path, backup: Path) -> None:
+    if real_source.exists() or real_source.is_symlink():
+        raise HuroshikiError(
+            f"Cannot restore the original Packwiz source because {real_source} was "
+            f"recreated externally; external changes were preserved and the exact "
+            f"original remains at {backup}."
+        )
+    try:
+        backup.rename(real_source)
+    except BaseException as error:
+        raise HuroshikiError(
+            f"Failed to restore the original Packwiz source from {backup}: {error}"
+        ) from error
 
 
 def template_config_snapshot(root: Path) -> dict[str, str]:
@@ -1426,6 +1413,10 @@ def tree_digest_snapshot(source: Path) -> dict[Path, str]:
             snapshot[path.relative_to(source)] = f"symlink:{path.readlink()}"
         elif path.is_file():
             snapshot[path.relative_to(source)] = file_digest(path)
+        elif path.is_dir():
+            snapshot[path.relative_to(source)] = "directory"
+        else:
+            snapshot[path.relative_to(source)] = f"special:{path.lstat().st_mode}"
     return snapshot
 
 
