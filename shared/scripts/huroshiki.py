@@ -2427,7 +2427,9 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
         table = self.query_one("#update-options", DataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        table.add_columns("Use", "MOD", "Provider", "Current", "New", "Status")
+        table.add_columns(
+            "Use", "MOD", "Provider", "Current", "New", "Files", "Status"
+        )
         try:
             self.transaction = core.PackTransaction.create(self.project_key)
             with self.app.suspend():
@@ -2457,7 +2459,12 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
                 candidate.provider,
                 candidate.current_version,
                 candidate.new_version,
-                candidate.status,
+                str(candidate.file_count) if candidate.available else "-",
+                (
+                    f"unavailable: {candidate.error}"
+                    if candidate.error
+                    else candidate.status
+                ),
             )
 
     def toggle_candidate(self) -> None:
@@ -2497,6 +2504,10 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
                         for item in selected
                     ),
                     "",
+                    f"Selected closures contain {sum(item.file_count for item in selected)} "
+                    f"file change(s), including "
+                    f"{sum(item.added_dependencies for item in selected)} added "
+                    "dependency record(s).",
                     "The real source will change only if every step succeeds.",
                 ],
             ),

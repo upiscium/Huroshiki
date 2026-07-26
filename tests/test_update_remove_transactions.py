@@ -155,11 +155,11 @@ url = "https://example.invalid/manual.jar"
         second = self.write_mod("second")
 
         def run(command, *, cwd, **_):
-            if command[-2:] == ["update", "--all"]:
-                for slug in ("first", "second"):
-                    (cwd / "mods" / f"{slug}.pw.toml").write_text(
-                        metadata(slug.title(), slug, "v2"), encoding="utf-8"
-                    )
+            if command[:3] == ["packwiz", "--yes", "update"]:
+                slug = command[3]
+                (cwd / "mods" / f"{slug}.pw.toml").write_text(
+                    metadata(slug.title(), slug, "v2"), encoding="utf-8"
+                )
             return self.completed(command)
 
         transaction = core.PackTransaction.create(self.key)
@@ -175,16 +175,179 @@ url = "https://example.invalid/manual.jar"
         self.assertIn('version = "v2"', first.read_text(encoding="utf-8"))
         self.assertIn('version = "v1"', second.read_text(encoding="utf-8"))
 
+    def test_selected_new_dependency_is_retained_by_final_refresh(self) -> None:
+        self.write_mod("first")
+
+        def run(command, *, cwd, **_):
+            if command == ["packwiz", "--yes", "update", "first"]:
+                (cwd / "mods" / "first.pw.toml").write_text(
+                    metadata("First", "first", "v2"), encoding="utf-8"
+                )
+                (cwd / "mods" / "dependency.pw.toml").write_text(
+                    metadata("Dependency", "dependency", "v2"), encoding="utf-8"
+                )
+                (cwd / "index.toml").write_text("resolver index\n", encoding="utf-8")
+                (cwd / "pack.toml").write_text("resolver pack\n", encoding="utf-8")
+            elif command == ["packwiz", "refresh"]:
+                self.assertTrue((cwd / "mods" / "dependency.pw.toml").is_file())
+                (cwd / "index.toml").write_text(
+                    "final index: dependency.pw.toml\n", encoding="utf-8"
+                )
+                (cwd / "pack.toml").write_text(
+                    'name = "Demo"\nindex-hash = "final"\n', encoding="utf-8"
+                )
+            return self.completed(command)
+
+        transaction = core.PackTransaction.create(self.key)
+        with patch.object(core.subprocess, "run", side_effect=run):
+            candidate = next(
+                item for item in transaction.prepare_updates() if item.available
+            )
+            self.assertEqual(candidate.added_dependencies, 1)
+            self.assertEqual(
+                {change.relative_path for change in candidate.changes},
+                {
+                    Path("mods/first.pw.toml"),
+                    Path("mods/dependency.pw.toml"),
+                    Path("index.toml"),
+                    Path("pack.toml"),
+                },
+            )
+            transaction.select_updates([candidate.root])
+            transaction.apply()
+
+        self.assertTrue((self.source / "mods" / "dependency.pw.toml").is_file())
+        self.assertIn(
+            "dependency.pw.toml",
+            (self.source / "index.toml").read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            'index-hash = "final"',
+            (self.source / "pack.toml").read_text(encoding="utf-8"),
+        )
+
+    def test_unselected_dependency_closure_is_absent(self) -> None:
+        self.write_mod("first")
+        self.write_mod("second")
+
+        def run(command, *, cwd, **_):
+            if command[:3] == ["packwiz", "--yes", "update"]:
+                slug = command[3]
+                (cwd / "mods" / f"{slug}.pw.toml").write_text(
+                    metadata(slug.title(), slug, "v2"), encoding="utf-8"
+                )
+                (cwd / "mods" / f"{slug}-dep.pw.toml").write_text(
+                    metadata(f"{slug.title()} Dep", f"{slug}-dep", "v2"),
+                    encoding="utf-8",
+                )
+            return self.completed(command)
+
+        transaction = core.PackTransaction.create(self.key)
+        with patch.object(core.subprocess, "run", side_effect=run):
+            candidates = transaction.prepare_updates()
+            self.assertFalse((transaction.source / "mods" / "first-dep.pw.toml").exists())
+            self.assertFalse((transaction.source / "mods" / "second-dep.pw.toml").exists())
+            first = next(item for item in candidates if item.slug == "first")
+            transaction.select_updates([first.root])
+            transaction.apply()
+
+        self.assertTrue((self.source / "mods" / "first-dep.pw.toml").is_file())
+        self.assertFalse((self.source / "mods" / "second-dep.pw.toml").exists())
+
+    def test_shared_dependency_closures_merge_once(self) -> None:
+        self.write_mod("first")
+        self.write_mod("second")
+
+        def run(command, *, cwd, **_):
+            if command[:3] == ["packwiz", "--yes", "update"]:
+                slug = command[3]
+                (cwd / "mods" / f"{slug}.pw.toml").write_text(
+                    metadata(slug.title(), slug, "v2"), encoding="utf-8"
+                )
+                (cwd / "mods" / "shared.pw.toml").write_text(
+                    metadata("Shared", "shared", "v2"), encoding="utf-8"
+                )
+            return self.completed(command)
+
+        transaction = core.PackTransaction.create(self.key)
+        with patch.object(core.subprocess, "run", side_effect=run):
+            candidates = transaction.prepare_updates()
+            transaction.select_updates(
+                item.root for item in candidates if item.available
+            )
+            transaction.apply()
+
+        shared = list(self.source.rglob("shared.pw.toml"))
+        self.assertEqual(len(shared), 1)
+        self.assertIn('version = "v2"', shared[0].read_text(encoding="utf-8"))
+
+    def test_conflicting_dependency_versions_abort_before_real_source_apply(self) -> None:
+        first = self.write_mod("first")
+        second = self.write_mod("second")
+        originals = (first.read_bytes(), second.read_bytes())
+
+        def run(command, *, cwd, **_):
+            if command[:3] == ["packwiz", "--yes", "update"]:
+                slug = command[3]
+                (cwd / "mods" / f"{slug}.pw.toml").write_text(
+                    metadata(slug.title(), slug, "v2"), encoding="utf-8"
+                )
+                (cwd / "mods" / "shared.pw.toml").write_text(
+                    metadata("Shared", "shared", f"from-{slug}"), encoding="utf-8"
+                )
+            return self.completed(command)
+
+        transaction = core.PackTransaction.create(self.key)
+        with patch.object(core.subprocess, "run", side_effect=run):
+            candidates = transaction.prepare_updates()
+            with self.assertRaisesRegex(core.HuroshikiError, "metadata disagreement"):
+                transaction.select_updates(
+                    item.root for item in candidates if item.available
+                )
+
+        self.assertEqual(first.read_bytes(), originals[0])
+        self.assertEqual(second.read_bytes(), originals[1])
+        self.assertFalse((self.source / "mods" / "shared.pw.toml").exists())
+        transaction.discard()
+
+    def test_removed_dependency_is_grouped_with_updated_root(self) -> None:
+        self.write_mod("first")
+        dependency = self.write_mod("dependency")
+
+        def run(command, *, cwd, **_):
+            if command == ["packwiz", "--yes", "update", "first"]:
+                (cwd / "mods" / "first.pw.toml").write_text(
+                    metadata("First", "first", "v2"), encoding="utf-8"
+                )
+                (cwd / "mods" / "dependency.pw.toml").unlink()
+            return self.completed(command)
+
+        transaction = core.PackTransaction.create(self.key)
+        with patch.object(core.subprocess, "run", side_effect=run):
+            candidates = transaction.prepare_updates()
+            first = next(item for item in candidates if item.slug == "first")
+            removed = next(
+                change
+                for change in first.changes
+                if change.relative_path == Path("mods/dependency.pw.toml")
+            )
+            self.assertIsNotNone(removed.before)
+            self.assertIsNone(removed.after)
+            transaction.select_updates([first.root])
+            transaction.apply()
+
+        self.assertFalse(dependency.exists())
+
     def test_update_all_applies_every_candidate(self) -> None:
         first = self.write_mod("first")
         second = self.write_mod("second")
 
         def run(command, *, cwd, **_):
-            if command[-2:] == ["update", "--all"]:
-                for slug in ("first", "second"):
-                    (cwd / "mods" / f"{slug}.pw.toml").write_text(
-                        metadata(slug.title(), slug, "v2"), encoding="utf-8"
-                    )
+            if command[:3] == ["packwiz", "--yes", "update"]:
+                slug = command[3]
+                (cwd / "mods" / f"{slug}.pw.toml").write_text(
+                    metadata(slug.title(), slug, "v2"), encoding="utf-8"
+                )
             return self.completed(command)
 
         with patch.object(core.subprocess, "run", side_effect=run):
@@ -206,6 +369,30 @@ url = "https://example.invalid/manual.jar"
             self.assertEqual(core.update_all(self.key), 7)
         self.assertEqual(target.read_bytes(), original)
 
+    def test_resolver_failure_is_unavailable_and_transaction_stays_clean(self) -> None:
+        target = self.write_mod("first")
+        original = target.read_bytes()
+
+        def run(command, *, cwd, **_):
+            (cwd / "mods" / "first.pw.toml").write_text(
+                metadata("First", "first", "broken"), encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(command, 9, "", "network failed")
+
+        transaction = core.PackTransaction.create(self.key)
+        with patch.object(core.subprocess, "run", side_effect=run):
+            candidates = transaction.prepare_updates()
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].status, "unavailable")
+        self.assertEqual(candidates[0].error, "network failed")
+        self.assertEqual(
+            (transaction.source / "mods" / "first.pw.toml").read_bytes(),
+            original,
+        )
+        self.assertEqual(target.read_bytes(), original)
+        transaction.discard()
+
     def test_discard_cancels_staged_update(self) -> None:
         target = self.write_mod("first")
         original = target.read_bytes()
@@ -226,7 +413,7 @@ url = "https://example.invalid/manual.jar"
         target = self.write_mod("first")
 
         def run(command, *, cwd, **_):
-            if command[-2:] == ["update", "--all"]:
+            if command == ["packwiz", "--yes", "update", "first"]:
                 (cwd / "mods" / "first.pw.toml").write_text(
                     metadata("First", "first", "v2"), encoding="utf-8"
                 )

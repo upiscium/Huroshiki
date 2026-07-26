@@ -81,12 +81,6 @@ LOG_ROOT = STATE_ROOT / "logs"
 TRASH_ROOT = STATE_ROOT / "trash"
 
 
-class PackwizCommandError(HuroshikiError):
-    def __init__(self, message: str, returncode: int) -> None:
-        super().__init__(message)
-        self.returncode = returncode
-
-
 PROJECT_KINDS = ("pack", "template")
 StateItem = packctl.StateItem
 
@@ -222,18 +216,38 @@ class ModInfo:
 
 
 @dataclass(frozen=True)
-class UpdateCandidate:
+class UpdateChange:
     relative_path: Path
+    before: bytes | None
+    after: bytes | None
+
+
+@dataclass(frozen=True)
+class UpdateCandidate:
+    key: str
+    root: Path
     slug: str
     name: str
     provider: str
     current_version: str
     new_version: str
     status: str
+    changes: tuple[UpdateChange, ...] = ()
+    added_dependencies: int = 0
+    error: str | None = None
+    error_returncode: int | None = None
+
+    @property
+    def relative_path(self) -> Path:
+        return self.root
 
     @property
     def available(self) -> bool:
         return self.status == "update"
+
+    @property
+    def file_count(self) -> int:
+        return len(self.changes)
 
 
 @dataclass(frozen=True)
@@ -448,6 +462,8 @@ class PackTransaction:
     template_config_baseline: dict[str, str] = field(default_factory=dict)
     template_manifest: list[object] | None = None
     batches: list[TransactionBatch] = field(default_factory=list)
+    update_candidates: tuple[UpdateCandidate, ...] = field(default_factory=tuple)
+    selected_update_changes: tuple[UpdateChange, ...] = field(default_factory=tuple)
     active: bool = True
     _project_lock: packctl.ProjectLock | None = field(default=None, init=False, repr=False)
     _operation: PackwizAddOperation | None = field(default=None, init=False, repr=False)
@@ -855,39 +871,39 @@ class PackTransaction:
             raise HuroshikiError(
                 "Template entries resolve compatible versions during MODPACK creation"
             )
-        result = subprocess.run(
-            ["packwiz", "--yes", "update", "--all"],
-            cwd=self.source,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise PackwizCommandError(
-                f"packwiz update failed with exit code {result.returncode}; "
-                "transaction was not applied",
-                result.returncode,
+        if tree_digest_snapshot(self.source) != self.real_source_baseline:
+            raise HuroshikiError(
+                "Updates must be prepared before other transaction changes are staged"
             )
-        return update_candidates(self.source, self.baseline_contents)
+        candidates = _prepare_update_candidates(
+            self.source,
+            self.root,
+            self.baseline_contents,
+        )
+        self.update_candidates = tuple(candidates)
+        return candidates
 
     def select_updates(self, selected_paths: Iterable[Path]) -> None:
         self.ensure_active()
         selected = set(selected_paths)
-        changed = changed_paths(
-            self.baseline,
-            metadata_digest_snapshot(self.source),
-        )
-        unknown = selected - changed
+        available = {
+            candidate.root: candidate
+            for candidate in self.update_candidates
+            if candidate.available
+        }
+        unknown = selected - available.keys()
         if unknown:
             raise HuroshikiError(
                 f"Unknown update selection: {', '.join(map(str, sorted(unknown)))}"
             )
-        for relative_path in changed - selected:
-            original = self.baseline_contents.get(relative_path)
-            path = safe_child(self.source, relative_path)
-            if original is None:
-                path.unlink(missing_ok=True)
-            else:
-                path.write_bytes(original)
+        for change in reversed(self.selected_update_changes):
+            _apply_update_change(self.source, change, use_after=False)
+        merged = _merge_update_closures(
+            available[path] for path in sorted(selected)
+        )
+        for change in merged:
+            _apply_update_change(self.source, change, use_after=True)
+        self.selected_update_changes = merged
 
     def remove_mods(self, slugs: Iterable[str]) -> int:
         self.ensure_active()
@@ -1622,55 +1638,395 @@ def metadata_is_pinned(data: dict[str, object]) -> bool:
     return isinstance(update, dict) and update.get("pin") is True
 
 
-def update_candidates(
+@dataclass(frozen=True)
+class _UpdateMetadata:
+    relative_path: Path
+    provider: str
+    project_id: str
+    filename: str
+    contents: bytes
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return self.provider, self.project_id
+
+
+UPDATE_RESOLVER_TIMEOUT_SECONDS = 120
+PACKWIZ_GENERATED_PATHS = {Path("index.toml"), Path("pack.toml")}
+
+
+def _file_content_snapshot(source: Path) -> dict[Path, bytes]:
+    return {
+        path.relative_to(source): path.read_bytes()
+        for path in sorted(source.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+def _content_changes(
+    before: Mapping[Path, bytes],
+    after: Mapping[Path, bytes],
+) -> tuple[UpdateChange, ...]:
+    return tuple(
+        UpdateChange(path, before.get(path), after.get(path))
+        for path in sorted(before.keys() | after.keys())
+        if before.get(path) != after.get(path)
+    )
+
+
+def _update_metadata_record(relative_path: Path, contents: bytes) -> _UpdateMetadata:
+    try:
+        relative = portable_relative_path(relative_path)
+        data = tomllib.loads(contents.decode("utf-8"))
+        mod = read_mod_data(relative, data)
+        provider = canonical_provider(mod.provider)
+        if provider not in {"modrinth", "curseforge", "url"} or not mod.project_id:
+            raise HuroshikiError(
+                f"Update metadata {relative} has no stable provider/project identity"
+            )
+        filename = portable_basename(mod.filename, context="Metadata filename")
+    except (PortablePathError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise HuroshikiError(f"Invalid update metadata {relative_path}: {error}") from error
+    return _UpdateMetadata(
+        relative,
+        provider,
+        mod.project_id,
+        filename,
+        contents,
+    )
+
+
+def _update_metadata_snapshot(source: Path) -> dict[tuple[str, str], _UpdateMetadata]:
+    records: dict[tuple[str, str], _UpdateMetadata] = {}
+    paths: dict[str, tuple[str, str]] = {}
+    filenames: dict[str, tuple[str, str]] = {}
+    for path in sorted(source.rglob("*.pw.toml")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        record = _update_metadata_record(path.relative_to(source), path.read_bytes())
+        path_key = portable_relative_path_key(record.relative_path)
+        filename_key = portable_basename_key(record.filename)
+        if record.identity in records:
+            previous = records[record.identity]
+            raise HuroshikiError(
+                f"Update resolver produced identity {record.provider}:{record.project_id} "
+                f"at both {previous.relative_path} and {record.relative_path}"
+            )
+        path_owner = paths.get(path_key)
+        if path_owner is not None and path_owner != record.identity:
+            raise HuroshikiError(
+                f"Update resolver produced portable metadata path collision at "
+                f"{record.relative_path}"
+            )
+        filename_owner = filenames.get(filename_key)
+        if filename_owner is not None and filename_owner != record.identity:
+            raise HuroshikiError(
+                f"Update resolver produced portable filename collision "
+                f"{record.filename!r}"
+            )
+        records[record.identity] = record
+        paths[path_key] = record.identity
+        filenames[filename_key] = record.identity
+    return records
+
+
+def _candidate_error(
+    root: Path,
+    mod: ModInfo,
+    data: dict[str, object],
+    message: str,
+    returncode: int | None = None,
+) -> UpdateCandidate:
+    provider = canonical_provider(mod.provider)
+    return UpdateCandidate(
+        key=f"{provider}:{mod.project_id}",
+        root=root,
+        slug=mod.slug,
+        name=mod.name,
+        provider=mod.provider,
+        current_version=metadata_version(data, mod.provider),
+        new_version="-",
+        status="unavailable",
+        error=message,
+        error_returncode=returncode,
+    )
+
+
+def _prepare_update_candidates(
     source: Path,
+    transaction_root: Path,
     baseline_contents: dict[Path, bytes],
 ) -> list[UpdateCandidate]:
-    current = metadata_digest_snapshot(source)
-    baseline = {
-        path: hashlib.sha256(contents).hexdigest()
-        for path, contents in baseline_contents.items()
-    }
-    changed = changed_paths(baseline, current)
+    before_files = _file_content_snapshot(source)
+    baseline_records = _update_metadata_snapshot(source)
+    resolver_root = transaction_root / "update-resolvers"
+    resolver_root.mkdir()
     candidates: list[UpdateCandidate] = []
     for relative_path, original in sorted(baseline_contents.items()):
         old_data = tomllib.loads(original.decode("utf-8"))
         old_mod = read_mod_data(relative_path, old_data)
-        path = safe_child(source, relative_path)
-        new_data = (
-            tomllib.loads(path.read_text(encoding="utf-8"))
-            if path.is_file()
-            else old_data
+        provider = canonical_provider(old_mod.provider)
+        key = f"{provider}:{old_mod.project_id}"
+        common = dict(
+            key=key,
+            root=relative_path,
+            slug=old_mod.slug,
+            name=old_mod.name,
+            provider=old_mod.provider,
+            current_version=metadata_version(old_data, old_mod.provider),
         )
-        provider = old_mod.provider
-        has_update_provider = canonical_provider(provider) in {
-            "modrinth",
-            "curseforge",
-        }
-        if relative_path in changed:
-            status = "update"
-        elif metadata_is_pinned(old_data):
-            status = "pinned"
-        elif not has_update_provider:
-            status = "unavailable"
-        else:
-            status = "current"
+        if metadata_is_pinned(old_data):
+            candidates.append(
+                UpdateCandidate(**common, new_version="-", status="pinned")
+            )
+            continue
+        if provider not in {"modrinth", "curseforge"} or not old_mod.project_id:
+            candidates.append(
+                UpdateCandidate(**common, new_version="-", status="unavailable")
+            )
+            continue
+
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=f"{old_mod.slug}-", dir=resolver_root
+            ) as directory:
+                resolver = Path(directory) / "source"
+                copy_transaction_source(source, resolver)
+                try:
+                    result = subprocess.run(
+                        ["packwiz", "--yes", "update", old_mod.slug],
+                        cwd=resolver,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        timeout=UPDATE_RESOLVER_TIMEOUT_SECONDS,
+                    )
+                except subprocess.TimeoutExpired:
+                    candidates.append(
+                        _candidate_error(
+                            relative_path,
+                            old_mod,
+                            old_data,
+                            f"resolver deadline exceeded after "
+                            f"{UPDATE_RESOLVER_TIMEOUT_SECONDS} seconds",
+                        )
+                    )
+                    continue
+                if result.returncode != 0:
+                    candidates.append(
+                        _candidate_error(
+                            relative_path,
+                            old_mod,
+                            old_data,
+                            concise_process_error(result),
+                            result.returncode,
+                        )
+                    )
+                    continue
+                resolved_records = _update_metadata_snapshot(resolver)
+                changes = _content_changes(
+                    before_files,
+                    _file_content_snapshot(resolver),
+                )
+        except (OSError, HuroshikiError) as error:
+            candidates.append(
+                _candidate_error(relative_path, old_mod, old_data, str(error))
+            )
+            continue
+
+        metadata_changed = any(
+            change.relative_path.name.endswith(".pw.toml") for change in changes
+        )
+        if not metadata_changed:
+            candidates.append(
+                UpdateCandidate(**common, new_version="-", status="current")
+            )
+            continue
+        resolved_root = resolved_records.get((provider, old_mod.project_id))
+        new_version = (
+            metadata_version(
+                tomllib.loads(resolved_root.contents.decode("utf-8")),
+                old_mod.provider,
+            )
+            if resolved_root is not None
+            else "-"
+        )
+        added_dependencies = sum(
+            identity not in baseline_records and identity != (provider, old_mod.project_id)
+            for identity in resolved_records
+        )
         candidates.append(
             UpdateCandidate(
-                relative_path=relative_path,
-                slug=old_mod.slug,
-                name=old_mod.name,
-                provider=provider,
-                current_version=metadata_version(old_data, provider),
-                new_version=(
-                    metadata_version(new_data, provider)
-                    if status == "update"
-                    else "-"
-                ),
-                status=status,
+                **common,
+                new_version=new_version,
+                status="update",
+                changes=changes,
+                added_dependencies=added_dependencies,
             )
         )
+    resolver_root.rmdir()
     return candidates
+
+
+def _metadata_semantics(record: _UpdateMetadata) -> dict[str, object]:
+    document = tomllib.loads(record.contents.decode("utf-8"))
+    document.pop("side", None)
+    document["filename"] = portable_basename(
+        str(document.get("filename", "")), context="Metadata filename"
+    )
+    return document
+
+
+def _merge_metadata_records(
+    existing: _UpdateMetadata,
+    incoming: _UpdateMetadata,
+) -> _UpdateMetadata:
+    if (
+        portable_relative_path_key(existing.relative_path)
+        != portable_relative_path_key(incoming.relative_path)
+        or portable_basename_key(existing.filename)
+        != portable_basename_key(incoming.filename)
+        or _metadata_semantics(existing) != _metadata_semantics(incoming)
+    ):
+        raise HuroshikiError(
+            "Update closure metadata disagreement for shared identity "
+            f"{incoming.provider}:{incoming.project_id}; dependency versions, paths, "
+            "downloads, or update metadata differ"
+        )
+    existing_mod = read_mod_data(
+        existing.relative_path,
+        tomllib.loads(existing.contents.decode("utf-8")),
+    )
+    incoming_mod = read_mod_data(
+        incoming.relative_path,
+        tomllib.loads(incoming.contents.decode("utf-8")),
+    )
+    return replace(
+        existing,
+        contents=_metadata_contents_with_side(
+            existing.contents,
+            union_side(existing_mod.side, incoming_mod.side),
+        ),
+    )
+
+
+def _merge_update_closures(
+    candidates: Iterable[UpdateCandidate],
+) -> tuple[UpdateChange, ...]:
+    selected = tuple(candidates)
+    if not selected:
+        return ()
+    baseline_by_identity: dict[tuple[str, str], _UpdateMetadata] = {}
+    metadata_operations: dict[tuple[str, str], _UpdateMetadata | None] = {}
+    other_operations: dict[str, UpdateChange] = {}
+
+    for candidate in selected:
+        before_records: dict[tuple[str, str], _UpdateMetadata] = {}
+        after_records: dict[tuple[str, str], _UpdateMetadata] = {}
+        for change in candidate.changes:
+            if not change.relative_path.name.endswith(".pw.toml"):
+                if change.relative_path in PACKWIZ_GENERATED_PATHS:
+                    continue
+                path_key = portable_relative_path_key(change.relative_path)
+                previous = other_operations.get(path_key)
+                if previous is not None and (
+                    previous.relative_path != change.relative_path
+                    or previous.before != change.before
+                    or previous.after != change.after
+                ):
+                    raise HuroshikiError(
+                        f"Update closure file disagreement at {change.relative_path}"
+                    )
+                other_operations[path_key] = change
+                continue
+            if change.before is not None:
+                record = _update_metadata_record(change.relative_path, change.before)
+                before_records[record.identity] = record
+                baseline_by_identity.setdefault(record.identity, record)
+            if change.after is not None:
+                record = _update_metadata_record(change.relative_path, change.after)
+                after_records[record.identity] = record
+
+        for identity in before_records.keys() | after_records.keys():
+            incoming = after_records.get(identity)
+            if identity not in metadata_operations:
+                metadata_operations[identity] = incoming
+                continue
+            existing = metadata_operations[identity]
+            if (existing is None) != (incoming is None):
+                raise HuroshikiError(
+                    "Update closure delete-vs-update conflict for "
+                    f"{identity[0]}:{identity[1]}"
+                )
+            if existing is not None and incoming is not None:
+                metadata_operations[identity] = _merge_metadata_records(
+                    existing, incoming
+                )
+
+    final_records = dict(baseline_by_identity)
+    final_records.update(
+        (identity, record)
+        for identity, record in metadata_operations.items()
+        if record is not None
+    )
+    for identity, record in metadata_operations.items():
+        if record is None:
+            final_records.pop(identity, None)
+
+    path_owners: dict[str, tuple[str, str]] = {}
+    filename_owners: dict[str, tuple[str, str]] = {}
+    for identity, record in final_records.items():
+        path_key = portable_relative_path_key(record.relative_path)
+        filename_key = portable_basename_key(record.filename)
+        if path_key in path_owners and path_owners[path_key] != identity:
+            raise HuroshikiError(
+                f"Update closure metadata path collision at {record.relative_path}"
+            )
+        if filename_key in filename_owners and filename_owners[filename_key] != identity:
+            raise HuroshikiError(
+                f"Update closure filename collision for {record.filename!r}"
+            )
+        path_owners[path_key] = identity
+        filename_owners[filename_key] = identity
+
+    merged: list[UpdateChange] = list(other_operations.values())
+    for identity, desired in metadata_operations.items():
+        original = baseline_by_identity.get(identity)
+        if original is not None and (
+            desired is None or original.relative_path != desired.relative_path
+        ):
+            merged.append(UpdateChange(original.relative_path, original.contents, None))
+        if desired is not None:
+            before = (
+                original.contents
+                if original is not None and original.relative_path == desired.relative_path
+                else None
+            )
+            if before != desired.contents:
+                merged.append(UpdateChange(desired.relative_path, before, desired.contents))
+    return tuple(sorted(merged, key=lambda item: item.relative_path))
+
+
+def _apply_update_change(
+    source: Path,
+    change: UpdateChange,
+    *,
+    use_after: bool,
+) -> None:
+    contents = change.after if use_after else change.before
+    path = safe_child(source, change.relative_path)
+    if contents is None:
+        path.unlink(missing_ok=True)
+        parent = path.parent
+        while parent != source:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(contents)
 
 
 def read_mod_data(relative_path: Path, data: dict[str, object]) -> ModInfo:
@@ -2230,19 +2586,27 @@ def update_all(project_key_value: str) -> int:
         )
     transaction = PackTransaction.create(project_key_value)
     try:
-        try:
-            candidates = transaction.prepare_updates()
-        except PackwizCommandError as error:
-            return error.returncode
+        candidates = transaction.prepare_updates()
         available = [candidate for candidate in candidates if candidate.available]
+        failures = [candidate for candidate in candidates if candidate.error]
+        for candidate in failures:
+            print(
+                f"Unable to resolve {candidate.name} [{candidate.provider}]: "
+                f"{candidate.error}",
+                file=sys.stderr,
+            )
         if not available:
+            if failures:
+                return failures[0].error_returncode or 1
             print("No MOD updates are available.")
             return 0
         print("MOD updates:")
         for candidate in available:
             print(
                 f"  {candidate.name} [{candidate.provider}] "
-                f"{candidate.current_version} -> {candidate.new_version}"
+                f"{candidate.current_version} -> {candidate.new_version} "
+                f"({candidate.file_count} files, "
+                f"{candidate.added_dependencies} added dependencies)"
             )
         transaction.select_updates(
             candidate.relative_path for candidate in available
