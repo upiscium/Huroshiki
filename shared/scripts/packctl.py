@@ -72,6 +72,23 @@ LOADER_FLAGS = {
     "fabric": "--fabric-version",
     "quilt": "--quilt-version",
 }
+TEMPLATE_COMMITTED_KEYS = frozenset(
+    {
+        "id",
+        "display_name",
+        "enabled",
+        "minecraft",
+        "loader",
+        "reference_loader_version",
+        "mods",
+    }
+)
+TEMPLATE_LOCAL_KEYS = frozenset({"url_max_jar_size_bytes"})
+PACK_LOCAL_KEYS = {
+    "distribution": frozenset({"rsync_target"}),
+    "minecraft_server": frozenset({"ssh_host", "stack_dir", "service"}),
+    "url_max_jar_size_bytes": None,
+}
 
 
 def _project_lock_root(project_key: str) -> Path:
@@ -176,6 +193,69 @@ def merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def validate_local_config(kind: str, path: Path, local: dict[str, Any]) -> None:
+    context = display_path(path)
+    if kind == "template":
+        for key in local:
+            if key in TEMPLATE_LOCAL_KEYS:
+                continue
+            if key in TEMPLATE_COMMITTED_KEYS:
+                raise ConfigError(
+                    f"{context}: {key} is committed semantic data; "
+                    "edit template.yaml instead"
+                )
+            raise ConfigError(
+                f"{context}: unsupported machine-local key {key!r}; "
+                "allowed key: url_max_jar_size_bytes"
+            )
+        value = local.get("url_max_jar_size_bytes")
+        if "url_max_jar_size_bytes" in local and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            raise ConfigError(
+                f"{context}: url_max_jar_size_bytes must be a positive integer"
+            )
+        return
+
+    if kind != "pack":
+        raise ConfigError(f"Unsupported local configuration kind: {kind}")
+    allowed = ", ".join(sorted(PACK_LOCAL_KEYS))
+    for key, value in local.items():
+        nested_keys = PACK_LOCAL_KEYS.get(key)
+        if key not in PACK_LOCAL_KEYS:
+            raise ConfigError(
+                f"{context}: unsupported machine-local key {key!r}; "
+                f"allowed keys: {allowed}"
+            )
+        if nested_keys is None:
+            continue
+        if not isinstance(value, dict):
+            raise ConfigError(f"{context}: {key} must be a mapping")
+        for nested_key, nested_value in value.items():
+            if nested_key not in nested_keys:
+                nested_allowed = ", ".join(sorted(nested_keys))
+                raise ConfigError(
+                    f"{context}: unsupported machine-local key "
+                    f"{key}.{nested_key}; allowed keys: {nested_allowed}"
+                )
+            if not isinstance(nested_value, str) or not nested_value.strip():
+                raise ConfigError(
+                    f"{context}: {key}.{nested_key} must be a non-empty string"
+                )
+            if key == "distribution" and nested_key == "rsync_target":
+                try:
+                    validate_rsync_target(nested_value.strip())
+                except ValueError as error:
+                    raise ConfigError(f"{context}: {error}") from error
+    value = local.get("url_max_jar_size_bytes")
+    if "url_max_jar_size_bytes" in local and (
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+    ):
+        raise ConfigError(
+            f"{context}: url_max_jar_size_bytes must be a positive integer"
+        )
+
+
 def ensure_safe_state_path(
     path: Path,
     *,
@@ -271,7 +351,10 @@ def get_pack_root(pack_id: str, *, must_exist: bool = True) -> Path:
 
 def load_pack_config(pack_id: str) -> dict[str, Any]:
     root = get_pack_root(pack_id)
-    config = merge(load_yaml(root / "pack.yaml"), load_yaml(root / "pack.local.yaml"))
+    local_path = root / "pack.local.yaml"
+    local = load_yaml(local_path)
+    validate_local_config("pack", local_path, local)
+    config = merge(load_yaml(root / "pack.yaml"), local)
     if config.get("id") != pack_id:
         raise ConfigError(f"packs/{pack_id}/pack.yaml must contain id: {pack_id}")
     return config
@@ -300,12 +383,9 @@ def load_template_config(template_id: str) -> dict[str, Any]:
     root = get_template_root(template_id)
     reject_legacy_template_source(root)
     config = load_yaml(root / "template.yaml")
-    local = load_yaml(root / "template.local.yaml")
-    if "mods" in local:
-        raise ConfigError(
-            f"templates/{template_id}/template.local.yaml must not define mods; "
-            "edit template.yaml instead"
-        )
+    local_path = root / "template.local.yaml"
+    local = load_yaml(local_path)
+    validate_local_config("template", local_path, local)
     config = merge(config, local)
     if config.get("id") != template_id:
         raise ConfigError(
@@ -1462,6 +1542,13 @@ def validate_pack_directory(root: Path) -> list[str]:
     local: dict[str, Any] | None = {}
     if local_path.exists():
         local = validation_yaml(local_path, errors)
+    local_is_valid = local is not None
+    if local is not None:
+        try:
+            validate_local_config("pack", local_path, local)
+        except ConfigError as error:
+            errors.append(str(error))
+            local_is_valid = False
 
     try:
         validate_project_id(root.name)
@@ -1469,7 +1556,9 @@ def validate_pack_directory(root: Path) -> list[str]:
         errors.append(f"{display_path(root)}: invalid directory name: {error}")
 
     if config is not None:
-        effective = merge(config, local or {})
+        effective = merge(
+            config, local if local_is_valid and local is not None else {}
+        )
         validate_manifest_identity(root, effective, manifest, errors)
         validation_text(effective, "display_name", manifest, errors)
         validate_enabled(effective, manifest, errors)
@@ -1513,6 +1602,13 @@ def validate_template_directory(root: Path) -> list[str]:
     local: dict[str, Any] | None = {}
     if local_path.exists():
         local = validation_yaml(local_path, errors)
+    local_is_valid = local is not None
+    if local is not None:
+        try:
+            validate_local_config("template", local_path, local)
+        except ConfigError as error:
+            errors.append(str(error))
+            local_is_valid = False
     try:
         validate_project_id(root.name)
     except ConfigError as error:
@@ -1520,12 +1616,9 @@ def validate_template_directory(root: Path) -> list[str]:
     if config is None:
         return errors
     committed = config
-    if local is not None and "mods" in local:
-        errors.append(
-            f"{display_path(local_path)}: mods is committed structural data; "
-            "edit template.yaml instead"
-        )
-    config = merge(committed, local or {})
+    config = merge(
+        committed, local if local_is_valid and local is not None else {}
+    )
 
     validate_manifest_identity(root, committed, manifest, errors)
     validation_text(committed, "display_name", manifest, errors)

@@ -157,6 +157,29 @@ packctl clean-huroshiki-state --apply --older-than 14 --project pack:example
 State cleanup is a dry run unless `--apply` is supplied. Active transactions and locks are never
 selected for deletion.
 
+## Local Configuration
+
+Committed manifests define project identity and Packwiz/template semantics. Ignored local files are
+only for machine-local operational settings; both runtime loading and `packctl validate` reject all
+other keys.
+
+`pack.local.yaml` recursively overrides only these settings:
+
+```yaml
+distribution:
+  rsync_target: user@host:/srv/packs/demo
+minecraft_server:
+  ssh_host: user@host
+  stack_dir: /srv/demo
+  service: demo
+url_max_jar_size_bytes: 268435456
+```
+
+The exact allowed paths are `distribution.rsync_target`, `minecraft_server.ssh_host`,
+`minecraft_server.stack_dir`, `minecraft_server.service`, and `url_max_jar_size_bytes`. Identity,
+display, enablement, Minecraft/loader versions, MOD data, and every unknown top-level or nested key
+are prohibited in `pack.local.yaml`.
+
 ## Template Format
 
 Templates are YAML MOD lists, not Packwiz projects:
@@ -180,8 +203,12 @@ mods:
 ```
 
 Every field shown above, including `mods`, is required in committed `template.yaml`.
-`template.local.yaml` may override scalar configuration values, but must not define `mods`; MOD-list
-editing, listing, and composition always use the committed list.
+`template.local.yaml` permits exactly one operational key: a positive integer
+`url_max_jar_size_bytes`. It cannot define `id`, `display_name`, `enabled`, `minecraft`, `loader`,
+`reference_loader_version`, `mods`, or any unknown key. Template listing, composition, side changes,
+and deletion always use and update committed semantic data in `template.yaml`; the local URL limit is
+used only for bounded URL downloads. Changing either template configuration file while a staged
+template transaction is open prevents that transaction from being applied.
 
 Any `templates/<id>/source` entry, including a symlink, is a validation error. Legacy Packwiz
 template fallback and migration commands have been removed. Before upgrading, extract required
@@ -189,8 +216,8 @@ provider IDs and sides into `template.yaml`, add all required fields shown above
 then run `packctl validate-template <id>`.
 
 URL entries use `provider: url`, a stable logical `project_id`, and a public `.jar` URL. Downloads
-default to 256 MiB; set `url_max_jar_size_bytes` in the effective pack or template configuration to
-change the limit.
+default to 256 MiB; set `url_max_jar_size_bytes` in the committed manifest or its permitted local
+configuration to change the limit.
 
 ## Zsh Completion
 

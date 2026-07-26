@@ -403,7 +403,7 @@ class PackTransaction:
     baseline: dict[Path, str]
     baseline_contents: dict[Path, bytes] = field(default_factory=dict)
     real_source_baseline: dict[Path, str] = field(default_factory=dict)
-    template_config_baseline: str = ""
+    template_config_baseline: dict[str, str] = field(default_factory=dict)
     template_manifest: list[object] | None = None
     batches: list[TransactionBatch] = field(default_factory=list)
     active: bool = True
@@ -456,7 +456,6 @@ class PackTransaction:
                     real_source_baseline=tree_digest_snapshot(real_source),
                 )
             else:
-                config_path = real_root / "template.yaml"
                 config = packctl.load_template_config(project_id)
                 minecraft, loader, loader_version = packctl.template_versions(
                     project_id
@@ -474,7 +473,7 @@ class PackTransaction:
                     source=tx_source,
                     baseline={},
                     baseline_contents={},
-                    template_config_baseline=file_digest(config_path),
+                    template_config_baseline=template_config_snapshot(real_root),
                 )
             transaction._project_lock = project_lock
             return transaction
@@ -882,10 +881,10 @@ class PackTransaction:
 
         kind, project_id = split_project_key(self.project_key)
         if kind == "template":
-            config_path = project_root(self.project_key) / "template.yaml"
-            if file_digest(config_path) != self.template_config_baseline:
+            real_root = project_root(self.project_key)
+            if template_config_snapshot(real_root) != self.template_config_baseline:
                 raise HuroshikiError(
-                    "The template manifest changed while this transaction was open. "
+                    "The template configuration changed while this transaction was open. "
                     "Discard the staged transaction and retry."
                 )
             if self.template_manifest is not None:
@@ -1293,6 +1292,14 @@ def file_digest(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def template_config_snapshot(root: Path) -> dict[str, str]:
+    snapshot: dict[str, str] = {}
+    for name in ("template.yaml", "template.local.yaml"):
+        path = root / name
+        snapshot[name] = file_digest(path) if path.is_file() else "missing"
+    return snapshot
 
 
 def tree_digest_snapshot(source: Path) -> dict[Path, str]:

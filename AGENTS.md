@@ -15,8 +15,8 @@
 - `project_locks.py` implements advisory-lock files and owner metadata; `packctl.py` validates project keys, chooses lock paths, and reexports the public lock API.
 - `url_artifacts.py` owns self-hosted URL validation, bounded downloads, JAR identity parsing, URL logs, and Packwiz metadata writes; `huroshiki_core.py` reexports that API and coordinates it with transactions and project configuration.
 - `deploy_support.py` contains the pure rsync change parser/command builder and distribution digest model; deployment configuration, preview execution, confirmation guards, and CLI behavior remain in `packctl.py`.
-- A pack lives at `packs/<id>/`: `pack.yaml` is committed configuration, ignored `pack.local.yaml` recursively overrides it, `source/` is the canonical Packwiz project, and `content/common|client|server` overlays distribution content.
-- A template lives at `templates/<id>/template.yaml` and stores provider IDs, sides, and a reference loader version. It is a creation recipe, not a persistent Packwiz project; resolver projects are temporary. Any `templates/<id>/source` entry, including a symlink, is invalid.
+- A pack lives at `packs/<id>/`: `pack.yaml` is committed configuration, `source/` is the canonical Packwiz project, and `content/common|client|server` overlays distribution content. Ignored `pack.local.yaml` may recursively override only `distribution.rsync_target`, `minecraft_server.ssh_host`, `minecraft_server.stack_dir`, `minecraft_server.service`, and `url_max_jar_size_bytes`; all identity, Packwiz semantic, and unknown keys are invalid.
+- A template lives at `templates/<id>/template.yaml` and stores committed identity, Minecraft/loader settings, provider IDs, sides, and a reference loader version. Ignored `template.local.yaml` permits only `url_max_jar_size_bytes`; all other keys are invalid. A template is a creation recipe, not a persistent Packwiz project; resolver projects are temporary. Any `templates/<id>/source` entry, including a symlink, is invalid.
 
 ## Generated and Operational State
 

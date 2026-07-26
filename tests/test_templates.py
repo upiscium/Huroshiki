@@ -96,6 +96,9 @@ class TemplateManifestTest(unittest.TestCase):
 
     def test_template_side_edit_and_delete_update_yaml(self) -> None:
         key = core.project_key("template", "base")
+        local = self.template_root / "template.local.yaml"
+        local.write_text("url_max_jar_size_bytes: 1024\n", encoding="utf-8")
+        local_before = local.read_bytes()
         mods = core.list_mods(key)
         core.set_installed_mod_side(
             key, mods[0].relative_path, client=False, server=True
@@ -107,30 +110,80 @@ class TemplateManifestTest(unittest.TestCase):
         result = core.remove_installed_mods(key, [changed[1].slug])
         self.assertEqual(result, 0)
         self.assertEqual([mod.name for mod in core.list_mods(key)], ["Create"])
+        self.assertEqual(local.read_bytes(), local_before)
 
     def test_local_mods_cannot_override_listing_or_composition_data(self) -> None:
         (self.template_root / "template.local.yaml").write_text(
-            "display_name: Local Base\nmods: []\n", encoding="utf-8"
+            "mods: []\n", encoding="utf-8"
         )
 
         with self.assertRaisesRegex(
-            packctl.ConfigError, "template.local.yaml must not define mods"
+            packctl.ConfigError, "mods is committed semantic data"
         ):
             packctl.load_template_config("base")
         with self.assertRaisesRegex(
-            packctl.ConfigError, "template.local.yaml must not define mods"
+            packctl.ConfigError, "mods is committed semantic data"
         ):
             packctl.template_mods("base")
         with self.assertRaisesRegex(
-            packctl.ConfigError, "template.local.yaml must not define mods"
+            packctl.ConfigError, "mods is committed semantic data"
         ):
             core.list_mods("template:base")
         with self.assertRaisesRegex(
-            packctl.ConfigError, "template.local.yaml must not define mods"
+            packctl.ConfigError, "mods is committed semantic data"
         ):
             core.prepare_template_composition(
                 template_ids=["base"], minecraft="1.21.1", loader="neoforge"
             )
+
+    def test_template_local_schema_allows_only_url_limit(self) -> None:
+        local = self.template_root / "template.local.yaml"
+        local.write_text("url_max_jar_size_bytes: 1024\n", encoding="utf-8")
+        self.assertEqual(
+            packctl.load_template_config("base")["url_max_jar_size_bytes"],
+            1024,
+        )
+
+        for key in sorted(packctl.TEMPLATE_COMMITTED_KEYS):
+            with self.subTest(key=key):
+                local.write_text(f"{key}: local\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    packctl.ConfigError,
+                    rf"{key} is committed semantic data; edit template.yaml instead",
+                ):
+                    packctl.load_template_config("base")
+
+        local.write_text("future_setting: true\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            packctl.ConfigError,
+            "unsupported machine-local key 'future_setting'.*allowed key: "
+            "url_max_jar_size_bytes",
+        ):
+            packctl.load_template_config("base")
+
+    def test_disallowed_template_local_config_becomes_project_error(self) -> None:
+        (self.template_root / "template.local.yaml").write_text(
+            "display_name: Local Base\n", encoding="utf-8"
+        )
+
+        info = core.project_info("template:base")
+
+        self.assertIsNotNone(info.error)
+        self.assertIn("display_name is committed semantic data", info.error or "")
+
+    def test_template_transaction_conflicts_when_local_limit_changes(self) -> None:
+        local = self.template_root / "template.local.yaml"
+        local.write_text("url_max_jar_size_bytes: 1024\n", encoding="utf-8")
+        transaction = core.PackTransaction.create("template:base")
+        try:
+            local.write_text("url_max_jar_size_bytes: 2048\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                core.HuroshikiError,
+                "template configuration changed while this transaction was open",
+            ):
+                transaction.apply()
+        finally:
+            transaction.discard()
 
     def test_candidate_matching_ignores_loader_version(self) -> None:
         candidates = core.compatible_templates("1.21.1", "neoforge")

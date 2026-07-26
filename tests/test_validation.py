@@ -270,7 +270,7 @@ minecraft_server:
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")
 
-    def test_effective_local_fields_and_ids_are_validated(self) -> None:
+    def test_disallowed_local_fields_are_rejected_by_schema(self) -> None:
         (self.pack_root / "pack.local.yaml").write_text(
             "id: other\ndisplay_name: ''\nenabled: 'yes'\n"
             "url_max_jar_size_bytes: 0\n",
@@ -286,13 +286,8 @@ minecraft_server:
 
         self.assertEqual(result, 1)
         for expected in (
-            "packs/demo/pack.yaml: id 'other' must match directory name 'demo'",
-            "display_name must be a non-empty string",
-            "enabled must be a boolean",
-            "url_max_jar_size_bytes must be a positive integer",
-            "templates/base/template.yaml: id 'other' must match directory name 'base'",
-            "loader must be one of",
-            "template.local.yaml: mods is committed structural data",
+            "pack.local.yaml: unsupported machine-local key 'id'",
+            "template.local.yaml: id is committed semantic data",
         ):
             self.assertIn(expected, stderr)
 
@@ -336,13 +331,72 @@ mods: []
 
     def test_template_local_yaml_rejects_mods_even_when_committed_mods_exist(self) -> None:
         (self.template_root / "template.local.yaml").write_text(
-            "display_name: Local Base\nmods: []\n", encoding="utf-8"
+            "mods: []\n", encoding="utf-8"
         )
 
         result, _, stderr = self.validate_all()
 
         self.assertEqual(result, 1)
-        self.assertIn("template.local.yaml: mods is committed structural data", stderr)
+        self.assertIn("template.local.yaml: mods is committed semantic data", stderr)
+
+    def test_pack_local_schema_allows_only_operational_fields(self) -> None:
+        allowed_values = {
+            "distribution": "distribution:\n  rsync_target: local:/demo\n",
+            "minecraft_server": (
+                "minecraft_server:\n"
+                "  ssh_host: local\n"
+                "  stack_dir: /srv/demo\n"
+                "  service: demo\n"
+            ),
+            "url_max_jar_size_bytes": "url_max_jar_size_bytes: 1024\n",
+        }
+        local = self.pack_root / "pack.local.yaml"
+        for key, text in allowed_values.items():
+            with self.subTest(key=key):
+                local.write_text(text, encoding="utf-8")
+                self.assertEqual(self.validate_all()[0], 0)
+                packctl.load_pack_config("demo")
+
+        rejected = {
+            "identity": "id: other\n",
+            "packwiz semantic": "minecraft: 1.20.1\n",
+            "unknown top-level": "future_setting: true\n",
+            "unknown nested": "distribution:\n  future_target: local:/demo\n",
+        }
+        for label, text in rejected.items():
+            with self.subTest(label=label):
+                local.write_text(text, encoding="utf-8")
+                result, _, stderr = self.validate_all()
+                self.assertEqual(result, 1)
+                self.assertIn("unsupported machine-local key", stderr)
+                with self.assertRaisesRegex(
+                    packctl.ConfigError, "unsupported machine-local key"
+                ):
+                    packctl.load_pack_config("demo")
+
+    def test_template_validation_and_runtime_share_local_policy(self) -> None:
+        local = self.template_root / "template.local.yaml"
+        cases: dict[str, tuple[str, bool]] = {
+            "allowed": ("url_max_jar_size_bytes: 1024\n", True),
+            "unknown": ("future_setting: true\n", False),
+            "invalid value": ("url_max_jar_size_bytes: false\n", False),
+            "null value": ("url_max_jar_size_bytes: null\n", False),
+        }
+        cases.update(
+            (f"semantic {key}", (f"{key}: local\n", False))
+            for key in packctl.TEMPLATE_COMMITTED_KEYS
+        )
+        for label, (text, valid) in cases.items():
+            with self.subTest(label=label):
+                local.write_text(text, encoding="utf-8")
+                result, _, _ = self.validate_all()
+                if valid:
+                    self.assertEqual(result, 0)
+                    packctl.load_template_config("base")
+                else:
+                    self.assertEqual(result, 1)
+                    with self.assertRaises(packctl.ConfigError):
+                        packctl.load_template_config("base")
 
     def test_aggregate_validation_reports_legacy_source_before_bad_manifest(self) -> None:
         (self.template_root / "source").mkdir()
