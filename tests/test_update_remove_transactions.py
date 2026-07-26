@@ -11,11 +11,18 @@ import huroshiki_core as core
 import packctl
 
 
-def metadata(name: str, slug: str, version: str, *, pin: bool = False) -> str:
+def metadata(
+    name: str,
+    slug: str,
+    version: str,
+    *,
+    pin: bool = False,
+    side: str = "both",
+) -> str:
     pinned = "pin = true\n" if pin else ""
     return f'''name = "{name}"
 filename = "{slug}-{version}.jar"
-side = "both"
+side = "{side}"
 {pinned}[download]
 hash-format = "sha256"
 hash = "00"
@@ -117,6 +124,34 @@ class UpdateTransactionTest(TransactionTestCase):
             with self.assertRaisesRegex(core.HuroshikiError, "while.*copy"):
                 core.update_all(self.key)
         self.assertIn("external", target.read_text(encoding="utf-8"))
+
+    def test_source_directory_replacement_during_copy_is_not_followed(self) -> None:
+        self.write_mod("first")
+        mods = self.source / "mods"
+        displaced = self.source / "displaced-mods"
+        external = self.root / "external"
+        external.mkdir()
+        secret = external / "secret"
+        secret.write_text("keep", encoding="utf-8")
+        real_open = os.open
+        replaced = False
+
+        def replace_then_open(path, flags, *args, dir_fd=None, **kwargs):
+            nonlocal replaced
+            if path == "mods" and dir_fd is not None and not replaced:
+                replaced = True
+                mods.rename(displaced)
+                mods.symlink_to(external, target_is_directory=True)
+            return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+
+        with patch.object(
+            packctl, "pack_source_fd_entry_issues", return_value=[]
+        ), patch.object(core.os, "open", side_effect=replace_then_open):
+            with self.assertRaisesRegex(core.HuroshikiError, "changed while opening"):
+                core.PackTransaction.create(self.key)
+
+        self.assertEqual(secret.read_text(encoding="utf-8"), "keep")
+        self.assertFalse(packctl.project_lock_is_active(self.key))
 
     def test_no_candidates_reports_current_and_pinned(self) -> None:
         self.write_mod("current")
@@ -280,6 +315,64 @@ url = "https://example.invalid/manual.jar"
         shared = list(self.source.rglob("shared.pw.toml"))
         self.assertEqual(len(shared), 1)
         self.assertIn('version = "v2"', shared[0].read_text(encoding="utf-8"))
+
+    def test_first_incoming_update_unions_existing_side(self) -> None:
+        target = self.source / "mods/first.pw.toml"
+        target.write_text(
+            metadata("First", "first", "v1", side="client"), encoding="utf-8"
+        )
+
+        def run(command, *, cwd, **_):
+            if command == ["packwiz", "--yes", "update", "first"]:
+                (cwd / "mods/first.pw.toml").write_text(
+                    metadata("First", "first", "v2", side="server"),
+                    encoding="utf-8",
+                )
+            return self.completed(command)
+
+        transaction = core.PackTransaction.create(self.key)
+        with patch.object(core.subprocess, "run", side_effect=run):
+            candidate = next(
+                item for item in transaction.prepare_updates() if item.available
+            )
+            transaction.select_updates([candidate.root])
+            transaction.apply()
+
+        contents = target.read_text(encoding="utf-8")
+        self.assertIn('version = "v2"', contents)
+        self.assertIn('side = "both"', contents)
+
+    def test_shared_incoming_updates_union_existing_side_once(self) -> None:
+        self.write_mod("first")
+        self.write_mod("second")
+        shared = self.source / "mods/shared.pw.toml"
+        shared.write_text(
+            metadata("Shared", "shared", "v1", side="client"), encoding="utf-8"
+        )
+
+        def run(command, *, cwd, **_):
+            if command[:3] == ["packwiz", "--yes", "update"]:
+                slug = command[3]
+                (cwd / "mods" / f"{slug}.pw.toml").write_text(
+                    metadata(slug.title(), slug, "v2"), encoding="utf-8"
+                )
+                (cwd / "mods/shared.pw.toml").write_text(
+                    metadata("Shared", "shared", "v2", side="server"),
+                    encoding="utf-8",
+                )
+            return self.completed(command)
+
+        transaction = core.PackTransaction.create(self.key)
+        with patch.object(core.subprocess, "run", side_effect=run):
+            candidates = transaction.prepare_updates()
+            transaction.select_updates(
+                item.root for item in candidates if item.available
+            )
+            transaction.apply()
+
+        contents = shared.read_text(encoding="utf-8")
+        self.assertIn('version = "v2"', contents)
+        self.assertIn('side = "both"', contents)
 
     def test_conflicting_dependency_versions_abort_before_real_source_apply(self) -> None:
         first = self.write_mod("first")
@@ -556,6 +649,96 @@ url = "https://example.invalid/manual.jar"
         self.assertEqual(target.read_bytes(), original)
         self.assertFalse((transaction.root / "replaced-source").exists())
         transaction.discard()
+
+    def test_failure_after_successful_staged_rename_restores_exact_source(self) -> None:
+        for failure in (KeyboardInterrupt(), RuntimeError("after rename")):
+            with self.subTest(failure=type(failure).__name__):
+                target = self.write_mod("first")
+                original = {
+                    path.relative_to(self.source): path.read_bytes()
+                    for path in self.source.rglob("*")
+                    if path.is_file()
+                }
+                transaction = core.PackTransaction.create(self.key)
+                (transaction.source / "mods/first.pw.toml").write_text(
+                    metadata("First", "first", "v2"), encoding="utf-8"
+                )
+                real_rename = Path.rename
+
+                def rename_then_fail(path: Path, destination: Path):
+                    result = real_rename(path, destination)
+                    if path == transaction.source:
+                        raise failure
+                    return result
+
+                try:
+                    with patch.object(
+                        core.subprocess,
+                        "run",
+                        side_effect=lambda command, **_: self.completed(command),
+                    ), patch.object(Path, "rename", rename_then_fail):
+                        with self.assertRaises(type(failure)):
+                            transaction.apply()
+
+                    restored = {
+                        path.relative_to(self.source): path.read_bytes()
+                        for path in self.source.rglob("*")
+                        if path.is_file()
+                    }
+                    self.assertEqual(restored, original)
+                    self.assertNotIn(
+                        'version = "v2"', target.read_text(encoding="utf-8")
+                    )
+                    self.assertTrue(
+                        (transaction.root / "failed-staged-source").is_dir()
+                    )
+                finally:
+                    transaction.discard()
+                self.assertFalse(packctl.project_lock_is_active(self.key))
+
+    def test_external_recreation_after_staged_rename_is_preserved(self) -> None:
+        self.write_mod("first")
+        transaction = core.PackTransaction.create(self.key)
+        original = {
+            path.relative_to(self.source): path.read_bytes()
+            for path in self.source.rglob("*")
+            if path.is_file()
+        }
+        real_rename = Path.rename
+
+        def install_then_recreate(path: Path, destination: Path):
+            result = real_rename(path, destination)
+            if path == transaction.source:
+                real_rename(destination, transaction.source)
+                destination.mkdir()
+                (destination / "external.txt").write_text("keep", encoding="utf-8")
+                raise RuntimeError("external recreation")
+            return result
+
+        try:
+            with patch.object(
+                core.subprocess,
+                "run",
+                side_effect=lambda command, **_: self.completed(command),
+            ), patch.object(Path, "rename", install_then_recreate):
+                with self.assertRaisesRegex(
+                    core.HuroshikiError, "recreated externally"
+                ):
+                    transaction.apply()
+
+            self.assertEqual(
+                (self.source / "external.txt").read_text(encoding="utf-8"), "keep"
+            )
+            backup = transaction.root / "replaced-source"
+            retained = {
+                path.relative_to(backup): path.read_bytes()
+                for path in backup.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(retained, original)
+        finally:
+            transaction.discard()
+        self.assertFalse(packctl.project_lock_is_active(self.key))
 
     def test_late_old_inode_write_is_retained_until_completed_state_cleanup(self) -> None:
         target = self.write_mod("first")

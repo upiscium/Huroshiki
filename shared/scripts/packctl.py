@@ -1456,43 +1456,154 @@ def validate_packwiz_versions(source: Path, errors: list[str]) -> None:
 
 def pack_source_entry_issues(source: Path) -> list[tuple[Path, str]]:
     """Inspect a Packwiz source without following any filesystem links."""
-    issues: list[tuple[Path, str]] = []
-    if source.is_symlink():
-        try:
-            target = source.readlink()
-        except OSError as error:
-            target = Path(f"<unreadable: {error}>")
-        return [(Path("."), f"symlink is not allowed -> {target}")]
-    if not source.exists():
-        return issues
     try:
-        root_mode = source.stat(follow_symlinks=False).st_mode
+        root_metadata = os.stat(source, follow_symlinks=False)
+    except FileNotFoundError:
+        return []
     except OSError as error:
         return [(Path("."), f"could not inspect safely: {error}")]
-    if not stat.S_ISDIR(root_mode):
+    if stat.S_ISLNK(root_metadata.st_mode):
+        try:
+            target = os.readlink(source)
+        except OSError as error:
+            target = f"<unreadable: {error}>"
+        return [(Path("."), f"symlink is not allowed -> {target}")]
+    if not stat.S_ISDIR(root_metadata.st_mode):
         return [(Path("."), "source must be an ordinary directory")]
 
-    def scan(directory: Path, relative: Path) -> None:
+    try:
+        root_fd = os.open(
+            source,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError as error:
+        return [(Path("."), f"could not inspect safely: {error}")]
+    try:
+        opened = os.fstat(root_fd)
+        if (opened.st_dev, opened.st_ino) != (
+            root_metadata.st_dev,
+            root_metadata.st_ino,
+        ):
+            return [(Path("."), "source was replaced while being opened")]
+        issues = pack_source_fd_entry_issues(root_fd)
         try:
-            with os.scandir(directory) as iterator:
-                entries = sorted(iterator, key=lambda item: item.name)
+            current = os.stat(source, follow_symlinks=False)
+        except OSError as error:
+            issues.append((Path("."), f"source was replaced while scanning: {error}"))
+        else:
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                issues.append((Path("."), "source was replaced while scanning"))
+        return issues
+    finally:
+        os.close(root_fd)
+
+
+def pack_source_fd_entry_issues(root_fd: int) -> list[tuple[Path, str]]:
+    """Inspect an already pinned Packwiz source directory."""
+    issues: list[tuple[Path, str]] = []
+    if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+        return [(Path("."), "source must be an ordinary directory")]
+
+    def scan(directory_fd: int, relative: Path) -> None:
+        try:
+            with os.scandir(directory_fd) as iterator:
+                names = sorted(entry.name for entry in iterator)
         except OSError as error:
             issues.append((relative, f"could not inspect safely: {error}"))
             return
-        for entry in entries:
-            item_relative = relative / entry.name
+        for name in names:
+            item_relative = relative / name
             try:
-                mode = entry.stat(follow_symlinks=False).st_mode
+                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                mode = metadata.st_mode
                 if stat.S_ISLNK(mode):
                     try:
-                        target = os.readlink(entry.path)
+                        target = os.readlink(name, dir_fd=directory_fd)
                     except OSError as error:
                         target = f"<unreadable: {error}>"
                     issues.append(
                         (item_relative, f"symlink is not allowed -> {target}")
                     )
                 elif stat.S_ISDIR(mode):
-                    scan(Path(entry.path), item_relative)
+                    try:
+                        child_fd = os.open(
+                            name,
+                            os.O_RDONLY
+                            | os.O_DIRECTORY
+                            | os.O_NOFOLLOW
+                            | os.O_CLOEXEC,
+                            dir_fd=directory_fd,
+                        )
+                    except OSError as error:
+                        issues.append(
+                            (item_relative, f"entry changed while opening: {error}")
+                        )
+                        continue
+                    try:
+                        opened = os.fstat(child_fd)
+                        if (opened.st_dev, opened.st_ino) != (
+                            metadata.st_dev,
+                            metadata.st_ino,
+                        ):
+                            issues.append(
+                                (item_relative, "entry was replaced while opening")
+                            )
+                            continue
+                        scan(child_fd, item_relative)
+                        try:
+                            current = os.stat(
+                                name,
+                                dir_fd=directory_fd,
+                                follow_symlinks=False,
+                            )
+                        except OSError as error:
+                            issues.append(
+                                (
+                                    item_relative,
+                                    f"entry was replaced while scanning: {error}",
+                                )
+                            )
+                        else:
+                            if (
+                                not stat.S_ISDIR(current.st_mode)
+                                or (current.st_dev, current.st_ino)
+                                != (opened.st_dev, opened.st_ino)
+                            ):
+                                issues.append(
+                                    (item_relative, "entry was replaced while scanning")
+                                )
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISREG(mode):
+                    try:
+                        file_fd = os.open(
+                            name,
+                            os.O_RDONLY
+                            | os.O_NOFOLLOW
+                            | os.O_CLOEXEC
+                            | os.O_NONBLOCK,
+                            dir_fd=directory_fd,
+                        )
+                    except OSError as error:
+                        issues.append(
+                            (item_relative, f"entry changed while opening: {error}")
+                        )
+                        continue
+                    try:
+                        opened = os.fstat(file_fd)
+                        if (
+                            not stat.S_ISREG(opened.st_mode)
+                            or (opened.st_dev, opened.st_ino)
+                            != (metadata.st_dev, metadata.st_ino)
+                        ):
+                            issues.append(
+                                (item_relative, "entry was replaced while opening")
+                            )
+                    finally:
+                        os.close(file_fd)
                 elif not stat.S_ISREG(mode):
                     issues.append(
                         (item_relative, "special filesystem entry is not allowed")
@@ -1502,7 +1613,7 @@ def pack_source_entry_issues(source: Path) -> list[tuple[Path, str]]:
                     (item_relative, f"could not inspect safely: {error}")
                 )
 
-    scan(source, Path("."))
+    scan(root_fd, Path("."))
     return issues
 
 

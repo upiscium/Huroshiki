@@ -175,6 +175,31 @@ class RepositoryValidationTest(unittest.TestCase):
         )
         self.assertEqual((external / "secret").read_text(), "keep")
 
+    def test_pack_source_directory_replacement_during_open_is_unsafe(self) -> None:
+        source = self.pack_root / "source"
+        mods = source / "mods"
+        displaced = source / "displaced-mods"
+        external = self.root / "external"
+        external.mkdir()
+        (external / "secret").write_text("keep", encoding="utf-8")
+        real_open = os.open
+        replaced = False
+
+        def replace_then_open(path, flags, *args, dir_fd=None, **kwargs):
+            nonlocal replaced
+            if path == "mods" and dir_fd is not None and not replaced:
+                replaced = True
+                mods.rename(displaced)
+                mods.symlink_to(external, target_is_directory=True)
+            return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+
+        with patch.object(packctl.os, "open", side_effect=replace_then_open):
+            result, _, stderr = self.validate_all()
+
+        self.assertEqual(result, 1)
+        self.assertIn("packs/demo/source/mods: entry changed while opening", stderr)
+        self.assertEqual((external / "secret").read_text(encoding="utf-8"), "keep")
+
     def test_portable_metadata_filename_collisions_accumulate(self) -> None:
         (self.pack_root / "source/mods/create.pw.toml").write_text(
             'name = "Create"\nfilename = "Same.jar"\nside = "both"\n',

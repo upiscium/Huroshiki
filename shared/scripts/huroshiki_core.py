@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field, replace
 import hashlib
+import os
 from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1141,29 +1143,98 @@ class PackTransaction:
         real_root = project_root(self.project_key)
         real_source = real_root / "source"
         backup = self.root / "replaced-source"
-        if backup.exists():
+        try:
+            os.stat(backup, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
             raise HuroshikiError(f"Backup path already exists: {backup}")
 
+        staged_fd, staged_metadata = _open_pinned_source(self.source)
+        original_fd = -1
         try:
-            real_source.rename(backup)
+            staged_issues = packctl.pack_source_fd_entry_issues(staged_fd)
+            if staged_issues:
+                details = "; ".join(
+                    f"{relative}: {message}" for relative, message in staged_issues
+                )
+                raise HuroshikiError(f"Unsafe staged Packwiz source: {details}")
+            original_fd, original_metadata = _open_pinned_source(real_source)
             if (
-                tree_digest_snapshot(backup) != self.real_source_baseline
+                _source_fd_snapshot(original_fd) != self.real_source_baseline
                 or pack_config_snapshot(real_root) != self.pack_config_baseline
             ):
-                _restore_source_backup(real_source, backup)
                 raise HuroshikiError(
                     "The real Packwiz source changed or pack configuration changed while "
                     "this transaction was open. Discard the staged transaction and retry "
                     "to avoid overwriting external changes."
                 )
+            real_source.rename(backup)
+            backup_metadata = os.stat(backup, follow_symlinks=False)
+            if (
+                not _same_entry(original_metadata, backup_metadata)
+                or tree_digest_snapshot(backup) != self.real_source_baseline
+                or pack_config_snapshot(real_root) != self.pack_config_baseline
+            ):
+                _restore_source_backup(real_source, backup, original_metadata)
+                raise HuroshikiError(
+                    "The real Packwiz source changed or pack configuration changed while "
+                    "this transaction was open. Discard the staged transaction and retry "
+                    "to avoid overwriting external changes."
+                )
+            current_staged = os.stat(self.source, follow_symlinks=False)
+            if not _same_entry(staged_metadata, current_staged):
+                _restore_source_backup(real_source, backup, original_metadata)
+                raise HuroshikiError(
+                    "The staged Packwiz source was replaced before publication; the "
+                    "original source was restored."
+                )
             self.source.rename(real_source)
+            try:
+                installed = os.stat(real_source, follow_symlinks=False)
+            except OSError as error:
+                _rollback_source_publication(
+                    real_source,
+                    backup,
+                    staged_metadata,
+                    original_metadata,
+                    self.root,
+                )
+                raise HuroshikiError(
+                    f"The staged Packwiz source was not installed safely: {error}"
+                ) from error
+            if not _same_entry(staged_metadata, installed):
+                _rollback_source_publication(
+                    real_source,
+                    backup,
+                    staged_metadata,
+                    original_metadata,
+                    self.root,
+                )
+                raise HuroshikiError(
+                    "The installed Packwiz source was replaced during publication"
+                )
         except BaseException as swap_error:
-            if backup.exists():
+            try:
+                backup_present = os.stat(backup, follow_symlinks=False)
+            except FileNotFoundError:
+                backup_present = None
+            if backup_present is not None:
                 try:
-                    _restore_source_backup(real_source, backup)
+                    _rollback_source_publication(
+                        real_source,
+                        backup,
+                        staged_metadata,
+                        original_metadata,
+                        self.root,
+                    )
                 except HuroshikiError as rollback_error:
                     raise rollback_error from swap_error
             raise
+        finally:
+            if original_fd >= 0:
+                os.close(original_fd)
+            os.close(staged_fd)
 
         self.active = False
         self._finish_state()
@@ -1513,10 +1584,288 @@ def file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+_SOURCE_DIRECTORY_FLAGS = (
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+)
+_SOURCE_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+
+
+def _same_entry(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _open_pinned_source(source: Path) -> tuple[int, os.stat_result]:
+    try:
+        metadata = os.stat(source, follow_symlinks=False)
+        source_fd = os.open(source, _SOURCE_DIRECTORY_FLAGS)
+    except OSError as error:
+        raise HuroshikiError(f"Unsafe Packwiz source {source}: {error}") from error
+    try:
+        opened = os.fstat(source_fd)
+    except BaseException:
+        os.close(source_fd)
+        raise
+    if not stat.S_ISDIR(metadata.st_mode) or not _same_entry(metadata, opened):
+        os.close(source_fd)
+        raise HuroshikiError(
+            f"Unsafe Packwiz source {source}: source was replaced while opening"
+        )
+    return source_fd, opened
+
+
+def _digest_fd(file_fd: int) -> str:
+    digest = hashlib.sha256()
+    while chunk := os.read(file_fd, 1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_fd_snapshot(
+    directory_fd: int,
+    relative: Path = Path("."),
+) -> dict[Path, str]:
+    snapshot: dict[Path, str] = {}
+    try:
+        with os.scandir(directory_fd) as iterator:
+            names = sorted(entry.name for entry in iterator)
+    except OSError as error:
+        raise HuroshikiError(
+            f"Unsafe Packwiz source at {relative}: could not list directory: {error}"
+        ) from error
+    for name in names:
+        item_relative = relative / name
+        if item_relative.parts[0] == ".":
+            item_relative = Path(*item_relative.parts[1:])
+        try:
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise HuroshikiError(
+                f"Unsafe Packwiz source at {item_relative}: {error}"
+            ) from error
+        if stat.S_ISDIR(metadata.st_mode):
+            try:
+                child_fd = os.open(name, _SOURCE_DIRECTORY_FLAGS, dir_fd=directory_fd)
+            except OSError as error:
+                raise HuroshikiError(
+                    f"Unsafe Packwiz source at {item_relative}: changed while opening: {error}"
+                ) from error
+            try:
+                opened = os.fstat(child_fd)
+                if not _same_entry(metadata, opened):
+                    raise HuroshikiError(
+                        f"Unsafe Packwiz source at {item_relative}: replaced while opening"
+                    )
+                snapshot[item_relative] = "directory"
+                snapshot.update(_source_fd_snapshot(child_fd, item_relative))
+                current = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if not stat.S_ISDIR(current.st_mode) or not _same_entry(opened, current):
+                    raise HuroshikiError(
+                        f"Unsafe Packwiz source at {item_relative}: replaced while scanning"
+                    )
+            finally:
+                os.close(child_fd)
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            kind = "symlink" if stat.S_ISLNK(metadata.st_mode) else "special entry"
+            raise HuroshikiError(
+                f"Unsafe Packwiz source at {item_relative}: {kind} is not allowed"
+            )
+        try:
+            file_fd = os.open(name, _SOURCE_FILE_FLAGS, dir_fd=directory_fd)
+        except OSError as error:
+            raise HuroshikiError(
+                f"Unsafe Packwiz source at {item_relative}: changed while opening: {error}"
+            ) from error
+        try:
+            opened = os.fstat(file_fd)
+            if not stat.S_ISREG(opened.st_mode) or not _same_entry(metadata, opened):
+                raise HuroshikiError(
+                    f"Unsafe Packwiz source at {item_relative}: replaced while opening"
+                )
+            snapshot[item_relative] = _digest_fd(file_fd)
+            after_read = os.fstat(file_fd)
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not _same_entry(opened, current)
+                or opened.st_size != after_read.st_size
+                or opened.st_mtime_ns != after_read.st_mtime_ns
+                or opened.st_ctime_ns != after_read.st_ctime_ns
+            ):
+                raise HuroshikiError(
+                    f"Unsafe Packwiz source at {item_relative}: changed while reading"
+                )
+        finally:
+            os.close(file_fd)
+    return snapshot
+
+
+def _copy_source_fd(
+    source_fd: int,
+    destination_fd: int,
+    relative: Path = Path("."),
+) -> dict[Path, str]:
+    snapshot: dict[Path, str] = {}
+    with os.scandir(source_fd) as iterator:
+        names = sorted(entry.name for entry in iterator)
+    for name in names:
+        item_relative = relative / name
+        if item_relative.parts[0] == ".":
+            item_relative = Path(*item_relative.parts[1:])
+        metadata = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        if stat.S_ISDIR(metadata.st_mode):
+            try:
+                child_fd = os.open(name, _SOURCE_DIRECTORY_FLAGS, dir_fd=source_fd)
+            except OSError as error:
+                raise HuroshikiError(
+                    f"Unsafe Packwiz source at {item_relative}: changed while opening: {error}"
+                ) from error
+            output_fd = -1
+            try:
+                opened = os.fstat(child_fd)
+                if not _same_entry(metadata, opened):
+                    raise HuroshikiError(
+                        f"Unsafe Packwiz source at {item_relative}: replaced while opening"
+                    )
+                os.mkdir(name, stat.S_IMODE(opened.st_mode), dir_fd=destination_fd)
+                output_fd = os.open(name, _SOURCE_DIRECTORY_FLAGS, dir_fd=destination_fd)
+                os.fchmod(output_fd, stat.S_IMODE(opened.st_mode))
+                snapshot[item_relative] = "directory"
+                snapshot.update(_copy_source_fd(child_fd, output_fd, item_relative))
+                current = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(current.st_mode) or not _same_entry(opened, current):
+                    raise HuroshikiError(
+                        f"Unsafe Packwiz source at {item_relative}: replaced while copying"
+                    )
+                current_output = os.stat(
+                    name, dir_fd=destination_fd, follow_symlinks=False
+                )
+                if not stat.S_ISDIR(current_output.st_mode) or not _same_entry(
+                    os.fstat(output_fd), current_output
+                ):
+                    raise HuroshikiError(
+                        f"Transaction destination at {item_relative} was replaced"
+                    )
+            finally:
+                if output_fd >= 0:
+                    os.close(output_fd)
+                os.close(child_fd)
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            kind = "symlink" if stat.S_ISLNK(metadata.st_mode) else "special entry"
+            raise HuroshikiError(
+                f"Unsafe Packwiz source at {item_relative}: {kind} is not allowed"
+            )
+        try:
+            file_fd = os.open(name, _SOURCE_FILE_FLAGS, dir_fd=source_fd)
+        except OSError as error:
+            raise HuroshikiError(
+                f"Unsafe Packwiz source at {item_relative}: changed while opening: {error}"
+            ) from error
+        output_fd = -1
+        try:
+            opened = os.fstat(file_fd)
+            if not stat.S_ISREG(opened.st_mode) or not _same_entry(metadata, opened):
+                raise HuroshikiError(
+                    f"Unsafe Packwiz source at {item_relative}: replaced while opening"
+                )
+            output_fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                stat.S_IMODE(opened.st_mode),
+                dir_fd=destination_fd,
+            )
+            digest = hashlib.sha256()
+            while chunk := os.read(file_fd, 1024 * 1024):
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(output_fd, view)
+                    view = view[written:]
+            os.fchmod(output_fd, stat.S_IMODE(opened.st_mode))
+            snapshot[item_relative] = digest.hexdigest()
+            after_read = os.fstat(file_fd)
+            current = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+            current_output = os.stat(
+                name, dir_fd=destination_fd, follow_symlinks=False
+            )
+            if (
+                not _same_entry(opened, current)
+                or opened.st_size != after_read.st_size
+                or opened.st_mtime_ns != after_read.st_mtime_ns
+                or opened.st_ctime_ns != after_read.st_ctime_ns
+            ):
+                raise HuroshikiError(
+                    f"Unsafe Packwiz source at {item_relative}: changed while copying"
+                )
+            if not stat.S_ISREG(current_output.st_mode) or not _same_entry(
+                os.fstat(output_fd), current_output
+            ):
+                raise HuroshikiError(
+                    f"Transaction destination at {item_relative} was replaced"
+                )
+        finally:
+            if output_fd >= 0:
+                os.close(output_fd)
+            os.close(file_fd)
+    return snapshot
+
+
 def copy_transaction_source(source: Path, destination: Path) -> None:
-    ensure_safe_pack_source(source)
-    shutil.copytree(source, destination, symlinks=True)
-    ensure_safe_pack_source(destination)
+    source_fd, source_metadata = _open_pinned_source(source)
+    parent_fd = destination_fd = -1
+    try:
+        issues = packctl.pack_source_fd_entry_issues(source_fd)
+        if issues:
+            details = "; ".join(f"{relative}: {message}" for relative, message in issues)
+            raise HuroshikiError(f"Unsafe Packwiz source {source}: {details}")
+        parent_fd = os.open(destination.parent, _SOURCE_DIRECTORY_FLAGS)
+        os.mkdir(destination.name, 0o700, dir_fd=parent_fd)
+        destination_fd = os.open(
+            destination.name, _SOURCE_DIRECTORY_FLAGS, dir_fd=parent_fd
+        )
+        os.fchmod(destination_fd, stat.S_IMODE(source_metadata.st_mode))
+        copied = _copy_source_fd(source_fd, destination_fd)
+        try:
+            current = os.stat(source, follow_symlinks=False)
+            current_destination = os.stat(
+                destination.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+        except OSError as error:
+            raise HuroshikiError(
+                f"A transaction source entry was replaced while copying: {error}"
+            ) from error
+        if not _same_entry(source_metadata, current):
+            raise HuroshikiError(
+                "The pack source was replaced while the transaction copy was being created"
+            )
+        if not _same_entry(os.fstat(destination_fd), current_destination):
+            raise HuroshikiError(
+                "The transaction destination was replaced while the copy was being created"
+            )
+        if (
+            _source_fd_snapshot(source_fd) != copied
+            or _source_fd_snapshot(destination_fd) != copied
+        ):
+            raise HuroshikiError(
+                "The pack source changed while the transaction copy was being created"
+            )
+    except BaseException:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+            destination_fd = -1
+        if parent_fd >= 0:
+            os.close(parent_fd)
+            parent_fd = -1
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        os.close(source_fd)
 
 
 def ensure_safe_pack_source(source: Path) -> None:
@@ -1530,8 +1879,26 @@ def ensure_safe_pack_source(source: Path) -> None:
     raise HuroshikiError(f"Unsafe Packwiz source: {details}")
 
 
-def _restore_source_backup(real_source: Path, backup: Path) -> None:
-    if real_source.exists() or real_source.is_symlink():
+def _restore_source_backup(
+    real_source: Path,
+    backup: Path,
+    expected_backup: os.stat_result,
+) -> None:
+    try:
+        backup_metadata = os.stat(backup, follow_symlinks=False)
+    except OSError as error:
+        raise HuroshikiError(
+            f"Cannot restore the exact original Packwiz source from {backup}: {error}"
+        ) from error
+    if not _same_entry(expected_backup, backup_metadata):
+        raise HuroshikiError(
+            f"Cannot restore the exact original Packwiz source because {backup} was replaced"
+        )
+    try:
+        os.stat(real_source, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
         raise HuroshikiError(
             f"Cannot restore the original Packwiz source because {real_source} was "
             f"recreated externally; external changes were preserved and the exact "
@@ -1543,6 +1910,57 @@ def _restore_source_backup(real_source: Path, backup: Path) -> None:
         raise HuroshikiError(
             f"Failed to restore the original Packwiz source from {backup}: {error}"
         ) from error
+
+
+def _rollback_source_publication(
+    real_source: Path,
+    backup: Path,
+    staged_metadata: os.stat_result,
+    original_metadata: os.stat_result,
+    transaction_root: Path,
+) -> None:
+    try:
+        current = os.stat(real_source, follow_symlinks=False)
+    except FileNotFoundError:
+        current = None
+    except OSError as error:
+        raise HuroshikiError(
+            f"Cannot inspect the published Packwiz source during rollback: {error}; "
+            f"the exact original remains at {backup}."
+        ) from error
+
+    if current is not None and _same_entry(current, staged_metadata):
+        failed_staged = transaction_root / "failed-staged-source"
+        try:
+            os.stat(failed_staged, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise HuroshikiError(
+                f"Cannot retain the failed staged source because {failed_staged} exists; "
+                f"the exact original remains at {backup}."
+            )
+        try:
+            real_source.rename(failed_staged)
+        except BaseException as error:
+            try:
+                moved = os.stat(failed_staged, follow_symlinks=False)
+            except OSError:
+                moved = None
+            if moved is None or not _same_entry(moved, staged_metadata):
+                raise HuroshikiError(
+                    "Failed to move the staged Packwiz source out of publication; "
+                    f"the exact original remains at {backup}: {error}"
+                ) from error
+        current = None
+
+    if current is not None:
+        raise HuroshikiError(
+            f"Cannot restore the original Packwiz source because {real_source} was "
+            f"recreated externally; external changes were preserved and the exact "
+            f"original remains at {backup}."
+        )
+    _restore_source_backup(real_source, backup, original_metadata)
 
 
 def template_config_snapshot(root: Path) -> dict[str, str]:
@@ -1562,17 +1980,17 @@ def pack_config_snapshot(root: Path) -> dict[str, str]:
 
 
 def tree_digest_snapshot(source: Path) -> dict[Path, str]:
-    snapshot: dict[Path, str] = {}
-    for path in sorted(source.rglob("*")):
-        if path.is_symlink():
-            snapshot[path.relative_to(source)] = f"symlink:{path.readlink()}"
-        elif path.is_file():
-            snapshot[path.relative_to(source)] = file_digest(path)
-        elif path.is_dir():
-            snapshot[path.relative_to(source)] = "directory"
-        else:
-            snapshot[path.relative_to(source)] = f"special:{path.lstat().st_mode}"
-    return snapshot
+    source_fd, source_metadata = _open_pinned_source(source)
+    try:
+        snapshot = _source_fd_snapshot(source_fd)
+        current = os.stat(source, follow_symlinks=False)
+        if not _same_entry(source_metadata, current):
+            raise HuroshikiError(
+                f"Unsafe Packwiz source {source}: source was replaced while scanning"
+            )
+        return snapshot
+    finally:
+        os.close(source_fd)
 
 
 def metadata_digest_snapshot(source: Path) -> dict[Path, str]:
@@ -2172,6 +2590,23 @@ def _merge_update_closures(
         for identity in before_records.keys() | after_records.keys():
             incoming = after_records.get(identity)
             if identity not in metadata_operations:
+                baseline = baseline_by_identity.get(identity)
+                if baseline is not None and incoming is not None:
+                    baseline_mod = read_mod_data(
+                        baseline.relative_path,
+                        tomllib.loads(baseline.contents.decode("utf-8")),
+                    )
+                    incoming_mod = read_mod_data(
+                        incoming.relative_path,
+                        tomllib.loads(incoming.contents.decode("utf-8")),
+                    )
+                    incoming = replace(
+                        incoming,
+                        contents=_metadata_contents_with_side(
+                            incoming.contents,
+                            union_side(baseline_mod.side, incoming_mod.side),
+                        ),
+                    )
                 metadata_operations[identity] = incoming
                 continue
             existing = metadata_operations[identity]
