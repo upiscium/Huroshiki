@@ -125,6 +125,20 @@ class TransactionalBuildTest(unittest.TestCase):
             self.assertEqual((output / "new.txt").read_text(), "new build")
             self.assertTrue((output / "mods" / "demo.pw.toml").is_file())
 
+    def test_overlay_copy_preserves_executable_mode(self) -> None:
+        self.write_metadata("both")
+        script = self.pack_root / "content" / "server" / "start.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\n", encoding="utf-8")
+        script.chmod(0o755)
+
+        with patch.object(packctl, "run"):
+            result = packctl.build_pack("demo")
+
+        self.assertEqual(result, 0)
+        output = self.pack_root / "dist" / "server" / "start.sh"
+        self.assertEqual(output.stat().st_mode & 0o777, 0o755)
+
     def test_overlay_symlink_stops_before_secret_copy_and_preserves_dist(self) -> None:
         self.write_metadata("both")
         secret = self.root / "secret.txt"

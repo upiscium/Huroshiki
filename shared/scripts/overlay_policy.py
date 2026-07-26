@@ -573,6 +573,7 @@ def _copy_overlay_directory(
             )
             if output_fd is None:
                 continue
+            os.fchmod(output_fd, stat.S_IMODE(opened_metadata.st_mode))
             with os.fdopen(os.dup(file_fd), "rb") as source, os.fdopen(
                 output_fd, "wb"
             ) as target:
