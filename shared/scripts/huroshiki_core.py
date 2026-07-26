@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import tomllib
+import stat
 from typing import Callable, Iterable, Mapping
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
@@ -22,6 +23,13 @@ from uuid import uuid4
 import tomlkit
 
 import packctl
+from overlay_policy import (
+    OVERLAY_TARGETS,
+    OverlayPolicyError,
+    normalize_overlay_relative_path,
+    safe_overlay_child,
+    scan_content_overlays,
+)
 from template_merge import (
     ConflictResolution,
     ConflictSelection,
@@ -222,6 +230,7 @@ class TemplateInfo:
     relative_path: Path
     full_path: Path
     size: int
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1107,7 +1116,7 @@ def safe_child(root: Path, relative: Path) -> Path:
     return candidate
 
 
-TEMPLATE_TARGETS = ("common", "client", "server")
+TEMPLATE_TARGETS = OVERLAY_TARGETS
 
 
 def normalize_template_target(target: str) -> str:
@@ -1120,16 +1129,10 @@ def normalize_template_target(target: str) -> str:
 
 
 def normalize_template_relative_path(value: str | Path) -> Path:
-    relative = Path(value)
-    if relative.is_absolute() or not relative.parts:
-        raise HuroshikiError("Template path must be relative")
-    if any(part in {"", ".", ".."} for part in relative.parts):
-        raise HuroshikiError(
-            "Template path cannot contain '.', '..', or empty components"
-        )
-    if relative.name == ".gitkeep":
-        raise HuroshikiError(".gitkeep is managed internally")
-    return relative
+    try:
+        return normalize_overlay_relative_path(value)
+    except OverlayPolicyError as error:
+        raise HuroshikiError(str(error)) from error
 
 
 def template_base(project_key_value: str, target: str) -> Path:
@@ -1142,33 +1145,49 @@ def resolve_template_path(
     target: str,
     relative_path: str | Path,
 ) -> Path:
-    base = template_base(project_key_value, target)
     relative = normalize_template_relative_path(relative_path)
-    return safe_child(base, relative)
+    try:
+        return safe_overlay_child(
+            project_root(project_key_value) / "content",
+            normalize_template_target(target),
+            relative,
+        )
+    except OverlayPolicyError as error:
+        raise HuroshikiError(str(error)) from error
 
 
 def list_templates(project_key_value: str) -> list[TemplateInfo]:
-    project_root(project_key_value)
+    root = project_root(project_key_value)
     templates: list[TemplateInfo] = []
-    for target in TEMPLATE_TARGETS:
-        base = template_base(project_key_value, target)
-        if not base.is_dir():
+    scan = scan_content_overlays(root / "content")
+    issue_by_path: dict[Path, list[str]] = {}
+    for issue in scan.issues:
+        issue_by_path.setdefault(issue.relative_path, []).append(issue.message)
+    for entry in scan.entries:
+        if entry.relative_path.name == ".gitkeep" or entry.kind == "directory":
             continue
-        for path in sorted(base.rglob("*")):
-            if (
-                not path.is_file()
-                or path.is_symlink()
-                or path.name == ".gitkeep"
-            ):
-                continue
+        if entry.relative_path == Path("."):
             templates.append(
                 TemplateInfo(
-                    target=target,
-                    relative_path=path.relative_to(base),
-                    full_path=path,
-                    size=path.stat().st_size,
+                    target="content",
+                    relative_path=Path("."),
+                    full_path=root / "content",
+                    size=entry.size,
+                    error="; ".join(issue_by_path[entry.relative_path]),
                 )
             )
+            continue
+        target = entry.relative_path.parts[0]
+        relative = Path(*entry.relative_path.parts[1:])
+        templates.append(
+            TemplateInfo(
+                target=target,
+                relative_path=relative,
+                full_path=root / "content" / entry.relative_path,
+                size=entry.size,
+                error="; ".join(issue_by_path.get(entry.relative_path, ())) or None,
+            )
+        )
     return templates
 
 
@@ -1200,12 +1219,17 @@ def create_template(
                 normalized_target,
                 relative,
             )
-            if path.exists():
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
                 raise HuroshikiError(
                     f"Template file already exists: {normalized_target}/{relative}"
                 )
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("", encoding="utf-8")
+            with path.open("x", encoding="utf-8"):
+                pass
             return TemplateInfo(
                 target=normalized_target,
                 relative_path=relative,
@@ -1226,7 +1250,11 @@ def read_template_text(
         target,
         relative_path,
     )
-    if not path.is_file() or path.is_symlink():
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        metadata = None
+    if metadata is None or not stat.S_ISREG(metadata.st_mode):
         raise HuroshikiError(f"Template file does not exist: {path}")
     try:
         return path.read_text(encoding="utf-8")
@@ -1249,11 +1277,19 @@ def write_template_text(
                 target,
                 relative_path,
             )
-            if not path.is_file() or path.is_symlink():
+            try:
+                metadata = path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                metadata = None
+            if metadata is None or not stat.S_ISREG(metadata.st_mode):
                 raise HuroshikiError(f"Template file does not exist: {path}")
-            temporary = path.with_name(f".{path.name}.huroshiki-tmp")
-            temporary.write_text(text, encoding="utf-8")
-            temporary.replace(path)
+            temporary = path.with_name(f".{path.name}.huroshiki-tmp-{uuid4().hex}")
+            try:
+                with temporary.open("x", encoding="utf-8") as handle:
+                    handle.write(text)
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
     except packctl.ConfigError as error:
         raise HuroshikiError(str(error)) from error
 
@@ -1265,13 +1301,17 @@ def delete_template(
 ) -> None:
     try:
         with packctl.ProjectLock(project_key_value, "delete template file"):
-            base = template_base(project_key_value, target).resolve()
+            base = template_base(project_key_value, target)
             path = resolve_template_path(
                 project_key_value,
                 target,
                 relative_path,
             )
-            if not path.is_file() or path.is_symlink():
+            try:
+                metadata = path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                metadata = None
+            if metadata is None or not stat.S_ISREG(metadata.st_mode):
                 raise HuroshikiError(f"Template file does not exist: {path}")
             path.unlink()
 

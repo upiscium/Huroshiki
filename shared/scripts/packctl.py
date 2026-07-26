@@ -37,6 +37,7 @@ from deploy_support import (
 )
 from packctl_errors import ConfigError
 from huroshiki_paths import resolve_root, root_argument
+from overlay_policy import scan_content_overlays
 import project_locks
 from project_locks import ProjectLockMetadata, process_start_identity
 
@@ -1525,6 +1526,11 @@ def validate_pack_directory(root: Path) -> list[str]:
                     )
             except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
                 errors.append(f"{display_path(metadata)}: {error}")
+    for issue in scan_content_overlays(root / "content").issues:
+        path = root / "content"
+        if issue.relative_path != Path("."):
+            path /= issue.relative_path
+        errors.append(f"{display_path(path)}: {issue.message}")
     return errors
 
 
@@ -1710,6 +1716,13 @@ def build_target(
             if side not in TARGET_SIDES[target]:
                 metadata.unlink()
 
+        overlay_errors = [
+            f"content/{issue.relative_path}: {issue.message}"
+            for issue in scan_content_overlays(root / "content").issues
+        ]
+        if overlay_errors:
+            return errors + overlay_errors
+
         copy_tree(root / "content" / "common", destination)
         copy_tree(root / "content" / target, destination)
 
@@ -1736,6 +1749,15 @@ def _build_pack(pack_id: str) -> int:
     for required in (root / "source" / "pack.toml", root / "source" / "index.toml"):
         if not required.is_file():
             raise ConfigError(f"Missing required file: {required}")
+    overlay_errors = [
+        f"content/{issue.relative_path}: {issue.message}"
+        for issue in scan_content_overlays(root / "content").issues
+    ]
+    if overlay_errors:
+        print("Build stopped because content overlays are invalid:", file=sys.stderr)
+        for error in overlay_errors:
+            print(f"  - {error}", file=sys.stderr)
+        return 1
     workspace = Path(tempfile.mkdtemp(prefix=".build-dist-", dir=root))
     staged_dist = workspace / "dist"
     preserve_workspace = False

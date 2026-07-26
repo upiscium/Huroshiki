@@ -1195,7 +1195,7 @@ class TemplateScreen(ProjectChildScreen, FilterListScreen):
         table = self.query_one("#template-table", DataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        table.add_columns("Target", "Path", "Bytes")
+        table.add_columns("Target", "Path", "Bytes", "Status")
         self.reload_templates()
         table.focus()
 
@@ -1220,6 +1220,7 @@ class TemplateScreen(ProjectChildScreen, FilterListScreen):
                 template.target,
                 str(template.relative_path),
                 str(template.size),
+                template.error or "valid",
             )
 
     def reload_filter_rows(self, query: str) -> None:
@@ -1245,6 +1246,9 @@ class TemplateScreen(ProjectChildScreen, FilterListScreen):
         template = self.current_template()
         if template is None:
             self.app.notify("No file is selected", severity="warning")
+            return
+        if template.error is not None:
+            self.app.notify(template.error, severity="error")
             return
         try:
             self.app.switch_screen(
@@ -1287,6 +1291,9 @@ class TemplateScreen(ProjectChildScreen, FilterListScreen):
         template = self.current_template()
         if template is None:
             self.app.notify("No file is selected", severity="warning")
+            return
+        if template.error is not None:
+            self.app.notify(template.error, severity="error")
             return
         self.app.push_screen(
             ConfirmModal(

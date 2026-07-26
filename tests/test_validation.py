@@ -123,6 +123,28 @@ class RepositoryValidationTest(unittest.TestCase):
         run.assert_not_called()
         urlopen.assert_not_called()
 
+    def test_overlay_errors_accumulate_and_source_metadata_remains_allowed(self) -> None:
+        common = self.pack_root / "content" / "common"
+        nested = self.pack_root / "content" / "client" / "nested"
+        common.mkdir(parents=True)
+        nested.mkdir(parents=True)
+        (common / "pack.toml").write_text("reserved", encoding="utf-8")
+        (nested / "extra.pw.toml").write_text("reserved", encoding="utf-8")
+        dangling = self.pack_root / "content" / "server" / "dangling"
+        dangling.parent.mkdir(parents=True)
+        dangling.symlink_to(self.root / "missing")
+
+        result, _, stderr = self.validate_all()
+
+        self.assertEqual(result, 1)
+        for expected in (
+            "packs/demo/content/common/pack.toml: Packwiz-owned path",
+            "packs/demo/content/client/nested/extra.pw.toml: Packwiz-owned path",
+            f"packs/demo/content/server/dangling: symlink is not allowed -> {self.root / 'missing'}",
+        ):
+            self.assertIn(expected, stderr)
+        self.assertNotIn("packs/demo/source/mods/create.pw.toml: Packwiz-owned", stderr)
+
     def test_accumulates_pack_and_template_errors_with_paths(self) -> None:
         (self.pack_root / "pack.yaml").write_text(
             '''id: wrong

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Overlay Safety (#32, #33)
+
+- Validation, builds, and interactive content editing now share one no-follow overlay policy.
+- Content overlays reject every symlink and every Packwiz-owned `pack.toml`, `index.toml`, or
+  `*.pw.toml` path. Builds preserve the previous distribution when an invalid overlay is found.
+
 ### Breaking: Public CLI Boundary (#30)
 
 - `huroshiki` is the interactive interface, `packctl` is the noninteractive interface, and Just is

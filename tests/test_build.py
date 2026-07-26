@@ -123,6 +123,39 @@ class TransactionalBuildTest(unittest.TestCase):
             self.assertEqual((output / "new.txt").read_text(), "new build")
             self.assertTrue((output / "mods" / "demo.pw.toml").is_file())
 
+    def test_overlay_symlink_stops_before_secret_copy_and_preserves_dist(self) -> None:
+        self.write_metadata("both")
+        secret = self.root / "secret.txt"
+        secret.write_text("private data", encoding="utf-8")
+        link = self.pack_root / "content" / "common" / "secret.txt"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(secret)
+        before = self.dist_snapshot()
+        stderr = StringIO()
+
+        with patch.object(packctl, "run") as run, redirect_stderr(stderr):
+            result = packctl.build_pack("demo")
+
+        self.assertEqual(result, 1)
+        self.assertEqual(self.dist_snapshot(), before)
+        self.assertIn(f"content/common/secret.txt: symlink is not allowed -> {secret}", stderr.getvalue())
+        self.assertNotIn(b"private data", self.dist_snapshot().values())
+        run.assert_not_called()
+
+    def test_reserved_overlay_stops_before_replacing_dist(self) -> None:
+        self.write_metadata("both")
+        reserved = self.pack_root / "content" / "server" / "nested" / "index.toml"
+        reserved.parent.mkdir(parents=True)
+        reserved.write_text("malicious", encoding="utf-8")
+        before = self.dist_snapshot()
+
+        with patch.object(packctl, "run") as run:
+            result = packctl.build_pack("demo")
+
+        self.assertEqual(result, 1)
+        self.assertEqual(self.dist_snapshot(), before)
+        run.assert_not_called()
+
     def test_keyboard_interrupt_during_swap_restores_dist(self) -> None:
         self.write_metadata("both")
         before = self.dist_snapshot()

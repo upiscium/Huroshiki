@@ -56,6 +56,11 @@ available there for `just test-huroshiki` and `just check`; it is not in the pac
 Do not edit `packs/*/dist/`; each build replaces both distributions. Packwiz metadata must declare
 `side = "client"`, `"server"`, or `"both"`.
 
+Content overlays may contain only ordinary files and directories. Symlinks are rejected without
+following them, and Packwiz-owned names (`pack.toml`, `index.toml`, and `*.pw.toml`) belong only in
+`source/`; validation and builds reject those case-sensitive Packwiz names anywhere under
+`content/common|client|server`.
+
 ## Interactive Use
 
 Open the project browser or one project directly:
