@@ -21,8 +21,8 @@
 - `packctl migrate-template`, legacy `source/pack.toml` and `source/*.pw.toml` fallback, and the
   associated migration API were removed.
 - Before upgrading a legacy template, manually write `id`, `display_name`, `enabled`, `minecraft`,
-  `loader`, `reference_loader_version`, and `mods` into its effective YAML configuration; remove
+  `loader`, `reference_loader_version`, and `mods` into the committed `template.yaml`; remove
   `templates/<id>/source`; then run `packctl validate-template <id>`.
 - Any `templates/<id>/source` entry, including a symlink, is now a hard validation error.
-- Required template fields continue to be checked after merging `template.local.yaml`; no new policy
-  requiring every effective field to appear in the committed manifest was introduced.
+- `template.local.yaml` may override supported scalar settings, but it cannot supply missing required
+  fields or define `mods`; MOD entries remain committed structural data in `template.yaml`.
