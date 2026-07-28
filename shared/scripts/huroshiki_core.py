@@ -348,6 +348,22 @@ class TemplateCreationReport:
         return lines
 
 
+@dataclass(frozen=True)
+class ResolvedMetadata:
+    identity: tuple[str, str]
+    relative_path: Path
+    filename: str
+    contents: bytes
+    provider: str
+    project_id: str
+
+
+@dataclass(frozen=True)
+class ResolvedModClosure:
+    root_identity: tuple[str, str]
+    metadata: tuple[ResolvedMetadata, ...]
+
+
 class PackwizAddOperation:
     def __init__(
         self,
@@ -368,10 +384,20 @@ class PackwizAddOperation:
         self.cancel_event = threading.Event()
         self.done = threading.Event()
         self.result: AddOperationResult | None = None
-
+        self.menu_items: dict[int, str] = {}
+        self.selected_label: str | None = None
         self.checkpoint = transaction.root / f"checkpoint-{uuid4().hex}"
         copy_transaction_source(transaction.source, self.checkpoint)
-        self.before = metadata_digest_snapshot(transaction.source)
+        self.resolver_root = transaction.root / f"resolver-{uuid4().hex}"
+        self.resolver_source = self.resolver_root / "source"
+        minecraft, loader, loader_version = packctl.project_versions(transaction.source)
+        create_resolver_source(
+            self.resolver_source,
+            display_name=f"Resolve {self.query}",
+            minecraft=minecraft,
+            loader=loader,
+            loader_version=loader_version,
+        )
 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         self.log_dir = (
@@ -386,11 +412,17 @@ class PackwizAddOperation:
         )
         self.session: PackwizPtySession | None = None
         if self.provider != "url":
+            def record_event(event: ParserEvent) -> None:
+                if event.kind == "search_results":
+                    self.menu_items = {item.index: item.label for item in event.items}
+                if self.on_event is not None:
+                    self.on_event(event)
+
             self.session = PackwizPtySession(
                 build_add_command(self.provider, self.query),
-                cwd=transaction.source,
+                cwd=self.resolver_source,
                 log_dir=self.log_dir,
-                on_event=on_event,
+                on_event=record_event,
             )
 
     def run(self) -> AddOperationResult:
@@ -424,6 +456,7 @@ class PackwizAddOperation:
     def send_selection(self, index: int) -> None:
         if self.session is None:
             raise HuroshikiError("URL additions do not expose search results")
+        self.selected_label = self.menu_items.get(index)
         self.session.send_line(str(index))
 
     def confirm(self, accepted: bool = True) -> None:
@@ -626,34 +659,28 @@ class PackTransaction:
                 "",
                 "" if result.success else result.message,
             )
-        checkpoint = self.root / f"checkpoint-{uuid4().hex}"
-        copy_transaction_source(self.source, checkpoint)
-        before = metadata_digest_snapshot(self.source)
-        result = subprocess.run(
-            build_add_command(provider, query), cwd=self.source, text=True, check=False
-        )
-        if result.returncode != 0:
-            shutil.rmtree(self.source, ignore_errors=True)
-            checkpoint.rename(self.source)
-            return result
         try:
-            ensure_safe_pack_source(self.source)
-        except BaseException:
-            shutil.rmtree(self.source, ignore_errors=True)
-            checkpoint.rename(self.source)
-            raise
-        changed = tuple(
-            sorted(changed_paths(before, metadata_digest_snapshot(self.source)))
-        )
-        if not changed:
-            shutil.rmtree(self.source, ignore_errors=True)
-            checkpoint.rename(self.source)
-            return result
+            minecraft, loader, loader_version = packctl.project_versions(self.source)
+            closure = resolve_mod_closure(
+                provider=provider,
+                selector=query,
+                minecraft=minecraft,
+                loader=loader,
+                loader_version=loader_version,
+            )
+            changed = merge_metadata_closure(
+                self.source,
+                closure,
+                requested_side="both",
+            )
+        except Exception as error:
+            return subprocess.CompletedProcess(
+                build_add_command(provider, query), 1, "", str(error)
+            )
         self.batches.append(
             TransactionBatch(provider=provider, query=query, changed_files=changed)
         )
-        shutil.rmtree(checkpoint, ignore_errors=True)
-        return result
+        return subprocess.CompletedProcess(build_add_command(provider, query), 0, "", "")
 
     def add_mod_transactionally(self, provider: str, selector: str, side: str) -> int:
         """Run one synchronous add entirely in staging, then atomically apply it."""
@@ -667,7 +694,6 @@ class PackTransaction:
             raise HuroshikiError(str(error)) from error
         provider, selector = normalize_add_selector(provider, selector)
         ensure_safe_pack_source(self.source)
-        before = metadata_digest_snapshot(self.source)
 
         if provider == "url":
             client, server = flags_from_side(normalized_side)
@@ -682,17 +708,22 @@ class PackTransaction:
                     raise HuroshikiError(result.message)
                 return result.returncode or 1
         else:
-            command = build_add_command(provider, selector)
-            result = subprocess.run(
-                command,
-                cwd=self.source,
-                text=True,
-                check=False,
+            minecraft, loader, loader_version = packctl.project_versions(self.source)
+            closure = resolve_mod_closure(
+                provider=provider,
+                selector=selector,
+                minecraft=minecraft,
+                loader=loader,
+                loader_version=loader_version,
             )
-            if result.returncode != 0:
-                return result.returncode
-            ensure_safe_pack_source(self.source)
-            changed = self._classify_add_changes(before, normalized_side)
+            try:
+                changed = merge_metadata_closure(
+                    self.source,
+                    closure,
+                    requested_side=normalized_side,
+                )
+            except Exception as error:
+                raise HuroshikiError(f"Could not merge resolved MOD closure: {error}") from error
             self.batches.append(
                 TransactionBatch(
                     provider=provider,
@@ -703,70 +734,6 @@ class PackTransaction:
 
         self.apply()
         return 0
-
-    def _classify_add_changes(
-        self,
-        before: dict[Path, str],
-        side: str,
-    ) -> tuple[Path, ...]:
-        ensure_safe_pack_source(self.source)
-        changed = tuple(
-            sorted(changed_paths(before, metadata_digest_snapshot(self.source)))
-        )
-        metadata_paths = tuple(
-            relative_path
-            for relative_path in changed
-            if (self.source / relative_path).is_file()
-            and relative_path.name.endswith(".pw.toml")
-        )
-        if not metadata_paths:
-            raise HuroshikiError(
-                "Packwiz did not create or modify any .pw.toml files. "
-                "The project may already be installed."
-            )
-        baseline_by_path: dict[Path, ModInfo] = {}
-        baseline_by_identity: dict[tuple[str, str], ModInfo] = {}
-        for baseline_path, contents in self.baseline_contents.items():
-            try:
-                baseline_mod = read_mod_data(
-                    baseline_path,
-                    tomllib.loads(contents.decode("utf-8")),
-                )
-            except (UnicodeError, tomllib.TOMLDecodeError) as error:
-                raise HuroshikiError(
-                    f"Could not preserve baseline side for {baseline_path}: {error}"
-                ) from error
-            baseline_by_path[baseline_path] = baseline_mod
-            identity = (canonical_provider(baseline_mod.provider), baseline_mod.project_id)
-            if identity[0] in {"modrinth", "curseforge", "url"} and identity[1]:
-                baseline_by_identity[identity] = baseline_mod
-
-        for relative_path in metadata_paths:
-            try:
-                current = read_mod(self.source, relative_path)
-                baseline_mod = baseline_by_path.get(relative_path)
-                identity = (canonical_provider(current.provider), current.project_id)
-                identity_match = baseline_by_identity.get(identity)
-                if baseline_mod is None:
-                    baseline_mod = identity_match
-                elif identity_match is not None and identity_match.side != baseline_mod.side:
-                    raise HuroshikiError(
-                        f"Conflicting baseline side identity for {relative_path}"
-                    )
-                assigned_side = side
-                if baseline_mod is not None:
-                    if baseline_mod.side_error is not None:
-                        raise HuroshikiError(
-                            f"Cannot preserve invalid baseline side for "
-                            f"{baseline_mod.relative_path}: {baseline_mod.side_error}"
-                        )
-                    assigned_side = union_side(baseline_mod.side, side)
-                packctl.set_side_file(self.source / relative_path, assigned_side)
-            except Exception as error:
-                raise HuroshikiError(
-                    f"Could not assign side to {relative_path}: {error}"
-                ) from error
-        return metadata_paths
 
     def _finish_add(
         self,
@@ -787,34 +754,29 @@ class PackTransaction:
                 )
 
             ensure_safe_pack_source(self.source)
-            changed = tuple(
-                sorted(
-                    changed_paths(
-                        operation.before,
-                        metadata_digest_snapshot(self.source),
-                    )
-                )
-            )
-            if pty_result.returncode != 0 or not changed:
+            if pty_result.returncode != 0:
                 self._rollback_add(operation)
-                reason = (
-                    "Packwiz was cancelled or failed"
-                    if pty_result.returncode != 0
-                    else "Packwiz made no metadata changes"
-                )
                 return AddOperationResult(
                     returncode=pty_result.returncode,
                     changed_files=(),
                     raw_log=pty_result.raw_log,
                     text_log=pty_result.text_log,
                     event_log=pty_result.event_log,
-                    message=reason,
+                    message="Packwiz was cancelled or failed",
                     cancelled=operation.cancelled,
                 )
 
-            changed = self._classify_add_changes(
-                operation.before,
-                side_from_flags(operation.client, operation.server),
+            metadata = _read_resolver_metadata(operation.resolver_source)
+            selector = operation.selected_label or operation.query
+            root_identity = _resolved_root_identity(
+                operation.provider,
+                selector,
+                metadata,
+            )
+            changed = merge_metadata_closure(
+                self.source,
+                ResolvedModClosure(root_identity, metadata),
+                requested_side=side_from_flags(operation.client, operation.server),
             )
 
             self.batches.append(
@@ -825,6 +787,7 @@ class PackTransaction:
                 )
             )
             shutil.rmtree(operation.checkpoint, ignore_errors=True)
+            shutil.rmtree(operation.resolver_root, ignore_errors=True)
             self._operation = None
             return AddOperationResult(
                 returncode=0,
@@ -860,15 +823,17 @@ class PackTransaction:
                     )
                 relative_path = Path("mods") / f"{artifact.mod_id}.pw.toml"
                 write_url_metadata(
-                    self.source,
+                    operation.resolver_source,
                     relative_path,
                     artifact,
-                    side_from_flags(operation.client, operation.server),
+                    "both",
                 )
-                ensure_safe_pack_source(self.source)
-                changed = self._classify_add_changes(
-                    operation.before,
-                    side_from_flags(operation.client, operation.server),
+                metadata = _read_resolver_metadata(operation.resolver_source)
+                identity = ("url", artifact.mod_id)
+                changed = merge_metadata_closure(
+                    self.source,
+                    ResolvedModClosure(identity, metadata),
+                    requested_side=side_from_flags(operation.client, operation.server),
                 )
                 if not changed:
                     raise HuroshikiError("The URL metadata is already current")
@@ -880,6 +845,7 @@ class PackTransaction:
                     )
                 )
                 shutil.rmtree(operation.checkpoint, ignore_errors=True)
+                shutil.rmtree(operation.resolver_root, ignore_errors=True)
                 self._operation = None
 
             raw_log, text_log, event_log = url_log_paths(operation.log_dir)
@@ -911,6 +877,7 @@ class PackTransaction:
             if operation.checkpoint.exists():
                 shutil.rmtree(self.source, ignore_errors=True)
                 operation.checkpoint.rename(self.source)
+            shutil.rmtree(operation.resolver_root, ignore_errors=True)
             if self._operation is operation:
                 self._operation = None
 
@@ -2905,14 +2872,6 @@ def _apply_profile_entry(transaction: PackTransaction, entry: Mapping[str, objec
 
     if provider == "modrinth":
         project_id: str | int = packctl.resolve_modrinth(str(project))
-        add_command = [
-            "packwiz",
-            "--yes",
-            "modrinth",
-            "add",
-            "--project-id",
-            str(project_id),
-        ]
     else:
         try:
             project_id = int(project)
@@ -2920,33 +2879,25 @@ def _apply_profile_entry(transaction: PackTransaction, entry: Mapping[str, objec
             raise HuroshikiError(
                 "CurseForge profiles require numeric project IDs"
             ) from error
-        add_command = [
-            "packwiz",
-            "--yes",
-            "curseforge",
-            "add",
-            "--addon-id",
-            str(project_id),
-        ]
-
-    metadata = packctl.find_metadata(transaction.source, provider, project_id)
-    already_installed = metadata is not None
-    if not already_installed:
-        packctl.run(add_command, cwd=transaction.source)
-        metadata = packctl.find_metadata(transaction.source, provider, project_id)
-    if metadata is None:
-        raise HuroshikiError(
-            f"Metadata not found after adding {provider}:{project}"
-        )
-
-    current_side = packctl.read_toml(metadata).get("side")
-    side = (
-        union_side(str(current_side), str(requested_side))
-        if already_installed and current_side in packctl.VALID_SIDES
-        else str(requested_side)
+    minecraft, loader, loader_version = packctl.project_versions(transaction.source)
+    closure = resolve_mod_closure(
+        provider=str(provider),
+        selector=str(project_id),
+        minecraft=minecraft,
+        loader=loader,
+        loader_version=loader_version,
     )
-    packctl.set_side_file(metadata, side)
-    return metadata.relative_to(transaction.source)
+    changed = merge_metadata_closure(
+        transaction.source,
+        closure,
+        requested_side=str(requested_side),
+    )
+    metadata_path = packctl.find_metadata(transaction.source, str(provider), project_id)
+    if metadata_path is None:
+        raise HuroshikiError(
+            f"Metadata not found after merging {provider}:{project_id} closure"
+        )
+    return metadata_path.relative_to(transaction.source)
 
 
 def apply_profiles(
@@ -3346,17 +3297,6 @@ def compatible_templates(minecraft: str, loader: str) -> list[ProjectInfo]:
     ]
 
 
-def template_install_command(provider: str, project_id: str) -> list[str]:
-    normalized = canonical_provider(provider)
-    if normalized == "curseforge":
-        return [
-            "packwiz", "--yes", "curseforge", "add", "--addon-id", project_id
-        ]
-    if normalized == "modrinth":
-        return ["packwiz", "--yes", "modrinth", "add", project_id]
-    raise HuroshikiError(f"Unsupported Packwiz provider in template: {provider}")
-
-
 def concise_process_error(result: subprocess.CompletedProcess[str]) -> str:
     text = (result.stderr or result.stdout or "Packwiz returned a non-zero exit code").strip()
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -3367,22 +3307,9 @@ TEMPLATE_RESOLVER_TIMEOUT_SECONDS = 120
 
 
 @dataclass(frozen=True)
-class _ResolvedTemplateMetadata:
-    relative_path: Path
-    provider: str
-    project_id: str
-    filename: str
-    contents: bytes
-
-    @property
-    def identity(self) -> tuple[str, str]:
-        return self.provider, self.project_id
-
-
-@dataclass(frozen=True)
 class _ResolvedTemplateRoot:
     entry: MergedTemplateMod
-    metadata: tuple[_ResolvedTemplateMetadata, ...]
+    metadata: tuple[ResolvedMetadata, ...]
     root_identity: tuple[str, str]
 
 
@@ -3394,9 +3321,9 @@ def _metadata_contents_with_side(contents: bytes, side: str) -> bytes:
 
 def _read_resolver_metadata(
     source: Path,
-    side: str,
-) -> tuple[_ResolvedTemplateMetadata, ...]:
-    records: list[_ResolvedTemplateMetadata] = []
+    side: str | None = None,
+) -> tuple[ResolvedMetadata, ...]:
+    records: list[ResolvedMetadata] = []
     identities: dict[tuple[str, str], Path] = {}
     paths: dict[str, tuple[str, str]] = {}
     filenames: dict[str, tuple[str, str]] = {}
@@ -3441,17 +3368,241 @@ def _read_resolver_metadata(
         paths[path_key] = identity
         filenames[filename_key] = identity
         records.append(
-            _ResolvedTemplateMetadata(
+            ResolvedMetadata(
+                identity,
                 relative,
+                filename,
+                path.read_bytes(),
                 provider,
                 mod.project_id,
-                filename,
-                _metadata_contents_with_side(path.read_bytes(), side),
             )
         )
     if not records:
         raise HuroshikiError("No metadata changes were produced")
-    return tuple(records)
+    resolved = tuple(records)
+    return _resolved_metadata_with_side(resolved, side) if side is not None else resolved
+
+
+def _resolved_metadata_with_side(
+    metadata: Iterable[ResolvedMetadata], side: str
+) -> tuple[ResolvedMetadata, ...]:
+    return tuple(
+        replace(item, contents=_metadata_contents_with_side(item.contents, side))
+        for item in metadata
+    )
+
+
+def _resolved_root_identity(
+    provider: str,
+    selector: str,
+    metadata: tuple[ResolvedMetadata, ...],
+) -> tuple[str, str]:
+    expected = (canonical_provider(provider), selector)
+    if any(item.identity == expected for item in metadata):
+        return expected
+    matching_names = []
+    for item in metadata:
+        mod = read_mod_data(
+            item.relative_path,
+            tomllib.loads(item.contents.decode("utf-8")),
+        )
+        name = mod.name.strip().casefold()
+        selected = selector.strip().casefold()
+        if selected == name or any(
+            selected.startswith(name + separator)
+            for separator in (" by ", " - ", " [", " (")
+        ):
+            matching_names.append(item.identity)
+    if len(matching_names) == 1:
+        return matching_names[0]
+    if len(metadata) == 1:
+        return metadata[0].identity
+    found = ", ".join(f"{item.provider}:{item.project_id}" for item in metadata)
+    raise HuroshikiError(
+        f"Requested root identity for {provider}:{selector} could not be determined "
+        f"from resolver metadata ({found})"
+    )
+
+
+def resolve_mod_closure(
+    *,
+    provider: str,
+    selector: str,
+    minecraft: str,
+    loader: str,
+    loader_version: str,
+    cancel_event: threading.Event | None = None,
+) -> ResolvedModClosure:
+    normalized_provider, normalized_selector = normalize_add_selector(provider, selector)
+    if cancel_event is not None and cancel_event.is_set():
+        raise HuroshikiError("MOD resolution was cancelled")
+    state_root = ROOT / ".huroshiki"
+    transaction_root = state_root / "transactions"
+    packctl.make_state_directory(
+        transaction_root,
+        state_root=state_root,
+        repository_root=ROOT,
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="mod-resolver-", dir=transaction_root
+    ) as directory:
+        source = Path(directory) / "source"
+        create_resolver_source(
+            source,
+            display_name=f"Resolve {normalized_selector}",
+            minecraft=minecraft,
+            loader=loader,
+            loader_version=loader_version,
+        )
+        if normalized_provider == "url":
+            artifact = download_url_artifact(
+                normalized_selector,
+                cancel_event or threading.Event(),
+                Path(directory) / "logs",
+                loader,
+                DEFAULT_URL_MAX_JAR_SIZE_BYTES,
+                allow_private_networks=False,
+            )
+            identity = ("url", artifact.mod_id)
+            write_url_metadata(
+                source,
+                Path("mods") / f"{artifact.mod_id}.pw.toml",
+                artifact,
+                "both",
+            )
+            return ResolvedModClosure(identity, _read_resolver_metadata(source))
+        try:
+            command = build_add_command(normalized_provider, normalized_selector)
+            command.insert(1, "--yes")
+            process = subprocess.run(
+                command,
+                cwd=source,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=TEMPLATE_RESOLVER_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise HuroshikiError(
+                f"Packwiz resolver deadline exceeded after "
+                f"{TEMPLATE_RESOLVER_TIMEOUT_SECONDS} seconds"
+            ) from error
+        if cancel_event is not None and cancel_event.is_set():
+            raise HuroshikiError("MOD resolution was cancelled")
+        if process.returncode != 0:
+            raise HuroshikiError(concise_process_error(process))
+        metadata = _read_resolver_metadata(source)
+        root_identity = _resolved_root_identity(
+            normalized_provider, normalized_selector, metadata
+        )
+        return ResolvedModClosure(root_identity, metadata)
+
+
+def _closure_metadata_semantics(contents: bytes) -> tuple[object, object, object]:
+    document = tomllib.loads(contents.decode("utf-8"))
+    return document.get("filename"), document.get("download"), document.get("update")
+
+
+def merge_metadata_closure(
+    staged_source: Path,
+    closure: ResolvedModClosure,
+    *,
+    requested_side: str,
+) -> tuple[Path, ...]:
+    side = packctl.normalize_side(requested_side)
+    ensure_safe_pack_source(staged_source)
+    if not any(item.identity == closure.root_identity for item in closure.metadata):
+        raise HuroshikiError(
+            f"Resolved closure does not contain requested root "
+            f"{closure.root_identity[0]}:{closure.root_identity[1]}"
+        )
+    existing_mods = [
+        read_mod(staged_source, path.relative_to(staged_source))
+        for path in sorted(staged_source.rglob("*.pw.toml"))
+    ]
+    existing_by_identity: dict[tuple[str, str], ModInfo] = {}
+    path_owners: dict[str, tuple[str, str]] = {}
+    filename_owners: dict[str, tuple[str, str]] = {}
+    for mod in existing_mods:
+        identity = (canonical_provider(mod.provider), mod.project_id)
+        if identity in existing_by_identity:
+            raise HuroshikiError(
+                f"Existing metadata identity {identity[0]}:{identity[1]} is duplicated"
+            )
+        existing_by_identity[identity] = mod
+        path_owners[portable_relative_path_key(mod.relative_path)] = identity
+        filename_owners[portable_basename_key(mod.filename)] = identity
+
+    pending: list[tuple[ResolvedMetadata, ModInfo | None, str]] = []
+    incoming_identities: set[tuple[str, str]] = set()
+    for item in closure.metadata:
+        canonical_identity = (canonical_provider(item.provider), item.project_id)
+        if item.identity != canonical_identity:
+            raise HuroshikiError(
+                f"Resolved metadata identity mismatch for {item.relative_path}: "
+                f"{item.identity!r} vs {canonical_identity!r}"
+            )
+        if item.identity in incoming_identities:
+            raise HuroshikiError(
+                f"Resolved closure contains duplicate identity "
+                f"{item.provider}:{item.project_id}"
+            )
+        incoming_identities.add(item.identity)
+        path_key = portable_relative_path_key(item.relative_path)
+        filename_key = portable_basename_key(item.filename)
+        existing = existing_by_identity.get(item.identity)
+        path_owner = path_owners.get(path_key)
+        if path_owner is not None and path_owner != item.identity:
+            raise HuroshikiError(
+                f"Metadata path collision at {item.relative_path}: "
+                f"{path_owner[0]}:{path_owner[1]} vs {item.provider}:{item.project_id}"
+            )
+        filename_owner = filename_owners.get(filename_key)
+        if filename_owner is not None and filename_owner != item.identity:
+            raise HuroshikiError(
+                f"Filename collision for {item.filename!r}: "
+                f"{filename_owner[0]}:{filename_owner[1]} vs "
+                f"{item.provider}:{item.project_id}"
+            )
+        if existing is not None:
+            existing_contents = safe_child(staged_source, existing.relative_path).read_bytes()
+            if item.provider != "url" and (
+                portable_basename_key(existing.filename) != filename_key
+                or _closure_metadata_semantics(existing_contents)
+                != _closure_metadata_semantics(item.contents)
+            ):
+                raise HuroshikiError(
+                    "Resolved metadata disagreement for existing identity "
+                    f"{item.provider}:{item.project_id}"
+                )
+            if existing.side_error is not None:
+                raise HuroshikiError(
+                    f"Cannot preserve invalid existing side for {existing.relative_path}: "
+                    f"{existing.side_error}"
+                )
+            assigned_side = union_side(existing.side, side)
+        else:
+            path_owners[path_key] = item.identity
+            filename_owners[filename_key] = item.identity
+            assigned_side = side
+        pending.append((item, existing, assigned_side))
+
+    changed: list[Path] = []
+    for item, existing, assigned_side in pending:
+        relative_path = existing.relative_path if existing is not None else item.relative_path
+        path = safe_child(staged_source, relative_path)
+        contents = (
+            path.read_bytes()
+            if existing is not None and item.provider != "url"
+            else item.contents
+        )
+        updated = _metadata_contents_with_side(contents, assigned_side)
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists() or path.read_bytes() != updated:
+            path.write_bytes(updated)
+            changed.append(relative_path)
+    return tuple(changed)
 
 
 def _resolve_template_root(
@@ -3461,6 +3612,29 @@ def _resolve_template_root(
     loader: str,
     loader_version: str,
 ) -> _ResolvedTemplateRoot:
+    expected_identity = (
+        canonical_provider(entry.provider),
+        entry.project_id,
+    )
+    if expected_identity[0] != "url":
+        closure = resolve_mod_closure(
+            provider=entry.provider,
+            selector=entry.project_id,
+            minecraft=minecraft,
+            loader=loader,
+            loader_version=loader_version,
+        )
+        metadata = _resolved_metadata_with_side(closure.metadata, entry.side)
+        if closure.root_identity != expected_identity:
+            found = ", ".join(
+                f"{item.provider}:{item.project_id}" for item in metadata
+            )
+            raise HuroshikiError(
+                f"Requested root identity {expected_identity[0]}:{expected_identity[1]} "
+                f"was not independently resolved (resolver produced: {found or 'none'})"
+            )
+        return _ResolvedTemplateRoot(entry, metadata, expected_identity)
+
     state_root = ROOT / ".huroshiki"
     transaction_root = state_root / "transactions"
     packctl.make_state_directory(
@@ -3479,60 +3653,39 @@ def _resolve_template_root(
             loader=loader,
             loader_version=loader_version,
         )
-        expected_identity = (
-            canonical_provider(entry.provider),
-            entry.project_id,
+        log_dir = (
+            state_root
+            / "logs"
+            / "template-create"
+            / f"resolver-{uuid4().hex[:8]}"
         )
-        if expected_identity[0] == "url":
-            log_dir = (
-                state_root
-                / "logs"
-                / "template-create"
-                / f"resolver-{uuid4().hex[:8]}"
+        packctl.ensure_safe_state_path(
+            log_dir,
+            state_root=state_root,
+            repository_root=ROOT,
+        )
+        artifact = download_url_artifact(
+            entry.url or "",
+            threading.Event(),
+            log_dir,
+            loader,
+            entry.max_url_jar_size_bytes or DEFAULT_URL_MAX_JAR_SIZE_BYTES,
+            allow_private_networks=entry.url_allow_private_networks,
+        )
+        if artifact.mod_id != entry.project_id:
+            raise HuroshikiError(
+                f"URL now contains MOD ID {artifact.mod_id}, expected {entry.project_id}"
             )
-            packctl.ensure_safe_state_path(
-                log_dir,
-                state_root=state_root,
-                repository_root=ROOT,
-            )
-            artifact = download_url_artifact(
-                entry.url or "",
-                threading.Event(),
-                log_dir,
-                loader,
-                entry.max_url_jar_size_bytes or DEFAULT_URL_MAX_JAR_SIZE_BYTES,
-                allow_private_networks=entry.url_allow_private_networks,
-            )
-            if artifact.mod_id != entry.project_id:
-                raise HuroshikiError(
-                    f"URL now contains MOD ID {artifact.mod_id}, expected {entry.project_id}"
-                )
-            write_url_metadata(
-                source,
-                Path("mods") / f"{entry.project_id}.pw.toml",
-                artifact,
-                entry.side,
-            )
-        else:
-            command = template_install_command(entry.provider, entry.project_id)
-            try:
-                process = subprocess.run(
-                    command,
-                    cwd=source,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    timeout=TEMPLATE_RESOLVER_TIMEOUT_SECONDS,
-                )
-            except subprocess.TimeoutExpired as error:
-                raise HuroshikiError(
-                    f"Packwiz resolver deadline exceeded after "
-                    f"{TEMPLATE_RESOLVER_TIMEOUT_SECONDS} seconds"
-                ) from error
-            if process.returncode != 0:
-                raise HuroshikiError(concise_process_error(process))
+        write_url_metadata(
+            source,
+            Path("mods") / f"{entry.project_id}.pw.toml",
+            artifact,
+            entry.side,
+        )
 
-        metadata = _read_resolver_metadata(source, entry.side)
+        metadata = _resolved_metadata_with_side(
+            _read_resolver_metadata(source), entry.side
+        )
         matching_roots = [item for item in metadata if item.identity == expected_identity]
         if len(matching_roots) != 1:
             found = ", ".join(
@@ -3548,11 +3701,11 @@ def _resolve_template_root(
 def _merge_resolved_template_roots(
     roots: Iterable[_ResolvedTemplateRoot],
 ) -> tuple[
-    tuple[_ResolvedTemplateMetadata, ...],
+    tuple[ResolvedMetadata, ...],
     tuple[RetainedTemplateCandidate, ...],
     tuple[TemplateInstallFailure, ...],
 ]:
-    merged: dict[tuple[str, str], _ResolvedTemplateMetadata] = {}
+    merged: dict[tuple[str, str], ResolvedMetadata] = {}
     path_owners: dict[str, tuple[str, str]] = {}
     filename_owners: dict[str, tuple[str, str]] = {}
     url_root_owners: dict[tuple[str, str], str] = {}

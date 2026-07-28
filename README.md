@@ -81,11 +81,12 @@ The TUI creates packs and templates, composes multiple templates, installs and r
 sides and content overlays, builds, previews deployments, publishes, and manages retained state.
 Template composition matches Minecraft and loader type, resolves current compatible files for the
 new pack's loader version, preserves template order, and unions sides for identical provider IDs.
-Each Packwiz root is resolved in an isolated temporary project before the destination is created;
-its side applies to its full dependency closure, and shared dependencies union sides across any
-number of roots. Conflicts may retain multiple sources only when their final metadata paths,
-provider identities, and JAR filenames remain independently representable. URL roots continue to
-use bounded downloads and do not acquire an implicit Packwiz dependency closure.
+Every Packwiz root added through the TUI, CLI, a profile, or template composition is resolved in an
+isolated temporary project. Its requested side applies to the complete dependency closure, including
+dependencies whose metadata was already installed and would not otherwise change. Metadata merges
+use canonical provider/project identity, preserve existing locations, union sides, and reject
+version/download/update disagreements plus portable metadata-path or JAR-filename collisions. URL
+roots continue to use bounded downloads and do not acquire an implicit Packwiz dependency closure.
 
 ### Navigation
 
@@ -144,7 +145,7 @@ packctl update demo --build
 ```
 
 Multiple profile names are applied in the declared order as one transaction. A
-failed install or refresh leaves the pack's real `source/` unchanged.
+failed resolve, closure merge, or refresh leaves the pack's real `source/` unchanged.
 
 Build and distribute:
 

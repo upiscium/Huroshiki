@@ -77,7 +77,11 @@ class ProjectLockTest(unittest.TestCase):
         for project_id in ("demo", "other"):
             source = self.packs / project_id / "source"
             source.mkdir(parents=True)
-            (source / "pack.toml").write_text('name = "Demo"\n', encoding="utf-8")
+            (source / "pack.toml").write_text(
+                'name = "Demo"\n[versions]\nminecraft = "1.21.1"\n'
+                'neoforge = "21.1.234"\n',
+                encoding="utf-8",
+            )
             (source / "index.toml").write_text(
                 'hash-format = "sha256"\n', encoding="utf-8"
             )

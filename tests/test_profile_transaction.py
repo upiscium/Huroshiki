@@ -30,7 +30,11 @@ class ProfileTransactionTest(unittest.TestCase):
         self.packs = self.root / "packs"
         self.source = self.packs / "demo" / "source"
         (self.source / "mods").mkdir(parents=True)
-        (self.source / "pack.toml").write_bytes(b'name = "Demo"\n')
+        (self.source / "pack.toml").write_text(
+            'name = "Demo"\n[versions]\nminecraft = "1.21.1"\n'
+            'neoforge = "21.1.234"\n',
+            encoding="utf-8",
+        )
         (self.source / "index.toml").write_bytes(b"original index\n")
         (self.packs / "demo" / "pack.yaml").write_text(
             "id: demo\ndisplay_name: Demo\nenabled: true\n", encoding="utf-8"
@@ -84,6 +88,31 @@ class ProfileTransactionTest(unittest.TestCase):
 
         return run
 
+    def resolver(
+        self,
+        events: list[str] | None = None,
+        fail_project: str | None = None,
+    ):
+        def resolve(*, provider, selector, **_):
+            project_id = str(selector)
+            if events is not None:
+                events.append(project_id)
+            if project_id == fail_project:
+                raise core.HuroshikiError("resolver failed")
+            contents = metadata(provider, project_id).encode("utf-8")
+            identity = (provider, project_id)
+            record = core.ResolvedMetadata(
+                identity,
+                Path("mods") / f"{project_id}.pw.toml",
+                f"{project_id}.jar",
+                contents,
+                provider,
+                project_id,
+            )
+            return core.ResolvedModClosure(identity, (record,))
+
+        return resolve
+
     @staticmethod
     def refresh_success(command, *, cwd, **_):
         if command == ["packwiz", "refresh"]:
@@ -104,12 +133,12 @@ class ProfileTransactionTest(unittest.TestCase):
             install_directories.append(cwd)
             self.install()(command, cwd=cwd)
 
-        with patch.object(packctl, "run", side_effect=install), patch.object(
+        with patch.object(core, "resolve_mod_closure", side_effect=self.resolver()), patch.object(
             core.subprocess, "run", side_effect=self.refresh_success
         ) as run:
             core.apply_profiles(self.key, profile, ["base"])
 
-        self.assertEqual(len(set(install_directories)), 1)
+        self.assertEqual(install_directories, [])
         self.assertEqual(run.call_count, 1)
         self.assertIn('side = "client"', (self.source / "mods/101.pw.toml").read_text())
         self.assertIn('side = "server"', (self.source / "mods/202.pw.toml").read_text())
@@ -122,12 +151,11 @@ class ProfileTransactionTest(unittest.TestCase):
             {"source": "curseforge", "project": 202, "side": "server"},
         )
 
-        def install(command, *, cwd=None):
-            if command[-1] == "202":
-                raise subprocess.CalledProcessError(7, command)
-            self.install()(command, cwd=cwd)
-
-        with patch.object(packctl, "run", side_effect=install):
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=self.resolver(fail_project="202"),
+        ):
             with self.assertRaisesRegex(
                 core.HuroshikiError, r"Profile 'base' entry 2.*202"
             ):
@@ -151,7 +179,7 @@ class ProfileTransactionTest(unittest.TestCase):
                         raise failure
                     return failure
 
-                with patch.object(packctl, "run", side_effect=self.install()), patch.object(
+                with patch.object(core, "resolve_mod_closure", side_effect=self.resolver()), patch.object(
                     core.subprocess, "run", side_effect=refresh
                 ):
                     expected = KeyboardInterrupt if isinstance(failure, KeyboardInterrupt) else core.HuroshikiError
@@ -168,7 +196,7 @@ class ProfileTransactionTest(unittest.TestCase):
             (self.source / "index.toml").write_bytes(b"external index\n")
             return subprocess.CompletedProcess(command, 0)
 
-        with patch.object(packctl, "run", side_effect=self.install()), patch.object(
+        with patch.object(core, "resolve_mod_closure", side_effect=self.resolver()), patch.object(
             core.subprocess, "run", side_effect=refresh
         ):
             with self.assertRaisesRegex(core.HuroshikiError, "real Packwiz source changed"):
@@ -182,7 +210,7 @@ class ProfileTransactionTest(unittest.TestCase):
             {"source": "curseforge", "project": 101, "side": "client"}
         )
         with packctl.ProjectLock(self.key, "other operation"), patch.object(
-            packctl, "run"
+            core, "resolve_mod_closure"
         ) as install:
             with self.assertRaisesRegex(core.HuroshikiError, "Project is locked"):
                 core.apply_profiles(self.key, profile, ["base"])
@@ -215,11 +243,11 @@ class ProfileTransactionTest(unittest.TestCase):
         profile = self.profiles(
             {"source": "curseforge", "project": 101, "side": "server"}
         )
-        with patch.object(packctl, "run") as install, patch.object(
+        with patch.object(core, "resolve_mod_closure", side_effect=self.resolver()) as install, patch.object(
             core.subprocess, "run", side_effect=self.refresh_success
         ):
             core.apply_profiles(self.key, profile, ["base"])
-        install.assert_not_called()
+        install.assert_called_once()
         self.assertIn('side = "both"', target.read_text(encoding="utf-8"))
 
     def test_multiple_profiles_keep_order_and_roll_back_together(self) -> None:
@@ -233,13 +261,11 @@ class ProfileTransactionTest(unittest.TestCase):
         }
         events: list[str] = []
 
-        def install(command, *, cwd=None):
-            events.append(command[-1])
-            if command[-1] == "2":
-                raise subprocess.CalledProcessError(5, command)
-            self.install()(command, cwd=cwd)
-
-        with patch.object(packctl, "run", side_effect=install):
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=self.resolver(events, fail_project="2"),
+        ):
             with self.assertRaisesRegex(core.HuroshikiError, r"Profile 'second' entry 2"):
                 core.apply_profiles(self.key, profiles, ["first", "second"])
         self.assertEqual(events, ["3", "1", "2"])
