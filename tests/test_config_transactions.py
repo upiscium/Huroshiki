@@ -32,6 +32,38 @@ minecraft_server:
 
 
 class ConfigTransactionTest(unittest.TestCase):
+    def test_exchange_state_classification_uses_complete_snapshots(self) -> None:
+        expected = packctl.ConfigFileSnapshot(
+            "settings.yaml", True, 0o600, 1, 10, b"old", "old"
+        )
+        staged = packctl.ConfigFileSnapshot(
+            ".settings.tmp", True, 0o600, 1, 20, b"new", "new"
+        )
+        target_changed = packctl.ConfigFileSnapshot(
+            "settings.yaml", True, 0o600, 1, 20, b"external", "external"
+        )
+        temporary_changed = packctl.ConfigFileSnapshot(
+            ".settings.tmp", True, 0o600, 1, 10, b"external", "external"
+        )
+
+        cases = (
+            (staged, expected, "intact"),
+            (target_changed, expected, "target_changed"),
+            (staged, temporary_changed, "temporary_changed"),
+            (target_changed, temporary_changed, "both_changed"),
+        )
+        for target, temporary_snapshot, expected_result in cases:
+            with self.subTest(expected_result=expected_result):
+                self.assertEqual(
+                    packctl.classify_exchange_state(
+                        target=target,
+                        temporary=temporary_snapshot,
+                        staged=staged,
+                        expected=expected,
+                    ),
+                    expected_result,
+                )
+
     def test_snapshot_bytes_are_parsed_without_reopening_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -218,7 +250,7 @@ class ConfigTransactionTest(unittest.TestCase):
             self.assertEqual(recovery[0].read_text(encoding="utf-8"), "value: new\n")
             self.assertEqual(committed.read_text(encoding="utf-8"), "id: external\n")
 
-    def test_exchange_mismatch_rolls_back_external_change(self) -> None:
+    def test_exchange_temporary_change_preserves_staged_canonical(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             target = root / "settings.yaml"
@@ -238,7 +270,7 @@ class ConfigTransactionTest(unittest.TestCase):
                 with patch.object(packctl, "renameat2", side_effect=race):
                     with self.assertRaisesRegex(
                         packctl.ConfigError,
-                        "external configuration remains at the canonical path",
+                        "staged configuration remains at the canonical path",
                     ):
                         packctl._write_yaml_atomic(
                             directory,
@@ -247,7 +279,13 @@ class ConfigTransactionTest(unittest.TestCase):
                             guard_snapshots=(snapshot,),
                         )
 
-            self.assertEqual(target.read_text(encoding="utf-8"), "value: external\n")
+            self.assertEqual(target.read_text(encoding="utf-8"), "value: new\n")
+            temporary_recovery = list(root.glob(".settings.yaml.huroshiki-*.tmp"))
+            self.assertEqual(len(temporary_recovery), 1)
+            self.assertEqual(
+                temporary_recovery[0].read_text(encoding="utf-8"),
+                "value: external\n",
+            )
             recovery = list(root.glob(".settings.yaml.huroshiki-*.staged"))
             self.assertEqual(len(recovery), 1)
             self.assertEqual(recovery[0].read_text(encoding="utf-8"), "value: new\n")
@@ -260,22 +298,33 @@ class ConfigTransactionTest(unittest.TestCase):
             with packctl.open_config_directory(root) as directory:
                 snapshot = packctl.read_config_snapshot(directory, target.name)
                 renameat2 = packctl.renameat2
+                check_snapshots = packctl._check_config_snapshots
+                checks = 0
                 failed_restore = False
 
                 def race(old_fd, old_name, new_fd, new_name, flags):
                     nonlocal failed_restore
-                    if flags == packctl.RENAME_EXCHANGE:
-                        target.write_text("value: external\n", encoding="utf-8")
-                    elif (
+                    if (
                         flags == packctl.RENAME_NOREPLACE
-                        and new_name == target.name
-                        and old_name.endswith(".tmp")
+                        and old_name == target.name
+                        and new_name.endswith(".rollback")
                     ):
                         failed_restore = True
                         raise OSError("rollback unavailable")
                     return renameat2(old_fd, old_name, new_fd, new_name, flags)
 
-                with patch.object(packctl, "renameat2", side_effect=race):
+                def fail_companion(directory_arg, snapshots):
+                    nonlocal checks
+                    checks += 1
+                    if checks == 2:
+                        raise packctl.ConfigError("companion changed")
+                    return check_snapshots(directory_arg, snapshots)
+
+                with patch.object(
+                    packctl,
+                    "_check_config_snapshots",
+                    side_effect=fail_companion,
+                ), patch.object(packctl, "renameat2", side_effect=race):
                     with self.assertRaisesRegex(
                         packctl.ConfigError,
                         "original and staged recovery artifacts remain",
@@ -294,7 +343,8 @@ class ConfigTransactionTest(unittest.TestCase):
                 if path.name.startswith(".settings.yaml.huroshiki-")
             ]
             self.assertGreaterEqual(len(recovery), 2)
-            self.assertIn("value: external\n", [path.read_text() for path in recovery])
+            self.assertIn("value: original\n", [path.read_text() for path in recovery])
+            self.assertIn("value: new\n", [path.read_text() for path in recovery])
 
     def test_interrupt_after_exchange_rolls_back_without_deleting_old_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -369,6 +419,121 @@ class ConfigTransactionTest(unittest.TestCase):
             }
             self.assertIn("value: original\n", recovery_contents)
             self.assertIn("value: new\n", recovery_contents)
+
+    def test_post_exchange_in_place_change_remains_canonical(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "settings.yaml"
+            target.write_text("value: original\n", encoding="utf-8")
+            with packctl.open_config_directory(root) as directory:
+                snapshot = packctl.read_config_snapshot(directory, target.name)
+                renameat2 = packctl.renameat2
+                changed = False
+
+                def race(old_fd, old_name, new_fd, new_name, flags):
+                    nonlocal changed
+                    result = renameat2(old_fd, old_name, new_fd, new_name, flags)
+                    if flags == packctl.RENAME_EXCHANGE and not changed:
+                        changed = True
+                        target.write_text("value: external\n", encoding="utf-8")
+                    return result
+
+                with patch.object(packctl, "renameat2", side_effect=race):
+                    with self.assertRaisesRegex(
+                        packctl.ConfigError,
+                        "external configuration remains at the canonical path",
+                    ):
+                        packctl._write_yaml_atomic(
+                            directory,
+                            {"value": "new"},
+                            expected_snapshot=snapshot,
+                            guard_snapshots=(snapshot,),
+                        )
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "value: external\n")
+            recovery_contents = {
+                path.read_text(encoding="utf-8")
+                for path in root.iterdir()
+                if path.name.startswith(".settings.yaml.huroshiki-")
+            }
+            self.assertIn("value: original\n", recovery_contents)
+            self.assertIn("value: new\n", recovery_contents)
+
+    def test_post_exchange_temporary_change_preserves_both_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "settings.yaml"
+            target.write_text("value: original\n", encoding="utf-8")
+            temporary_name = ""
+            with packctl.open_config_directory(root) as directory:
+                snapshot = packctl.read_config_snapshot(directory, target.name)
+                renameat2 = packctl.renameat2
+
+                def race(old_fd, old_name, new_fd, new_name, flags):
+                    nonlocal temporary_name
+                    result = renameat2(old_fd, old_name, new_fd, new_name, flags)
+                    if flags == packctl.RENAME_EXCHANGE and not temporary_name:
+                        temporary_name = old_name
+                        (root / old_name).write_text(
+                            "value: external temporary\n", encoding="utf-8"
+                        )
+                    return result
+
+                with patch.object(packctl, "renameat2", side_effect=race):
+                    with self.assertRaisesRegex(packctl.ConfigError, "canonical path"):
+                        packctl._write_yaml_atomic(
+                            directory,
+                            {"value": "new"},
+                            expected_snapshot=snapshot,
+                            guard_snapshots=(snapshot,),
+                        )
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "value: new\n")
+            self.assertEqual(
+                (root / temporary_name).read_text(encoding="utf-8"),
+                "value: external temporary\n",
+            )
+
+    def test_post_exchange_both_changes_preserve_both_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "settings.yaml"
+            target.write_text("value: original\n", encoding="utf-8")
+            temporary_name = ""
+            with packctl.open_config_directory(root) as directory:
+                snapshot = packctl.read_config_snapshot(directory, target.name)
+                renameat2 = packctl.renameat2
+
+                def race(old_fd, old_name, new_fd, new_name, flags):
+                    nonlocal temporary_name
+                    result = renameat2(old_fd, old_name, new_fd, new_name, flags)
+                    if flags == packctl.RENAME_EXCHANGE and not temporary_name:
+                        temporary_name = old_name
+                        target.write_text("value: external target\n", encoding="utf-8")
+                        (root / old_name).write_text(
+                            "value: external temporary\n", encoding="utf-8"
+                        )
+                    return result
+
+                with patch.object(packctl, "renameat2", side_effect=race):
+                    with self.assertRaisesRegex(
+                        packctl.ConfigError,
+                        "external configuration remains at the canonical path",
+                    ):
+                        packctl._write_yaml_atomic(
+                            directory,
+                            {"value": "new"},
+                            expected_snapshot=snapshot,
+                            guard_snapshots=(snapshot,),
+                        )
+
+            self.assertEqual(
+                target.read_text(encoding="utf-8"), "value: external target\n"
+            )
+            self.assertEqual(
+                (root / temporary_name).read_text(encoding="utf-8"),
+                "value: external temporary\n",
+            )
 
     def test_external_replacement_after_original_restore_keeps_original_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -546,7 +711,7 @@ class ConfigTransactionTest(unittest.TestCase):
                 if target_exists:
                     self.assertEqual(
                         target.read_text(encoding="utf-8"),
-                        "value: original\n",
+                        "value: tampered\n",
                     )
                 else:
                     self.assertFalse(target.exists())

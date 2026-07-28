@@ -22,7 +22,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from typing import Any
+from typing import Any, Literal
 import unicodedata
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse
@@ -128,6 +128,12 @@ class ConfigFileSnapshot:
     inode: int | None
     bytes: bytes | None
     digest: str | None
+
+
+@dataclass(frozen=True)
+class ExchangeState:
+    target: ConfigFileSnapshot
+    temporary: ConfigFileSnapshot
 
 
 @dataclass
@@ -344,6 +350,24 @@ def _same_config_identity(
     )
 
 
+def classify_exchange_state(
+    *,
+    target: ConfigFileSnapshot,
+    temporary: ConfigFileSnapshot,
+    staged: ConfigFileSnapshot,
+    expected: ConfigFileSnapshot,
+) -> Literal["intact", "target_changed", "temporary_changed", "both_changed"]:
+    target_matches = _same_config_snapshot(target, staged)
+    temporary_matches = _same_config_snapshot(temporary, expected)
+    if target_matches and temporary_matches:
+        return "intact"
+    if temporary_matches:
+        return "target_changed"
+    if target_matches:
+        return "temporary_changed"
+    return "both_changed"
+
+
 def _check_config_snapshots(
     directory: ConfigDirectory,
     snapshots: tuple[ConfigFileSnapshot, ...],
@@ -482,6 +506,38 @@ def _create_config_recovery_link(
     raise ConfigError(f"Could not allocate recovery link for {target_name}")
 
 
+def _create_config_recovery_copy(
+    directory: ConfigDirectory,
+    snapshot: ConfigFileSnapshot,
+    target_name: str,
+    label: str,
+) -> str:
+    mode = snapshot.mode if snapshot.mode is not None else 0o600
+    for _ in range(100):
+        recovery_name = _config_artifact_name(target_name, label)
+        try:
+            descriptor = os.open(
+                recovery_name,
+                _CONFIG_TEMP_FLAGS,
+                mode,
+                dir_fd=directory.fd,
+            )
+        except FileExistsError:
+            continue
+        try:
+            _write_all(descriptor, snapshot.bytes or b"")
+            os.fchmod(descriptor, mode)
+            os.fsync(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            _unlink_config_artifact(directory, recovery_name)
+            raise
+        os.close(descriptor)
+        os.fsync(directory.fd)
+        return recovery_name
+    raise ConfigError(f"Could not allocate recovery copy for {target_name}")
+
+
 def _unlink_config_artifact(directory: ConfigDirectory, name: str | None) -> None:
     if name is None:
         return
@@ -550,7 +606,7 @@ def _config_snapshot_role(
         return "missing"
     if _same_config_snapshot(snapshot, expected):
         return "original"
-    if _same_config_identity(snapshot, staged):
+    if _same_config_snapshot(snapshot, staged):
         return "staged"
     return "external"
 
@@ -585,9 +641,9 @@ def _write_yaml_atomic(
         finally:
             os.close(descriptor)
         staged_snapshot = read_config_snapshot(directory, temporary_name)
-        staged_recovery_name = _create_config_recovery_link(
+        staged_recovery_name = _create_config_recovery_copy(
             directory,
-            temporary_name,
+            staged_snapshot,
             expected_snapshot.name,
             "staged",
         )
@@ -731,9 +787,18 @@ def _write_yaml_atomic(
             if _same_config_identity(temporary, staged_snapshot):
                 preserve_artifacts = False
                 raise
-            canonical = read_config_snapshot(directory, expected_snapshot.name)
+            state = ExchangeState(
+                target=read_config_snapshot(directory, expected_snapshot.name),
+                temporary=temporary,
+            )
+            exchange_state = classify_exchange_state(
+                target=state.target,
+                temporary=state.temporary,
+                staged=staged_snapshot,
+                expected=expected_snapshot,
+            )
             rollback_name: str | None = None
-            if _same_config_identity(canonical, staged_snapshot):
+            if exchange_state == "intact":
                 rollback_name = _config_artifact_name(
                     expected_snapshot.name,
                     "rollback",
