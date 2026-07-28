@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import hashlib
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -18,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from typing import Any
+from typing import Any, Callable
 import unicodedata
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse
@@ -95,6 +97,92 @@ PACK_LOCAL_KEYS = {
     "url_max_jar_size_bytes": None,
     "url_allow_private_networks": None,
 }
+
+
+CONFIG_WRITE_RACE_ERROR = "changed while applying command; retry the operation"
+
+
+@dataclass(frozen=True)
+class ConfigFileSnapshot:
+    path: Path
+    exists: bool
+    mode: int | None
+    digest: str | None
+
+
+def config_file_snapshot(path: Path) -> ConfigFileSnapshot:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return ConfigFileSnapshot(path=path, exists=False, mode=None, digest=None)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ConfigError(
+                f"{display_path(path)} must be a regular file, not a symlink"
+            ) from error
+        raise
+
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ConfigError(f"{display_path(path)} must be a regular file")
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            for chunk in iter(lambda: source.read(8192), b""):
+                digest.update(chunk)
+        return ConfigFileSnapshot(
+            path=path,
+            exists=True,
+            mode=stat.S_IMODE(metadata.st_mode),
+            digest=digest.hexdigest(),
+        )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _snapshot_changed(expected: ConfigFileSnapshot) -> bool:
+    try:
+        current = config_file_snapshot(expected.path)
+    except (ConfigError, OSError):
+        return True
+    return current != expected
+
+
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _check_snapshot_stable(snapshot: ConfigFileSnapshot) -> None:
+    if _snapshot_changed(snapshot):
+        raise ConfigError(
+            f"{display_path(snapshot.path)} {CONFIG_WRITE_RACE_ERROR}"
+        )
+
+
+def _mutate_yaml_with_snapshot(
+    path: Path,
+    snapshot: ConfigFileSnapshot,
+    mutate: Callable[[dict[str, Any]], None],
+    *,
+    validate: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    _check_snapshot_stable(snapshot)
+    data = load_yaml(path)
+    mutate(data)
+    if validate is not None:
+        validate(data)
+    _check_snapshot_stable(snapshot)
+    _write_yaml_atomic(
+        path,
+        data,
+        expected_snapshot=snapshot,
+    )
 
 
 def _project_lock_root(project_key: str) -> Path:
@@ -189,13 +277,50 @@ def load_yaml(path: Path) -> dict[str, Any]:
     return value
 
 
-def _write_yaml_atomic(path: Path, value: dict[str, Any]) -> None:
-    temporary = path.with_name(f".{path.name}.huroshiki-tmp")
-    temporary.write_text(
-        yaml.safe_dump(value, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
+def _normalize_project_text(field: str, value: str) -> str:
+    normalized = value.strip()
+    validate_project_text(field, normalized)
+    return normalized
+
+
+def _write_yaml_atomic(
+    path: Path,
+    value: dict[str, Any],
+    *,
+    expected_snapshot: ConfigFileSnapshot,
+) -> None:
+    if _snapshot_changed(expected_snapshot):
+        raise ConfigError(
+            f"{display_path(path)} {CONFIG_WRITE_RACE_ERROR}"
+        )
+
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.huroshiki-",
+        suffix=".tmp",
+        dir=path.parent,
     )
-    temporary.replace(path)
+    temporary_path = Path(temporary_name)
+    try:
+        if expected_snapshot.mode is not None:
+            os.fchmod(fd, expected_snapshot.mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as destination:
+            destination.write(yaml.safe_dump(value, sort_keys=False, allow_unicode=True))
+            destination.flush()
+            os.fsync(destination.fileno())
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+    try:
+        if _snapshot_changed(expected_snapshot):
+            temporary_path.unlink(missing_ok=True)
+            raise ConfigError(
+                f"{display_path(path)} {CONFIG_WRITE_RACE_ERROR}"
+            )
+        os.replace(temporary_path, path)
+        _sync_directory(path.parent)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -1227,6 +1352,16 @@ def _normalize_bool_flag(value: str) -> bool:
     raise argparse.ArgumentTypeError("must be one of true/false, yes/no, on/off, 1/0")
 
 
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def cmd_show_deployment(args: argparse.Namespace) -> int:
     config = load_pack_config(args.pack)
     print(f"distribution:")
@@ -1250,25 +1385,53 @@ def cmd_set_deployment(args: argparse.Namespace) -> int:
             "set-deployment requires at least one of --rsync-target, --ssh-host, --stack-dir, or --service"
         )
 
+    rsync_target = None
+    if args.rsync_target is not None:
+        rsync_target = _normalize_project_text("Rsync target", args.rsync_target)
+        try:
+            validate_rsync_target(rsync_target)
+        except ValueError as error:
+            raise ConfigError(str(error)) from error
+    ssh_host = (
+        _normalize_project_text("SSH host", args.ssh_host)
+        if args.ssh_host is not None
+        else None
+    )
+    stack_dir = (
+        _normalize_project_text("Stack directory", args.stack_dir)
+        if args.stack_dir is not None
+        else None
+    )
+    service = (
+        _normalize_project_text("Service", args.service)
+        if args.service is not None
+        else None
+    )
+
     with ProjectLock(f"pack:{args.pack}", "set deployment settings"):
         root = get_pack_root(args.pack)
         local_path = root / "pack.local.yaml"
-        local = load_yaml(local_path)
+        local_snapshot = config_file_snapshot(local_path)
 
-        if args.rsync_target is not None:
-            local.setdefault("distribution", {})["rsync_target"] = args.rsync_target
+        def apply_updates(local: dict[str, Any]) -> None:
+            if rsync_target is not None:
+                local.setdefault("distribution", {})["rsync_target"] = rsync_target
 
-        if args.ssh_host is not None or args.stack_dir is not None or args.service is not None:
-            existing = local.setdefault("minecraft_server", {})
-            if args.ssh_host is not None:
-                existing["ssh_host"] = args.ssh_host
-            if args.stack_dir is not None:
-                existing["stack_dir"] = args.stack_dir
-            if args.service is not None:
-                existing["service"] = args.service
+            if ssh_host is not None or stack_dir is not None or service is not None:
+                existing = local.setdefault("minecraft_server", {})
+                if ssh_host is not None:
+                    existing["ssh_host"] = ssh_host
+                if stack_dir is not None:
+                    existing["stack_dir"] = stack_dir
+                if service is not None:
+                    existing["service"] = service
 
-        validate_local_config("pack", local_path, local)
-        _write_yaml_atomic(local_path, local)
+        _mutate_yaml_with_snapshot(
+            local_path,
+            local_snapshot,
+            apply_updates,
+            validate=lambda local: validate_local_config("pack", local_path, local),
+        )
 
     print(f"Updated {display_path(local_path)}")
     return 0
@@ -1286,6 +1449,12 @@ def cmd_set_url_policy(args: argparse.Namespace) -> int:
         raise ConfigError(
             "set-url-policy requires --max-size and/or --allow-private-networks"
         )
+    if args.max_size is not None and (
+        isinstance(args.max_size, bool)
+        or not isinstance(args.max_size, int)
+        or args.max_size <= 0
+    ):
+        raise ConfigError("url_max_jar_size_bytes must be a positive integer")
 
     kind = args.kind
     project = args.project
@@ -1298,13 +1467,20 @@ def cmd_set_url_policy(args: argparse.Namespace) -> int:
             root = get_template_root(project)
             local_path = root / "template.local.yaml"
 
-        local = load_yaml(local_path)
-        if args.max_size is not None:
-            local["url_max_jar_size_bytes"] = args.max_size
-        if args.allow_private_networks is not None:
-            local["url_allow_private_networks"] = args.allow_private_networks
-        validate_local_config(kind, local_path, local)
-        _write_yaml_atomic(local_path, local)
+        local_snapshot = config_file_snapshot(local_path)
+
+        def apply_policy(local: dict[str, Any]) -> None:
+            if args.max_size is not None:
+                local["url_max_jar_size_bytes"] = args.max_size
+            if args.allow_private_networks is not None:
+                local["url_allow_private_networks"] = args.allow_private_networks
+
+        _mutate_yaml_with_snapshot(
+            local_path,
+            local_snapshot,
+            apply_policy,
+            validate=lambda local: validate_local_config(kind, local_path, local),
+        )
 
     print(f"Updated {display_path(local_path)}")
     return 0
@@ -1317,15 +1493,22 @@ def cmd_show_template_loader_version(args: argparse.Namespace) -> int:
 
 
 def cmd_set_template_loader_version(args: argparse.Namespace) -> int:
-    validate_project_text("Loader version", args.loader_version)
-    reference_loader_version = args.loader_version.strip()
+    reference_loader_version = _normalize_project_text(
+        "Loader version", args.loader_version
+    )
 
     with ProjectLock(f"template:{args.template}", "set template loader version"):
         root = get_template_root(args.template)
         path = root / "template.yaml"
-        config = load_yaml(path)
-        config["reference_loader_version"] = reference_loader_version
-        _write_yaml_atomic(path, config)
+        template_snapshot = config_file_snapshot(path)
+
+        _mutate_yaml_with_snapshot(
+            path,
+            template_snapshot,
+            lambda config: config.__setitem__(
+                "reference_loader_version", reference_loader_version
+            ),
+        )
         load_template_config(args.template)
 
     print(f"Updated {display_path(root / 'template.yaml')}")
@@ -2805,7 +2988,7 @@ def parser() -> argparse.ArgumentParser:
     item = sub.add_parser("set-url-policy")
     item.add_argument("kind", choices=("pack", "template"))
     item.add_argument("project")
-    item.add_argument("--max-size", type=int, dest="max_size")
+    item.add_argument("--max-size", type=_positive_int, dest="max_size")
     item.add_argument(
         "--allow-private-networks",
         type=_normalize_bool_flag,

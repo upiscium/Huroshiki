@@ -128,6 +128,14 @@ class PublicCliTest(unittest.TestCase):
             .allow_private_networks
         )
 
+    def test_parser_rejects_non_positive_url_policy_size(self) -> None:
+        for value in ("0", "-1", "invalid"):
+            with self.subTest(value=value), redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit):
+                    packctl.parser().parse_args(
+                        ["set-url-policy", "pack", "demo", "--max-size", value]
+                    )
+
     def test_set_and_show_deployment_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -227,6 +235,90 @@ class PublicCliTest(unittest.TestCase):
             finally:
                 for patch_item in reversed(patches):
                     patch_item.stop()
+
+    def test_set_deployment_normalizes_and_validates_rsync_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            pack_root = packs / "demo"
+            pack_root.mkdir(parents=True)
+            (pack_root / "pack.yaml").write_text(
+                "id: demo\n"
+                "distribution:\n  rsync_target: origin:/packs/demo\n"
+                "minecraft_server:\n  ssh_host: old\n  stack_dir: /srv/old\n  service: old\n",
+                encoding="utf-8",
+            )
+
+            patches = [
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+            ]
+            for patch_item in patches:
+                patch_item.start()
+
+            try:
+                args = type(
+                    "Args",
+                    (),
+                    {
+                        "pack": "demo",
+                        "rsync_target": " deploy@example:/srv/demo  ",
+                        "ssh_host": None,
+                        "stack_dir": None,
+                        "service": None,
+                    },
+                )()
+                self.assertEqual(packctl.cmd_set_deployment(args), 0)
+                local = packctl.load_yaml(pack_root / "pack.local.yaml")
+                self.assertEqual(
+                    local["distribution"]["rsync_target"],
+                    "deploy@example:/srv/demo",
+                )
+
+                with self.assertRaisesRegex(
+                    packctl.ConfigError,
+                    "rsync_target must be an explicit host:/absolute/path remote target",
+                ):
+                    packctl.cmd_set_deployment(
+                        type(
+                            "Args",
+                            (),
+                            {
+                                "pack": "demo",
+                                "rsync_target": "invalid_target",
+                                "ssh_host": None,
+                                "stack_dir": None,
+                                "service": None,
+                            },
+                        )()
+                    )
+            finally:
+                for patch_item in reversed(patches):
+                    patch_item.stop()
+
+    def test_set_deployment_validates_values_before_locking(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "pack": "demo",
+                "rsync_target": None,
+                "ssh_host": "  ",
+                "stack_dir": None,
+                "service": None,
+            },
+        )()
+
+        with patch.object(packctl, "ProjectLock") as project_lock:
+            with self.assertRaisesRegex(
+                packctl.ConfigError,
+                "SSH host must be a non-empty string",
+            ):
+                packctl.cmd_set_deployment(args)
+
+        project_lock.assert_not_called()
 
     def test_set_and_show_url_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -356,6 +448,254 @@ class PublicCliTest(unittest.TestCase):
             finally:
                 for patch_item in reversed(patches):
                     patch_item.stop()
+
+    def test_set_url_policy_rejects_non_positive_size(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            pack_root = packs / "demo"
+            pack_root.mkdir(parents=True)
+            (pack_root / "pack.yaml").write_text("id: demo\n", encoding="utf-8")
+
+            patches = [
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+            ]
+            for patch_item in patches:
+                patch_item.start()
+
+            try:
+                args = type(
+                    "Args",
+                    (),
+                    {
+                        "kind": "pack",
+                        "project": "demo",
+                        "max_size": 0,
+                        "allow_private_networks": None,
+                    },
+                )()
+                with self.assertRaisesRegex(
+                    packctl.ConfigError,
+                    "url_max_jar_size_bytes must be a positive integer",
+                ):
+                    packctl.cmd_set_url_policy(args)
+            finally:
+                for patch_item in reversed(patches):
+                    patch_item.stop()
+
+    def test_set_deployment_uses_snapshot_for_atomic_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            pack_root = packs / "demo"
+            pack_root.mkdir(parents=True)
+            (pack_root / "pack.yaml").write_text(
+                "id: demo\n"
+                "distribution:\n  rsync_target: origin:/packs/demo\n"
+                "minecraft_server:\n  ssh_host: old\n  stack_dir: /srv/old\n  service: old\n",
+                encoding="utf-8",
+            )
+
+            patches = [
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+            ]
+            for patch_item in patches:
+                patch_item.start()
+
+            try:
+                snapshot = packctl.ConfigFileSnapshot(
+                    path=pack_root / "pack.local.yaml",
+                    exists=True,
+                    mode=0o644,
+                    digest="digest",
+                )
+                with patch.object(packctl, "config_file_snapshot", return_value=snapshot) as snapshot_fn:
+                    with patch.object(packctl, "_write_yaml_atomic") as write:
+                        result = packctl.cmd_set_deployment(
+                            type(
+                                "Args",
+                                (),
+                                {
+                                    "pack": "demo",
+                                    "rsync_target": "deploy@example:/srv/demo",
+                                    "ssh_host": None,
+                                    "stack_dir": None,
+                                    "service": None,
+                                },
+                            )()
+                        )
+                        self.assertEqual(result, 0)
+                        self.assertEqual(snapshot_fn.call_count, 3)
+                        snapshot_fn.assert_called_with(pack_root / "pack.local.yaml")
+                        self.assertIs(
+                            write.call_args.kwargs["expected_snapshot"],
+                            snapshot,
+                        )
+            finally:
+                for patch_item in reversed(patches):
+                    patch_item.stop()
+
+    def test_set_url_policy_uses_snapshot_for_atomic_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            pack_root = packs / "demo"
+            pack_root.mkdir(parents=True)
+            (pack_root / "pack.yaml").write_text("id: demo\n", encoding="utf-8")
+
+            patches = [
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+            ]
+            for patch_item in patches:
+                patch_item.start()
+
+            try:
+                snapshot = packctl.ConfigFileSnapshot(
+                    path=pack_root / "pack.local.yaml",
+                    exists=True,
+                    mode=0o644,
+                    digest="digest",
+                )
+                with patch.object(packctl, "config_file_snapshot", return_value=snapshot) as snapshot_fn:
+                    with patch.object(packctl, "_write_yaml_atomic") as write:
+                        result = packctl.cmd_set_url_policy(
+                            type(
+                                "Args",
+                                (),
+                                {
+                                    "kind": "pack",
+                                    "project": "demo",
+                                    "max_size": 2048,
+                                    "allow_private_networks": None,
+                                },
+                            )()
+                        )
+                        self.assertEqual(result, 0)
+                        self.assertEqual(snapshot_fn.call_count, 3)
+                        snapshot_fn.assert_called_with(pack_root / "pack.local.yaml")
+                        self.assertIs(
+                            write.call_args.kwargs["expected_snapshot"],
+                            snapshot,
+                        )
+            finally:
+                for patch_item in reversed(patches):
+                    patch_item.stop()
+
+    def test_set_template_loader_version_uses_snapshot_for_atomic_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            templates = root / "templates"
+            template_root = templates / "base"
+            template_root.mkdir(parents=True)
+            template_path = template_root / "template.yaml"
+            template_path.write_text(
+                "id: base\nenabled: true\ndisplay_name: Base\nminecraft: 1.21.1\n"
+                "loader: neoforge\nreference_loader_version: 21.1.234\nmods: []\n",
+                encoding="utf-8",
+            )
+
+            patches = [
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "TEMPLATES", templates),
+            ]
+            for patch_item in patches:
+                patch_item.start()
+
+            try:
+                snapshot = packctl.ConfigFileSnapshot(
+                    path=template_path,
+                    exists=True,
+                    mode=0o644,
+                    digest="digest",
+                )
+                with patch.object(packctl, "config_file_snapshot", return_value=snapshot) as snapshot_fn:
+                    with patch.object(packctl, "_write_yaml_atomic") as write:
+                        result = packctl.cmd_set_template_loader_version(
+                            type(
+                                "Args",
+                                (),
+                                {"template": "base", "loader_version": "21.1.235"},
+                            )()
+                        )
+                        self.assertEqual(result, 0)
+                        self.assertEqual(snapshot_fn.call_count, 3)
+                        snapshot_fn.assert_called_with(template_path)
+                        self.assertIs(
+                            write.call_args.kwargs["expected_snapshot"],
+                            snapshot,
+                        )
+            finally:
+                for patch_item in reversed(patches):
+                    patch_item.stop()
+
+    def test_mutate_yaml_with_snapshot_rejects_changed_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.yaml"
+            path.write_text("value: 1\n", encoding="utf-8")
+            snapshot = packctl.config_file_snapshot(path)
+
+            with patch.object(
+                packctl,
+                "_snapshot_changed",
+                side_effect=[False, True],
+            ) as snapshot_changed, patch.object(packctl, "_write_yaml_atomic") as write:
+                with self.assertRaisesRegex(
+                    packctl.ConfigError,
+                    packctl.CONFIG_WRITE_RACE_ERROR,
+                ):
+                    packctl._mutate_yaml_with_snapshot(
+                        path,
+                        snapshot,
+                        lambda data: data.__setitem__("value", 2),
+                    )
+
+                self.assertEqual(snapshot_changed.call_count, 2)
+                write.assert_not_called()
+
+    def test_write_yaml_atomic_detects_stale_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.yaml"
+            path.write_text("value: 1\n", encoding="utf-8")
+            snapshot = packctl.config_file_snapshot(path)
+            path.write_text("value: 2\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                packctl.ConfigError, "changed while applying command"
+            ):
+                packctl._write_yaml_atomic(
+                    path,
+                    {"value": 3},
+                    expected_snapshot=snapshot,
+                )
+
+            self.assertEqual(path.read_text(encoding="utf-8"), "value: 2\n")
+
+    def test_write_yaml_atomic_rejects_new_dangling_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.yaml"
+            snapshot = packctl.config_file_snapshot(path)
+            path.symlink_to(Path(directory) / "missing.yaml")
+
+            with self.assertRaisesRegex(
+                packctl.ConfigError,
+                "changed while applying command",
+            ):
+                packctl._write_yaml_atomic(
+                    path,
+                    {"value": 1},
+                    expected_snapshot=snapshot,
+                )
+
+            self.assertTrue(path.is_symlink())
 
     def test_set_template_loader_version_updates_template_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

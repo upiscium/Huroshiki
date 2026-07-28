@@ -363,11 +363,7 @@ enabled: true
 minecraft: 1.21.1
 loader: neoforge
 reference_loader_version: 21.1.234
-mods:
-  - name: Fatal
-    provider: modrinth
-    project_id: fatal
-    side: both
+mods: []
 ''',
                 encoding="utf-8",
             )
@@ -406,6 +402,56 @@ mods:
             finally:
                 for item in reversed(patches):
                     item.stop()
+
+    def test_resolver_oserror_aborts_before_destination_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            template_root = templates / "base"
+            template_root.mkdir(parents=True)
+            (template_root / "template.yaml").write_text(
+                '''id: base
+display_name: Base
+enabled: true
+minecraft: 1.21.1
+loader: neoforge
+reference_loader_version: 21.1.234
+mods:
+  - name: Fatal
+    provider: modrinth
+    project_id: fatal
+    side: both
+''',
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(core, "ROOT", root),
+                patch.object(core, "PACKS", packs),
+                patch.object(core, "TEMPLATES", templates),
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+                patch.object(core, "create_project") as create,
+                patch.object(
+                    core.subprocess,
+                    "run",
+                    side_effect=OSError("packwiz unavailable"),
+                ),
+            ):
+                with self.assertRaisesRegex(OSError, "packwiz unavailable"):
+                    core.create_pack_from_template(
+                        template_id="base",
+                        project_id="generated",
+                        display_name="Generated",
+                        minecraft="1.21.1",
+                        loader="neoforge",
+                        loader_version="21.1.999",
+                    )
+
+            create.assert_not_called()
+            self.assertFalse((packs / "generated").exists())
 
     def test_source_initialization_failure_removes_owned_destination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -457,11 +503,7 @@ enabled: true
 minecraft: 1.21.1
 loader: neoforge
 reference_loader_version: 21.1.234
-mods:
-  - name: Fatal
-    provider: modrinth
-    project_id: fatal
-    side: both
+mods: []
 ''',
                 encoding="utf-8",
             )
