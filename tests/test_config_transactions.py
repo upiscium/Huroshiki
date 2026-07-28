@@ -66,7 +66,7 @@ class ConfigTransactionTest(unittest.TestCase):
                 with self.assertRaisesRegex(packctl.ConfigError, "regular file"):
                     packctl.read_config_snapshot(directory, "directory.yaml")
 
-    def test_pinned_parent_prevents_replacement_directory_write(self) -> None:
+    def test_replaced_project_directory_rejects_pinned_write(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             parent = Path(temporary)
             root = parent / "project"
@@ -77,22 +77,90 @@ class ConfigTransactionTest(unittest.TestCase):
                 root.rename(pinned)
                 root.mkdir()
 
-                packctl._write_yaml_atomic(
-                    directory,
-                    {"value": "new"},
-                    expected_snapshot=snapshot,
-                    guard_snapshots=(snapshot,),
-                )
+                with self.assertRaisesRegex(
+                    packctl.ConfigError,
+                    "managed project directory is no longer current",
+                ):
+                    packctl._write_yaml_atomic(
+                        directory,
+                        {"value": "new"},
+                        expected_snapshot=snapshot,
+                        guard_snapshots=(snapshot,),
+                    )
 
-            self.assertEqual(
-                (pinned / "settings.yaml").read_text(encoding="utf-8"),
-                "value: new\n",
-            )
+            self.assertFalse((pinned / "settings.yaml").exists())
             self.assertFalse((root / "settings.yaml").exists())
-            self.assertEqual(
-                stat.S_IMODE((pinned / "settings.yaml").stat().st_mode),
-                0o600,
-            )
+
+    def test_replaced_collection_directory_rejects_pinned_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            collection = repository / "packs"
+            project = collection / "demo"
+            project.mkdir(parents=True)
+            with packctl.open_config_directory(project) as directory:
+                snapshot = packctl.read_config_snapshot(directory, "settings.yaml")
+                moved = repository / "packs-old"
+                collection.rename(moved)
+                (collection / "demo").mkdir(parents=True)
+
+                with self.assertRaisesRegex(
+                    packctl.ConfigError,
+                    "managed project directory is no longer current",
+                ):
+                    packctl._write_yaml_atomic(
+                        directory,
+                        {"value": "new"},
+                        expected_snapshot=snapshot,
+                        guard_snapshots=(snapshot,),
+                    )
+
+            self.assertFalse((moved / "demo/settings.yaml").exists())
+            self.assertFalse((collection / "demo/settings.yaml").exists())
+
+    def test_directory_replacement_after_publication_is_detected_and_rolled_back(self) -> None:
+        for target_exists in (False, True):
+            with self.subTest(target_exists=target_exists), tempfile.TemporaryDirectory() as temporary:
+                parent = Path(temporary)
+                root = parent / "project"
+                root.mkdir()
+                target = root / "settings.yaml"
+                if target_exists:
+                    target.write_text("value: original\n", encoding="utf-8")
+                with packctl.open_config_directory(root) as directory:
+                    snapshot = packctl.read_config_snapshot(directory, target.name)
+                    renameat2 = packctl.renameat2
+                    replaced = False
+
+                    def race(old_fd, old_name, new_fd, new_name, flags):
+                        nonlocal replaced
+                        result = renameat2(old_fd, old_name, new_fd, new_name, flags)
+                        if not replaced:
+                            replaced = True
+                            root.rename(parent / "moved-project")
+                            root.mkdir()
+                        return result
+
+                    with patch.object(packctl, "renameat2", side_effect=race):
+                        with self.assertRaisesRegex(
+                            packctl.ConfigError,
+                            "managed project directory is no longer current",
+                        ):
+                            packctl._write_yaml_atomic(
+                                directory,
+                                {"value": "new"},
+                                expected_snapshot=snapshot,
+                                guard_snapshots=(snapshot,),
+                            )
+
+                moved_target = parent / "moved-project/settings.yaml"
+                if target_exists:
+                    self.assertEqual(
+                        moved_target.read_text(encoding="utf-8"),
+                        "value: original\n",
+                    )
+                else:
+                    self.assertFalse(moved_target.exists())
+                self.assertFalse((root / "settings.yaml").exists())
 
     def test_missing_target_noreplace_preserves_external_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -145,7 +213,7 @@ class ConfigTransactionTest(unittest.TestCase):
                         )
 
             self.assertFalse(local.exists())
-            recovery = list(root.glob(".pack.local.yaml.huroshiki-*.tmp"))
+            recovery = list(root.glob(".pack.local.yaml.huroshiki-*.staged"))
             self.assertEqual(len(recovery), 1)
             self.assertEqual(recovery[0].read_text(encoding="utf-8"), "value: new\n")
             self.assertEqual(committed.read_text(encoding="utf-8"), "id: external\n")
@@ -170,7 +238,7 @@ class ConfigTransactionTest(unittest.TestCase):
                 with patch.object(packctl, "renameat2", side_effect=race):
                     with self.assertRaisesRegex(
                         packctl.ConfigError,
-                        "staged configuration retained",
+                        "external configuration remains at the canonical path",
                     ):
                         packctl._write_yaml_atomic(
                             directory,
@@ -180,7 +248,7 @@ class ConfigTransactionTest(unittest.TestCase):
                         )
 
             self.assertEqual(target.read_text(encoding="utf-8"), "value: external\n")
-            recovery = list(root.glob(".settings.yaml.huroshiki-*.tmp"))
+            recovery = list(root.glob(".settings.yaml.huroshiki-*.staged"))
             self.assertEqual(len(recovery), 1)
             self.assertEqual(recovery[0].read_text(encoding="utf-8"), "value: new\n")
 
@@ -192,22 +260,25 @@ class ConfigTransactionTest(unittest.TestCase):
             with packctl.open_config_directory(root) as directory:
                 snapshot = packctl.read_config_snapshot(directory, target.name)
                 renameat2 = packctl.renameat2
-                exchanges = 0
+                failed_restore = False
 
                 def race(old_fd, old_name, new_fd, new_name, flags):
-                    nonlocal exchanges
+                    nonlocal failed_restore
                     if flags == packctl.RENAME_EXCHANGE:
-                        exchanges += 1
-                        if exchanges == 1:
-                            target.write_text("value: external\n", encoding="utf-8")
-                        else:
-                            raise OSError("rollback unavailable")
+                        target.write_text("value: external\n", encoding="utf-8")
+                    elif (
+                        flags == packctl.RENAME_NOREPLACE
+                        and new_name == target.name
+                        and old_name.endswith(".tmp")
+                    ):
+                        failed_restore = True
+                        raise OSError("rollback unavailable")
                     return renameat2(old_fd, old_name, new_fd, new_name, flags)
 
                 with patch.object(packctl, "renameat2", side_effect=race):
                     with self.assertRaisesRegex(
                         packctl.ConfigError,
-                        "external configuration is preserved",
+                        "original and staged recovery artifacts remain",
                     ):
                         packctl._write_yaml_atomic(
                             directory,
@@ -216,12 +287,14 @@ class ConfigTransactionTest(unittest.TestCase):
                             guard_snapshots=(snapshot,),
                         )
 
-            recovery = list(root.glob(".settings.yaml.huroshiki-*.tmp"))
-            self.assertEqual(len(recovery), 1)
-            self.assertEqual(
-                recovery[0].read_text(encoding="utf-8"),
-                "value: external\n",
-            )
+            self.assertTrue(failed_restore)
+            recovery = [
+                path
+                for path in root.iterdir()
+                if path.name.startswith(".settings.yaml.huroshiki-")
+            ]
+            self.assertGreaterEqual(len(recovery), 2)
+            self.assertIn("value: external\n", [path.read_text() for path in recovery])
 
     def test_interrupt_after_exchange_rolls_back_without_deleting_old_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -252,9 +325,172 @@ class ConfigTransactionTest(unittest.TestCase):
                         )
 
             self.assertEqual(target.read_text(encoding="utf-8"), "value: original\n")
-            recovery = list(root.glob(".settings.yaml.huroshiki-*.tmp"))
+            recovery = list(root.glob(".settings.yaml.huroshiki-*.staged"))
             self.assertEqual(len(recovery), 1)
             self.assertEqual(recovery[0].read_text(encoding="utf-8"), "value: new\n")
+
+    def test_post_exchange_external_replacement_remains_canonical(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "settings.yaml"
+            target.write_text("value: original\n", encoding="utf-8")
+            with packctl.open_config_directory(root) as directory:
+                snapshot = packctl.read_config_snapshot(directory, target.name)
+                renameat2 = packctl.renameat2
+                replaced = False
+
+                def race(old_fd, old_name, new_fd, new_name, flags):
+                    nonlocal replaced
+                    result = renameat2(old_fd, old_name, new_fd, new_name, flags)
+                    if flags == packctl.RENAME_EXCHANGE and not replaced:
+                        replaced = True
+                        external = root / "external.yaml"
+                        external.write_text("value: external\n", encoding="utf-8")
+                        os.replace(external, target)
+                    return result
+
+                with patch.object(packctl, "renameat2", side_effect=race):
+                    with self.assertRaisesRegex(
+                        packctl.ConfigError,
+                        "external configuration remains at the canonical path",
+                    ):
+                        packctl._write_yaml_atomic(
+                            directory,
+                            {"value": "new"},
+                            expected_snapshot=snapshot,
+                            guard_snapshots=(snapshot,),
+                        )
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "value: external\n")
+            recovery_contents = {
+                path.read_text(encoding="utf-8")
+                for path in root.iterdir()
+                if path.name.startswith(".settings.yaml.huroshiki-")
+            }
+            self.assertIn("value: original\n", recovery_contents)
+            self.assertIn("value: new\n", recovery_contents)
+
+    def test_external_replacement_after_original_restore_keeps_original_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "settings.yaml"
+            target.write_text("value: original\n", encoding="utf-8")
+            with packctl.open_config_directory(root) as directory:
+                snapshot = packctl.read_config_snapshot(directory, target.name)
+                renameat2 = packctl.renameat2
+                check_snapshots = packctl._check_config_snapshots
+                checks = 0
+
+                def fail_companion(directory_arg, snapshots):
+                    nonlocal checks
+                    checks += 1
+                    if checks == 2:
+                        raise packctl.ConfigError("companion changed")
+                    return check_snapshots(directory_arg, snapshots)
+
+                def replace_after_restore(old_fd, old_name, new_fd, new_name, flags):
+                    result = renameat2(old_fd, old_name, new_fd, new_name, flags)
+                    if (
+                        flags == packctl.RENAME_NOREPLACE
+                        and old_name.endswith(".tmp")
+                        and new_name == target.name
+                    ):
+                        external = root / "external.yaml"
+                        external.write_text("value: external\n", encoding="utf-8")
+                        os.replace(external, target)
+                    return result
+
+                with patch.object(
+                    packctl,
+                    "_check_config_snapshots",
+                    side_effect=fail_companion,
+                ), patch.object(
+                    packctl,
+                    "renameat2",
+                    side_effect=replace_after_restore,
+                ):
+                    with self.assertRaisesRegex(
+                        packctl.ConfigError,
+                        "external configuration remains at the canonical path",
+                    ):
+                        packctl._write_yaml_atomic(
+                            directory,
+                            {"value": "new"},
+                            expected_snapshot=snapshot,
+                            guard_snapshots=(snapshot,),
+                        )
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "value: external\n")
+            recovery_contents = {
+                path.read_text(encoding="utf-8")
+                for path in root.iterdir()
+                if path.name.startswith(".settings.yaml.huroshiki-")
+            }
+            self.assertIn("value: original\n", recovery_contents)
+            self.assertIn("value: new\n", recovery_contents)
+
+    def test_external_replacement_during_quarantine_is_relinked_canonical(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "settings.yaml"
+            target.write_text("value: original\n", encoding="utf-8")
+            with packctl.open_config_directory(root) as directory:
+                snapshot = packctl.read_config_snapshot(directory, target.name)
+                renameat2 = packctl.renameat2
+                check_snapshots = packctl._check_config_snapshots
+                checks = 0
+                replaced = False
+
+                def fail_companion(directory_arg, snapshots):
+                    nonlocal checks
+                    checks += 1
+                    if checks == 2:
+                        raise packctl.ConfigError("companion changed")
+                    return check_snapshots(directory_arg, snapshots)
+
+                def replace_before_quarantine(old_fd, old_name, new_fd, new_name, flags):
+                    nonlocal replaced
+                    if (
+                        flags == packctl.RENAME_NOREPLACE
+                        and old_name == target.name
+                        and new_name.endswith(".rollback")
+                        and not replaced
+                    ):
+                        replaced = True
+                        external = root / "external.yaml"
+                        external.write_text("value: external\n", encoding="utf-8")
+                        os.replace(external, target)
+                    return renameat2(old_fd, old_name, new_fd, new_name, flags)
+
+                with patch.object(
+                    packctl,
+                    "_check_config_snapshots",
+                    side_effect=fail_companion,
+                ), patch.object(
+                    packctl,
+                    "renameat2",
+                    side_effect=replace_before_quarantine,
+                ):
+                    with self.assertRaisesRegex(
+                        packctl.ConfigError,
+                        "external configuration remains at the canonical path",
+                    ):
+                        packctl._write_yaml_atomic(
+                            directory,
+                            {"value": "new"},
+                            expected_snapshot=snapshot,
+                            guard_snapshots=(snapshot,),
+                        )
+
+            self.assertTrue(replaced)
+            self.assertEqual(target.read_text(encoding="utf-8"), "value: external\n")
+            recovery_contents = {
+                path.read_text(encoding="utf-8")
+                for path in root.iterdir()
+                if path.name.startswith(".settings.yaml.huroshiki-")
+            }
+            self.assertIn("value: original\n", recovery_contents)
+            self.assertIn("value: new\n", recovery_contents)
 
     def test_existing_target_mode_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -354,6 +590,34 @@ class ConfigTransactionTest(unittest.TestCase):
 
             self.assertEqual(target.read_text(encoding="utf-8"), "value: original\n")
             self.assertEqual(list(root.glob(".settings.yaml.huroshiki-*.tmp")), [])
+
+    def test_post_commit_cleanup_and_warning_failures_do_not_fail_transaction(self) -> None:
+        class BrokenStderr:
+            def write(self, _: str) -> int:
+                raise BrokenPipeError("stderr closed")
+
+            def flush(self) -> None:
+                raise BrokenPipeError("stderr closed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "settings.yaml"
+            target.write_text("value: original\n", encoding="utf-8")
+            with packctl.open_config_directory(root) as directory:
+                snapshot = packctl.read_config_snapshot(directory, target.name)
+                with patch.object(
+                    packctl.os,
+                    "unlink",
+                    side_effect=OSError("cleanup unavailable"),
+                ), patch.object(packctl.sys, "stderr", BrokenStderr()):
+                    packctl._write_yaml_atomic(
+                        directory,
+                        {"value": "new"},
+                        expected_snapshot=snapshot,
+                        guard_snapshots=(snapshot,),
+                    )
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "value: new\n")
 
     def test_template_invalid_local_config_does_not_publish(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

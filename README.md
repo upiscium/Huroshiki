@@ -210,12 +210,14 @@ normalized non-root POSIX absolute paths without `.` or `..` components. Compose
 contain only letters, digits, `_`, `.`, and `-`, and must start with a letter or digit. SSH execution
 uses an explicit `--` option terminator.
 
-The settings commands snapshot both committed and local configuration, validate the prospective
-merged project entirely in memory, and publish through Linux `renameat2` compare-and-swap. They do
+The settings commands pin the managed collection and project directory, snapshot both committed and
+local configuration, validate the prospective merged project entirely in memory, and publish through
+Linux `renameat2` compare-and-swap. The directory identities are rechecked before and after
+publication so a renamed or replaced project path fails closed. They do
 not follow configuration symlinks or reopen a snapshotted file by path. A new local file is mode
 `0600`; an existing file keeps its mode. Unsupported atomic rename semantics fail closed. If an
-exchange detects an external writer, Huroshiki restores that writer's file and reports the retained
-staged recovery filename.
+exchange detects an external writer at the canonical path, Huroshiki leaves it canonical and reports
+separate original and staged recovery filenames.
 
 `packctl show-url-policy <kind> <project>` reports effective values rather than `None`, including
 whether each value came from `default`, `committed`, or `local`. The defaults are 256 MiB and

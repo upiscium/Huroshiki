@@ -136,11 +136,19 @@ class ConfigDirectory:
     fd: int
     device: int
     inode: int
+    parent_path: Path
+    parent_fd: int
+    parent_device: int
+    parent_inode: int
+    name: str
 
     def close(self) -> None:
         if self.fd >= 0:
             os.close(self.fd)
             self.fd = -1
+        if self.parent_fd >= 0:
+            os.close(self.parent_fd)
+            self.parent_fd = -1
 
     def __enter__(self) -> "ConfigDirectory":
         return self
@@ -164,11 +172,45 @@ class EffectiveUrlPolicy:
 
 
 def open_config_directory(path: Path) -> ConfigDirectory:
+    managed_path = Path(os.path.abspath(path))
+    if not managed_path.name:
+        raise ConfigError(f"Invalid configuration directory: {path}")
+    parent_path = managed_path.parent
+    parent_descriptor = -1
+    descriptor = -1
     try:
-        expected = os.stat(path, follow_symlinks=False)
-        descriptor = os.open(path, _CONFIG_DIRECTORY_FLAGS)
-    except OSError as error:
-        raise ConfigError(f"Could not safely open {display_path(path)}: {error}") from error
+        expected_parent = os.stat(parent_path, follow_symlinks=False)
+        parent_descriptor = os.open(parent_path, _CONFIG_DIRECTORY_FLAGS)
+        opened_parent = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(expected_parent.st_mode)
+            or not stat.S_ISDIR(opened_parent.st_mode)
+            or (expected_parent.st_dev, expected_parent.st_ino)
+            != (opened_parent.st_dev, opened_parent.st_ino)
+        ):
+            raise ConfigError(
+                f"{display_path(parent_path)} was replaced while being opened"
+            )
+        expected = os.stat(
+            managed_path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        descriptor = os.open(
+            managed_path.name,
+            _CONFIG_DIRECTORY_FLAGS,
+            dir_fd=parent_descriptor,
+        )
+    except BaseException as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+        if isinstance(error, OSError):
+            raise ConfigError(
+                f"Could not safely open {display_path(managed_path)}: {error}"
+            ) from error
+        raise
 
     try:
         opened = os.fstat(descriptor)
@@ -178,17 +220,58 @@ def open_config_directory(path: Path) -> ConfigDirectory:
             or (expected.st_dev, expected.st_ino) != (opened.st_dev, opened.st_ino)
         ):
             raise ConfigError(
-                f"{display_path(path)} was replaced while being opened"
+                f"{display_path(managed_path)} was replaced while being opened"
             )
         return ConfigDirectory(
-            path=path,
+            path=managed_path,
             fd=descriptor,
             device=opened.st_dev,
             inode=opened.st_ino,
+            parent_path=parent_path,
+            parent_fd=parent_descriptor,
+            parent_device=opened_parent.st_dev,
+            parent_inode=opened_parent.st_ino,
+            name=managed_path.name,
         )
     except BaseException:
-        os.close(descriptor)
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
         raise
+
+
+def check_config_directory_identity(directory: ConfigDirectory) -> None:
+    try:
+        opened_parent = os.fstat(directory.parent_fd)
+        current_parent = os.stat(directory.parent_path, follow_symlinks=False)
+        opened = os.fstat(directory.fd)
+        current = os.stat(
+            directory.name,
+            dir_fd=directory.parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise ConfigError(
+            f"{display_path(directory.path)} changed while applying command; "
+            "managed project directory is no longer current"
+        ) from error
+    if (
+        not stat.S_ISDIR(opened_parent.st_mode)
+        or not stat.S_ISDIR(current_parent.st_mode)
+        or (opened_parent.st_dev, opened_parent.st_ino)
+        != (directory.parent_device, directory.parent_inode)
+        or (current_parent.st_dev, current_parent.st_ino)
+        != (directory.parent_device, directory.parent_inode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or (opened.st_dev, opened.st_ino) != (directory.device, directory.inode)
+        or (current.st_dev, current.st_ino) != (directory.device, directory.inode)
+    ):
+        raise ConfigError(
+            f"{display_path(directory.path)} changed while applying command; "
+            "managed project directory is no longer current"
+        )
 
 
 def read_config_snapshot(
@@ -372,6 +455,106 @@ def _write_all(descriptor: int, contents: bytes) -> None:
         view = view[written:]
 
 
+def _config_artifact_name(target_name: str, label: str) -> str:
+    return f".{target_name}.huroshiki-{uuid4().hex}.{label}"
+
+
+def _create_config_recovery_link(
+    directory: ConfigDirectory,
+    source_name: str,
+    target_name: str,
+    label: str,
+) -> str:
+    for _ in range(100):
+        recovery_name = _config_artifact_name(target_name, label)
+        try:
+            os.link(
+                source_name,
+                recovery_name,
+                src_dir_fd=directory.fd,
+                dst_dir_fd=directory.fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            continue
+        os.fsync(directory.fd)
+        return recovery_name
+    raise ConfigError(f"Could not allocate recovery link for {target_name}")
+
+
+def _unlink_config_artifact(directory: ConfigDirectory, name: str | None) -> None:
+    if name is None:
+        return
+    try:
+        os.unlink(name, dir_fd=directory.fd)
+    except FileNotFoundError:
+        pass
+
+
+def _link_config_artifact_noreplace(
+    directory: ConfigDirectory,
+    source_name: str,
+    target_name: str,
+) -> None:
+    os.link(
+        source_name,
+        target_name,
+        src_dir_fd=directory.fd,
+        dst_dir_fd=directory.fd,
+        follow_symlinks=False,
+    )
+
+
+def _cleanup_committed_config_artifacts(
+    directory: ConfigDirectory,
+    names: tuple[str | None, ...],
+) -> None:
+    errors: list[str] = []
+    for name in names:
+        if name is None:
+            continue
+        try:
+            os.unlink(name, dir_fd=directory.fd)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            errors.append(f"{name}: {error}")
+    try:
+        os.fsync(directory.fd)
+    except OSError as error:
+        errors.append(f"directory fsync: {error}")
+    if errors:
+        try:
+            print(
+                "warning: configuration committed but recovery cleanup was incomplete: "
+                + "; ".join(errors),
+                file=sys.stderr,
+            )
+        except BaseException:
+            pass
+
+
+def _config_recovery_location(directory: ConfigDirectory, name: str) -> str:
+    return (
+        f"{name} in pinned directory dev={directory.device} inode={directory.inode}"
+    )
+
+
+def _config_snapshot_role(
+    snapshot: ConfigFileSnapshot,
+    *,
+    expected: ConfigFileSnapshot,
+    staged: ConfigFileSnapshot,
+) -> str:
+    if not snapshot.exists:
+        return "missing"
+    if _same_config_snapshot(snapshot, expected):
+        return "original"
+    if _same_config_identity(snapshot, staged):
+        return "staged"
+    return "external"
+
+
 def _write_yaml_atomic(
     directory: ConfigDirectory,
     value: dict[str, Any],
@@ -379,6 +562,7 @@ def _write_yaml_atomic(
     expected_snapshot: ConfigFileSnapshot,
     guard_snapshots: tuple[ConfigFileSnapshot, ...],
 ) -> None:
+    check_config_directory_identity(directory)
     serialized = yaml.safe_dump(
         value,
         sort_keys=False,
@@ -390,8 +574,9 @@ def _write_yaml_atomic(
         expected_snapshot.name,
         mode,
     )
-    cleanup_temporary = True
-    keep_recovery = False
+    staged_recovery_name: str | None = None
+    exchanged_recovery_name: str | None = None
+    preserve_artifacts = False
     try:
         try:
             _write_all(descriptor, serialized)
@@ -400,10 +585,23 @@ def _write_yaml_atomic(
         finally:
             os.close(descriptor)
         staged_snapshot = read_config_snapshot(directory, temporary_name)
+        staged_recovery_name = _create_config_recovery_link(
+            directory,
+            temporary_name,
+            expected_snapshot.name,
+            "staged",
+        )
 
+        check_config_directory_identity(directory)
         _check_config_snapshots(directory, guard_snapshots)
+        companion_snapshots = tuple(
+            snapshot
+            for snapshot in guard_snapshots
+            if snapshot.name != expected_snapshot.name
+        )
         if not expected_snapshot.exists:
             try:
+                check_config_directory_identity(directory)
                 renameat2(
                     directory.fd,
                     temporary_name,
@@ -411,6 +609,7 @@ def _write_yaml_atomic(
                     expected_snapshot.name,
                     RENAME_NOREPLACE,
                 )
+                check_config_directory_identity(directory)
                 published = read_config_snapshot(
                     directory,
                     expected_snapshot.name,
@@ -420,70 +619,79 @@ def _write_yaml_atomic(
                         f"{display_path(directory.path / expected_snapshot.name)} "
                         "temporary configuration changed before publication"
                     )
-                companion_snapshots = tuple(
-                    snapshot
-                    for snapshot in guard_snapshots
-                    if snapshot.name != expected_snapshot.name
-                )
                 _check_config_snapshots(directory, companion_snapshots)
-                cleanup_temporary = False
+                check_config_directory_identity(directory)
                 os.fsync(directory.fd)
+                check_config_directory_identity(directory)
+                preserve_artifacts = True
+                _cleanup_committed_config_artifacts(
+                    directory,
+                    (staged_recovery_name,),
+                )
                 return
             except BaseException as error:
-                keep_recovery = True
+                preserve_artifacts = True
                 temporary = read_config_snapshot(directory, temporary_name)
                 if temporary.exists and _same_config_identity(
                     temporary,
                     staged_snapshot,
                 ):
-                    keep_recovery = False
+                    preserve_artifacts = False
                     if isinstance(error, FileExistsError):
                         raise ConfigError(
                             f"{display_path(directory.path / expected_snapshot.name)} "
                             f"{CONFIG_WRITE_RACE_ERROR}"
                         ) from error
                     raise
-                try:
-                    renameat2(
-                        directory.fd,
+                canonical = read_config_snapshot(directory, expected_snapshot.name)
+                rollback_name: str | None = None
+                if _same_config_identity(canonical, staged_snapshot):
+                    rollback_name = _config_artifact_name(
                         expected_snapshot.name,
-                        directory.fd,
-                        temporary_name,
-                        RENAME_NOREPLACE,
+                        "rollback",
                     )
-                    moved = read_config_snapshot(directory, temporary_name)
-                    if _same_config_identity(moved, staged_snapshot):
-                        keep_recovery = True
-                    else:
+                    try:
                         renameat2(
                             directory.fd,
-                            temporary_name,
-                            directory.fd,
                             expected_snapshot.name,
+                            directory.fd,
+                            rollback_name,
                             RENAME_NOREPLACE,
                         )
-                        keep_recovery = False
-                    os.fsync(directory.fd)
-                except BaseException as rollback_error:
-                    keep_recovery = True
-                    os.fsync(directory.fd)
-                    raise ConfigError(
-                        f"{error}; rollback failed: {rollback_error}; configuration "
-                        f"recovery is required in {display_path(directory.path)}"
-                    ) from error
+                        moved = read_config_snapshot(directory, rollback_name)
+                        if _same_config_identity(moved, staged_snapshot):
+                            _unlink_config_artifact(directory, rollback_name)
+                            rollback_name = None
+                        else:
+                            try:
+                                _link_config_artifact_noreplace(
+                                    directory,
+                                    rollback_name,
+                                    expected_snapshot.name,
+                                )
+                            except FileExistsError:
+                                pass
+                        os.fsync(directory.fd)
+                    except BaseException as rollback_error:
+                        os.fsync(directory.fd)
+                        detail = (
+                            _config_recovery_location(directory, rollback_name)
+                            if rollback_name is not None
+                            else "the pinned configuration directory"
+                        )
+                        raise ConfigError(
+                            f"{error}; rollback failed: {rollback_error}; recovery "
+                            f"artifacts remain in {detail}"
+                        ) from error
                 if not isinstance(error, Exception):
                     raise
-                if keep_recovery:
-                    detail = (
-                        "staged configuration retained at "
-                        f"{display_path(directory.path / temporary_name)}"
-                    )
-                else:
-                    detail = "publication was rolled back"
-                raise ConfigError(f"{error}; {detail}") from error
+                raise ConfigError(
+                    f"{error}; staged configuration retained at "
+                    f"{_config_recovery_location(directory, staged_recovery_name)}"
+                ) from error
 
-        old_removed = False
         try:
+            check_config_directory_identity(directory)
             renameat2(
                 directory.fd,
                 temporary_name,
@@ -491,6 +699,7 @@ def _write_yaml_atomic(
                 expected_snapshot.name,
                 RENAME_EXCHANGE,
             )
+            check_config_directory_identity(directory)
             published = read_config_snapshot(directory, expected_snapshot.name)
             if not _same_config_snapshot(published, staged_snapshot):
                 raise ConfigError(
@@ -503,53 +712,114 @@ def _write_yaml_atomic(
                     f"{display_path(directory.path / expected_snapshot.name)} "
                     f"{CONFIG_WRITE_RACE_ERROR}"
                 )
-            companion_snapshots = tuple(
-                snapshot
-                for snapshot in guard_snapshots
-                if snapshot.name != expected_snapshot.name
-            )
             _check_config_snapshots(directory, companion_snapshots)
-            os.unlink(temporary_name, dir_fd=directory.fd)
-            old_removed = True
-            cleanup_temporary = False
+            check_config_directory_identity(directory)
             os.fsync(directory.fd)
+            check_config_directory_identity(directory)
+            preserve_artifacts = True
+            _cleanup_committed_config_artifacts(
+                directory,
+                (temporary_name, staged_recovery_name),
+            )
         except BaseException as error:
-            keep_recovery = True
+            preserve_artifacts = True
             temporary = read_config_snapshot(directory, temporary_name)
-            if old_removed or not temporary.exists:
-                keep_recovery = False
+            if not temporary.exists:
+                preserve_artifacts = False
                 os.fsync(directory.fd)
                 raise
             if _same_config_identity(temporary, staged_snapshot):
-                keep_recovery = False
+                preserve_artifacts = False
                 raise
-            try:
-                renameat2(
-                    directory.fd,
-                    temporary_name,
-                    directory.fd,
+            canonical = read_config_snapshot(directory, expected_snapshot.name)
+            rollback_name: str | None = None
+            if _same_config_identity(canonical, staged_snapshot):
+                rollback_name = _config_artifact_name(
                     expected_snapshot.name,
-                    RENAME_EXCHANGE,
+                    "rollback",
                 )
+                try:
+                    renameat2(
+                        directory.fd,
+                        expected_snapshot.name,
+                        directory.fd,
+                        rollback_name,
+                        RENAME_NOREPLACE,
+                    )
+                    moved = read_config_snapshot(directory, rollback_name)
+                    if _same_config_identity(moved, staged_snapshot):
+                        exchanged_recovery_name = _create_config_recovery_link(
+                            directory,
+                            temporary_name,
+                            expected_snapshot.name,
+                            "exchanged",
+                        )
+                        renameat2(
+                            directory.fd,
+                            temporary_name,
+                            directory.fd,
+                            expected_snapshot.name,
+                            RENAME_NOREPLACE,
+                        )
+                        _unlink_config_artifact(directory, rollback_name)
+                        rollback_name = None
+                    else:
+                        try:
+                            _link_config_artifact_noreplace(
+                                directory,
+                                rollback_name,
+                                expected_snapshot.name,
+                            )
+                        except FileExistsError:
+                            pass
+                    os.fsync(directory.fd)
+                except BaseException as rollback_error:
+                    os.fsync(directory.fd)
+                    detail = (
+                        _config_recovery_location(directory, rollback_name)
+                        if rollback_name is not None
+                        else "the pinned configuration directory"
+                    )
+                    raise ConfigError(
+                        f"{error}; rollback failed: {rollback_error}; original and "
+                        f"staged recovery artifacts remain in {detail}"
+                    ) from error
+            else:
                 os.fsync(directory.fd)
-            except BaseException as rollback_error:
-                os.fsync(directory.fd)
-                raise ConfigError(
-                    f"{error}; rollback failed: {rollback_error}; external configuration "
-                    f"is preserved at {display_path(directory.path / temporary_name)}"
-                ) from error
             if not isinstance(error, Exception):
                 raise
+            canonical_after = read_config_snapshot(
+                directory,
+                expected_snapshot.name,
+            )
+            canonical_role = _config_snapshot_role(
+                canonical_after,
+                expected=expected_snapshot,
+                staged=staged_snapshot,
+            )
+            temporary_after = read_config_snapshot(directory, temporary_name)
+            temporary_detail = (
+                "; exchanged recovery is at "
+                f"{_config_recovery_location(directory, temporary_name)}"
+                if temporary_after.exists
+                else ""
+            )
+            exchanged_detail = (
+                "; exchanged recovery is at "
+                f"{_config_recovery_location(directory, exchanged_recovery_name)}"
+                if exchanged_recovery_name is not None
+                else ""
+            )
             raise ConfigError(
-                f"{error}; staged configuration retained at "
-                f"{display_path(directory.path / temporary_name)}"
+                f"{error}; {canonical_role} configuration remains at the canonical "
+                f"path{temporary_detail}{exchanged_detail}; staged recovery is at "
+                f"{_config_recovery_location(directory, staged_recovery_name)}"
             ) from error
     finally:
-        if cleanup_temporary and not keep_recovery:
-            try:
-                os.unlink(temporary_name, dir_fd=directory.fd)
-            except FileNotFoundError:
-                pass
+        if not preserve_artifacts:
+            _unlink_config_artifact(directory, temporary_name)
+            _unlink_config_artifact(directory, staged_recovery_name)
+            _unlink_config_artifact(directory, exchanged_recovery_name)
 
 
 def _project_lock_root(project_key: str) -> Path:
