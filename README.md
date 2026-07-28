@@ -203,6 +203,26 @@ The exact allowed paths are `distribution.rsync_target`, `minecraft_server.ssh_h
 display, enablement, Minecraft/loader versions, MOD data, and every unknown top-level or nested key
 are prohibited in `pack.local.yaml`.
 
+Deployment targets are validated for their eventual command usage. SSH targets accept a hostname,
+an IPv4 address, a bracketed IPv6 address, and an optional `user@` prefix; option-like values,
+whitespace, paths, command suffixes, and malformed brackets are rejected. Stack directories must be
+normalized non-root POSIX absolute paths without `.` or `..` components. Compose service names may
+contain only letters, digits, `_`, `.`, and `-`, and must start with a letter or digit. SSH execution
+uses an explicit `--` option terminator.
+
+The settings commands pin the managed collection and project directory, snapshot both committed and
+local configuration, validate the prospective merged project entirely in memory, and publish through
+Linux `renameat2` compare-and-swap. The directory identities are rechecked before and after
+publication so a renamed or replaced project path fails closed. They do
+not follow configuration symlinks or reopen a snapshotted file by path. A new local file is mode
+`0600`; an existing file keeps its mode. Unsupported atomic rename semantics fail closed. If an
+exchange detects an external writer at the canonical path, Huroshiki leaves it canonical and reports
+separate original and staged recovery filenames.
+
+`packctl show-url-policy <kind> <project>` reports effective values rather than `None`, including
+whether each value came from `default`, `committed`, or `local`. The defaults are 256 MiB and
+`url_allow_private_networks: false`.
+
 ## Template Format
 
 Templates are YAML MOD lists, not Packwiz projects:

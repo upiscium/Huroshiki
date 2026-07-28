@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
+import hashlib
+import ipaddress
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -9,7 +13,7 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
@@ -18,7 +22,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from typing import Any
+from typing import Any, Literal
 import unicodedata
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse
@@ -42,6 +46,7 @@ from overlay_policy import copy_content_overlays, scan_content_overlays
 from portable_paths import PortablePathError, portable_basename_key
 import project_locks
 from project_locks import ProjectLockMetadata, process_start_identity
+from url_artifacts import DEFAULT_URL_MAX_JAR_SIZE_BYTES
 
 ROOT = resolve_root(import_root_argument(sys.argv[1:]))
 PACKS = ROOT / "packs"
@@ -69,6 +74,9 @@ TARGET_SIDES = {
     "server": {"server", "both"},
 }
 PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+SSH_USER_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9_.-]*$")
+SSH_HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$")
+COMPOSE_SERVICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 LOADER_FLAGS = {
     "neoforge": "--neoforge-version",
     "forge": "--forge-version",
@@ -95,6 +103,788 @@ PACK_LOCAL_KEYS = {
     "url_max_jar_size_bytes": None,
     "url_allow_private_networks": None,
 }
+
+
+CONFIG_WRITE_RACE_ERROR = "changed while applying command; retry the operation"
+RENAME_NOREPLACE = 1
+RENAME_EXCHANGE = 2
+_CONFIG_DIRECTORY_FLAGS = (
+    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+)
+_CONFIG_FILE_FLAGS = (
+    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+)
+_CONFIG_TEMP_FLAGS = (
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+)
+
+
+@dataclass(frozen=True)
+class ConfigFileSnapshot:
+    name: str
+    exists: bool
+    mode: int | None
+    device: int | None
+    inode: int | None
+    bytes: bytes | None
+    digest: str | None
+
+
+@dataclass(frozen=True)
+class ExchangeState:
+    target: ConfigFileSnapshot
+    temporary: ConfigFileSnapshot
+
+
+@dataclass
+class ConfigDirectory:
+    path: Path
+    fd: int
+    device: int
+    inode: int
+    parent_path: Path
+    parent_fd: int
+    parent_device: int
+    parent_inode: int
+    name: str
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+        if self.parent_fd >= 0:
+            os.close(self.parent_fd)
+            self.parent_fd = -1
+
+    def __enter__(self) -> "ConfigDirectory":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+@dataclass(frozen=True)
+class ProjectConfigSnapshot:
+    committed: ConfigFileSnapshot
+    local: ConfigFileSnapshot
+
+
+@dataclass(frozen=True)
+class EffectiveUrlPolicy:
+    max_size: int
+    max_size_source: str
+    allow_private: bool
+    allow_private_source: str
+
+
+def open_config_directory(path: Path) -> ConfigDirectory:
+    managed_path = Path(os.path.abspath(path))
+    if not managed_path.name:
+        raise ConfigError(f"Invalid configuration directory: {path}")
+    parent_path = managed_path.parent
+    parent_descriptor = -1
+    descriptor = -1
+    try:
+        expected_parent = os.stat(parent_path, follow_symlinks=False)
+        parent_descriptor = os.open(parent_path, _CONFIG_DIRECTORY_FLAGS)
+        opened_parent = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(expected_parent.st_mode)
+            or not stat.S_ISDIR(opened_parent.st_mode)
+            or (expected_parent.st_dev, expected_parent.st_ino)
+            != (opened_parent.st_dev, opened_parent.st_ino)
+        ):
+            raise ConfigError(
+                f"{display_path(parent_path)} was replaced while being opened"
+            )
+        expected = os.stat(
+            managed_path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        descriptor = os.open(
+            managed_path.name,
+            _CONFIG_DIRECTORY_FLAGS,
+            dir_fd=parent_descriptor,
+        )
+    except BaseException as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+        if isinstance(error, OSError):
+            raise ConfigError(
+                f"Could not safely open {display_path(managed_path)}: {error}"
+            ) from error
+        raise
+
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(expected.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or (expected.st_dev, expected.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise ConfigError(
+                f"{display_path(managed_path)} was replaced while being opened"
+            )
+        return ConfigDirectory(
+            path=managed_path,
+            fd=descriptor,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+            parent_path=parent_path,
+            parent_fd=parent_descriptor,
+            parent_device=opened_parent.st_dev,
+            parent_inode=opened_parent.st_ino,
+            name=managed_path.name,
+        )
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+        raise
+
+
+def check_config_directory_identity(directory: ConfigDirectory) -> None:
+    try:
+        opened_parent = os.fstat(directory.parent_fd)
+        current_parent = os.stat(directory.parent_path, follow_symlinks=False)
+        opened = os.fstat(directory.fd)
+        current = os.stat(
+            directory.name,
+            dir_fd=directory.parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise ConfigError(
+            f"{display_path(directory.path)} changed while applying command; "
+            "managed project directory is no longer current"
+        ) from error
+    if (
+        not stat.S_ISDIR(opened_parent.st_mode)
+        or not stat.S_ISDIR(current_parent.st_mode)
+        or (opened_parent.st_dev, opened_parent.st_ino)
+        != (directory.parent_device, directory.parent_inode)
+        or (current_parent.st_dev, current_parent.st_ino)
+        != (directory.parent_device, directory.parent_inode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or (opened.st_dev, opened.st_ino) != (directory.device, directory.inode)
+        or (current.st_dev, current.st_ino) != (directory.device, directory.inode)
+    ):
+        raise ConfigError(
+            f"{display_path(directory.path)} changed while applying command; "
+            "managed project directory is no longer current"
+        )
+
+
+def read_config_snapshot(
+    directory: ConfigDirectory,
+    name: str,
+) -> ConfigFileSnapshot:
+    if not name or Path(name).name != name or name in {".", ".."}:
+        raise ConfigError(f"Invalid configuration filename: {name!r}")
+    try:
+        descriptor = os.open(
+            name,
+            _CONFIG_FILE_FLAGS,
+            dir_fd=directory.fd,
+        )
+    except FileNotFoundError:
+        return ConfigFileSnapshot(name, False, None, None, None, None, None)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            message = "must be a regular file, not a symlink"
+        else:
+            message = f"could not be opened safely: {error}"
+        raise ConfigError(f"{display_path(directory.path / name)} {message}") from error
+
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ConfigError(
+                f"{display_path(directory.path / name)} must be a regular file"
+            )
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        contents = b"".join(chunks)
+        return ConfigFileSnapshot(
+            name=name,
+            exists=True,
+            mode=stat.S_IMODE(metadata.st_mode),
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            bytes=contents,
+            digest=hashlib.sha256(contents).hexdigest(),
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _same_config_snapshot(
+    current: ConfigFileSnapshot,
+    expected: ConfigFileSnapshot,
+) -> bool:
+    return (
+        current.exists == expected.exists
+        and current.mode == expected.mode
+        and current.device == expected.device
+        and current.inode == expected.inode
+        and current.bytes == expected.bytes
+        and current.digest == expected.digest
+    )
+
+
+def _same_config_identity(
+    current: ConfigFileSnapshot,
+    expected: ConfigFileSnapshot,
+) -> bool:
+    return (
+        current.exists
+        and expected.exists
+        and current.device == expected.device
+        and current.inode == expected.inode
+    )
+
+
+def classify_exchange_state(
+    *,
+    target: ConfigFileSnapshot,
+    temporary: ConfigFileSnapshot,
+    staged: ConfigFileSnapshot,
+    expected: ConfigFileSnapshot,
+) -> Literal["intact", "target_changed", "temporary_changed", "both_changed"]:
+    target_matches = _same_config_snapshot(target, staged)
+    temporary_matches = _same_config_snapshot(temporary, expected)
+    if target_matches and temporary_matches:
+        return "intact"
+    if temporary_matches:
+        return "target_changed"
+    if target_matches:
+        return "temporary_changed"
+    return "both_changed"
+
+
+def _check_config_snapshots(
+    directory: ConfigDirectory,
+    snapshots: tuple[ConfigFileSnapshot, ...],
+) -> None:
+    for expected in snapshots:
+        try:
+            current = read_config_snapshot(directory, expected.name)
+        except (ConfigError, OSError) as error:
+            raise ConfigError(
+                f"{display_path(directory.path / expected.name)} "
+                f"{CONFIG_WRITE_RACE_ERROR}"
+            ) from error
+        if not _same_config_snapshot(current, expected):
+            raise ConfigError(
+                f"{display_path(directory.path / expected.name)} "
+                f"{CONFIG_WRITE_RACE_ERROR}"
+            )
+
+
+def project_config_snapshot(
+    directory: ConfigDirectory,
+    kind: str,
+) -> ProjectConfigSnapshot:
+    if kind == "pack":
+        committed_name, local_name = "pack.yaml", "pack.local.yaml"
+    elif kind == "template":
+        committed_name, local_name = "template.yaml", "template.local.yaml"
+    else:
+        raise ConfigError(f"Unsupported project kind: {kind}")
+    return ProjectConfigSnapshot(
+        committed=read_config_snapshot(directory, committed_name),
+        local=read_config_snapshot(directory, local_name),
+    )
+
+
+def renameat2(
+    old_dir_fd: int,
+    old_name: str,
+    new_dir_fd: int,
+    new_name: str,
+    flags: int,
+) -> None:
+    if sys.platform != "linux":
+        raise OSError(errno.ENOTSUP, "atomic config rename is unavailable")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as error:
+        raise OSError(errno.ENOTSUP, "atomic config rename is unavailable") from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        old_dir_fd,
+        os.fsencode(old_name),
+        new_dir_fd,
+        os.fsencode(new_name),
+        flags,
+    ) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), new_name)
+
+
+def create_config_temp(
+    directory: ConfigDirectory,
+    target_name: str,
+    mode: int,
+) -> tuple[int, str]:
+    for _ in range(100):
+        name = f".{target_name}.huroshiki-{uuid4().hex}.tmp"
+        try:
+            descriptor = os.open(
+                name,
+                _CONFIG_TEMP_FLAGS,
+                mode,
+                dir_fd=directory.fd,
+            )
+        except FileExistsError:
+            continue
+        return descriptor, name
+    raise ConfigError(f"Could not allocate temporary file for {target_name}")
+
+
+def parse_yaml_snapshot(snapshot: ConfigFileSnapshot) -> dict[str, Any]:
+    if not snapshot.exists:
+        return {}
+    try:
+        value = yaml.safe_load((snapshot.bytes or b"").decode("utf-8"))
+    except (UnicodeError, yaml.YAMLError) as error:
+        raise ConfigError(f"{snapshot.name}: {error}") from error
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(f"{snapshot.name} must contain a YAML mapping")
+    return value
+
+
+def _write_all(descriptor: int, contents: bytes) -> None:
+    view = memoryview(contents)
+    while view:
+        written = os.write(descriptor, view)
+        if written == 0:
+            raise OSError(errno.EIO, "short write while creating config temporary")
+        view = view[written:]
+
+
+def _config_artifact_name(target_name: str, label: str) -> str:
+    return f".{target_name}.huroshiki-{uuid4().hex}.{label}"
+
+
+def _create_config_recovery_link(
+    directory: ConfigDirectory,
+    source_name: str,
+    target_name: str,
+    label: str,
+) -> str:
+    for _ in range(100):
+        recovery_name = _config_artifact_name(target_name, label)
+        try:
+            os.link(
+                source_name,
+                recovery_name,
+                src_dir_fd=directory.fd,
+                dst_dir_fd=directory.fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            continue
+        os.fsync(directory.fd)
+        return recovery_name
+    raise ConfigError(f"Could not allocate recovery link for {target_name}")
+
+
+def _create_config_recovery_copy(
+    directory: ConfigDirectory,
+    snapshot: ConfigFileSnapshot,
+    target_name: str,
+    label: str,
+) -> str:
+    mode = snapshot.mode if snapshot.mode is not None else 0o600
+    for _ in range(100):
+        recovery_name = _config_artifact_name(target_name, label)
+        try:
+            descriptor = os.open(
+                recovery_name,
+                _CONFIG_TEMP_FLAGS,
+                mode,
+                dir_fd=directory.fd,
+            )
+        except FileExistsError:
+            continue
+        try:
+            _write_all(descriptor, snapshot.bytes or b"")
+            os.fchmod(descriptor, mode)
+            os.fsync(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            _unlink_config_artifact(directory, recovery_name)
+            raise
+        os.close(descriptor)
+        os.fsync(directory.fd)
+        return recovery_name
+    raise ConfigError(f"Could not allocate recovery copy for {target_name}")
+
+
+def _unlink_config_artifact(directory: ConfigDirectory, name: str | None) -> None:
+    if name is None:
+        return
+    try:
+        os.unlink(name, dir_fd=directory.fd)
+    except FileNotFoundError:
+        pass
+
+
+def _link_config_artifact_noreplace(
+    directory: ConfigDirectory,
+    source_name: str,
+    target_name: str,
+) -> None:
+    os.link(
+        source_name,
+        target_name,
+        src_dir_fd=directory.fd,
+        dst_dir_fd=directory.fd,
+        follow_symlinks=False,
+    )
+
+
+def _cleanup_committed_config_artifacts(
+    directory: ConfigDirectory,
+    names: tuple[str | None, ...],
+) -> None:
+    errors: list[str] = []
+    for name in names:
+        if name is None:
+            continue
+        try:
+            os.unlink(name, dir_fd=directory.fd)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            errors.append(f"{name}: {error}")
+    try:
+        os.fsync(directory.fd)
+    except OSError as error:
+        errors.append(f"directory fsync: {error}")
+    if errors:
+        try:
+            print(
+                "warning: configuration committed but recovery cleanup was incomplete: "
+                + "; ".join(errors),
+                file=sys.stderr,
+            )
+        except BaseException:
+            pass
+
+
+def _config_recovery_location(directory: ConfigDirectory, name: str) -> str:
+    return (
+        f"{name} in pinned directory dev={directory.device} inode={directory.inode}"
+    )
+
+
+def _config_snapshot_role(
+    snapshot: ConfigFileSnapshot,
+    *,
+    expected: ConfigFileSnapshot,
+    staged: ConfigFileSnapshot,
+) -> str:
+    if not snapshot.exists:
+        return "missing"
+    if _same_config_snapshot(snapshot, expected):
+        return "original"
+    if _same_config_snapshot(snapshot, staged):
+        return "staged"
+    return "external"
+
+
+def _write_yaml_atomic(
+    directory: ConfigDirectory,
+    value: dict[str, Any],
+    *,
+    expected_snapshot: ConfigFileSnapshot,
+    guard_snapshots: tuple[ConfigFileSnapshot, ...],
+) -> None:
+    check_config_directory_identity(directory)
+    serialized = yaml.safe_dump(
+        value,
+        sort_keys=False,
+        allow_unicode=True,
+    ).encode("utf-8")
+    mode = expected_snapshot.mode if expected_snapshot.mode is not None else 0o600
+    descriptor, temporary_name = create_config_temp(
+        directory,
+        expected_snapshot.name,
+        mode,
+    )
+    staged_recovery_name: str | None = None
+    exchanged_recovery_name: str | None = None
+    preserve_artifacts = False
+    try:
+        try:
+            _write_all(descriptor, serialized)
+            os.fchmod(descriptor, mode)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        staged_snapshot = read_config_snapshot(directory, temporary_name)
+        staged_recovery_name = _create_config_recovery_copy(
+            directory,
+            staged_snapshot,
+            expected_snapshot.name,
+            "staged",
+        )
+
+        check_config_directory_identity(directory)
+        _check_config_snapshots(directory, guard_snapshots)
+        companion_snapshots = tuple(
+            snapshot
+            for snapshot in guard_snapshots
+            if snapshot.name != expected_snapshot.name
+        )
+        if not expected_snapshot.exists:
+            try:
+                check_config_directory_identity(directory)
+                renameat2(
+                    directory.fd,
+                    temporary_name,
+                    directory.fd,
+                    expected_snapshot.name,
+                    RENAME_NOREPLACE,
+                )
+                check_config_directory_identity(directory)
+                published = read_config_snapshot(
+                    directory,
+                    expected_snapshot.name,
+                )
+                if not _same_config_snapshot(published, staged_snapshot):
+                    raise ConfigError(
+                        f"{display_path(directory.path / expected_snapshot.name)} "
+                        "temporary configuration changed before publication"
+                    )
+                _check_config_snapshots(directory, companion_snapshots)
+                check_config_directory_identity(directory)
+                os.fsync(directory.fd)
+                check_config_directory_identity(directory)
+                preserve_artifacts = True
+                _cleanup_committed_config_artifacts(
+                    directory,
+                    (staged_recovery_name,),
+                )
+                return
+            except BaseException as error:
+                preserve_artifacts = True
+                temporary = read_config_snapshot(directory, temporary_name)
+                if temporary.exists and _same_config_identity(
+                    temporary,
+                    staged_snapshot,
+                ):
+                    preserve_artifacts = False
+                    if isinstance(error, FileExistsError):
+                        raise ConfigError(
+                            f"{display_path(directory.path / expected_snapshot.name)} "
+                            f"{CONFIG_WRITE_RACE_ERROR}"
+                        ) from error
+                    raise
+                canonical = read_config_snapshot(directory, expected_snapshot.name)
+                rollback_name: str | None = None
+                if _same_config_identity(canonical, staged_snapshot):
+                    rollback_name = _config_artifact_name(
+                        expected_snapshot.name,
+                        "rollback",
+                    )
+                    try:
+                        renameat2(
+                            directory.fd,
+                            expected_snapshot.name,
+                            directory.fd,
+                            rollback_name,
+                            RENAME_NOREPLACE,
+                        )
+                        moved = read_config_snapshot(directory, rollback_name)
+                        if _same_config_identity(moved, staged_snapshot):
+                            _unlink_config_artifact(directory, rollback_name)
+                            rollback_name = None
+                        else:
+                            try:
+                                _link_config_artifact_noreplace(
+                                    directory,
+                                    rollback_name,
+                                    expected_snapshot.name,
+                                )
+                            except FileExistsError:
+                                pass
+                        os.fsync(directory.fd)
+                    except BaseException as rollback_error:
+                        os.fsync(directory.fd)
+                        detail = (
+                            _config_recovery_location(directory, rollback_name)
+                            if rollback_name is not None
+                            else "the pinned configuration directory"
+                        )
+                        raise ConfigError(
+                            f"{error}; rollback failed: {rollback_error}; recovery "
+                            f"artifacts remain in {detail}"
+                        ) from error
+                if not isinstance(error, Exception):
+                    raise
+                raise ConfigError(
+                    f"{error}; staged configuration retained at "
+                    f"{_config_recovery_location(directory, staged_recovery_name)}"
+                ) from error
+
+        try:
+            check_config_directory_identity(directory)
+            renameat2(
+                directory.fd,
+                temporary_name,
+                directory.fd,
+                expected_snapshot.name,
+                RENAME_EXCHANGE,
+            )
+            check_config_directory_identity(directory)
+            published = read_config_snapshot(directory, expected_snapshot.name)
+            if not _same_config_snapshot(published, staged_snapshot):
+                raise ConfigError(
+                    f"{display_path(directory.path / expected_snapshot.name)} "
+                    "temporary configuration changed before publication"
+                )
+            exchanged = read_config_snapshot(directory, temporary_name)
+            if not _same_config_snapshot(exchanged, expected_snapshot):
+                raise ConfigError(
+                    f"{display_path(directory.path / expected_snapshot.name)} "
+                    f"{CONFIG_WRITE_RACE_ERROR}"
+                )
+            _check_config_snapshots(directory, companion_snapshots)
+            check_config_directory_identity(directory)
+            os.fsync(directory.fd)
+            check_config_directory_identity(directory)
+            preserve_artifacts = True
+            _cleanup_committed_config_artifacts(
+                directory,
+                (temporary_name, staged_recovery_name),
+            )
+        except BaseException as error:
+            preserve_artifacts = True
+            temporary = read_config_snapshot(directory, temporary_name)
+            if not temporary.exists:
+                preserve_artifacts = False
+                os.fsync(directory.fd)
+                raise
+            if _same_config_identity(temporary, staged_snapshot):
+                preserve_artifacts = False
+                raise
+            state = ExchangeState(
+                target=read_config_snapshot(directory, expected_snapshot.name),
+                temporary=temporary,
+            )
+            exchange_state = classify_exchange_state(
+                target=state.target,
+                temporary=state.temporary,
+                staged=staged_snapshot,
+                expected=expected_snapshot,
+            )
+            rollback_name: str | None = None
+            if exchange_state == "intact":
+                rollback_name = _config_artifact_name(
+                    expected_snapshot.name,
+                    "rollback",
+                )
+                try:
+                    renameat2(
+                        directory.fd,
+                        expected_snapshot.name,
+                        directory.fd,
+                        rollback_name,
+                        RENAME_NOREPLACE,
+                    )
+                    moved = read_config_snapshot(directory, rollback_name)
+                    if _same_config_identity(moved, staged_snapshot):
+                        exchanged_recovery_name = _create_config_recovery_link(
+                            directory,
+                            temporary_name,
+                            expected_snapshot.name,
+                            "exchanged",
+                        )
+                        renameat2(
+                            directory.fd,
+                            temporary_name,
+                            directory.fd,
+                            expected_snapshot.name,
+                            RENAME_NOREPLACE,
+                        )
+                        _unlink_config_artifact(directory, rollback_name)
+                        rollback_name = None
+                    else:
+                        try:
+                            _link_config_artifact_noreplace(
+                                directory,
+                                rollback_name,
+                                expected_snapshot.name,
+                            )
+                        except FileExistsError:
+                            pass
+                    os.fsync(directory.fd)
+                except BaseException as rollback_error:
+                    os.fsync(directory.fd)
+                    detail = (
+                        _config_recovery_location(directory, rollback_name)
+                        if rollback_name is not None
+                        else "the pinned configuration directory"
+                    )
+                    raise ConfigError(
+                        f"{error}; rollback failed: {rollback_error}; original and "
+                        f"staged recovery artifacts remain in {detail}"
+                    ) from error
+            else:
+                os.fsync(directory.fd)
+            if not isinstance(error, Exception):
+                raise
+            canonical_after = read_config_snapshot(
+                directory,
+                expected_snapshot.name,
+            )
+            canonical_role = _config_snapshot_role(
+                canonical_after,
+                expected=expected_snapshot,
+                staged=staged_snapshot,
+            )
+            temporary_after = read_config_snapshot(directory, temporary_name)
+            temporary_detail = (
+                "; exchanged recovery is at "
+                f"{_config_recovery_location(directory, temporary_name)}"
+                if temporary_after.exists
+                else ""
+            )
+            exchanged_detail = (
+                "; exchanged recovery is at "
+                f"{_config_recovery_location(directory, exchanged_recovery_name)}"
+                if exchanged_recovery_name is not None
+                else ""
+            )
+            raise ConfigError(
+                f"{error}; {canonical_role} configuration remains at the canonical "
+                f"path{temporary_detail}{exchanged_detail}; staged recovery is at "
+                f"{_config_recovery_location(directory, staged_recovery_name)}"
+            ) from error
+    finally:
+        if not preserve_artifacts:
+            _unlink_config_artifact(directory, temporary_name)
+            _unlink_config_artifact(directory, staged_recovery_name)
+            _unlink_config_artifact(directory, exchanged_recovery_name)
 
 
 def _project_lock_root(project_key: str) -> Path:
@@ -189,13 +979,10 @@ def load_yaml(path: Path) -> dict[str, Any]:
     return value
 
 
-def _write_yaml_atomic(path: Path, value: dict[str, Any]) -> None:
-    temporary = path.with_name(f".{path.name}.huroshiki-tmp")
-    temporary.write_text(
-        yaml.safe_dump(value, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+def _normalize_project_text(field: str, value: str) -> str:
+    normalized = value.strip()
+    validate_project_text(field, normalized)
+    return normalized
 
 
 def merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -206,6 +993,86 @@ def merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
         else:
             result[key] = deepcopy(value)
     return result
+
+
+def _reject_unsafe_remote_text(field: str, value: str) -> str:
+    normalized = value.strip()
+    validate_project_text(field, normalized)
+    if normalized != value or any(character.isspace() for character in normalized):
+        raise ConfigError(f"{field} must not contain whitespace")
+    return normalized
+
+
+def validate_ssh_target(value: str) -> str:
+    target = _reject_unsafe_remote_text("SSH target", value)
+    if target.startswith("-"):
+        raise ConfigError("SSH target must not begin with '-'")
+    if "/" in target:
+        raise ConfigError("SSH target must not contain '/'")
+    if target.count("@") > 1:
+        raise ConfigError("SSH target must contain at most one '@'")
+    user: str | None = None
+    host = target
+    if "@" in target:
+        user, host = target.split("@", 1)
+        if not user or not SSH_USER_RE.fullmatch(user):
+            raise ConfigError("SSH target user is empty or invalid")
+    if not host:
+        raise ConfigError("SSH target host must be non-empty")
+    if host.startswith("[") or host.endswith("]"):
+        if not (host.startswith("[") and host.endswith("]")):
+            raise ConfigError("SSH target has malformed IPv6 brackets")
+        address = host[1:-1]
+        try:
+            ipaddress.IPv6Address(address)
+        except ValueError as error:
+            raise ConfigError("SSH target has malformed IPv6 brackets") from error
+    elif any(character in host for character in "[]:"):
+        raise ConfigError("SSH target must bracket IPv6 addresses and contain no command")
+    elif any(
+        not label or len(label) > 63 or not SSH_HOST_LABEL_RE.fullmatch(label)
+        for label in host.split(".")
+    ):
+        raise ConfigError("SSH target host is invalid")
+    return f"{user}@{host}" if user is not None else host
+
+
+def validate_remote_stack_dir(value: str) -> str:
+    stack_dir = value.strip()
+    validate_project_text("Stack directory", stack_dir)
+    if stack_dir != value:
+        raise ConfigError("Stack directory must not have surrounding whitespace")
+    if not stack_dir.startswith("/") or stack_dir == "/":
+        raise ConfigError("Stack directory must be a non-root POSIX absolute path")
+    if any(part in {".", ".."} for part in stack_dir.split("/")):
+        raise ConfigError("Stack directory must not contain '.' or '..' components")
+    if PurePosixPath(stack_dir).as_posix() != stack_dir:
+        raise ConfigError("Stack directory must be a normalized POSIX absolute path")
+    return stack_dir
+
+
+def validate_compose_service(value: str) -> str:
+    service = value.strip()
+    validate_project_text("Compose service", service)
+    if service != value:
+        raise ConfigError("Compose service must not have surrounding whitespace")
+    if not COMPOSE_SERVICE_RE.fullmatch(service):
+        raise ConfigError(
+            "Compose service must use only letters, digits, '_', '.', or '-' and "
+            "start with a letter or digit"
+        )
+    return service
+
+
+def validate_url_policy(config: dict[str, Any], context: str) -> None:
+    value = config.get("url_max_jar_size_bytes")
+    if "url_max_jar_size_bytes" in config and (
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+    ):
+        raise ConfigError(f"{context}: url_max_jar_size_bytes must be a positive integer")
+    allow_private = config.get("url_allow_private_networks")
+    if "url_allow_private_networks" in config and not isinstance(allow_private, bool):
+        raise ConfigError(f"{context}: url_allow_private_networks must be a boolean")
 
 
 def validate_local_config(kind: str, path: Path, local: dict[str, Any]) -> None:
@@ -223,20 +1090,7 @@ def validate_local_config(kind: str, path: Path, local: dict[str, Any]) -> None:
                 f"{context}: unsupported machine-local key {key!r}; "
                 "allowed keys: url_allow_private_networks, url_max_jar_size_bytes"
             )
-        value = local.get("url_max_jar_size_bytes")
-        if "url_max_jar_size_bytes" in local and (
-            isinstance(value, bool) or not isinstance(value, int) or value <= 0
-        ):
-            raise ConfigError(
-                f"{context}: url_max_jar_size_bytes must be a positive integer"
-            )
-        allow_private = local.get("url_allow_private_networks")
-        if "url_allow_private_networks" in local and not isinstance(
-            allow_private, bool
-        ):
-            raise ConfigError(
-                f"{context}: url_allow_private_networks must be a boolean"
-            )
+        validate_url_policy(local, context)
         return
 
     if kind != "pack":
@@ -266,19 +1120,25 @@ def validate_local_config(kind: str, path: Path, local: dict[str, Any]) -> None:
                 )
             if key == "distribution" and nested_key == "rsync_target":
                 try:
-                    validate_rsync_target(nested_value.strip())
+                    validate_rsync_target(nested_value)
                 except ValueError as error:
                     raise ConfigError(f"{context}: {error}") from error
-    value = local.get("url_max_jar_size_bytes")
-    if "url_max_jar_size_bytes" in local and (
-        isinstance(value, bool) or not isinstance(value, int) or value <= 0
-    ):
-        raise ConfigError(
-            f"{context}: url_max_jar_size_bytes must be a positive integer"
-        )
-    allow_private = local.get("url_allow_private_networks")
-    if "url_allow_private_networks" in local and not isinstance(allow_private, bool):
-        raise ConfigError(f"{context}: url_allow_private_networks must be a boolean")
+            elif key == "minecraft_server" and nested_key == "ssh_host":
+                try:
+                    validate_ssh_target(nested_value)
+                except ConfigError as error:
+                    raise ConfigError(f"{context}: {error}") from error
+            elif key == "minecraft_server" and nested_key == "stack_dir":
+                try:
+                    validate_remote_stack_dir(nested_value)
+                except ConfigError as error:
+                    raise ConfigError(f"{context}: {error}") from error
+            elif key == "minecraft_server" and nested_key == "service":
+                try:
+                    validate_compose_service(nested_value)
+                except ConfigError as error:
+                    raise ConfigError(f"{context}: {error}") from error
+    validate_url_policy(local, context)
 
 
 def ensure_safe_state_path(
@@ -372,6 +1232,119 @@ def get_pack_root(pack_id: str, *, must_exist: bool = True) -> Path:
     if must_exist and not root.is_dir():
         raise ConfigError(f"Unknown pack: {pack_id}")
     return root
+
+
+def _prospective_text(config: dict[str, Any], key: str, context: str) -> str:
+    value = config.get(key)
+    if not isinstance(value, str):
+        raise ConfigError(f"{context}: {key} must be a non-empty string")
+    normalized = value.strip()
+    validate_project_text(key.replace("_", " ").title(), normalized)
+    return normalized
+
+
+def _validate_prospective_deployment(config: dict[str, Any], context: str) -> None:
+    errors: list[str] = []
+    try:
+        distribution = require_mapping(config, "distribution", context)
+    except ConfigError as error:
+        errors.append(str(error))
+    else:
+        try:
+            target = distribution.get("rsync_target")
+            if not isinstance(target, str) or not target:
+                raise ConfigError(
+                    f"{context}.distribution.rsync_target must be a non-empty string"
+                )
+            validate_rsync_target(target)
+        except (ConfigError, ValueError) as error:
+            errors.append(str(error))
+    try:
+        server = require_mapping(config, "minecraft_server", context)
+    except ConfigError as error:
+        errors.append(str(error))
+    else:
+        validators = {
+            "ssh_host": validate_ssh_target,
+            "stack_dir": validate_remote_stack_dir,
+            "service": validate_compose_service,
+        }
+        for field, validator in validators.items():
+            try:
+                raw_value = server.get(field)
+                if not isinstance(raw_value, str) or not raw_value.strip():
+                    raise ConfigError(
+                        f"{context}.minecraft_server.{field} must be a non-empty string"
+                    )
+                validator(raw_value)
+            except ConfigError as error:
+                errors.append(str(error))
+    if errors:
+        raise ConfigError("; ".join(errors))
+
+
+def prospective_pack_config(
+    pack_id: str,
+    committed: dict[str, Any],
+    local: dict[str, Any],
+) -> dict[str, Any]:
+    committed_path = Path("packs") / pack_id / "pack.yaml"
+    local_path = Path("packs") / pack_id / "pack.local.yaml"
+    validate_local_config("pack", local_path, local)
+    if "url_allow_private_networks" in committed:
+        raise ConfigError(
+            f"{committed_path}: url_allow_private_networks is machine-local only; "
+            "move it to pack.local.yaml"
+        )
+    if committed.get("id") != pack_id:
+        raise ConfigError(f"{committed_path} must contain id: {pack_id}")
+    config = merge(committed, local)
+    _prospective_text(config, "display_name", str(committed_path))
+    if not isinstance(config.get("enabled"), bool):
+        raise ConfigError(f"{committed_path}: enabled must be a boolean")
+    validate_url_policy(config, str(committed_path))
+    _validate_prospective_deployment(config, str(committed_path))
+    return config
+
+
+def prospective_template_config(
+    template_id: str,
+    committed: dict[str, Any],
+    local: dict[str, Any],
+) -> dict[str, Any]:
+    committed_path = Path("templates") / template_id / "template.yaml"
+    local_path = Path("templates") / template_id / "template.local.yaml"
+    validate_local_config("template", local_path, local)
+    if "url_allow_private_networks" in committed:
+        raise ConfigError(
+            f"{committed_path}: url_allow_private_networks is machine-local only; "
+            "move it to template.local.yaml"
+        )
+    if committed.get("id") != template_id:
+        raise ConfigError(f"{committed_path} must contain id: {template_id}")
+    for key in (
+        "display_name",
+        "minecraft",
+        "loader",
+        "reference_loader_version",
+    ):
+        _prospective_text(committed, key, str(committed_path))
+    if not isinstance(committed.get("enabled"), bool):
+        raise ConfigError(f"{committed_path}: enabled must be a boolean")
+    loader = str(committed["loader"]).strip().lower()
+    if loader not in LOADER_FLAGS:
+        raise ConfigError(
+            f"{committed_path}: loader must be one of "
+            f"{', '.join(sorted(LOADER_FLAGS))}"
+        )
+    mods = committed.get("mods")
+    if not isinstance(mods, list):
+        raise ConfigError(f"{committed_path}: mods must be a list")
+    for index, entry in enumerate(mods):
+        normalize_template_mod(entry, f"{committed_path}: mods[{index}]")
+    config = merge(committed, local)
+    validate_url_policy(config, str(committed_path))
+    return config
 
 
 def load_pack_config(pack_id: str) -> dict[str, Any]:
@@ -1227,6 +2200,16 @@ def _normalize_bool_flag(value: str) -> bool:
     raise argparse.ArgumentTypeError("must be one of true/false, yes/no, on/off, 1/0")
 
 
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def cmd_show_deployment(args: argparse.Namespace) -> int:
     config = load_pack_config(args.pack)
     print(f"distribution:")
@@ -1250,35 +2233,100 @@ def cmd_set_deployment(args: argparse.Namespace) -> int:
             "set-deployment requires at least one of --rsync-target, --ssh-host, --stack-dir, or --service"
         )
 
+    rsync_target = None
+    if args.rsync_target is not None:
+        rsync_target = _normalize_project_text("Rsync target", args.rsync_target)
+        try:
+            validate_rsync_target(rsync_target)
+        except ValueError as error:
+            raise ConfigError(str(error)) from error
+    ssh_host = validate_ssh_target(args.ssh_host) if args.ssh_host is not None else None
+    stack_dir = (
+        validate_remote_stack_dir(args.stack_dir)
+        if args.stack_dir is not None
+        else None
+    )
+    service = (
+        validate_compose_service(args.service)
+        if args.service is not None
+        else None
+    )
+
     with ProjectLock(f"pack:{args.pack}", "set deployment settings"):
         root = get_pack_root(args.pack)
         local_path = root / "pack.local.yaml"
-        local = load_yaml(local_path)
+        with open_config_directory(root) as directory:
+            snapshot = project_config_snapshot(directory, "pack")
+            committed = parse_yaml_snapshot(snapshot.committed)
+            local = parse_yaml_snapshot(snapshot.local)
+            if rsync_target is not None:
+                local.setdefault("distribution", {})["rsync_target"] = rsync_target
 
-        if args.rsync_target is not None:
-            local.setdefault("distribution", {})["rsync_target"] = args.rsync_target
-
-        if args.ssh_host is not None or args.stack_dir is not None or args.service is not None:
-            existing = local.setdefault("minecraft_server", {})
-            if args.ssh_host is not None:
-                existing["ssh_host"] = args.ssh_host
-            if args.stack_dir is not None:
-                existing["stack_dir"] = args.stack_dir
-            if args.service is not None:
-                existing["service"] = args.service
-
-        validate_local_config("pack", local_path, local)
-        _write_yaml_atomic(local_path, local)
+            if ssh_host is not None or stack_dir is not None or service is not None:
+                existing = local.setdefault("minecraft_server", {})
+                if ssh_host is not None:
+                    existing["ssh_host"] = ssh_host
+                if stack_dir is not None:
+                    existing["stack_dir"] = stack_dir
+                if service is not None:
+                    existing["service"] = service
+            prospective_pack_config(args.pack, committed, local)
+            _write_yaml_atomic(
+                directory,
+                local,
+                expected_snapshot=snapshot.local,
+                guard_snapshots=(snapshot.committed, snapshot.local),
+            )
 
     print(f"Updated {display_path(local_path)}")
     return 0
 
 
 def cmd_show_url_policy(args: argparse.Namespace) -> int:
-    config = load_project_config(args.kind, args.project)
-    print(f"url_max_jar_size_bytes: {config.get('url_max_jar_size_bytes', None)}")
-    print(f"url_allow_private_networks: {config.get('url_allow_private_networks', None)}")
+    policy = effective_url_policy(args.kind, args.project)
+    print(f"url_max_jar_size_bytes: {policy.max_size}")
+    print(f"url_max_jar_size_source: {policy.max_size_source}")
+    print(f"url_allow_private_networks: {str(policy.allow_private).lower()}")
+    print(f"url_allow_private_networks_source: {policy.allow_private_source}")
     return 0
+
+
+def effective_url_policy(kind: str, project: str) -> EffectiveUrlPolicy:
+    root = get_project_root(kind, project)
+    if kind == "template":
+        reject_legacy_template_source(root)
+    committed_name = "pack.yaml" if kind == "pack" else "template.yaml"
+    local_name = "pack.local.yaml" if kind == "pack" else "template.local.yaml"
+    committed = load_yaml(root / committed_name)
+    local = load_yaml(root / local_name)
+    config = (
+        prospective_pack_config(project, committed, local)
+        if kind == "pack"
+        else prospective_template_config(project, committed, local)
+    )
+    max_size_source = (
+        "local"
+        if "url_max_jar_size_bytes" in local
+        else "committed"
+        if "url_max_jar_size_bytes" in committed
+        else "default"
+    )
+    allow_private_source = (
+        "local"
+        if "url_allow_private_networks" in local
+        else "committed"
+        if "url_allow_private_networks" in committed
+        else "default"
+    )
+    return EffectiveUrlPolicy(
+        max_size=config.get(
+            "url_max_jar_size_bytes",
+            DEFAULT_URL_MAX_JAR_SIZE_BYTES,
+        ),
+        max_size_source=max_size_source,
+        allow_private=config.get("url_allow_private_networks", False),
+        allow_private_source=allow_private_source,
+    )
 
 
 def cmd_set_url_policy(args: argparse.Namespace) -> int:
@@ -1286,25 +2334,39 @@ def cmd_set_url_policy(args: argparse.Namespace) -> int:
         raise ConfigError(
             "set-url-policy requires --max-size and/or --allow-private-networks"
         )
+    if args.max_size is not None and (
+        isinstance(args.max_size, bool)
+        or not isinstance(args.max_size, int)
+        or args.max_size <= 0
+    ):
+        raise ConfigError("url_max_jar_size_bytes must be a positive integer")
 
     kind = args.kind
     project = args.project
 
     with ProjectLock(f"{kind}:{project}", "set URL policy"):
-        if kind == "pack":
-            root = get_pack_root(project)
-            local_path = root / "pack.local.yaml"
-        else:
-            root = get_template_root(project)
-            local_path = root / "template.local.yaml"
-
-        local = load_yaml(local_path)
-        if args.max_size is not None:
-            local["url_max_jar_size_bytes"] = args.max_size
-        if args.allow_private_networks is not None:
-            local["url_allow_private_networks"] = args.allow_private_networks
-        validate_local_config(kind, local_path, local)
-        _write_yaml_atomic(local_path, local)
+        root = get_project_root(kind, project)
+        local_path = root / (
+            "pack.local.yaml" if kind == "pack" else "template.local.yaml"
+        )
+        with open_config_directory(root) as directory:
+            snapshot = project_config_snapshot(directory, kind)
+            committed = parse_yaml_snapshot(snapshot.committed)
+            local = parse_yaml_snapshot(snapshot.local)
+            if args.max_size is not None:
+                local["url_max_jar_size_bytes"] = args.max_size
+            if args.allow_private_networks is not None:
+                local["url_allow_private_networks"] = args.allow_private_networks
+            if kind == "pack":
+                prospective_pack_config(project, committed, local)
+            else:
+                prospective_template_config(project, committed, local)
+            _write_yaml_atomic(
+                directory,
+                local,
+                expected_snapshot=snapshot.local,
+                guard_snapshots=(snapshot.committed, snapshot.local),
+            )
 
     print(f"Updated {display_path(local_path)}")
     return 0
@@ -1317,16 +2379,25 @@ def cmd_show_template_loader_version(args: argparse.Namespace) -> int:
 
 
 def cmd_set_template_loader_version(args: argparse.Namespace) -> int:
-    validate_project_text("Loader version", args.loader_version)
-    reference_loader_version = args.loader_version.strip()
+    reference_loader_version = _normalize_project_text(
+        "Loader version", args.loader_version
+    )
 
     with ProjectLock(f"template:{args.template}", "set template loader version"):
         root = get_template_root(args.template)
         path = root / "template.yaml"
-        config = load_yaml(path)
-        config["reference_loader_version"] = reference_loader_version
-        _write_yaml_atomic(path, config)
-        load_template_config(args.template)
+        with open_config_directory(root) as directory:
+            snapshot = project_config_snapshot(directory, "template")
+            committed = parse_yaml_snapshot(snapshot.committed)
+            local = parse_yaml_snapshot(snapshot.local)
+            committed["reference_loader_version"] = reference_loader_version
+            prospective_template_config(args.template, committed, local)
+            _write_yaml_atomic(
+                directory,
+                committed,
+                expected_snapshot=snapshot.committed,
+                guard_snapshots=(snapshot.committed, snapshot.local),
+            )
 
     print(f"Updated {display_path(root / 'template.yaml')}")
     return 0
@@ -1524,25 +2595,10 @@ def validate_url_size_limit(
 def validate_deployment_config(
     config: dict[str, Any], path: Path, errors: list[str]
 ) -> None:
-    sections = {
-        "distribution": ("rsync_target",),
-        "minecraft_server": ("ssh_host", "stack_dir", "service"),
-    }
-    for section, fields in sections.items():
-        try:
-            mapping = require_mapping(config, section, display_path(path))
-        except ConfigError as error:
-            errors.append(f"{display_path(path)}: {error}")
-            continue
-        for field in fields:
-            try:
-                value = require_text(mapping, field, f"{display_path(path)}.{section}")
-                if section == "distribution" and field == "rsync_target":
-                    validate_rsync_target(value)
-            except ConfigError as error:
-                errors.append(f"{display_path(path)}: {error}")
-            except ValueError as error:
-                errors.append(f"{display_path(path)}: {error}")
+    try:
+        _validate_prospective_deployment(config, display_path(path))
+    except ConfigError as error:
+        errors.append(str(error))
 
 
 def validate_packwiz_versions(source: Path, errors: list[str]) -> None:
@@ -2123,11 +3179,11 @@ def cmd_validate_template(args: argparse.Namespace) -> int:
 
 def distribution_target_from_config(config: dict[str, Any], pack_id: str) -> str:
     distribution = require_mapping(config, "distribution", pack_id)
-    target = require_text(
-        distribution,
-        "rsync_target",
-        f"{pack_id}.distribution",
-    )
+    target = distribution.get("rsync_target")
+    if not isinstance(target, str) or not target:
+        raise ConfigError(
+            f"{pack_id}.distribution.rsync_target must be a non-empty string"
+        )
     try:
         return validate_rsync_target(target)
     except ValueError as error:
@@ -2239,10 +3295,18 @@ def minecraft_server_target_from_config(
     config: dict[str, Any], pack_id: str
 ) -> tuple[str, str, str]:
     server = require_mapping(config, "minecraft_server", pack_id)
+    values: dict[str, str] = {}
+    for field in ("ssh_host", "stack_dir", "service"):
+        value = server.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(
+                f"{pack_id}.minecraft_server.{field} must be a non-empty string"
+            )
+        values[field] = value
     return (
-        require_text(server, "ssh_host", f"{pack_id}.minecraft_server"),
-        require_text(server, "stack_dir", f"{pack_id}.minecraft_server"),
-        require_text(server, "service", f"{pack_id}.minecraft_server"),
+        validate_ssh_target(values["ssh_host"]),
+        validate_remote_stack_dir(values["stack_dir"]),
+        validate_compose_service(values["service"]),
     )
 
 
@@ -2331,7 +3395,7 @@ def cmd_deploy_dry_run(args: argparse.Namespace) -> int:
 def cmd_restart(args: argparse.Namespace) -> int:
     host, stack, service = minecraft_server_target(args.pack)
     remote = f"cd {shlex.quote(stack)} && docker compose restart {shlex.quote(service)}"
-    run(["ssh", host, remote])
+    run(["ssh", "--", host, remote])
     return 0
 
 
@@ -2359,7 +3423,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
                 f"cd {shlex.quote(stack)} && docker compose restart "
                 f"{shlex.quote(service)}"
             )
-            run(["ssh", host, remote])
+            run(["ssh", "--", host, remote])
             return 0
         finally:
             discard_deploy_snapshot(snapshot)
@@ -2805,7 +3869,7 @@ def parser() -> argparse.ArgumentParser:
     item = sub.add_parser("set-url-policy")
     item.add_argument("kind", choices=("pack", "template"))
     item.add_argument("project")
-    item.add_argument("--max-size", type=int, dest="max_size")
+    item.add_argument("--max-size", type=_positive_int, dest="max_size")
     item.add_argument(
         "--allow-private-networks",
         type=_normalize_bool_flag,

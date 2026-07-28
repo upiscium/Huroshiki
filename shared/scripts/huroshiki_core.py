@@ -3286,7 +3286,7 @@ def run_project_action(
                 f"cd {shlex.quote(stack)} && docker compose restart "
                 f"{shlex.quote(service)}"
             )
-            packctl.run(["ssh", host, remote])
+            packctl.run(["ssh", "--", host, remote])
             return 0
     except packctl.ConfigError as error:
         raise HuroshikiError(str(error)) from error
@@ -3769,7 +3769,7 @@ def _create_pack_from_templates(
                     loader_version=loader_version,
                 )
             )
-        except (HuroshikiError, OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        except (HuroshikiError, UnicodeError, tomllib.TOMLDecodeError) as error:
             reason = str(error)
             print(f"warning: {entry.name}: {reason}", file=sys.stderr, flush=True)
             resolution_failures.append(
