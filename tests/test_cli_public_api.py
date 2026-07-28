@@ -76,13 +76,335 @@ class PublicCliTest(unittest.TestCase):
     def test_help_exposes_public_commands_and_omits_removed_commands(self) -> None:
         help_text = packctl.parser().format_help()
 
-        for command in ("list-templates", "publish", "serve"):
+        for command in (
+            "list-templates",
+            "publish",
+            "serve",
+            "show-deployment",
+            "set-deployment",
+            "show-url-policy",
+            "set-url-policy",
+            "show-template-loader-version",
+            "set-template-loader-version",
+        ):
             self.assertIn(command, help_text)
         for command in ("migrate-template", "use", "current"):
             self.assertIsNone(re.search(rf"(?:[{{,]){command}(?:[,}}])", help_text))
             with self.subTest(command=command), redirect_stderr(StringIO()):
                 with self.assertRaises(SystemExit):
                     packctl.parser().parse_args([command])
+
+    def test_parser_routes_new_setting_commands(self) -> None:
+        self.assertIs(
+            packctl.parser().parse_args(["show-deployment", "demo"]).func,
+            packctl.cmd_show_deployment,
+        )
+        self.assertIs(
+            packctl.parser().parse_args(["set-deployment", "demo"]).func,
+            packctl.cmd_set_deployment,
+        )
+        self.assertIs(
+            packctl.parser().parse_args(["show-url-policy", "pack", "demo"]).func,
+            packctl.cmd_show_url_policy,
+        )
+        self.assertIs(
+            packctl.parser().parse_args(["show-template-loader-version", "demo"]).func,
+            packctl.cmd_show_template_loader_version,
+        )
+
+    def test_parse_bool_flag_forms_for_url_policy(self) -> None:
+        self.assertTrue(packctl._normalize_bool_flag("yes"))
+        self.assertTrue(packctl._normalize_bool_flag("TRUE"))
+        self.assertTrue(packctl._normalize_bool_flag("1"))
+        self.assertTrue(packctl._normalize_bool_flag("on"))
+        self.assertFalse(packctl._normalize_bool_flag("no"))
+        self.assertFalse(packctl._normalize_bool_flag("FALSE"))
+        self.assertFalse(packctl._normalize_bool_flag("0"))
+        self.assertFalse(packctl._normalize_bool_flag("off"))
+        self.assertIsNone(packctl.parser().parse_args(["set-url-policy", "pack", "demo"]).allow_private_networks)
+        self.assertFalse(
+            packctl.parser()
+            .parse_args(["set-url-policy", "pack", "demo", "--allow-private-networks", "off"])
+            .allow_private_networks
+        )
+
+    def test_set_and_show_deployment_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            pack_root = packs / "demo"
+            pack_root.mkdir(parents=True)
+            (pack_root / "pack.yaml").write_text(
+                "id: demo\ndistribution:\n  rsync_target: origin:/demo\n"
+                "minecraft_server:\n  ssh_host: old\n  stack_dir: /srv/old\n  service: old\n",
+                encoding="utf-8",
+            )
+
+            patches = [
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+            ]
+            for patch_item in patches:
+                patch_item.start()
+
+            try:
+                self.assertIsNotNone(
+                    packctl.ProjectLock
+                )
+                set_args = type(
+                    "Args",
+                    (),
+                    {
+                        "pack": "demo",
+                        "rsync_target": "deploy@example:/srv/demo",
+                        "ssh_host": "example",
+                        "stack_dir": None,
+                        "service": "minecraft",
+                    },
+                )()
+                result = packctl.cmd_set_deployment(set_args)
+                self.assertEqual(result, 0)
+
+                out = StringIO()
+                with redirect_stdout(out):
+                    show_result = packctl.cmd_show_deployment(
+                        type("Args", (), {"pack": "demo"})()
+                    )
+                text = out.getvalue()
+                self.assertEqual(show_result, 0)
+                self.assertIn("rsync_target: deploy@example:/srv/demo", text)
+                self.assertIn("ssh_host: example", text)
+                self.assertIn("service: minecraft", text)
+                local = (pack_root / "pack.local.yaml").read_text(encoding="utf-8")
+                self.assertIn("deploy@example:/srv/demo", local)
+                self.assertIn("service: minecraft", local)
+
+            finally:
+                for patch_item in reversed(patches):
+                    patch_item.stop()
+
+    def test_set_deployment_requires_a_target_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            pack_root = packs / "demo"
+            pack_root.mkdir(parents=True)
+            (pack_root / "pack.yaml").write_text(
+                "id: demo\n"
+                "distribution:\n  rsync_target: origin:/packs/demo\n"
+                "minecraft_server:\n  ssh_host: old\n  stack_dir: /srv/old\n  service: old\n",
+                encoding="utf-8",
+            )
+
+            patches = [
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+            ]
+            for patch_item in patches:
+                patch_item.start()
+
+            try:
+                args = type(
+                    "Args",
+                    (),
+                    {
+                        "pack": "demo",
+                        "rsync_target": None,
+                        "ssh_host": None,
+                        "stack_dir": None,
+                        "service": None,
+                    },
+                )()
+                with self.assertRaisesRegex(
+                    packctl.ConfigError,
+                    "set-deployment requires at least one of --rsync-target",
+                ):
+                    packctl.cmd_set_deployment(args)
+            finally:
+                for patch_item in reversed(patches):
+                    patch_item.stop()
+
+    def test_set_and_show_url_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            pack_root = packs / "demo"
+            template_root = templates / "base"
+            pack_root.mkdir(parents=True)
+            template_root.mkdir(parents=True)
+            (pack_root / "pack.yaml").write_text(
+                "id: demo\n",
+                encoding="utf-8",
+            )
+            (template_root / "template.yaml").write_text(
+                "id: base\nenabled: true\ndisplay_name: Base\nminecraft: 1.21.1\n"
+                "loader: neoforge\nreference_loader_version: 21.1.234\nmods: []\n",
+                encoding="utf-8",
+            )
+
+            patches = [
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+            ]
+            for patch_item in patches:
+                patch_item.start()
+
+            try:
+                set_pack = type(
+                    "Args",
+                    (),
+                    {
+                        "kind": "pack",
+                        "project": "demo",
+                        "max_size": 1024,
+                        "allow_private_networks": True,
+                    },
+                )()
+                self.assertEqual(packctl.cmd_set_url_policy(set_pack), 0)
+                set_template = type(
+                    "Args",
+                    (),
+                    {
+                        "kind": "template",
+                        "project": "base",
+                        "max_size": 2048,
+                        "allow_private_networks": None,
+                    },
+                )()
+                self.assertEqual(packctl.cmd_set_url_policy(set_template), 0)
+
+                show_pack = StringIO()
+                with redirect_stdout(show_pack):
+                    self.assertEqual(
+                        packctl.cmd_show_url_policy(
+                            type("Args", (), {"kind": "pack", "project": "demo"})()
+                        ),
+                        0,
+                    )
+                output = show_pack.getvalue()
+                self.assertIn("url_max_jar_size_bytes: 1024", output)
+                self.assertIn("url_allow_private_networks: True", output)
+
+                show_template = StringIO()
+                with redirect_stdout(show_template):
+                    self.assertEqual(
+                        packctl.cmd_show_url_policy(
+                            type("Args", (), {"kind": "template", "project": "base"})()
+                        ),
+                        0,
+                    )
+                output = show_template.getvalue()
+                self.assertIn("url_max_jar_size_bytes: 2048", output)
+
+                local_text = (pack_root / "pack.local.yaml").read_text(encoding="utf-8")
+                self.assertIn("url_allow_private_networks: true", local_text)
+                self.assertIn("url_max_jar_size_bytes: 1024", local_text)
+                self.assertEqual(
+                    (
+                        template_root / "template.local.yaml"
+                    ).read_text(encoding="utf-8").strip(),
+                    'url_max_jar_size_bytes: 2048',
+                )
+            finally:
+                for patch_item in reversed(patches):
+                    patch_item.stop()
+
+    def test_set_url_policy_requires_a_value_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            pack_root = packs / "demo"
+            pack_root.mkdir(parents=True)
+            (pack_root / "pack.yaml").write_text(
+                "id: demo\n"
+                "distribution:\n  rsync_target: origin:/packs/demo\n"
+                "minecraft_server:\n  ssh_host: old\n  stack_dir: /srv/old\n  service: old\n",
+                encoding="utf-8",
+            )
+
+            patches = [
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+            ]
+            for patch_item in patches:
+                patch_item.start()
+
+            try:
+                args = type(
+                    "Args",
+                    (),
+                    {
+                        "kind": "pack",
+                        "project": "demo",
+                        "max_size": None,
+                        "allow_private_networks": None,
+                    },
+                )()
+                with self.assertRaisesRegex(
+                    packctl.ConfigError,
+                    "set-url-policy requires --max-size",
+                ):
+                    packctl.cmd_set_url_policy(args)
+            finally:
+                for patch_item in reversed(patches):
+                    patch_item.stop()
+
+    def test_set_template_loader_version_updates_template_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            templates = root / "templates"
+            template_root = templates / "base"
+            template_root.mkdir(parents=True)
+            template_path = template_root / "template.yaml"
+            template_path.write_text(
+                "id: base\nenabled: true\ndisplay_name: Base\nminecraft: 1.21.1\n"
+                "loader: neoforge\nreference_loader_version: 21.1.234\nmods: []\n",
+                encoding="utf-8",
+            )
+
+            patches = [
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "TEMPLATES", templates),
+            ]
+            for patch_item in patches:
+                patch_item.start()
+
+            try:
+                self.assertIs(
+                    packctl.parser().parse_args(["show-template-loader-version", "base"]).func,
+                    packctl.cmd_show_template_loader_version,
+                )
+                self.assertEqual(
+                    packctl.cmd_set_template_loader_version(
+                        type("Args", (), {"template": "base", "loader_version": "21.1.235"})()
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    packctl.cmd_show_template_loader_version(
+                        type("Args", (), {"template": "base"})()
+                    ),
+                    0,
+                )
+                out = StringIO()
+                with redirect_stdout(out):
+                    packctl.cmd_show_template_loader_version(
+                        type("Args", (), {"template": "base"})()
+                    )
+                self.assertIn("21.1.235", out.getvalue())
+                text = template_path.read_text(encoding="utf-8")
+                self.assertIn("reference_loader_version: 21.1.235", text)
+            finally:
+                for patch_item in reversed(patches):
+                    patch_item.stop()
 
     def test_list_templates_is_a_public_human_readable_command(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
