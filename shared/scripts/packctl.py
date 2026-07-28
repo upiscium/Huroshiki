@@ -2408,10 +2408,20 @@ def cmd_update(args: argparse.Namespace) -> int:
 
     try:
         result = huroshiki_core.update_all(
-            huroshiki_core.project_key("pack", args.pack)
+            huroshiki_core.project_key("pack", args.pack),
+            allow_partial=args.allow_partial,
         )
-        if result != 0 or not args.build:
-            return result
+        if result.partial:
+            if args.build:
+                print(
+                    "Skipping build because only a partial update was applied.",
+                    file=sys.stderr,
+                )
+            return 2
+        if result.failures:
+            return result.failures[0].error_returncode or 1
+        if not args.build:
+            return 0
         return build_pack(args.pack)
     except huroshiki_core.HuroshikiError as error:
         raise ConfigError(str(error)) from error
@@ -3879,6 +3889,7 @@ def parser() -> argparse.ArgumentParser:
     item = sub.add_parser("update")
     item.add_argument("pack")
     item.add_argument("--build", action="store_true")
+    item.add_argument("--allow-partial", action="store_true")
     item.set_defaults(func=cmd_update)
     item = sub.add_parser("side")
     item.add_argument("pack")

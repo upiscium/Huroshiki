@@ -150,6 +150,11 @@ packctl update demo --build
 Multiple profile names are applied in the declared order as one transaction. A
 failed resolve, closure merge, or refresh leaves the pack's real `source/` unchanged.
 
+`packctl update` is fail-closed: if any resolver fails, it applies no candidates and returns the
+first resolver error code (or `1`). `--allow-partial` explicitly applies only resolvable candidates
+and returns `2`; `--build` is skipped after that partial result. The TUI keeps resolver failures
+unavailable while allowing the user to review and explicitly select successful candidates.
+
 Build and distribute:
 
 ```bash

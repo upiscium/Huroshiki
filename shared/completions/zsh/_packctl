@@ -147,6 +147,7 @@ _packctl() {
       _arguments '--root=[managed repository root]:root directory:_directories' \
         '--port=[HTTP server port]:port' \
         '--build[build after a successful update]' \
+        '--allow-partial[apply resolvable updates despite resolver failures]' \
         '--apply[apply state cleanup]' \
         '--project=[project key]:project key' \
         '--older-than=[minimum age in days]:days' \
