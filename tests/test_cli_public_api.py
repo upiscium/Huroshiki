@@ -661,12 +661,18 @@ class PublicCliTest(unittest.TestCase):
         self.assertIn("Base", stdout.getvalue())
 
     def test_update_builds_only_after_a_successful_update(self) -> None:
-        args = type("Args", (), {"pack": "demo", "build": True})()
+        import huroshiki_core as core
+
+        args = type(
+            "Args",
+            (),
+            {"pack": "demo", "build": True, "allow_partial": False},
+        )()
         events: list[str] = []
 
-        def update(_: str) -> int:
+        def update(_: str, **__) -> core.UpdateRunReport:
             events.append("update")
-            return 0
+            return core.UpdateRunReport((), (), (), False, False)
 
         def build(_: str) -> int:
             events.append("build")
@@ -679,11 +685,29 @@ class PublicCliTest(unittest.TestCase):
         self.assertEqual(events, ["update", "build"])
 
         events.clear()
-        with patch("huroshiki_core.update_all", return_value=7), patch.object(
+        failure = MagicMock(error_returncode=7)
+        failed_report = core.UpdateRunReport((), (), (failure,), False, False)
+        with patch(
+            "huroshiki_core.update_all", return_value=failed_report
+        ), patch.object(
             packctl, "build_pack"
         ) as build_mock:
             self.assertEqual(packctl.cmd_update(args), 7)
         build_mock.assert_not_called()
+
+        partial_args = type(
+            "Args",
+            (),
+            {"pack": "demo", "build": True, "allow_partial": True},
+        )()
+        partial_report = core.UpdateRunReport((), (), (failure,), True, True)
+        stderr = StringIO()
+        with patch(
+            "huroshiki_core.update_all", return_value=partial_report
+        ), patch.object(packctl, "build_pack") as build_mock, redirect_stderr(stderr):
+            self.assertEqual(packctl.cmd_update(partial_args), 2)
+        build_mock.assert_not_called()
+        self.assertIn("Skipping build", stderr.getvalue())
 
     def test_serve_builds_then_runs_server_for_pack_dist(self) -> None:
         args = type("Args", (), {"pack": "demo", "port": 9090})()

@@ -255,6 +255,15 @@ class UpdateCandidate:
 
 
 @dataclass(frozen=True)
+class UpdateRunReport:
+    candidates: tuple[UpdateCandidate, ...]
+    selected: tuple[UpdateCandidate, ...]
+    failures: tuple[UpdateCandidate, ...]
+    applied: bool
+    partial: bool
+
+
+@dataclass(frozen=True)
 class TemplateInfo:
     target: str
     relative_path: Path
@@ -3347,7 +3356,11 @@ def run_project_action(
                 pass
 
 
-def update_all(project_key_value: str) -> int:
+def update_all(
+    project_key_value: str,
+    *,
+    allow_partial: bool = False,
+) -> UpdateRunReport:
     kind, _ = split_project_key(project_key_value)
     if kind == "template":
         raise HuroshikiError(
@@ -3355,20 +3368,22 @@ def update_all(project_key_value: str) -> int:
         )
     transaction = PackTransaction.create(project_key_value)
     try:
-        candidates = transaction.prepare_updates()
-        available = [candidate for candidate in candidates if candidate.available]
-        failures = [candidate for candidate in candidates if candidate.error]
+        candidates = tuple(transaction.prepare_updates())
+        available = tuple(candidate for candidate in candidates if candidate.available)
+        failures = tuple(candidate for candidate in candidates if candidate.error)
         for candidate in failures:
             print(
                 f"Unable to resolve {candidate.name} [{candidate.provider}]: "
                 f"{candidate.error}",
                 file=sys.stderr,
             )
+        if failures and not allow_partial:
+            return UpdateRunReport(candidates, (), failures, False, False)
         if not available:
             if failures:
-                return failures[0].error_returncode or 1
+                return UpdateRunReport(candidates, (), failures, False, False)
             print("No MOD updates are available.")
-            return 0
+            return UpdateRunReport(candidates, (), (), False, False)
         print("MOD updates:")
         for candidate in available:
             print(
@@ -3381,7 +3396,13 @@ def update_all(project_key_value: str) -> int:
             candidate.relative_path for candidate in available
         )
         transaction.apply()
-        return 0
+        return UpdateRunReport(
+            candidates,
+            available,
+            failures,
+            True,
+            bool(failures),
+        )
     finally:
         transaction.discard()
 

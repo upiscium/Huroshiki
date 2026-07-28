@@ -473,9 +473,28 @@ url = "https://example.invalid/manual.jar"
             return self.completed(command)
 
         with patch.object(core.subprocess, "run", side_effect=run):
-            self.assertEqual(core.update_all(self.key), 0)
+            report = core.update_all(self.key)
+        self.assertTrue(report.applied)
+        self.assertFalse(report.partial)
+        self.assertEqual(len(report.selected), 2)
         self.assertIn('version = "v2"', first.read_text(encoding="utf-8"))
         self.assertIn('version = "v2"', second.read_text(encoding="utf-8"))
+
+    def test_update_all_reports_no_available_updates_without_applying(self) -> None:
+        target = self.write_mod("current")
+        original = target.read_bytes()
+
+        with patch.object(
+            core.subprocess,
+            "run",
+            side_effect=lambda command, **_: self.completed(command),
+        ):
+            report = core.update_all(self.key)
+
+        self.assertFalse(report.applied)
+        self.assertEqual(report.selected, ())
+        self.assertEqual(report.failures, ())
+        self.assertEqual(target.read_bytes(), original)
 
     def test_update_failure_leaves_real_source_unchanged(self) -> None:
         target = self.write_mod("first")
@@ -488,8 +507,45 @@ url = "https://example.invalid/manual.jar"
             return self.completed(command, 7)
 
         with patch.object(core.subprocess, "run", side_effect=run):
-            self.assertEqual(core.update_all(self.key), 7)
+            report = core.update_all(self.key)
+        self.assertFalse(report.applied)
+        self.assertEqual(report.failures[0].error_returncode, 7)
         self.assertEqual(target.read_bytes(), original)
+
+    def test_update_all_fails_closed_unless_partial_is_explicit(self) -> None:
+        first = self.write_mod("first")
+        second = self.write_mod("second")
+        first_original = first.read_bytes()
+        second_original = second.read_bytes()
+
+        def run(command, *, cwd, **_):
+            if command[:3] == ["packwiz", "--yes", "update"]:
+                slug = command[3]
+                if slug == "second":
+                    return subprocess.CompletedProcess(command, 9, "", "network failed")
+                (cwd / "mods" / "first.pw.toml").write_text(
+                    metadata("First", "first", "v2"), encoding="utf-8"
+                )
+            return self.completed(command)
+
+        with patch.object(core.subprocess, "run", side_effect=run):
+            report = core.update_all(self.key)
+        self.assertFalse(report.applied)
+        self.assertFalse(report.partial)
+        self.assertEqual(report.selected, ())
+        self.assertEqual(report.failures[0].error_returncode, 9)
+        self.assertEqual(first.read_bytes(), first_original)
+        self.assertEqual(second.read_bytes(), second_original)
+        with packctl.ProjectLock(self.key, "verify release"):
+            pass
+
+        with patch.object(core.subprocess, "run", side_effect=run):
+            report = core.update_all(self.key, allow_partial=True)
+        self.assertTrue(report.applied)
+        self.assertTrue(report.partial)
+        self.assertEqual([candidate.slug for candidate in report.selected], ["first"])
+        self.assertIn('version = "v2"', first.read_text(encoding="utf-8"))
+        self.assertEqual(second.read_bytes(), second_original)
 
     def test_resolver_failure_is_unavailable_and_transaction_stays_clean(self) -> None:
         target = self.write_mod("first")
