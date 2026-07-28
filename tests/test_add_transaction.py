@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -59,6 +60,11 @@ class AddTransactionTest(unittest.TestCase):
                 "resolve_modrinth_identity",
                 side_effect=lambda selector: packctl.modrinth_project_reference(selector),
             ),
+            patch.object(
+                core,
+                "run_resolver_process",
+                side_effect=self.run_fake_resolver,
+            ),
         ]
         for item in self.patches:
             item.start()
@@ -84,6 +90,17 @@ class AddTransactionTest(unittest.TestCase):
     @staticmethod
     def completed(command: list[str], returncode: int = 0):
         return subprocess.CompletedProcess(command, returncode)
+
+    @staticmethod
+    def run_fake_resolver(command, *, cwd, cancel_event, deadline):
+        result = core.subprocess.run(command, cwd=cwd, check=False)
+        return core.ResolverProcessResult(
+            result.returncode,
+            result.stdout or "",
+            result.stderr or "",
+            False,
+            False,
+        )
 
     def install_files(self, cwd: Path, root_id: str = "example") -> None:
         (cwd / "mods/root.pw.toml").write_text(
@@ -707,8 +724,39 @@ class AddTransactionTest(unittest.TestCase):
                         core.add_mod_transactionally(
                             self.key, "modrinth", "example", "both"
                         )
-                self.assertEqual(self.snapshot(), original)
-                self.assert_unlocked()
+            self.assertEqual(self.snapshot(), original)
+            self.assert_unlocked()
+
+    def test_cancelled_noninteractive_resolver_discards_and_unlocks(self) -> None:
+        original = self.snapshot()
+        cancelled = core.ResolverProcessResult(-15, "", "", True, False)
+        with patch.object(core, "run_resolver_process", return_value=cancelled):
+            with self.assertRaisesRegex(core.HuroshikiError, "resolution was cancelled"):
+                core.add_mod_transactionally(
+                    self.key, "modrinth", "example", "both"
+                )
+        self.assertEqual(self.snapshot(), original)
+        self.assert_unlocked()
+        transactions = self.root / ".huroshiki/transactions"
+        self.assertEqual(list(transactions.iterdir()), [])
+
+    def test_prestart_cancel_skips_selector_and_process_resolution(self) -> None:
+        cancel = threading.Event()
+        cancel.set()
+        with patch.object(core, "resolve_project_selector") as selector, patch.object(
+            core, "run_resolver_process"
+        ) as runner:
+            with self.assertRaisesRegex(core.HuroshikiError, "resolution was cancelled"):
+                core.resolve_mod_closure(
+                    provider="modrinth",
+                    selector="example",
+                    minecraft="1.21.1",
+                    loader="neoforge",
+                    loader_version="21.1.234",
+                    cancel_event=cancel,
+                )
+        selector.assert_not_called()
+        runner.assert_not_called()
 
     def test_external_source_or_configuration_change_aborts_apply(self) -> None:
         for external_change in ("source", "config"):

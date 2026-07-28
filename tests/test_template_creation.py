@@ -25,6 +25,28 @@ neoforge = "21.1.999"
 
 
 class TemplateCreationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.runner_patch = patch.object(
+            core,
+            "run_resolver_process",
+            side_effect=self.run_fake_resolver,
+        )
+        self.runner_patch.start()
+
+    def tearDown(self) -> None:
+        self.runner_patch.stop()
+
+    @staticmethod
+    def run_fake_resolver(command, *, cwd, cancel_event, deadline):
+        result = core.subprocess.run(command, cwd=cwd, check=False)
+        return core.ResolverProcessResult(
+            result.returncode,
+            result.stdout or "",
+            result.stderr or "",
+            False,
+            False,
+        )
+
     def test_report_optional_collections_default_to_empty(self) -> None:
         report = core.TemplateCreationReport("pack:generated", ("base",))
         self.assertEqual(report.installed, ())

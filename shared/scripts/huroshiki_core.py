@@ -9,6 +9,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import signal
 import shlex
 import shutil
 import stat
@@ -379,6 +380,15 @@ class ResolvedSelector:
     original: str
     canonical_project_id: str | None
     display_label: str | None = None
+
+
+@dataclass(frozen=True)
+class ResolverProcessResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    cancelled: bool
+    timed_out: bool
 
 
 @dataclass(frozen=True)
@@ -2490,16 +2500,13 @@ def _prepare_update_candidates(
     normalization_returncode: int | None = None
     try:
         copy_transaction_source(source, normalized)
-        try:
-            normalization = subprocess.run(
-                ["packwiz", "refresh"],
-                cwd=normalized,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=UPDATE_RESOLVER_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired:
+        normalization = run_resolver_process(
+            ["packwiz", "refresh"],
+            cwd=normalized,
+            cancel_event=None,
+            deadline=time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+        )
+        if normalization.timed_out:
             normalization_error = (
                 "disposable baseline normalization deadline exceeded after "
                 f"{UPDATE_RESOLVER_TIMEOUT_SECONDS} seconds"
@@ -2553,16 +2560,13 @@ def _prepare_update_candidates(
             ) as directory:
                 resolver = Path(directory) / "source"
                 copy_transaction_source(normalized, resolver)
-                try:
-                    result = subprocess.run(
-                        ["packwiz", "--yes", "update", old_mod.slug],
-                        cwd=resolver,
-                        text=True,
-                        capture_output=True,
-                        check=False,
-                        timeout=UPDATE_RESOLVER_TIMEOUT_SECONDS,
-                    )
-                except subprocess.TimeoutExpired:
+                result = run_resolver_process(
+                    ["packwiz", "--yes", "update", old_mod.slug],
+                    cwd=resolver,
+                    cancel_event=None,
+                    deadline=time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+                )
+                if result.timed_out:
                     candidates.append(
                         _candidate_error(
                             relative_path,
@@ -3416,13 +3420,94 @@ def compatible_templates(minecraft: str, loader: str) -> list[ProjectInfo]:
     ]
 
 
-def concise_process_error(result: subprocess.CompletedProcess[str]) -> str:
+def concise_process_error(
+    result: subprocess.CompletedProcess[str] | ResolverProcessResult,
+) -> str:
     text = (result.stderr or result.stdout or "Packwiz returned a non-zero exit code").strip()
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return lines[-1][:240] if lines else f"exit code {result.returncode}"
 
 
 TEMPLATE_RESOLVER_TIMEOUT_SECONDS = 120
+RESOLVER_POLL_SECONDS = 0.05
+RESOLVER_TERMINATE_GRACE_SECONDS = 2.0
+
+
+def _resolver_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stop_resolver_process(process: subprocess.Popen[bytes]) -> None:
+    process_group = process.pid
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    grace_deadline = time.monotonic() + RESOLVER_TERMINATE_GRACE_SECONDS
+    while _resolver_group_exists(process_group) and time.monotonic() < grace_deadline:
+        process.poll()
+        time.sleep(RESOLVER_POLL_SECONDS)
+    if _resolver_group_exists(process_group):
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    process.wait()
+
+
+def run_resolver_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    cancel_event: threading.Event | None,
+    deadline: float | None,
+) -> ResolverProcessResult:
+    if cancel_event is not None and cancel_event.is_set():
+        return ResolverProcessResult(-signal.SIGTERM, "", "", True, False)
+    if deadline is not None and time.monotonic() >= deadline:
+        return ResolverProcessResult(-signal.SIGTERM, "", "", False, True)
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            start_new_session=True,
+        )
+        cancelled = False
+        timed_out = False
+        try:
+            while process.poll() is None:
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    _stop_resolver_process(process)
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    timed_out = True
+                    _stop_resolver_process(process)
+                    break
+                time.sleep(RESOLVER_POLL_SECONDS)
+        except KeyboardInterrupt:
+            _stop_resolver_process(process)
+            raise
+        process.wait()
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read().decode("utf-8", errors="replace")
+        stderr = stderr_file.read().decode("utf-8", errors="replace")
+    return ResolverProcessResult(
+        process.returncode,
+        stdout,
+        stderr,
+        cancelled,
+        timed_out,
+    )
 
 
 @dataclass(frozen=True)
@@ -3538,6 +3623,8 @@ def resolve_mod_closure(
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
 ) -> ResolvedModClosure:
+    if cancel_event is not None and cancel_event.is_set():
+        raise HuroshikiError("MOD resolution was cancelled")
     if canonical_project_id is None:
         resolved_selector = resolve_project_selector(provider, selector)
     else:
@@ -3553,8 +3640,6 @@ def resolve_mod_closure(
     normalized_provider = resolved_selector.provider
     normalized_selector = resolved_selector.display_label or selector
     project_id = canonical_project_id or resolved_selector.canonical_project_id
-    if cancel_event is not None and cancel_event.is_set():
-        raise HuroshikiError("MOD resolution was cancelled")
     state_root = ROOT / ".huroshiki"
     transaction_root = state_root / "transactions"
     packctl.make_state_directory(
@@ -3603,27 +3688,21 @@ def resolve_mod_closure(
             command = [
                 "packwiz", "--yes", "curseforge", "add", "--addon-id", project_id
             ]
-        timeout = TEMPLATE_RESOLVER_TIMEOUT_SECONDS
-        if deadline is not None:
-            timeout = min(timeout, max(0.0, deadline - time.monotonic()))
-            if timeout == 0:
-                raise HuroshikiError("Packwiz resolver deadline exceeded")
-        try:
-            process = subprocess.run(
-                command,
-                cwd=source,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise HuroshikiError(
-                f"Packwiz resolver deadline exceeded after "
-                f"{TEMPLATE_RESOLVER_TIMEOUT_SECONDS} seconds"
-            ) from error
-        if cancel_event is not None and cancel_event.is_set():
+        resolver_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + TEMPLATE_RESOLVER_TIMEOUT_SECONDS
+        )
+        process = run_resolver_process(
+            command,
+            cwd=source,
+            cancel_event=cancel_event,
+            deadline=resolver_deadline,
+        )
+        if process.cancelled:
             raise HuroshikiError("MOD resolution was cancelled")
+        if process.timed_out:
+            raise HuroshikiError("Packwiz resolver deadline exceeded")
         if process.returncode != 0:
             raise HuroshikiError(concise_process_error(process))
         metadata = _read_resolver_metadata(source)

@@ -73,6 +73,11 @@ class TransactionTestCase(unittest.TestCase):
                 "DEPLOY_SNAPSHOT_ROOT",
                 self.root / ".huroshiki" / "deploy-snapshots",
             ),
+            patch.object(
+                core,
+                "run_resolver_process",
+                side_effect=self.run_fake_resolver,
+            ),
         ]
         for item in self.patches:
             item.start()
@@ -91,6 +96,20 @@ class TransactionTestCase(unittest.TestCase):
     @staticmethod
     def completed(command: list[str], returncode: int = 0) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(command, returncode)
+
+    @staticmethod
+    def run_fake_resolver(command, *, cwd, cancel_event, deadline):
+        try:
+            result = core.subprocess.run(command, cwd=cwd, check=False)
+        except subprocess.TimeoutExpired:
+            return core.ResolverProcessResult(-15, "", "", False, True)
+        return core.ResolverProcessResult(
+            result.returncode,
+            result.stdout or "",
+            result.stderr or "",
+            False,
+            False,
+        )
 
 
 class UpdateTransactionTest(TransactionTestCase):
