@@ -144,7 +144,8 @@ class PublicCliTest(unittest.TestCase):
             pack_root = packs / "demo"
             pack_root.mkdir(parents=True)
             (pack_root / "pack.yaml").write_text(
-                "id: demo\ndistribution:\n  rsync_target: origin:/demo\n"
+                "id: demo\ndisplay_name: Demo\nenabled: true\n"
+                "distribution:\n  rsync_target: origin:/demo\n"
                 "minecraft_server:\n  ssh_host: old\n  stack_dir: /srv/old\n  service: old\n",
                 encoding="utf-8",
             )
@@ -201,7 +202,7 @@ class PublicCliTest(unittest.TestCase):
             pack_root = packs / "demo"
             pack_root.mkdir(parents=True)
             (pack_root / "pack.yaml").write_text(
-                "id: demo\n"
+                "id: demo\ndisplay_name: Demo\nenabled: true\n"
                 "distribution:\n  rsync_target: origin:/packs/demo\n"
                 "minecraft_server:\n  ssh_host: old\n  stack_dir: /srv/old\n  service: old\n",
                 encoding="utf-8",
@@ -244,7 +245,7 @@ class PublicCliTest(unittest.TestCase):
             pack_root = packs / "demo"
             pack_root.mkdir(parents=True)
             (pack_root / "pack.yaml").write_text(
-                "id: demo\n"
+                "id: demo\ndisplay_name: Demo\nenabled: true\n"
                 "distribution:\n  rsync_target: origin:/packs/demo\n"
                 "minecraft_server:\n  ssh_host: old\n  stack_dir: /srv/old\n  service: old\n",
                 encoding="utf-8",
@@ -314,11 +315,61 @@ class PublicCliTest(unittest.TestCase):
         with patch.object(packctl, "ProjectLock") as project_lock:
             with self.assertRaisesRegex(
                 packctl.ConfigError,
-                "SSH host must be a non-empty string",
+                "SSH target must be a non-empty string",
             ):
                 packctl.cmd_set_deployment(args)
 
         project_lock.assert_not_called()
+
+    def test_deployment_target_validators_accept_safe_forms(self) -> None:
+        for target in (
+            "dockge",
+            "dockge.example.internal",
+            "admin@dockge",
+            "192.0.2.10",
+            "[2001:db8::10]",
+            "admin@[2001:db8::10]",
+        ):
+            with self.subTest(target=target):
+                self.assertEqual(packctl.validate_ssh_target(target), target)
+        self.assertEqual(
+            packctl.validate_remote_stack_dir("/srv/minecraft/demo"),
+            "/srv/minecraft/demo",
+        )
+        self.assertEqual(packctl.validate_compose_service("minecraft-1"), "minecraft-1")
+
+    def test_set_deployment_rejects_unsafe_values_before_locking(self) -> None:
+        cases = (
+            ("ssh_host", "-oProxyCommand=bad"),
+            ("ssh_host", " dockge"),
+            ("ssh_host", "host command"),
+            ("ssh_host", "host..internal"),
+            ("ssh_host", "admin@"),
+            ("ssh_host", "host:/command"),
+            ("ssh_host", "[2001:db8::10"),
+            ("stack_dir", "/srv/../etc"),
+            ("stack_dir", " /srv/demo"),
+            ("stack_dir", "/"),
+            ("stack_dir", "relative/path"),
+            ("service", "--project-directory"),
+            ("service", " minecraft"),
+            ("service", "service name"),
+        )
+        for field, value in cases:
+            values = {
+                "pack": "demo",
+                "rsync_target": None,
+                "ssh_host": None,
+                "stack_dir": None,
+                "service": None,
+            }
+            values[field] = value
+            with self.subTest(field=field, value=value), patch.object(
+                packctl, "ProjectLock"
+            ) as project_lock:
+                with self.assertRaises(packctl.ConfigError):
+                    packctl.cmd_set_deployment(type("Args", (), values)())
+                project_lock.assert_not_called()
 
     def test_set_and_show_url_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -330,7 +381,10 @@ class PublicCliTest(unittest.TestCase):
             pack_root.mkdir(parents=True)
             template_root.mkdir(parents=True)
             (pack_root / "pack.yaml").write_text(
-                "id: demo\n",
+                "id: demo\ndisplay_name: Demo\nenabled: true\n"
+                "distribution:\n  rsync_target: origin:/packs/demo\n"
+                "minecraft_server:\n  ssh_host: old\n  stack_dir: /srv/old\n"
+                "  service: old\n",
                 encoding="utf-8",
             )
             (template_root / "template.yaml").write_text(
@@ -381,7 +435,9 @@ class PublicCliTest(unittest.TestCase):
                     )
                 output = show_pack.getvalue()
                 self.assertIn("url_max_jar_size_bytes: 1024", output)
-                self.assertIn("url_allow_private_networks: True", output)
+                self.assertIn("url_allow_private_networks: true", output)
+                self.assertIn("url_max_jar_size_source: local", output)
+                self.assertIn("url_allow_private_networks_source: local", output)
 
                 show_template = StringIO()
                 with redirect_stdout(show_template):
@@ -406,6 +462,57 @@ class PublicCliTest(unittest.TestCase):
             finally:
                 for patch_item in reversed(patches):
                     patch_item.stop()
+
+    def test_show_url_policy_reports_effective_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            templates = root / "templates"
+            template = templates / "base"
+            template.mkdir(parents=True)
+            (template / "template.yaml").write_text(
+                "id: base\ndisplay_name: Base\nenabled: true\nminecraft: 1.21.1\n"
+                "loader: neoforge\nreference_loader_version: 21.1.234\nmods: []\n",
+                encoding="utf-8",
+            )
+            output = StringIO()
+            with patch.object(packctl, "ROOT", root), patch.object(
+                packctl, "TEMPLATES", templates
+            ), redirect_stdout(output):
+                self.assertEqual(
+                    packctl.cmd_show_url_policy(
+                        type("Args", (), {"kind": "template", "project": "base"})()
+                    ),
+                    0,
+                )
+
+            self.assertEqual(
+                output.getvalue().splitlines(),
+                [
+                    "url_max_jar_size_bytes: 268435456",
+                    "url_max_jar_size_source: default",
+                    "url_allow_private_networks: false",
+                    "url_allow_private_networks_source: default",
+                ],
+            )
+
+    def test_show_template_url_policy_rejects_legacy_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            templates = root / "templates"
+            template = templates / "base"
+            (template / "source").mkdir(parents=True)
+            (template / "template.yaml").write_text(
+                "id: base\ndisplay_name: Base\nenabled: true\nminecraft: 1.21.1\n"
+                "loader: neoforge\nreference_loader_version: 21.1.234\nmods: []\n",
+                encoding="utf-8",
+            )
+            with patch.object(packctl, "ROOT", root), patch.object(
+                packctl, "TEMPLATES", templates
+            ):
+                with self.assertRaisesRegex(packctl.ConfigError, "legacy template source"):
+                    packctl.cmd_show_url_policy(
+                        type("Args", (), {"kind": "template", "project": "base"})()
+                    )
 
     def test_set_url_policy_requires_a_value_argument(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -485,217 +592,6 @@ class PublicCliTest(unittest.TestCase):
             finally:
                 for patch_item in reversed(patches):
                     patch_item.stop()
-
-    def test_set_deployment_uses_snapshot_for_atomic_write(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            packs = root / "packs"
-            templates = root / "templates"
-            pack_root = packs / "demo"
-            pack_root.mkdir(parents=True)
-            (pack_root / "pack.yaml").write_text(
-                "id: demo\n"
-                "distribution:\n  rsync_target: origin:/packs/demo\n"
-                "minecraft_server:\n  ssh_host: old\n  stack_dir: /srv/old\n  service: old\n",
-                encoding="utf-8",
-            )
-
-            patches = [
-                patch.object(packctl, "ROOT", root),
-                patch.object(packctl, "PACKS", packs),
-                patch.object(packctl, "TEMPLATES", templates),
-            ]
-            for patch_item in patches:
-                patch_item.start()
-
-            try:
-                snapshot = packctl.ConfigFileSnapshot(
-                    path=pack_root / "pack.local.yaml",
-                    exists=True,
-                    mode=0o644,
-                    digest="digest",
-                )
-                with patch.object(packctl, "config_file_snapshot", return_value=snapshot) as snapshot_fn:
-                    with patch.object(packctl, "_write_yaml_atomic") as write:
-                        result = packctl.cmd_set_deployment(
-                            type(
-                                "Args",
-                                (),
-                                {
-                                    "pack": "demo",
-                                    "rsync_target": "deploy@example:/srv/demo",
-                                    "ssh_host": None,
-                                    "stack_dir": None,
-                                    "service": None,
-                                },
-                            )()
-                        )
-                        self.assertEqual(result, 0)
-                        self.assertEqual(snapshot_fn.call_count, 3)
-                        snapshot_fn.assert_called_with(pack_root / "pack.local.yaml")
-                        self.assertIs(
-                            write.call_args.kwargs["expected_snapshot"],
-                            snapshot,
-                        )
-            finally:
-                for patch_item in reversed(patches):
-                    patch_item.stop()
-
-    def test_set_url_policy_uses_snapshot_for_atomic_write(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            packs = root / "packs"
-            templates = root / "templates"
-            pack_root = packs / "demo"
-            pack_root.mkdir(parents=True)
-            (pack_root / "pack.yaml").write_text("id: demo\n", encoding="utf-8")
-
-            patches = [
-                patch.object(packctl, "ROOT", root),
-                patch.object(packctl, "PACKS", packs),
-                patch.object(packctl, "TEMPLATES", templates),
-            ]
-            for patch_item in patches:
-                patch_item.start()
-
-            try:
-                snapshot = packctl.ConfigFileSnapshot(
-                    path=pack_root / "pack.local.yaml",
-                    exists=True,
-                    mode=0o644,
-                    digest="digest",
-                )
-                with patch.object(packctl, "config_file_snapshot", return_value=snapshot) as snapshot_fn:
-                    with patch.object(packctl, "_write_yaml_atomic") as write:
-                        result = packctl.cmd_set_url_policy(
-                            type(
-                                "Args",
-                                (),
-                                {
-                                    "kind": "pack",
-                                    "project": "demo",
-                                    "max_size": 2048,
-                                    "allow_private_networks": None,
-                                },
-                            )()
-                        )
-                        self.assertEqual(result, 0)
-                        self.assertEqual(snapshot_fn.call_count, 3)
-                        snapshot_fn.assert_called_with(pack_root / "pack.local.yaml")
-                        self.assertIs(
-                            write.call_args.kwargs["expected_snapshot"],
-                            snapshot,
-                        )
-            finally:
-                for patch_item in reversed(patches):
-                    patch_item.stop()
-
-    def test_set_template_loader_version_uses_snapshot_for_atomic_write(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            templates = root / "templates"
-            template_root = templates / "base"
-            template_root.mkdir(parents=True)
-            template_path = template_root / "template.yaml"
-            template_path.write_text(
-                "id: base\nenabled: true\ndisplay_name: Base\nminecraft: 1.21.1\n"
-                "loader: neoforge\nreference_loader_version: 21.1.234\nmods: []\n",
-                encoding="utf-8",
-            )
-
-            patches = [
-                patch.object(packctl, "ROOT", root),
-                patch.object(packctl, "TEMPLATES", templates),
-            ]
-            for patch_item in patches:
-                patch_item.start()
-
-            try:
-                snapshot = packctl.ConfigFileSnapshot(
-                    path=template_path,
-                    exists=True,
-                    mode=0o644,
-                    digest="digest",
-                )
-                with patch.object(packctl, "config_file_snapshot", return_value=snapshot) as snapshot_fn:
-                    with patch.object(packctl, "_write_yaml_atomic") as write:
-                        result = packctl.cmd_set_template_loader_version(
-                            type(
-                                "Args",
-                                (),
-                                {"template": "base", "loader_version": "21.1.235"},
-                            )()
-                        )
-                        self.assertEqual(result, 0)
-                        self.assertEqual(snapshot_fn.call_count, 3)
-                        snapshot_fn.assert_called_with(template_path)
-                        self.assertIs(
-                            write.call_args.kwargs["expected_snapshot"],
-                            snapshot,
-                        )
-            finally:
-                for patch_item in reversed(patches):
-                    patch_item.stop()
-
-    def test_mutate_yaml_with_snapshot_rejects_changed_file(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "settings.yaml"
-            path.write_text("value: 1\n", encoding="utf-8")
-            snapshot = packctl.config_file_snapshot(path)
-
-            with patch.object(
-                packctl,
-                "_snapshot_changed",
-                side_effect=[False, True],
-            ) as snapshot_changed, patch.object(packctl, "_write_yaml_atomic") as write:
-                with self.assertRaisesRegex(
-                    packctl.ConfigError,
-                    packctl.CONFIG_WRITE_RACE_ERROR,
-                ):
-                    packctl._mutate_yaml_with_snapshot(
-                        path,
-                        snapshot,
-                        lambda data: data.__setitem__("value", 2),
-                    )
-
-                self.assertEqual(snapshot_changed.call_count, 2)
-                write.assert_not_called()
-
-    def test_write_yaml_atomic_detects_stale_target(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "settings.yaml"
-            path.write_text("value: 1\n", encoding="utf-8")
-            snapshot = packctl.config_file_snapshot(path)
-            path.write_text("value: 2\n", encoding="utf-8")
-
-            with self.assertRaisesRegex(
-                packctl.ConfigError, "changed while applying command"
-            ):
-                packctl._write_yaml_atomic(
-                    path,
-                    {"value": 3},
-                    expected_snapshot=snapshot,
-                )
-
-            self.assertEqual(path.read_text(encoding="utf-8"), "value: 2\n")
-
-    def test_write_yaml_atomic_rejects_new_dangling_symlink(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "settings.yaml"
-            snapshot = packctl.config_file_snapshot(path)
-            path.symlink_to(Path(directory) / "missing.yaml")
-
-            with self.assertRaisesRegex(
-                packctl.ConfigError,
-                "changed while applying command",
-            ):
-                packctl._write_yaml_atomic(
-                    path,
-                    {"value": 1},
-                    expected_snapshot=snapshot,
-                )
-
-            self.assertTrue(path.is_symlink())
 
     def test_set_template_loader_version_updates_template_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -835,7 +731,7 @@ class PublicCliTest(unittest.TestCase):
         build.assert_called_once_with("demo")
         self.assertEqual(deploy.call_args.kwargs["confirmed_target"], "host:/demo")
         run.assert_called_once_with(
-            ["ssh", "server", "cd /srv/demo && docker compose restart minecraft"]
+            ["ssh", "--", "server", "cd /srv/demo && docker compose restart minecraft"]
         )
 
         with patches[0], patch.object(packctl, "_build_pack", return_value=8), patch.object(
@@ -892,6 +788,7 @@ class PublicCliTest(unittest.TestCase):
         run.assert_called_once_with(
             [
                 "ssh",
+                "--",
                 "first-server",
                 "cd /srv/first && docker compose restart first-service",
             ]

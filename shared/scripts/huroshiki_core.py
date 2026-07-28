@@ -372,7 +372,6 @@ class PackwizAddOperation:
         self.checkpoint = transaction.root / f"checkpoint-{uuid4().hex}"
         copy_transaction_source(transaction.source, self.checkpoint)
         self.before = metadata_digest_snapshot(transaction.source)
-        self.before_contents = metadata_content_snapshot(transaction.source)
 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         self.log_dir = (
@@ -669,7 +668,6 @@ class PackTransaction:
         provider, selector = normalize_add_selector(provider, selector)
         ensure_safe_pack_source(self.source)
         before = metadata_digest_snapshot(self.source)
-        before_contents = metadata_content_snapshot(self.source)
 
         if provider == "url":
             client, server = flags_from_side(normalized_side)
@@ -694,11 +692,7 @@ class PackTransaction:
             if result.returncode != 0:
                 return result.returncode
             ensure_safe_pack_source(self.source)
-            changed = self._classify_add_changes(
-                before,
-                before_contents,
-                normalized_side,
-            )
+            changed = self._classify_add_changes(before, normalized_side)
             self.batches.append(
                 TransactionBatch(
                     provider=provider,
@@ -713,7 +707,6 @@ class PackTransaction:
     def _classify_add_changes(
         self,
         before: dict[Path, str],
-        before_contents: dict[Path, bytes],
         side: str,
     ) -> tuple[Path, ...]:
         ensure_safe_pack_source(self.source)
@@ -733,7 +726,7 @@ class PackTransaction:
             )
         baseline_by_path: dict[Path, ModInfo] = {}
         baseline_by_identity: dict[tuple[str, str], ModInfo] = {}
-        for baseline_path, contents in before_contents.items():
+        for baseline_path, contents in self.baseline_contents.items():
             try:
                 baseline_mod = read_mod_data(
                     baseline_path,
@@ -821,7 +814,6 @@ class PackTransaction:
 
             changed = self._classify_add_changes(
                 operation.before,
-                operation.before_contents,
                 side_from_flags(operation.client, operation.server),
             )
 
@@ -876,7 +868,6 @@ class PackTransaction:
                 ensure_safe_pack_source(self.source)
                 changed = self._classify_add_changes(
                     operation.before,
-                    operation.before_contents,
                     side_from_flags(operation.client, operation.server),
                 )
                 if not changed:
@@ -3295,7 +3286,7 @@ def run_project_action(
                 f"cd {shlex.quote(stack)} && docker compose restart "
                 f"{shlex.quote(service)}"
             )
-            packctl.run(["ssh", host, remote])
+            packctl.run(["ssh", "--", host, remote])
             return 0
     except packctl.ConfigError as error:
         raise HuroshikiError(str(error)) from error

@@ -363,7 +363,11 @@ enabled: true
 minecraft: 1.21.1
 loader: neoforge
 reference_loader_version: 21.1.234
-mods: []
+mods:
+  - name: Fatal
+    provider: modrinth
+    project_id: fatal
+    side: both
 ''',
                 encoding="utf-8",
             )
@@ -386,7 +390,13 @@ mods: []
                 return 0
 
             try:
-                with patch.object(core, "create_project", side_effect=fake_create), patch.object(
+                with patch.object(
+                    core,
+                    "_resolve_template_root",
+                    side_effect=core.HuroshikiError("No compatible files"),
+                ), patch.object(
+                    core, "create_project", side_effect=fake_create
+                ), patch.object(
                     core.subprocess, "run", side_effect=OSError("packwiz unavailable")
                 ):
                     with self.assertRaisesRegex(OSError, "packwiz unavailable"):
@@ -503,7 +513,11 @@ enabled: true
 minecraft: 1.21.1
 loader: neoforge
 reference_loader_version: 21.1.234
-mods: []
+mods:
+  - name: Fatal
+    provider: modrinth
+    project_id: fatal
+    side: both
 ''',
                 encoding="utf-8",
             )
@@ -528,6 +542,11 @@ mods: []
                 patch.object(core, "TEMPLATES", templates),
                 patch.object(packctl, "PACKS", packs),
                 patch.object(packctl, "TEMPLATES", templates),
+                patch.object(
+                    core,
+                    "_resolve_template_root",
+                    side_effect=core.HuroshikiError("No compatible files"),
+                ),
                 patch.object(core, "create_project", side_effect=fake_create),
                 patch.object(core.subprocess, "run", side_effect=OSError("packwiz unavailable")),
                 patch.object(core.shutil, "rmtree", side_effect=failed_rollback),

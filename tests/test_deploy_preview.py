@@ -247,7 +247,7 @@ class ConfirmedDeployTest(unittest.TestCase):
         self.assertEqual(result, 0)
         read_target.assert_called_once_with("demo")
         run.assert_called_once_with(
-            ["ssh", "server", "cd /srv/demo && docker compose restart minecraft"]
+            ["ssh", "--", "server", "cd /srv/demo && docker compose restart minecraft"]
         )
 
 

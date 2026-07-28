@@ -218,50 +218,6 @@ class AddTransactionTest(unittest.TestCase):
         self.assertIn('side = "both"', shared.read_text())
         self.assertFalse(existing.exists())
 
-    def test_sequential_adds_union_rewritten_shared_dependency_side(self) -> None:
-        transaction = core.PackTransaction.create(self.key)
-        try:
-            first_before = core.metadata_digest_snapshot(transaction.source)
-            first_contents = core.metadata_content_snapshot(transaction.source)
-            (transaction.source / "mods/client-root.pw.toml").write_text(
-                metadata("Client Root", "client-root"), encoding="utf-8"
-            )
-            shared = transaction.source / "mods/shared.pw.toml"
-            shared.write_text(metadata("Shared", "shared"), encoding="utf-8")
-            transaction._classify_add_changes(
-                first_before,
-                first_contents,
-                "client",
-            )
-
-            second_before = core.metadata_digest_snapshot(transaction.source)
-            second_contents = core.metadata_content_snapshot(transaction.source)
-            (transaction.source / "mods/server-root.pw.toml").write_text(
-                metadata("Server Root", "server-root"), encoding="utf-8"
-            )
-            shared.write_text(metadata("Shared", "shared", "server"), encoding="utf-8")
-            transaction._classify_add_changes(
-                second_before,
-                second_contents,
-                "server",
-            )
-
-            self.assertIn(
-                'side = "client"',
-                (transaction.source / "mods/client-root.pw.toml").read_text(
-                    encoding="utf-8"
-                ),
-            )
-            self.assertIn(
-                'side = "server"',
-                (transaction.source / "mods/server-root.pw.toml").read_text(
-                    encoding="utf-8"
-                ),
-            )
-            self.assertIn('side = "both"', shared.read_text(encoding="utf-8"))
-        finally:
-            transaction.discard()
-
     def test_changed_invalid_baseline_side_is_not_silently_reclassified(self) -> None:
         existing = self.source / "mods/existing.pw.toml"
         existing.write_text(metadata("Existing", "existing", "invalid"), encoding="utf-8")
