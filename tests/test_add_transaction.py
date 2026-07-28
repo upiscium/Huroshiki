@@ -54,6 +54,11 @@ class AddTransactionTest(unittest.TestCase):
             patch.object(packctl, "ROOT", self.root),
             patch.object(packctl, "PACKS", self.packs),
             patch.object(packctl, "STATE_ROOT", self.root / ".huroshiki"),
+            patch.object(
+                packctl,
+                "resolve_modrinth_identity",
+                side_effect=lambda selector: packctl.modrinth_project_reference(selector),
+            ),
         ]
         for item in self.patches:
             item.start()
@@ -386,6 +391,165 @@ class AddTransactionTest(unittest.TestCase):
         self.assertEqual(closure.root_identity, ("url", "private_mod"))
         self.assertEqual(len(closure.metadata), 1)
         self.assertEqual(closure.metadata[0].identity, closure.root_identity)
+
+    def test_modrinth_selectors_resolve_to_canonical_root_identity(self) -> None:
+        canonical_id = "Canonical1"
+        selectors = (
+            canonical_id,
+            "sodium-extra",
+            "feature-with-hyphens",
+            "https://modrinth.com/mod/sodium-extra",
+            "https://www.modrinth.com/project/sodium-extra",
+        )
+
+        def run(command, *, cwd, **_):
+            self.assertEqual(command[-2:], ["--project-id", canonical_id])
+            (cwd / "mods/root.pw.toml").write_text(
+                metadata("Completely Different Display", canonical_id), encoding="utf-8"
+            )
+            (cwd / "mods/dependency.pw.toml").write_text(
+                metadata("Completely Different Display", "dependency"), encoding="utf-8"
+            )
+            return self.completed(command)
+
+        for selector in selectors:
+            with self.subTest(selector=selector), patch.object(
+                packctl, "resolve_modrinth_identity", return_value=canonical_id
+            ) as resolve, patch.object(core.subprocess, "run", side_effect=run):
+                closure = core.resolve_mod_closure(
+                    provider="modrinth",
+                    selector=selector,
+                    minecraft="1.21.1",
+                    loader="neoforge",
+                    loader_version="21.1.234",
+                )
+            self.assertEqual(closure.root_identity, ("modrinth", canonical_id))
+            resolve.assert_called_once()
+
+    def test_modrinth_resolution_and_root_mismatch_fail_closed(self) -> None:
+        for error in (
+            packctl.ConfigError("API unavailable"),
+            packctl.ConfigError("API timed out"),
+        ):
+            with self.subTest(error=str(error)), patch.object(
+                packctl, "resolve_modrinth_identity", side_effect=error
+            ), patch.object(core.subprocess, "run") as run:
+                with self.assertRaisesRegex(core.HuroshikiError, str(error)):
+                    core.resolve_mod_closure(
+                        provider="modrinth",
+                        selector="slug",
+                        minecraft="1.21.1",
+                        loader="neoforge",
+                        loader_version="21.1.234",
+                    )
+                run.assert_not_called()
+
+        def wrong_root(command, *, cwd, **_):
+            (cwd / "mods/dependency.pw.toml").write_text(
+                metadata("Requested Display", "dependency"), encoding="utf-8"
+            )
+            return self.completed(command)
+
+        with patch.object(
+            packctl, "resolve_modrinth_identity", return_value="expected"
+        ), patch.object(core.subprocess, "run", side_effect=wrong_root):
+            with self.assertRaisesRegex(core.HuroshikiError, "resolved 0 times"):
+                core.resolve_mod_closure(
+                    provider="modrinth",
+                    selector="requested-display",
+                    minecraft="1.21.1",
+                    loader="neoforge",
+                    loader_version="21.1.234",
+                )
+
+    def test_curseforge_requires_canonical_numeric_identity(self) -> None:
+        def run(command, *, cwd, **_):
+            self.assertEqual(command[-2:], ["--addon-id", "12345"])
+            (cwd / "mods/root.pw.toml").write_text(
+                metadata("Root", "12345").replace("update.modrinth", "update.curseforge")
+                .replace('mod-id = "12345"', "project-id = 12345"),
+                encoding="utf-8",
+            )
+            (cwd / "mods/dependency.pw.toml").write_text(
+                metadata("Dependency", "dependency"), encoding="utf-8"
+            )
+            return self.completed(command)
+
+        for selector in ("12345", "cf:12345"):
+            with self.subTest(selector=selector), patch.object(
+                core.subprocess, "run", side_effect=run
+            ):
+                closure = core.resolve_mod_closure(
+                    provider="curseforge",
+                    selector=selector,
+                    minecraft="1.21.1",
+                    loader="neoforge",
+                    loader_version="21.1.234",
+                )
+            self.assertEqual(closure.root_identity, ("curseforge", "12345"))
+
+        for selector in (
+            "search terms",
+            "https://www.curseforge.com/minecraft/mc-mods/example",
+        ):
+            with self.subTest(selector=selector), patch.object(
+                core.subprocess, "run"
+            ) as run:
+                with self.assertRaisesRegex(
+                    core.HuroshikiError, "Canonical project ID is unavailable"
+                ):
+                    core.resolve_mod_closure(
+                        provider="curseforge",
+                        selector=selector,
+                        minecraft="1.21.1",
+                        loader="neoforge",
+                        loader_version="21.1.234",
+                    )
+                run.assert_not_called()
+
+    def test_interactive_selection_requires_canonical_identity(self) -> None:
+        for selection, succeeds in (
+            (
+                core.ResolverSelection(
+                    1, "Root - Project ID: 12345", "curseforge", "12345"
+                ),
+                True,
+            ),
+            (core.ResolverSelection(1, "Root display only", "curseforge", None), False),
+        ):
+            with self.subTest(selection=selection):
+                transaction = core.PackTransaction.create(self.key)
+                try:
+                    operation = transaction.begin_add(
+                        "curseforge", "search terms", client=True, server=True
+                    )
+                    operation.selection = selection
+                    project_id = "12345" if succeeds else "dependency"
+                    text = metadata("Root display only", project_id)
+                    if succeeds:
+                        text = text.replace(
+                            "update.modrinth", "update.curseforge"
+                        ).replace(
+                            f'mod-id = "{project_id}"', f"project-id = {project_id}"
+                        )
+                    (operation.resolver_source / "mods/root.pw.toml").write_text(
+                        text, encoding="utf-8"
+                    )
+                    pty_result = core.PtyResult(
+                        0,
+                        operation.log_dir / "raw.log",
+                        operation.log_dir / "events.jsonl",
+                        operation.log_dir / "output.log",
+                        "",
+                    )
+                    assert operation.session is not None
+                    with patch.object(operation.session, "run", return_value=pty_result):
+                        result = operation.run()
+                    self.assertEqual(result.success, succeeds, result.message)
+                    if not succeeds:
+                        self.assertIn("no canonical project ID", result.message)
+                finally:
+                    transaction.discard()
 
     def test_changed_invalid_baseline_side_is_not_silently_reclassified(self) -> None:
         existing = self.source / "mods/existing.pw.toml"

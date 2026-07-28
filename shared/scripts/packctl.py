@@ -2431,7 +2431,30 @@ def cmd_side(args: argparse.Namespace) -> int:
     return 0
 
 
-def resolve_modrinth(project: str) -> str:
+def modrinth_project_reference(selector: str) -> str:
+    value = selector.strip()
+    if value.lower().startswith("mr:"):
+        value = value[3:].strip()
+    parsed = urlparse(value)
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme != "https" or parsed.hostname not in {
+            "modrinth.com",
+            "www.modrinth.com",
+        }:
+            raise ConfigError(f"Invalid Modrinth project URL: {selector!r}")
+        if parsed.username is not None or parsed.password is not None:
+            raise ConfigError(f"Invalid Modrinth project URL: {selector!r}")
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) != 2 or parts[0] not in {"mod", "project"}:
+            raise ConfigError(f"Invalid Modrinth project URL: {selector!r}")
+        value = unquote(parts[1]).strip()
+    if not value or any(character.isspace() for character in value):
+        raise ConfigError(f"Invalid Modrinth project selector: {selector!r}")
+    return value
+
+
+def resolve_modrinth_identity(selector: str) -> str:
+    project = modrinth_project_reference(selector)
     request = Request(
         f"https://api.modrinth.com/v2/project/{quote(project, safe='')}",
         headers={"User-Agent": "upiscium-packwiz-monorepo/1.0"},
@@ -2439,7 +2462,12 @@ def resolve_modrinth(project: str) -> str:
     try:
         with urlopen(request, timeout=30) as response:
             data = json.load(response)
-    except (HTTPError, URLError, TimeoutError) as error:
+    except HTTPError as error:
+        error.close()
+        raise ConfigError(
+            f"Could not resolve Modrinth project {project!r}: {error}"
+        ) from error
+    except (URLError, TimeoutError) as error:
         raise ConfigError(
             f"Could not resolve Modrinth project {project!r}: {error}"
         ) from error
@@ -2447,6 +2475,10 @@ def resolve_modrinth(project: str) -> str:
     if not isinstance(project_id, str) or not project_id:
         raise ConfigError(f"No Modrinth project ID returned for {project!r}")
     return project_id
+
+
+def resolve_modrinth(project: str) -> str:
+    return resolve_modrinth_identity(project)
 
 
 def find_metadata(source: Path, provider: str, project_id: str | int) -> Path | None:

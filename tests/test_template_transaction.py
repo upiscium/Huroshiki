@@ -79,6 +79,11 @@ mods: []
                 patch.object(core, "LOG_ROOT", root / ".huroshiki" / "logs"),
                 patch.object(packctl, "ROOT", root),
                 patch.object(packctl, "TEMPLATES", templates),
+                patch.object(
+                    packctl,
+                    "resolve_modrinth_identity",
+                    return_value="example-id",
+                ),
                 patch.dict(os.environ, environment, clear=True),
             ]
             for item in patches:

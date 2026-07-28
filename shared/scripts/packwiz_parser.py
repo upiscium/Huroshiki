@@ -15,6 +15,7 @@ class MenuItem:
     label: str
     is_default: bool = False
     is_cancel: bool = False
+    canonical_project_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,9 @@ _YES_NO_RE = re.compile(
     r"(?:\([Yy]/[Nn]\)|\([Nn]/[Yy]\)|\[[Yy]/[Nn]\]|\[[Nn]/[Yy]\]|\b[Yy]/[Nn]\b|\b[Nn]/[Yy]\b)"
 )
 _SEARCH_RE = re.compile(r"^Searching\s+(Modrinth|CurseForge)\.\.\.$", re.IGNORECASE)
+_PROJECT_ID_RE = re.compile(
+    r"(?i)\b(?:project|addon)[ -]?id\s*[:=#]\s*([A-Za-z0-9]+)\b"
+)
 _ERROR_RE = re.compile(
     r"(?:failed|error|no projects found|cancelled|canceled)",
     re.IGNORECASE,
@@ -252,6 +256,9 @@ class PackwizOutputParser:
             label=label,
             is_default=is_default,
             is_cancel=is_cancel,
+            canonical_project_id=(
+                match.group(1) if (match := _PROJECT_ID_RE.search(label)) else None
+            ),
         )
 
 

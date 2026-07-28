@@ -364,6 +364,22 @@ class ResolvedModClosure:
     metadata: tuple[ResolvedMetadata, ...]
 
 
+@dataclass(frozen=True)
+class ResolvedSelector:
+    provider: str
+    original: str
+    canonical_project_id: str | None
+    display_label: str | None = None
+
+
+@dataclass(frozen=True)
+class ResolverSelection:
+    index: int
+    label: str
+    provider: str
+    canonical_project_id: str | None
+
+
 class PackwizAddOperation:
     def __init__(
         self,
@@ -384,8 +400,8 @@ class PackwizAddOperation:
         self.cancel_event = threading.Event()
         self.done = threading.Event()
         self.result: AddOperationResult | None = None
-        self.menu_items: dict[int, str] = {}
-        self.selected_label: str | None = None
+        self.menu_items: dict[int, ResolverSelection] = {}
+        self.selection: ResolverSelection | None = None
         self.checkpoint = transaction.root / f"checkpoint-{uuid4().hex}"
         copy_transaction_source(transaction.source, self.checkpoint)
         self.resolver_root = transaction.root / f"resolver-{uuid4().hex}"
@@ -414,7 +430,18 @@ class PackwizAddOperation:
         if self.provider != "url":
             def record_event(event: ParserEvent) -> None:
                 if event.kind == "search_results":
-                    self.menu_items = {item.index: item.label for item in event.items}
+                    self.menu_items = {
+                        item.index: ResolverSelection(
+                            item.index,
+                            item.label,
+                            self.provider,
+                            item.canonical_project_id
+                            or canonical_project_id_from_label(
+                                self.provider, item.label
+                            ),
+                        )
+                        for item in event.items
+                    }
                 if self.on_event is not None:
                     self.on_event(event)
 
@@ -456,7 +483,7 @@ class PackwizAddOperation:
     def send_selection(self, index: int) -> None:
         if self.session is None:
             raise HuroshikiError("URL additions do not expose search results")
-        self.selected_label = self.menu_items.get(index)
+        self.selection = self.menu_items.get(index)
         self.session.send_line(str(index))
 
     def confirm(self, accepted: bool = True) -> None:
@@ -767,11 +794,27 @@ class PackTransaction:
                 )
 
             metadata = _read_resolver_metadata(operation.resolver_source)
-            selector = operation.selected_label or operation.query
-            root_identity = _resolved_root_identity(
-                operation.provider,
-                selector,
-                metadata,
+            project_id = (
+                operation.selection.canonical_project_id
+                if operation.selection is not None
+                else None
+            )
+            if project_id is None:
+                selected = (
+                    operation.selection.label
+                    if operation.selection is not None
+                    else operation.query
+                )
+                project_id = resolve_project_selector(
+                    operation.provider, selected
+                ).canonical_project_id
+            if project_id is None:
+                raise HuroshikiError(
+                    "Selected Packwiz result has no canonical project ID; "
+                    "retry with an explicit provider project ID"
+                )
+            root_identity = resolved_root_identity(
+                operation.provider, project_id, metadata
             )
             changed = merge_metadata_closure(
                 self.source,
@@ -1335,6 +1378,60 @@ def normalize_add_selector(provider: str, query: str) -> tuple[str, str]:
     if normalized_provider == "url":
         validate_public_url(selector)
     return normalized_provider, selector
+
+
+def _curseforge_project_reference(selector: str) -> tuple[str, str | None]:
+    value = selector.strip()
+    if value.lower().startswith("cf:"):
+        value = value[3:].strip()
+    if value.isdecimal():
+        return value, value
+    parsed = urlparse(value)
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme != "https" or parsed.hostname not in {
+            "curseforge.com",
+            "www.curseforge.com",
+        }:
+            raise HuroshikiError(f"Invalid CurseForge project URL: {selector!r}")
+        parts = [unquote(part).strip() for part in parsed.path.split("/") if part]
+        if len(parts) != 3 or parts[:2] != ["minecraft", "mc-mods"] or not parts[2]:
+            raise HuroshikiError(f"Invalid CurseForge project URL: {selector!r}")
+        return parts[2], None
+    return value, None
+
+
+def resolve_project_selector(provider: str, selector: str) -> ResolvedSelector:
+    normalized_provider, normalized_selector = normalize_add_selector(provider, selector)
+    if normalized_provider == "modrinth":
+        try:
+            project_id = packctl.resolve_modrinth_identity(normalized_selector)
+        except packctl.ConfigError as error:
+            raise HuroshikiError(str(error)) from error
+        return ResolvedSelector(
+            normalized_provider,
+            selector,
+            project_id,
+            normalized_selector,
+        )
+    if normalized_provider == "curseforge":
+        label, project_id = _curseforge_project_reference(normalized_selector)
+        return ResolvedSelector(normalized_provider, selector, project_id, label)
+    return ResolvedSelector(normalized_provider, selector, None, normalized_selector)
+
+
+def canonical_project_id_from_label(provider: str, label: str) -> str | None:
+    if canonical_provider(provider) != "curseforge":
+        return None
+    value = label.strip()
+    if value.isdecimal():
+        return value
+    for pattern in (
+        r"(?i)\b(?:project|addon)[ -]?id\s*[:=#]?\s*(\d+)\b",
+    ):
+        match = re.search(pattern, value)
+        if match is not None:
+            return match.group(1)
+    return None
 
 
 def url_max_jar_size_bytes(config: dict[str, object]) -> int:
@@ -2886,6 +2983,7 @@ def _apply_profile_entry(transaction: PackTransaction, entry: Mapping[str, objec
         minecraft=minecraft,
         loader=loader,
         loader_version=loader_version,
+        canonical_project_id=str(project_id),
     )
     changed = merge_metadata_closure(
         transaction.source,
@@ -3392,36 +3490,20 @@ def _resolved_metadata_with_side(
     )
 
 
-def _resolved_root_identity(
+def resolved_root_identity(
     provider: str,
-    selector: str,
+    canonical_project_id: str,
     metadata: tuple[ResolvedMetadata, ...],
 ) -> tuple[str, str]:
-    expected = (canonical_provider(provider), selector)
-    if any(item.identity == expected for item in metadata):
-        return expected
-    matching_names = []
-    for item in metadata:
-        mod = read_mod_data(
-            item.relative_path,
-            tomllib.loads(item.contents.decode("utf-8")),
+    expected = (canonical_provider(provider), canonical_project_id)
+    matches = [item for item in metadata if item.identity == expected]
+    if len(matches) != 1:
+        found = ", ".join(f"{item.provider}:{item.project_id}" for item in metadata)
+        raise HuroshikiError(
+            f"Canonical root identity {expected[0]}:{expected[1]} was resolved "
+            f"{len(matches)} times (resolver produced: {found or 'none'})"
         )
-        name = mod.name.strip().casefold()
-        selected = selector.strip().casefold()
-        if selected == name or any(
-            selected.startswith(name + separator)
-            for separator in (" by ", " - ", " [", " (")
-        ):
-            matching_names.append(item.identity)
-    if len(matching_names) == 1:
-        return matching_names[0]
-    if len(metadata) == 1:
-        return metadata[0].identity
-    found = ", ".join(f"{item.provider}:{item.project_id}" for item in metadata)
-    raise HuroshikiError(
-        f"Requested root identity for {provider}:{selector} could not be determined "
-        f"from resolver metadata ({found})"
-    )
+    return expected
 
 
 def resolve_mod_closure(
@@ -3431,9 +3513,25 @@ def resolve_mod_closure(
     minecraft: str,
     loader: str,
     loader_version: str,
+    canonical_project_id: str | None = None,
     cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> ResolvedModClosure:
-    normalized_provider, normalized_selector = normalize_add_selector(provider, selector)
+    if canonical_project_id is None:
+        resolved_selector = resolve_project_selector(provider, selector)
+    else:
+        normalized_provider, normalized_selector = normalize_add_selector(
+            provider, selector
+        )
+        resolved_selector = ResolvedSelector(
+            normalized_provider,
+            selector,
+            canonical_project_id,
+            normalized_selector,
+        )
+    normalized_provider = resolved_selector.provider
+    normalized_selector = resolved_selector.display_label or selector
+    project_id = canonical_project_id or resolved_selector.canonical_project_id
     if cancel_event is not None and cancel_event.is_set():
         raise HuroshikiError("MOD resolution was cancelled")
     state_root = ROOT / ".huroshiki"
@@ -3471,16 +3569,32 @@ def resolve_mod_closure(
                 "both",
             )
             return ResolvedModClosure(identity, _read_resolver_metadata(source))
+        if project_id is None:
+            raise HuroshikiError(
+                f"Canonical project ID is unavailable for "
+                f"{normalized_provider}:{normalized_selector}; use an explicit project ID"
+            )
+        if normalized_provider == "modrinth":
+            command = [
+                "packwiz", "--yes", "modrinth", "add", "--project-id", project_id
+            ]
+        else:
+            command = [
+                "packwiz", "--yes", "curseforge", "add", "--addon-id", project_id
+            ]
+        timeout = TEMPLATE_RESOLVER_TIMEOUT_SECONDS
+        if deadline is not None:
+            timeout = min(timeout, max(0.0, deadline - time.monotonic()))
+            if timeout == 0:
+                raise HuroshikiError("Packwiz resolver deadline exceeded")
         try:
-            command = build_add_command(normalized_provider, normalized_selector)
-            command.insert(1, "--yes")
             process = subprocess.run(
                 command,
                 cwd=source,
                 text=True,
                 capture_output=True,
                 check=False,
-                timeout=TEMPLATE_RESOLVER_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired as error:
             raise HuroshikiError(
@@ -3492,8 +3606,8 @@ def resolve_mod_closure(
         if process.returncode != 0:
             raise HuroshikiError(concise_process_error(process))
         metadata = _read_resolver_metadata(source)
-        root_identity = _resolved_root_identity(
-            normalized_provider, normalized_selector, metadata
+        root_identity = resolved_root_identity(
+            normalized_provider, project_id, metadata
         )
         return ResolvedModClosure(root_identity, metadata)
 
@@ -3623,6 +3737,7 @@ def _resolve_template_root(
             minecraft=minecraft,
             loader=loader,
             loader_version=loader_version,
+            canonical_project_id=entry.project_id,
         )
         metadata = _resolved_metadata_with_side(closure.metadata, entry.side)
         if closure.root_identity != expected_identity:

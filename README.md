@@ -87,6 +87,9 @@ dependencies whose metadata was already installed and would not otherwise change
 use canonical provider/project identity, preserve existing locations, union sides, and reject
 version/download/update disagreements plus portable metadata-path or JAR-filename collisions. URL
 roots continue to use bounded downloads and do not acquire an implicit Packwiz dependency closure.
+Modrinth IDs, slugs, and project URLs are resolved through the Modrinth API before Packwiz runs.
+CurseForge automation requires a numeric project ID; an interactive result without an explicit
+project/addon ID fails closed rather than guessing from its display name.
 
 ### Navigation
 
