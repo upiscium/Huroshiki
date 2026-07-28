@@ -6,6 +6,18 @@ from packwiz_parser import PackwizOutputParser, visible_menu_items
 
 
 class PackwizOutputParserTest(unittest.TestCase):
+    def test_extracts_only_explicit_project_ids_from_menu_labels(self) -> None:
+        parser = PackwizOutputParser()
+        events = parser.feed(
+            b"1) Root - Project ID: 12345\n"
+            b"2) Similar Name (67890)\n"
+            b"0) Cancel\nChoose a number: ",
+        )
+        result = next(event for event in events if event.kind == "search_results")
+        items = {item.index: item for item in result.items}
+        self.assertEqual(items[1].canonical_project_id, "12345")
+        self.assertIsNone(items[2].canonical_project_id)
+
     def test_parses_split_ansi_menu(self) -> None:
         parser = PackwizOutputParser()
         payload = (

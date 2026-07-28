@@ -170,7 +170,7 @@ class TemplateResolverMergeTest(unittest.TestCase):
             report = self.create()
         self.assertEqual(report.installed, ())
         self.assertEqual(len(report.failed), 1)
-        self.assertIn("Requested root identity", report.failed[0].reason)
+        self.assertIn("Canonical root identity", report.failed[0].reason)
         self.assertEqual(report.retained, ())
 
     def test_composed_exact_root_selector_is_resolved_only_once(self) -> None:
