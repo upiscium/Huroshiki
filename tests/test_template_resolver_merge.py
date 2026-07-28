@@ -43,6 +43,17 @@ def metadata(
 
 
 class TemplateResolverMergeTest(unittest.TestCase):
+    @staticmethod
+    def run_fake_resolver(command, *, cwd, cancel_event, deadline):
+        result = core.subprocess.run(command, cwd=cwd, check=False)
+        return core.ResolverProcessResult(
+            result.returncode,
+            result.stdout or "",
+            result.stderr or "",
+            False,
+            False,
+        )
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -57,6 +68,11 @@ class TemplateResolverMergeTest(unittest.TestCase):
             patch.object(packctl, "ROOT", self.root),
             patch.object(packctl, "PACKS", self.packs),
             patch.object(packctl, "TEMPLATES", self.templates),
+            patch.object(
+                core,
+                "run_resolver_process",
+                side_effect=self.run_fake_resolver,
+            ),
         ]
         for item in self.patches:
             item.start()
