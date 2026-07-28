@@ -189,6 +189,15 @@ def load_yaml(path: Path) -> dict[str, Any]:
     return value
 
 
+def _write_yaml_atomic(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.huroshiki-tmp")
+    temporary.write_text(
+        yaml.safe_dump(value, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
 def merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     result = deepcopy(base)
     for key, value in override.items():
@@ -1207,6 +1216,120 @@ def cmd_remove(args: argparse.Namespace) -> int:
         )
     except huroshiki_core.HuroshikiError as error:
         raise ConfigError(str(error)) from error
+
+
+def _normalize_bool_flag(value: str) -> bool:
+    normalized = value.lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("must be one of true/false, yes/no, on/off, 1/0")
+
+
+def cmd_show_deployment(args: argparse.Namespace) -> int:
+    config = load_pack_config(args.pack)
+    print(f"distribution:")
+    print(f"  rsync_target: {distribution_target_from_config(config, args.pack)}")
+    ssh_host, stack_dir, service = minecraft_server_target_from_config(config, args.pack)
+    print("minecraft_server:")
+    print(f"  ssh_host: {ssh_host}")
+    print(f"  stack_dir: {stack_dir}")
+    print(f"  service: {service}")
+    return 0
+
+
+def cmd_set_deployment(args: argparse.Namespace) -> int:
+    if (
+        args.rsync_target is None
+        and args.ssh_host is None
+        and args.stack_dir is None
+        and args.service is None
+    ):
+        raise ConfigError(
+            "set-deployment requires at least one of --rsync-target, --ssh-host, --stack-dir, or --service"
+        )
+
+    with ProjectLock(f"pack:{args.pack}", "set deployment settings"):
+        root = get_pack_root(args.pack)
+        local_path = root / "pack.local.yaml"
+        local = load_yaml(local_path)
+
+        if args.rsync_target is not None:
+            local.setdefault("distribution", {})["rsync_target"] = args.rsync_target
+
+        if args.ssh_host is not None or args.stack_dir is not None or args.service is not None:
+            existing = local.setdefault("minecraft_server", {})
+            if args.ssh_host is not None:
+                existing["ssh_host"] = args.ssh_host
+            if args.stack_dir is not None:
+                existing["stack_dir"] = args.stack_dir
+            if args.service is not None:
+                existing["service"] = args.service
+
+        validate_local_config("pack", local_path, local)
+        _write_yaml_atomic(local_path, local)
+
+    print(f"Updated {display_path(local_path)}")
+    return 0
+
+
+def cmd_show_url_policy(args: argparse.Namespace) -> int:
+    config = load_project_config(args.kind, args.project)
+    print(f"url_max_jar_size_bytes: {config.get('url_max_jar_size_bytes', None)}")
+    print(f"url_allow_private_networks: {config.get('url_allow_private_networks', None)}")
+    return 0
+
+
+def cmd_set_url_policy(args: argparse.Namespace) -> int:
+    if args.max_size is None and args.allow_private_networks is None:
+        raise ConfigError(
+            "set-url-policy requires --max-size and/or --allow-private-networks"
+        )
+
+    kind = args.kind
+    project = args.project
+
+    with ProjectLock(f"{kind}:{project}", "set URL policy"):
+        if kind == "pack":
+            root = get_pack_root(project)
+            local_path = root / "pack.local.yaml"
+        else:
+            root = get_template_root(project)
+            local_path = root / "template.local.yaml"
+
+        local = load_yaml(local_path)
+        if args.max_size is not None:
+            local["url_max_jar_size_bytes"] = args.max_size
+        if args.allow_private_networks is not None:
+            local["url_allow_private_networks"] = args.allow_private_networks
+        validate_local_config(kind, local_path, local)
+        _write_yaml_atomic(local_path, local)
+
+    print(f"Updated {display_path(local_path)}")
+    return 0
+
+
+def cmd_show_template_loader_version(args: argparse.Namespace) -> int:
+    config = load_template_config(args.template)
+    print(config["reference_loader_version"])
+    return 0
+
+
+def cmd_set_template_loader_version(args: argparse.Namespace) -> int:
+    validate_project_text("Loader version", args.loader_version)
+    reference_loader_version = args.loader_version.strip()
+
+    with ProjectLock(f"template:{args.template}", "set template loader version"):
+        root = get_template_root(args.template)
+        path = root / "template.yaml"
+        config = load_yaml(path)
+        config["reference_loader_version"] = reference_loader_version
+        _write_yaml_atomic(path, config)
+        load_template_config(args.template)
+
+    print(f"Updated {display_path(root / 'template.yaml')}")
+    return 0
 
 
 def cmd_update(args: argparse.Namespace) -> int:
@@ -2616,6 +2739,16 @@ def parser() -> argparse.ArgumentParser:
     item = sub.add_parser("show")
     item.add_argument("pack")
     item.set_defaults(func=cmd_show)
+    item = sub.add_parser("show-deployment")
+    item.add_argument("pack")
+    item.set_defaults(func=cmd_show_deployment)
+    item = sub.add_parser("set-deployment")
+    item.add_argument("pack")
+    item.add_argument("--rsync-target")
+    item.add_argument("--ssh-host")
+    item.add_argument("--stack-dir")
+    item.add_argument("--service")
+    item.set_defaults(func=cmd_set_deployment)
     item = sub.add_parser("new")
     item.add_argument("pack")
     item.add_argument("display_name")
@@ -2665,6 +2798,27 @@ def parser() -> argparse.ArgumentParser:
     item.set_defaults(func=cmd_build)
     item = sub.add_parser("build-all")
     item.set_defaults(func=cmd_build_all)
+    item = sub.add_parser("show-url-policy")
+    item.add_argument("kind", choices=("pack", "template"))
+    item.add_argument("project")
+    item.set_defaults(func=cmd_show_url_policy)
+    item = sub.add_parser("set-url-policy")
+    item.add_argument("kind", choices=("pack", "template"))
+    item.add_argument("project")
+    item.add_argument("--max-size", type=int, dest="max_size")
+    item.add_argument(
+        "--allow-private-networks",
+        type=_normalize_bool_flag,
+        dest="allow_private_networks",
+    )
+    item.set_defaults(func=cmd_set_url_policy)
+    item = sub.add_parser("show-template-loader-version")
+    item.add_argument("template")
+    item.set_defaults(func=cmd_show_template_loader_version)
+    item = sub.add_parser("set-template-loader-version")
+    item.add_argument("template")
+    item.add_argument("loader_version")
+    item.set_defaults(func=cmd_set_template_loader_version)
     item = sub.add_parser("deploy")
     item.add_argument("pack")
     item.add_argument("--expected-target")

@@ -41,6 +41,8 @@ _packctl() {
       'list:list managed packs'
       'list-templates:list managed templates'
       'show:show pack configuration'
+      'show-deployment:show effective deployment targets'
+      'set-deployment:set local deployment targets'
       'new:create a pack'
       'new-template:create a template'
       'validate:validate the repository'
@@ -49,6 +51,10 @@ _packctl() {
       'add:add a mod'
       'remove:remove installed mods'
       'update:update all mods'
+      'show-url-policy:show effective URL policy for pack/template'
+      'set-url-policy:update URL policy in local config'
+      'show-template-loader-version:show template reference loader version'
+      'set-template-loader-version:set template reference loader version'
       'side:set metadata side'
       'profile:apply profiles'
       'build:build one pack'
@@ -70,7 +76,43 @@ _packctl() {
 
   argument_index=$(( CURRENT - command_index ))
   case "$command:$argument_index" in
-    (show:1|validate-for:1|add:1|remove:1|update:1|side:1|profile:1|build:1|serve:1|deploy:1|deploy-dry-run:1|restart:1|publish:1)
+    (show:1|show-deployment:1|validate-for:1|add:1|remove:1|update:1|side:1|profile:1|build:1|serve:1|deploy:1|deploy-dry-run:1|restart:1|publish:1)
+      candidates=("${(@f)$(_packctl_candidates packs)}")
+      _describe pack candidates
+      ;;
+    (show-template-loader-version:1|set-template-loader-version:1)
+      candidates=("${(@f)$(_packctl_candidates templates)}")
+      _describe template candidates
+      ;;
+    (show-url-policy:1|set-url-policy:1)
+      candidates=(pack template)
+      _describe 'project kind' candidates
+      ;;
+    (show-url-policy:2)
+      selected_kind="${words[command_index + 1]}"
+      case "$selected_kind" in
+        pack)
+          candidates=("${(@f)$(_packctl_candidates packs)}")
+          ;;
+        template)
+          candidates=("${(@f)$(_packctl_candidates templates)}")
+          ;;
+      esac
+      _describe project candidates
+      ;;
+    (set-url-policy:2)
+      selected_kind="${words[command_index + 1]}"
+      case "$selected_kind" in
+        pack)
+          candidates=("${(@f)$(_packctl_candidates packs)}")
+          ;;
+        template)
+          candidates=("${(@f)$(_packctl_candidates templates)}")
+          ;;
+      esac
+      _describe project candidates
+      ;;
+    (set-deployment:1)
       candidates=("${(@f)$(_packctl_candidates packs)}")
       _describe pack candidates
       ;;
