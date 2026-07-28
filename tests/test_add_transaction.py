@@ -31,7 +31,11 @@ class AddTransactionTest(unittest.TestCase):
         self.packs = self.root / "packs"
         self.source = self.packs / "demo" / "source"
         (self.source / "mods").mkdir(parents=True)
-        (self.source / "pack.toml").write_bytes(b'name = "Demo"\n')
+        (self.source / "pack.toml").write_text(
+            'name = "Demo"\n[versions]\nminecraft = "1.21.1"\n'
+            'neoforge = "21.1.234"\n',
+            encoding="utf-8",
+        )
         (self.source / "index.toml").write_bytes(b"original index\n")
         self.config = self.packs / "demo" / "pack.yaml"
         self.config.write_text(
@@ -76,18 +80,36 @@ class AddTransactionTest(unittest.TestCase):
     def completed(command: list[str], returncode: int = 0):
         return subprocess.CompletedProcess(command, returncode)
 
-    def install_files(self, cwd: Path) -> None:
+    def install_files(self, cwd: Path, root_id: str = "example") -> None:
         (cwd / "mods/root.pw.toml").write_text(
-            metadata("Root", "root"), encoding="utf-8"
+            metadata("Root", root_id), encoding="utf-8"
         )
         (cwd / "mods/dependency.pw.toml").write_text(
             metadata("Dependency", "dependency"), encoding="utf-8"
         )
-        (cwd / "pack.toml").write_bytes(b"staged pack\n")
-        (cwd / "index.toml").write_bytes(b"staged index\n")
 
     def assert_unlocked(self) -> None:
         self.assertFalse(packctl.project_lock_is_active(self.key))
+
+    @staticmethod
+    def closure(
+        root_id: str,
+        *dependencies: tuple[str, str],
+    ) -> core.ResolvedModClosure:
+        records = []
+        for project_id, filename in ((root_id, f"{root_id}.jar"), *dependencies):
+            identity = ("modrinth", project_id)
+            records.append(
+                core.ResolvedMetadata(
+                    identity,
+                    Path("mods") / f"{project_id}.pw.toml",
+                    filename,
+                    metadata(project_id, project_id).encode("utf-8"),
+                    "modrinth",
+                    project_id,
+                )
+            )
+        return core.ResolvedModClosure(("modrinth", root_id), tuple(records))
 
     def enable_private_url_provider(self) -> None:
         (self.packs / "demo/pack.local.yaml").write_text(
@@ -114,7 +136,7 @@ class AddTransactionTest(unittest.TestCase):
             self.assertEqual(self.snapshot(), original)
             self.assertNotEqual(cwd, self.source)
             command_directories.append(cwd)
-            if command == ["packwiz", "modrinth", "add", "example"]:
+            if "add" in command and command[-1] == "example":
                 self.install_files(cwd)
             elif command == ["packwiz", "refresh"]:
                 (cwd / "index.toml").write_bytes(b"refreshed index\n")
@@ -126,13 +148,16 @@ class AddTransactionTest(unittest.TestCase):
             )
 
         self.assertEqual(result, 0)
-        self.assertEqual(len(set(command_directories)), 1)
+        self.assertEqual(len(set(command_directories)), 2)
         self.assertIn('side = "client"', (self.source / "mods/root.pw.toml").read_text())
         self.assertIn(
             'side = "client"',
             (self.source / "mods/dependency.pw.toml").read_text(),
         )
-        self.assertEqual((self.source / "pack.toml").read_bytes(), b"staged pack\n")
+        self.assertIn(
+            'minecraft = "1.21.1"',
+            (self.source / "pack.toml").read_text(encoding="utf-8"),
+        )
         self.assertEqual((self.source / "index.toml").read_bytes(), b"refreshed index\n")
         self.assert_unlocked()
 
@@ -142,7 +167,7 @@ class AddTransactionTest(unittest.TestCase):
                 original = self.snapshot()
 
                 def run(command, *, cwd, **_):
-                    if command[:3] == ["packwiz", "modrinth", "add"]:
+                    if "add" in command:
                         self.install_files(cwd)
                         return self.completed(command, 7 if failure == "add" else 0)
                     if command == ["packwiz", "refresh"]:
@@ -152,12 +177,10 @@ class AddTransactionTest(unittest.TestCase):
 
                 with patch.object(core.subprocess, "run", side_effect=run):
                     if failure == "add":
-                        self.assertEqual(
+                        with self.assertRaises(core.HuroshikiError):
                             core.add_mod_transactionally(
                                 self.key, "modrinth", "example", "both"
-                            ),
-                            7,
-                        )
+                            )
                     else:
                         with self.assertRaises(core.HuroshikiError):
                             core.add_mod_transactionally(
@@ -174,7 +197,9 @@ class AddTransactionTest(unittest.TestCase):
             return self.completed(command)
 
         with patch.object(core.subprocess, "run", side_effect=run), patch.object(
-            packctl, "set_side_file", side_effect=OSError("side write failed")
+            core,
+            "_metadata_contents_with_side",
+            side_effect=OSError("side write failed"),
         ):
             with self.assertRaisesRegex(core.HuroshikiError, "side write failed"):
                 core.add_mod_transactionally(
@@ -192,8 +217,7 @@ class AddTransactionTest(unittest.TestCase):
         shared.write_text(metadata("Shared", "shared", "both"), encoding="utf-8")
 
         def run(command, *, cwd, **_):
-            if command[:3] == ["packwiz", "modrinth", "add"]:
-                (cwd / "mods/existing.pw.toml").unlink()
+            if "add" in command:
                 moved = cwd / "dependencies/existing-renamed.pw.toml"
                 moved.parent.mkdir()
                 moved.write_text(metadata("Existing", "existing", "server"), encoding="utf-8")
@@ -211,12 +235,157 @@ class AddTransactionTest(unittest.TestCase):
                 0,
             )
 
-        moved_text = (self.source / "dependencies/existing-renamed.pw.toml").read_text()
-        self.assertIn('side = "both"', moved_text)
+        self.assertIn('side = "both"', existing.read_text())
         self.assertIn('side = "server"', (self.source / "mods/root.pw.toml").read_text())
         self.assertIn('side = "client"', unchanged.read_text())
         self.assertIn('side = "both"', shared.read_text())
-        self.assertFalse(existing.exists())
+        self.assertFalse((self.source / "dependencies/existing-renamed.pw.toml").exists())
+
+    def test_unchanged_shared_dependency_unions_sides_from_complete_closure(self) -> None:
+        for first_side, requested_side in (("client", "server"), ("server", "client")):
+            with self.subTest(first_side=first_side, requested_side=requested_side):
+                shared = self.source / "mods/shared.pw.toml"
+                shared.write_text(
+                    metadata("shared", "shared", first_side), encoding="utf-8"
+                )
+                closure = self.closure("second-root", ("shared", "shared.jar"))
+
+                with patch.object(
+                    core, "resolve_mod_closure", return_value=closure
+                ), patch.object(
+                    core.subprocess,
+                    "run",
+                    side_effect=lambda command, **_: self.completed(command),
+                ):
+                    self.assertEqual(
+                        core.add_mod_transactionally(
+                            self.key, "modrinth", "second-root", requested_side
+                        ),
+                        0,
+                    )
+
+                self.assertEqual(packctl.read_toml(shared)["side"], "both")
+                (self.source / "mods/second-root.pw.toml").unlink()
+                shared.unlink()
+
+    def test_interactive_add_merges_isolated_complete_closure(self) -> None:
+        shared = self.source / "mods/shared.pw.toml"
+        shared.write_text(metadata("Shared", "shared", "client"), encoding="utf-8")
+        transaction = core.PackTransaction.create(self.key)
+        try:
+            operation = transaction.begin_add(
+                "modrinth",
+                "second-root",
+                client=False,
+                server=True,
+            )
+            (operation.resolver_source / "mods/second-root.pw.toml").write_text(
+                metadata("second-root", "second-root"), encoding="utf-8"
+            )
+            (operation.resolver_source / "mods/shared.pw.toml").write_text(
+                metadata("Shared", "shared"), encoding="utf-8"
+            )
+            pty_result = core.PtyResult(
+                0,
+                operation.log_dir / "raw.log",
+                operation.log_dir / "events.jsonl",
+                operation.log_dir / "output.log",
+                "",
+            )
+            assert operation.session is not None
+            with patch.object(operation.session, "run", return_value=pty_result):
+                result = operation.run()
+
+            self.assertTrue(result.success, result.message)
+            staged_shared = transaction.source / "mods/shared.pw.toml"
+            self.assertEqual(packctl.read_toml(staged_shared)["side"], "both")
+            self.assertFalse(operation.resolver_root.exists())
+            self.assertEqual(packctl.read_toml(shared)["side"], "client")
+        finally:
+            transaction.discard()
+
+    def test_closure_conflicts_abort_without_publishing(self) -> None:
+        existing = self.source / "mods/existing.pw.toml"
+        existing.write_text(metadata("Existing", "existing", "client"), encoding="utf-8")
+        original = self.snapshot()
+        divergent = self.closure("existing")
+        record = divergent.metadata[0]
+        divergent = core.ResolvedModClosure(
+            divergent.root_identity,
+            (
+                core.ResolvedMetadata(
+                    record.identity,
+                    record.relative_path,
+                    record.filename,
+                    record.contents.replace(b'version = "v1"', b'version = "v2"'),
+                    record.provider,
+                    record.project_id,
+                ),
+            ),
+        )
+        with patch.object(core, "resolve_mod_closure", return_value=divergent):
+            with self.assertRaisesRegex(core.HuroshikiError, "disagreement"):
+                core.add_mod_transactionally(
+                    self.key, "modrinth", "existing", "server"
+                )
+        self.assertEqual(self.snapshot(), original)
+        self.assert_unlocked()
+
+    def test_closure_path_and_filename_collisions_abort(self) -> None:
+        existing = self.source / "mods/existing.pw.toml"
+        existing.write_text(metadata("Existing", "existing"), encoding="utf-8")
+        original = self.snapshot()
+        base = self.closure("incoming").metadata[0]
+        cases = (
+            (
+                core.ResolvedMetadata(
+                    base.identity,
+                    Path("mods/existing.pw.toml"),
+                    base.filename,
+                    base.contents,
+                    base.provider,
+                    base.project_id,
+                ),
+                "Metadata path collision",
+            ),
+            (
+                core.ResolvedMetadata(
+                    base.identity,
+                    base.relative_path,
+                    "existing.jar",
+                    base.contents.replace(b'incoming.jar', b'existing.jar'),
+                    base.provider,
+                    base.project_id,
+                ),
+                "Filename collision",
+            ),
+        )
+        for record, message in cases:
+            with self.subTest(message=message), patch.object(
+                core,
+                "resolve_mod_closure",
+                return_value=core.ResolvedModClosure(base.identity, (record,)),
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, message):
+                    core.add_mod_transactionally(
+                        self.key, "modrinth", "incoming", "both"
+                    )
+                self.assertEqual(self.snapshot(), original)
+                self.assert_unlocked()
+
+    def test_url_resolver_returns_single_root_closure(self) -> None:
+        artifact = self.url_artifact()
+        with patch.object(core, "download_url_artifact", return_value=artifact):
+            closure = core.resolve_mod_closure(
+                provider="url",
+                selector="https://example.invalid/private-mod.jar",
+                minecraft="1.21.1",
+                loader="neoforge",
+                loader_version="21.1.234",
+            )
+        self.assertEqual(closure.root_identity, ("url", "private_mod"))
+        self.assertEqual(len(closure.metadata), 1)
+        self.assertEqual(closure.metadata[0].identity, closure.root_identity)
 
     def test_changed_invalid_baseline_side_is_not_silently_reclassified(self) -> None:
         existing = self.source / "mods/existing.pw.toml"
@@ -224,14 +393,14 @@ class AddTransactionTest(unittest.TestCase):
         original = self.snapshot()
 
         def run(command, *, cwd, **_):
-            if command[:3] == ["packwiz", "modrinth", "add"]:
+            if "add" in command:
                 (cwd / "mods/existing.pw.toml").write_text(
                     metadata("Existing", "existing", "server"), encoding="utf-8"
                 )
             return self.completed(command)
 
         with patch.object(core.subprocess, "run", side_effect=run):
-            with self.assertRaisesRegex(core.HuroshikiError, "invalid baseline side"):
+            with self.assertRaisesRegex(core.HuroshikiError, "invalid existing side"):
                 core.add_mod_transactionally(
                     self.key, "modrinth", "existing", "server"
                 )
@@ -360,7 +529,7 @@ class AddTransactionTest(unittest.TestCase):
                 original = self.snapshot()
 
                 def run(command, *, cwd, **_):
-                    if command[:3] == ["packwiz", "modrinth", "add"]:
+                    if "add" in command:
                         self.install_files(cwd)
                         if interrupted_command == "add":
                             raise KeyboardInterrupt
@@ -386,7 +555,7 @@ class AddTransactionTest(unittest.TestCase):
                 )
 
                 def run(command, *, cwd, **_):
-                    if command[:3] == ["packwiz", "modrinth", "add"]:
+                    if "add" in command:
                         self.install_files(cwd)
                     elif command == ["packwiz", "refresh"]:
                         if external_change == "source":
