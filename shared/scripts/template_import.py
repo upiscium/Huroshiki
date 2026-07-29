@@ -71,6 +71,36 @@ class ModCandidate:
 
 
 @dataclass(frozen=True)
+class ImportSelectionOption:
+    option_key: str
+    candidates: tuple[ModCandidate, ...]
+
+    @property
+    def selection_keys(self) -> tuple[str, ...]:
+        return tuple(candidate.selection_key for candidate in self.candidates)
+
+    @property
+    def candidate_keys(self) -> tuple[str, ...]:
+        return tuple(candidate.candidate_key for candidate in self.candidates)
+
+    @property
+    def selector_identity(self) -> tuple[str, str, str | None]:
+        identities = {candidate.selector_identity for candidate in self.candidates}
+        if len(identities) != 1:
+            raise TemplateMergeError("Selection option contains multiple selectors")
+        return next(iter(identities))
+
+    @property
+    def actual_identity(self) -> tuple[str, str] | None:
+        identities = {candidate.actual_identity for candidate in self.candidates}
+        if len(identities) != 1:
+            raise TemplateMergeError(
+                "Selection option contains multiple actual identities"
+            )
+        return next(iter(identities))
+
+
+@dataclass(frozen=True)
 class TemplateCompatibility:
     template_id: str
     minecraft: str
@@ -154,7 +184,7 @@ class ImportCandidateVerification:
 
 @dataclass(frozen=True)
 class ImportConflictResolution:
-    selection_keys: tuple[str, ...]
+    option_keys: tuple[str, ...]
     acknowledge_duplicate_risk: bool = False
 
 
@@ -164,6 +194,7 @@ class TemplateImportPlan:
     template_ids: tuple[str, ...]
     template_candidates: tuple[ModCandidate, ...]
     pack_candidates: tuple[ModCandidate, ...]
+    selection_options: tuple[ImportSelectionOption, ...]
     new_roots: tuple[ModCandidate, ...]
     existing_identities: tuple[ModCandidate, ...]
     side_conflicts: tuple[IdentitySideConflict, ...]
@@ -266,6 +297,48 @@ def merge_template_import_candidates(
                 ),
             )
     return tuple(merged)
+
+
+def _selection_option_key(candidates: Sequence[ModCandidate]) -> str:
+    if len(candidates) == 1:
+        return candidates[0].selection_key
+    payload = {
+        "version": 1,
+        "selection_keys": sorted(candidate.selection_key for candidate in candidates),
+        "selector_identity": candidates[0].selector_identity,
+        "actual_identity": candidates[0].actual_identity,
+    }
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return "group:" + hashlib.sha256(serialized).hexdigest()
+
+
+def import_selection_options(
+    candidates: Sequence[ModCandidate],
+) -> tuple[ImportSelectionOption, ...]:
+    groups: dict[tuple[object, ...], list[ModCandidate]] = {}
+    for candidate in candidates:
+        if candidate.actual_identity is None:
+            key: tuple[object, ...] = ("candidate", candidate.selection_key)
+        else:
+            key = (
+                "source",
+                candidate.selector_identity,
+                candidate.actual_identity,
+            )
+        groups.setdefault(key, []).append(candidate)
+    options = tuple(
+        ImportSelectionOption(_selection_option_key(group), tuple(group))
+        for group in groups.values()
+    )
+    option_keys = [option.option_key for option in options]
+    if len(option_keys) != len(set(option_keys)):
+        raise TemplateMergeError("Template import contains duplicate option keys")
+    return options
 
 
 def _name_conflicts(candidates: Sequence[ModCandidate]) -> tuple[CandidateNameConflict, ...]:
@@ -384,6 +457,7 @@ def _plan_digest_payload(
     template_ids: tuple[str, ...],
     pack_candidates: Sequence[ModCandidate],
     template_candidates: Sequence[ModCandidate],
+    selection_options: Sequence[ImportSelectionOption],
     verifications: Sequence[ImportCandidateVerification],
 ) -> str:
     def record(candidate: ModCandidate) -> dict[str, object]:
@@ -410,11 +484,20 @@ def _plan_digest_payload(
         }
 
     payload = {
-        "version": 3,
+        "version": 4,
         "pack_key": pack_key,
         "template_ids": template_ids,
         "pack_candidates": [record(item) for item in pack_candidates],
         "template_candidates": [record(item) for item in template_candidates],
+        "selection_options": [
+            {
+                "option_key": option.option_key,
+                "selection_keys": option.selection_keys,
+                "selector_identity": option.selector_identity,
+                "actual_identity": option.actual_identity,
+            }
+            for option in selection_options
+        ],
         "verifications": [
             {
                 "selector_identity": item.selector_identity,
@@ -508,6 +591,9 @@ def build_template_import_plan(
         verification = verification_by_selector[candidate.selector_identity]
         if candidate.actual_identity != verification.actual_identity:
             raise TemplateMergeError("Template candidate verification identity mismatch")
+    selection_options = import_selection_options(
+        (*pack_candidates, *merged_templates)
+    )
     pack_by_actual = {
         candidate.actual_identity: candidate for candidate in pack_candidates
     }
@@ -552,6 +638,7 @@ def build_template_import_plan(
         ordered_ids,
         merged_templates,
         tuple(pack_candidates),
+        selection_options,
         new_roots,
         existing,
         side_conflicts,
@@ -565,6 +652,7 @@ def build_template_import_plan(
             ordered_ids,
             pack_candidates,
             ordered_templates,
+            selection_options,
             verifications,
         ),
     )

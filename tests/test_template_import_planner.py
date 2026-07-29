@@ -9,6 +9,7 @@ from template_import import (
     ModCandidate,
     TemplateCompatibility,
     build_template_import_plan,
+    import_selection_options,
     candidate_from_template_entry,
     merge_template_import_candidates,
     resolve_template_import_plan,
@@ -89,6 +90,49 @@ def build(
 
 
 class TemplateImportPlannerTest(unittest.TestCase):
+    def test_selection_options_group_only_verified_equivalent_sources(self) -> None:
+        installed = pack_candidate("Installed", "shared")
+        equivalent = template_candidate(
+            "base",
+            name="Equivalent",
+            provider="modrinth",
+            project_id="shared",
+            side="both",
+            actual_provider="modrinth",
+            actual_project_id="shared",
+        )
+        changed = template_candidate(
+            "base",
+            name="Changed",
+            provider="modrinth",
+            project_id="shared",
+            side="both",
+            actual_provider="modrinth",
+            actual_project_id="changed",
+        )
+        failed = template_candidate(
+            "base",
+            name="Failed",
+            provider="url",
+            project_id="failed",
+            side="both",
+            url="https://mods.example/failed.jar",
+        )
+        options = import_selection_options((installed, equivalent, changed, failed))
+        self.assertEqual(len(options), 3)
+        grouped = next(option for option in options if len(option.candidates) == 2)
+        self.assertTrue(grouped.option_key.startswith("group:"))
+        self.assertEqual(grouped.candidates, (installed, equivalent))
+        self.assertEqual(grouped.selector_identity, installed.selector_identity)
+        self.assertEqual(grouped.actual_identity, installed.actual_identity)
+        singleton_keys = {
+            option.option_key for option in options if len(option.candidates) == 1
+        }
+        self.assertEqual(
+            singleton_keys,
+            {changed.selection_key, failed.selection_key},
+        )
+
     def logical_divergence(self, *, same_name: bool = False):
         installed = pack_candidate("Installed", "logical", provider="url")
         installed = installed.__class__(
