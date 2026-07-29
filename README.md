@@ -258,6 +258,11 @@ Use `packctl show-pack-url <pack> [--raw]`, `packctl set-pack-url <pack> <url>`,
 `packctl clear-pack-url <pack>`. Clearing removes only the local override, so a committed URL
 becomes effective again.
 
+`packctl loader-version <pack> <version|latest|recommended>` prepares a Packwiz loader migration
+and prints the resulting loader version and changed files without modifying the real pack. Add
+`--apply` to publish the reviewed transaction. Minecraft version and loader type remain fixed;
+migration or refresh failures and concurrent pack changes leave the real source untouched.
+
 The settings commands pin the managed collection and project directory, snapshot both committed and
 local configuration, validate the prospective merged project entirely in memory, and publish through
 Linux `renameat2` compare-and-swap. The directory identities are rechecked before and after

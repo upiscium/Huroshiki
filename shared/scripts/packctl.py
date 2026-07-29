@@ -2787,6 +2787,51 @@ def cmd_update(args: argparse.Namespace) -> int:
         raise ConfigError(str(error)) from error
 
 
+def _print_loader_migration_preview(preview: Any) -> None:
+    print(f"Minecraft: {preview.minecraft}")
+    print(f"Loader: {preview.loader}")
+    print(f"Loader version: {preview.old_version} -> {preview.new_version}")
+    print("Changed files:")
+    if preview.changes:
+        for change in preview.changes:
+            print(f"  {change.relative_path}")
+    else:
+        print("  (none)")
+    if preview.warnings:
+        print("Warnings:")
+        for warning in preview.warnings:
+            print(f"  {warning}")
+
+
+def cmd_loader_version(args: argparse.Namespace) -> int:
+    import huroshiki_core
+
+    operation = None
+    try:
+        operation = huroshiki_core.prepare_loader_migration(
+            huroshiki_core.project_key("pack", args.pack),
+            args.version,
+        )
+        _print_loader_migration_preview(operation.preview)
+        if args.apply:
+            operation.apply()
+            print("Loader migration applied.")
+        else:
+            operation.discard()
+            print("Dry run only; no files were changed.")
+        return 0
+    except KeyboardInterrupt:
+        if operation is not None:
+            operation.cancel()
+        print("Loader migration cancelled.", file=sys.stderr)
+        return 130
+    except huroshiki_core.HuroshikiError as error:
+        raise ConfigError(str(error)) from error
+    finally:
+        if operation is not None:
+            operation.discard()
+
+
 def cmd_side(args: argparse.Namespace) -> int:
     with ProjectLock(f"pack:{args.pack}", "side"):
         side = normalize_side(args.side)
@@ -4296,6 +4341,11 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--build", action="store_true")
     item.add_argument("--allow-partial", action="store_true")
     item.set_defaults(func=cmd_update)
+    item = sub.add_parser("loader-version")
+    item.add_argument("pack")
+    item.add_argument("version")
+    item.add_argument("--apply", action="store_true")
+    item.set_defaults(func=cmd_loader_version)
     item = sub.add_parser("side")
     item.add_argument("pack")
     item.add_argument("metadata_file")

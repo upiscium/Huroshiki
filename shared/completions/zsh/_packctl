@@ -54,6 +54,7 @@ _packctl() {
       'add:add a mod'
       'remove:remove installed mods'
       'update:update all mods'
+      'loader-version:preview or apply a loader version migration'
       'show-url-policy:show effective URL policy for pack/template'
       'set-url-policy:update URL policy in local config'
       'show-template-loader-version:show template reference loader version'
@@ -79,7 +80,7 @@ _packctl() {
 
   argument_index=$(( CURRENT - command_index ))
   case "$command:$argument_index" in
-    (show:1|show-deployment:1|show-pack-url:1|set-pack-url:1|clear-pack-url:1|validate-for:1|add:1|remove:1|update:1|side:1|profile:1|build:1|serve:1|deploy:1|deploy-dry-run:1|restart:1|publish:1)
+    (show:1|show-deployment:1|show-pack-url:1|set-pack-url:1|clear-pack-url:1|validate-for:1|add:1|remove:1|update:1|loader-version:1|side:1|profile:1|build:1|serve:1|deploy:1|deploy-dry-run:1|restart:1|publish:1)
       candidates=("${(@f)$(_packctl_candidates packs)}")
       _describe pack candidates
       ;;
@@ -136,6 +137,10 @@ _packctl() {
     (side:3|add:3)
       sides=(both client server)
       _describe side sides
+      ;;
+    (loader-version:2)
+      candidates=(latest recommended)
+      _describe 'loader version' candidates
       ;;
     (profile:2|profile:*)
       selected_pack="${words[command_index + 1]}"
