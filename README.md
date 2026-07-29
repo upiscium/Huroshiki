@@ -171,6 +171,8 @@ unavailable while allowing the user to review and explicitly select successful c
 Update candidate preparation runs off the Textual event loop and reports normalization plus
 per-MOD progress. One cancellation event covers baseline refresh and every resolver; a 10-minute
 operation deadline bounds the complete preparation while each resolver remains capped at 2 minutes.
+The same cancellation and deadline checkpoints cover the initial transaction snapshot, source copy,
+normalization copies, and content snapshots; partial disposable copies are removed on interruption.
 The worker publishes progress through a queue that the Textual event loop polls; it does not call
 back into Textual or get joined by the event loop. Esc returns to the Project screen only after the
 operation has completed process cleanup and discarded its transaction.
