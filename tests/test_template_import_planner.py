@@ -517,6 +517,41 @@ class TemplateImportPlannerTest(unittest.TestCase):
         self.assertEqual(replace_plan.selected_template_candidates, (first,))
         self.assertEqual(replace_plan.selected_new_roots, (first,))
 
+    def test_pack_keep_suppresses_redundant_actual_conflict_between_urls(self) -> None:
+        installed = pack_candidate("Installed", "logical", provider="url")
+        installed = installed.__class__(
+            **{**installed.__dict__, "url": "https://mods.example/installed.jar"}
+        )
+        candidates = tuple(
+            template_candidate(
+                "base",
+                name=f"Replacement {index}",
+                provider="url",
+                project_id="logical",
+                side="both",
+                url=f"https://mods.example/{index}.jar",
+                actual_provider="url",
+                actual_project_id="shared-actual",
+            )
+            for index in (1, 2)
+        )
+        plan = build(["base"], [installed], list(candidates))
+        self.assertEqual(len(plan.logical_identity_conflicts), 1)
+        self.assertEqual(plan.url_selector_conflicts, ())
+        self.assertEqual(plan.actual_identity_conflicts, ())
+        conflict = plan.logical_identity_conflicts[0]
+        pack_option = next(
+            option for option in conflict.options if installed in option.candidates
+        )
+        keep = resolve_template_import_plan(
+            plan,
+            logical_identity_resolutions={
+                conflict.key: ImportConflictResolution((pack_option.option_key,))
+            },
+        )
+        self.assertEqual(keep.retained_pack_candidates, (installed,))
+        self.assertEqual(keep.selected_template_candidates, ())
+
     def test_failed_url_options_still_allow_installed_pack_selection(self) -> None:
         installed = pack_candidate("Installed", "logical", provider="url")
         installed = installed.__class__(

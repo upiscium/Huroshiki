@@ -647,7 +647,18 @@ def build_template_import_plan(
         for conflict in _url_selector_conflicts(selection_options)
         if conflict.logical_identity not in logical_conflict_identities
     )
-    actual_identity_conflicts = _actual_identity_conflicts(selection_options)
+    logical_option_sets = [
+        {option.option_key for option in conflict.options}
+        for conflict in logical_identity_conflicts
+    ]
+    actual_identity_conflicts = tuple(
+        conflict
+        for conflict in _actual_identity_conflicts(selection_options)
+        if not any(
+            {option.option_key for option in conflict.options} <= logical_options
+            for logical_options in logical_option_sets
+        )
+    )
     return TemplateImportPlan(
         pack_key,
         ordered_ids,
