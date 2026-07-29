@@ -33,9 +33,12 @@ import yaml
 from deploy_support import (
     DeployPreview,
     RsyncChange,
+    RsyncTargetParts,
     distribution_digest,
+    join_rsync_target,
     parse_rsync_changes,
     rsync_deploy_command,
+    split_rsync_target,
     validate_rsync_target,
 )
 from packctl_errors import ConfigError
@@ -173,6 +176,35 @@ class EffectiveUrlPolicy:
     max_size_source: str
     allow_private: bool
     allow_private_source: str
+
+
+@dataclass(frozen=True)
+class DeploymentSettings:
+    rsync_target: str
+    ssh_host: str
+    stack_dir: str
+    service: str
+
+
+@dataclass(frozen=True)
+class DeploymentSettingsSources:
+    rsync_target: str
+    ssh_host: str
+    stack_dir: str
+    service: str
+
+
+@dataclass(frozen=True)
+class DeploymentSettingsBaseline:
+    settings: DeploymentSettings
+    snapshot: ProjectConfigSnapshot
+
+
+class Unset:
+    __slots__ = ()
+
+
+UNSET = Unset()
 
 
 def open_config_directory(path: Path) -> ConfigDirectory:
@@ -2208,15 +2240,154 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _deployment_settings_from_config(
+    pack_id: str,
+    config: dict[str, Any],
+) -> DeploymentSettings:
+    ssh_host, stack_dir, service = minecraft_server_target_from_config(
+        config,
+        pack_id,
+    )
+    return DeploymentSettings(
+        distribution_target_from_config(config, pack_id),
+        ssh_host,
+        stack_dir,
+        service,
+    )
+
+
+def deployment_settings(pack_id: str) -> DeploymentSettings:
+    return deployment_settings_baseline(pack_id).settings
+
+
+def deployment_settings_baseline(pack_id: str) -> DeploymentSettingsBaseline:
+    root = get_pack_root(pack_id)
+    with open_config_directory(root) as directory:
+        snapshot = project_config_snapshot(directory, "pack")
+        committed = parse_yaml_snapshot(snapshot.committed)
+        local = parse_yaml_snapshot(snapshot.local)
+        config = prospective_pack_config(pack_id, committed, local)
+        return DeploymentSettingsBaseline(
+            _deployment_settings_from_config(pack_id, config),
+            snapshot,
+        )
+
+
+def deployment_settings_sources(pack_id: str) -> DeploymentSettingsSources:
+    baseline = deployment_settings_baseline(pack_id)
+    local = parse_yaml_snapshot(baseline.snapshot.local)
+    local_distribution = local.get("distribution", {})
+    local_server = local.get("minecraft_server", {})
+    if not isinstance(local_distribution, dict):
+        local_distribution = {}
+    if not isinstance(local_server, dict):
+        local_server = {}
+    return DeploymentSettingsSources(
+        "local" if "rsync_target" in local_distribution else "committed",
+        "local" if "ssh_host" in local_server else "committed",
+        "local" if "stack_dir" in local_server else "committed",
+        "local" if "service" in local_server else "committed",
+    )
+
+
+def update_deployment_settings(
+    pack_id: str,
+    *,
+    rsync_target: str | Unset = UNSET,
+    ssh_host: str | Unset = UNSET,
+    stack_dir: str | Unset = UNSET,
+    service: str | Unset = UNSET,
+    expected_baseline: ProjectConfigSnapshot | None = None,
+) -> DeploymentSettings:
+    normalized_rsync: str | Unset = rsync_target
+    if isinstance(rsync_target, str):
+        normalized_rsync = _normalize_project_text("Rsync target", rsync_target)
+        try:
+            normalized_rsync = validate_rsync_target(normalized_rsync)
+        except ValueError as error:
+            raise ConfigError(str(error)) from error
+    normalized_ssh = (
+        validate_ssh_target(ssh_host) if isinstance(ssh_host, str) else ssh_host
+    )
+    normalized_stack = (
+        validate_remote_stack_dir(stack_dir)
+        if isinstance(stack_dir, str)
+        else stack_dir
+    )
+    normalized_service = (
+        validate_compose_service(service) if isinstance(service, str) else service
+    )
+
+    with ProjectLock(f"pack:{pack_id}", "set deployment settings"):
+        root = get_pack_root(pack_id)
+        with open_config_directory(root) as directory:
+            snapshot = project_config_snapshot(directory, "pack")
+            if expected_baseline is not None and (
+                not _same_config_snapshot(
+                    snapshot.committed,
+                    expected_baseline.committed,
+                )
+                or not _same_config_snapshot(snapshot.local, expected_baseline.local)
+            ):
+                raise ConfigError(
+                    "Deployment configuration changed after it was loaded; retry the operation"
+                )
+            committed = parse_yaml_snapshot(snapshot.committed)
+            local = parse_yaml_snapshot(snapshot.local)
+            current = _deployment_settings_from_config(
+                pack_id,
+                prospective_pack_config(pack_id, committed, local),
+            )
+            requested = DeploymentSettings(
+                current.rsync_target
+                if isinstance(normalized_rsync, Unset)
+                else normalized_rsync,
+                current.ssh_host
+                if isinstance(normalized_ssh, Unset)
+                else normalized_ssh,
+                current.stack_dir
+                if isinstance(normalized_stack, Unset)
+                else normalized_stack,
+                current.service
+                if isinstance(normalized_service, Unset)
+                else normalized_service,
+            )
+            if requested == current:
+                return current
+
+            if not isinstance(normalized_rsync, Unset):
+                local.setdefault("distribution", {})["rsync_target"] = normalized_rsync
+            if any(
+                not isinstance(value, Unset)
+                for value in (normalized_ssh, normalized_stack, normalized_service)
+            ):
+                existing = local.setdefault("minecraft_server", {})
+                if not isinstance(normalized_ssh, Unset):
+                    existing["ssh_host"] = normalized_ssh
+                if not isinstance(normalized_stack, Unset):
+                    existing["stack_dir"] = normalized_stack
+                if not isinstance(normalized_service, Unset):
+                    existing["service"] = normalized_service
+
+            prospective = prospective_pack_config(pack_id, committed, local)
+            result = _deployment_settings_from_config(pack_id, prospective)
+            _write_yaml_atomic(
+                directory,
+                local,
+                expected_snapshot=snapshot.local,
+                guard_snapshots=(snapshot.committed, snapshot.local),
+            )
+            return result
+
+
 def cmd_show_deployment(args: argparse.Namespace) -> int:
-    config = load_pack_config(args.pack)
-    print(f"distribution:")
-    print(f"  rsync_target: {distribution_target_from_config(config, args.pack)}")
-    ssh_host, stack_dir, service = minecraft_server_target_from_config(config, args.pack)
+    settings = deployment_settings(args.pack)
+    print("distribution:")
+    print(f"  rsync_target: {settings.rsync_target}")
     print("minecraft_server:")
-    print(f"  ssh_host: {ssh_host}")
-    print(f"  stack_dir: {stack_dir}")
-    print(f"  service: {service}")
+    print(f"  ssh_host: {settings.ssh_host}")
+    print(f"  stack_dir: {settings.stack_dir}")
+    print(f"  service: {settings.service}")
     return 0
 
 
@@ -2231,52 +2402,14 @@ def cmd_set_deployment(args: argparse.Namespace) -> int:
             "set-deployment requires at least one of --rsync-target, --ssh-host, --stack-dir, or --service"
         )
 
-    rsync_target = None
-    if args.rsync_target is not None:
-        rsync_target = _normalize_project_text("Rsync target", args.rsync_target)
-        try:
-            validate_rsync_target(rsync_target)
-        except ValueError as error:
-            raise ConfigError(str(error)) from error
-    ssh_host = validate_ssh_target(args.ssh_host) if args.ssh_host is not None else None
-    stack_dir = (
-        validate_remote_stack_dir(args.stack_dir)
-        if args.stack_dir is not None
-        else None
+    update_deployment_settings(
+        args.pack,
+        rsync_target=UNSET if args.rsync_target is None else args.rsync_target,
+        ssh_host=UNSET if args.ssh_host is None else args.ssh_host,
+        stack_dir=UNSET if args.stack_dir is None else args.stack_dir,
+        service=UNSET if args.service is None else args.service,
     )
-    service = (
-        validate_compose_service(args.service)
-        if args.service is not None
-        else None
-    )
-
-    with ProjectLock(f"pack:{args.pack}", "set deployment settings"):
-        root = get_pack_root(args.pack)
-        local_path = root / "pack.local.yaml"
-        with open_config_directory(root) as directory:
-            snapshot = project_config_snapshot(directory, "pack")
-            committed = parse_yaml_snapshot(snapshot.committed)
-            local = parse_yaml_snapshot(snapshot.local)
-            if rsync_target is not None:
-                local.setdefault("distribution", {})["rsync_target"] = rsync_target
-
-            if ssh_host is not None or stack_dir is not None or service is not None:
-                existing = local.setdefault("minecraft_server", {})
-                if ssh_host is not None:
-                    existing["ssh_host"] = ssh_host
-                if stack_dir is not None:
-                    existing["stack_dir"] = stack_dir
-                if service is not None:
-                    existing["service"] = service
-            prospective_pack_config(args.pack, committed, local)
-            _write_yaml_atomic(
-                directory,
-                local,
-                expected_snapshot=snapshot.local,
-                guard_snapshots=(snapshot.committed, snapshot.local),
-            )
-
-    print(f"Updated {display_path(local_path)}")
+    print(f"Updated {display_path(get_pack_root(args.pack) / 'pack.local.yaml')}")
     return 0
 
 

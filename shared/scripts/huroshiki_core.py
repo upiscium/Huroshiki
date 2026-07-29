@@ -90,6 +90,10 @@ TRASH_ROOT = STATE_ROOT / "trash"
 
 PROJECT_KINDS = ("pack", "template")
 StateItem = packctl.StateItem
+DeploymentSettings = packctl.DeploymentSettings
+DeploymentSettingsSources = packctl.DeploymentSettingsSources
+DeploymentSettingsBaseline = packctl.DeploymentSettingsBaseline
+RsyncTargetParts = packctl.RsyncTargetParts
 
 
 def project_key(kind: str, project_id: str) -> str:
@@ -159,6 +163,103 @@ def project_root(key: str) -> Path:
 def project_config(key: str) -> dict[str, object]:
     kind, project_id = split_project_key(key)
     return packctl.load_project_config(kind, project_id)
+
+
+def deployment_settings(key: str) -> DeploymentSettings:
+    kind, project_id = split_project_key(key)
+    if kind != "pack":
+        raise HuroshikiError("Deployment settings are available only for packs")
+    try:
+        return packctl.deployment_settings(project_id)
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def deployment_settings_baseline(key: str) -> DeploymentSettingsBaseline:
+    kind, project_id = split_project_key(key)
+    if kind != "pack":
+        raise HuroshikiError("Deployment settings are available only for packs")
+    try:
+        return packctl.deployment_settings_baseline(project_id)
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def deployment_settings_sources(key: str) -> DeploymentSettingsSources:
+    kind, project_id = split_project_key(key)
+    if kind != "pack":
+        raise HuroshikiError("Deployment settings are available only for packs")
+    try:
+        return packctl.deployment_settings_sources(project_id)
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def proposed_deployment_settings(
+    *,
+    ssh_host: str,
+    stack_dir: str,
+    service: str,
+    rsync_host: str,
+    rsync_path: str,
+) -> DeploymentSettings:
+    try:
+        return DeploymentSettings(
+            packctl.join_rsync_target(rsync_host, rsync_path),
+            packctl.validate_ssh_target(ssh_host),
+            packctl.validate_remote_stack_dir(stack_dir),
+            packctl.validate_compose_service(service),
+        )
+    except (packctl.ConfigError, ValueError) as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def split_rsync_target(value: str) -> RsyncTargetParts:
+    try:
+        return packctl.split_rsync_target(value)
+    except ValueError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def update_deployment_settings(
+    key: str,
+    settings: DeploymentSettings,
+    *,
+    expected_baseline: DeploymentSettingsBaseline | None = None,
+) -> DeploymentSettings:
+    kind, project_id = split_project_key(key)
+    if kind != "pack":
+        raise HuroshikiError("Deployment settings are available only for packs")
+    try:
+        current = expected_baseline.settings if expected_baseline is not None else None
+        return packctl.update_deployment_settings(
+            project_id,
+            rsync_target=(
+                settings.rsync_target
+                if current is None or settings.rsync_target != current.rsync_target
+                else packctl.UNSET
+            ),
+            ssh_host=(
+                settings.ssh_host
+                if current is None or settings.ssh_host != current.ssh_host
+                else packctl.UNSET
+            ),
+            stack_dir=(
+                settings.stack_dir
+                if current is None or settings.stack_dir != current.stack_dir
+                else packctl.UNSET
+            ),
+            service=(
+                settings.service
+                if current is None or settings.service != current.service
+                else packctl.UNSET
+            ),
+            expected_baseline=(
+                expected_baseline.snapshot if expected_baseline is not None else None
+            ),
+        )
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
 
 
 def project_source(key: str) -> Path:

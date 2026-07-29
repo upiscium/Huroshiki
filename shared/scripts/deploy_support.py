@@ -24,6 +24,19 @@ class DeployPreview:
     snapshot: Path
 
 
+@dataclass(frozen=True)
+class RsyncTargetParts:
+    host: str
+    path: str
+
+
+_RSYNC_TARGET_RE = re.compile(
+    r"(?:(?P<user>[A-Za-z0-9][A-Za-z0-9._-]*)@)?"
+    r"(?P<host>[A-Za-z0-9][A-Za-z0-9._-]*|\[[0-9A-Fa-f:.]+\])"
+    r":(?P<path>/[A-Za-z0-9._/@+,:=-]*(?:/[A-Za-z0-9._/@+,:=-]*)*)"
+)
+
+
 def distribution_digest(dist: Path) -> str:
     digest = hashlib.sha256()
     paths = (dist, *sorted(dist.rglob("*"), key=lambda item: item.as_posix()))
@@ -56,12 +69,7 @@ def validate_rsync_target(target: str) -> str:
         raise ValueError("rsync_target must be a non-empty remote target")
     if any(ord(character) < 32 or ord(character) == 127 for character in target):
         raise ValueError("rsync_target must not contain control characters")
-    match = re.fullmatch(
-        r"(?:(?P<user>[A-Za-z0-9][A-Za-z0-9._-]*)@)?"
-        r"(?P<host>[A-Za-z0-9][A-Za-z0-9._-]*|\[[0-9A-Fa-f:.]+\])"
-        r":(?P<path>/[A-Za-z0-9._/@+,:=-]*(?:/[A-Za-z0-9._/@+,:=-]*)*)",
-        target,
-    )
+    match = _RSYNC_TARGET_RE.fullmatch(target)
     if match is None:
         raise ValueError(
             "rsync_target must be an explicit host:/absolute/path remote target"
@@ -73,6 +81,23 @@ def validate_rsync_target(target: str) -> str:
         except ValueError as error:
             raise ValueError("rsync_target contains an invalid IPv6 address") from error
     return target
+
+
+def split_rsync_target(value: str) -> RsyncTargetParts:
+    target = validate_rsync_target(value)
+    match = _RSYNC_TARGET_RE.fullmatch(target)
+    if match is None:
+        raise ValueError("rsync_target could not be parsed")
+    user = match.group("user")
+    host = match.group("host")
+    return RsyncTargetParts(
+        f"{user}@{host}" if user is not None else host,
+        match.group("path"),
+    )
+
+
+def join_rsync_target(host: str, path: str) -> str:
+    return validate_rsync_target(f"{host}:{path}")
 
 
 def parse_rsync_changes(output: str) -> tuple[RsyncChange, ...]:
