@@ -155,6 +155,7 @@ class ProviderLookupCoreTest(unittest.TestCase):
         cases = (
             (dict(cancelled=True), "cancelled"),
             (dict(timed_out=True), "deadline exceeded"),
+            (dict(termination_incomplete=True), "termination was incomplete"),
             (dict(orphaned_descendants=True), "background processes"),
             (dict(returncode=7, stderr="lookup failed"), "lookup failed"),
         )

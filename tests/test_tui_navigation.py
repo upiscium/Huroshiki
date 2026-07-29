@@ -202,7 +202,7 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
             app = _NavigationApp(screen)
             async with app.run_test() as pilot:
                 self.assertTrue(transaction.started.wait(1))
-                self.assertTrue(screen.preparing)
+                self.assertIsNotNone(screen.operation)
                 await pilot.press("l", "space", "enter")
                 await pilot.pause()
                 self.assertIs(app.screen, screen)
@@ -210,6 +210,21 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.2)
                 self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
         self.assertTrue(transaction.discarded)
+
+    async def test_update_thread_start_failure_discards_transaction(self) -> None:
+        transaction = _UpdateTransaction()
+        with self.patches(), patch.object(
+            huroshiki.core.PackTransaction,
+            "create",
+            return_value=transaction,
+        ), patch.object(threading.Thread, "start", side_effect=RuntimeError("start failed")):
+            screen = huroshiki.UpdateScreen("pack:demo")
+            app = _NavigationApp(screen)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+
+        self.assertTrue(transaction.discarded)
+        self.assertTrue(screen.operation.done.is_set())
 
     async def test_project_escape_stays_main_and_main_escape_stays_main(self) -> None:
         with self.patches():
