@@ -82,6 +82,7 @@ class PublicCliTest(unittest.TestCase):
             "serve",
             "show-deployment",
             "set-deployment",
+            "loader-version",
             "show-url-policy",
             "set-url-policy",
             "show-template-loader-version",

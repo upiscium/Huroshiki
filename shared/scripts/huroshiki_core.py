@@ -386,6 +386,17 @@ class UpdateChange:
 
 
 @dataclass(frozen=True)
+class LoaderMigrationPreview:
+    project_key: str
+    minecraft: str
+    loader: str
+    old_version: str
+    new_version: str
+    changes: tuple[UpdateChange, ...]
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class UpdateCandidate:
     key: str
     root: Path
@@ -1628,7 +1639,7 @@ class PackTransaction:
             ensure_safe_pack_source(self.source)
         return 0
 
-    def apply(self) -> None:
+    def apply(self, *, refresh: bool = True) -> None:
         self.ensure_active()
         with self._lock:
             if self._operation is not None and not self._operation.done.is_set():
@@ -1679,15 +1690,16 @@ class PackTransaction:
             return
 
         ensure_safe_pack_source(self.source)
-        refresh = subprocess.run(
-            ["packwiz", "refresh"],
-            cwd=self.source,
-            text=True,
-            check=False,
-        )
-        if refresh.returncode != 0:
-            raise HuroshikiError("packwiz refresh failed; transaction was not applied")
-        ensure_safe_pack_source(self.source)
+        if refresh:
+            refresh_result = subprocess.run(
+                ["packwiz", "refresh"],
+                cwd=self.source,
+                text=True,
+                check=False,
+            )
+            if refresh_result.returncode != 0:
+                raise HuroshikiError("packwiz refresh failed; transaction was not applied")
+            ensure_safe_pack_source(self.source)
 
         real_root = project_root(self.project_key)
         real_source = real_root / "source"
@@ -3087,6 +3099,8 @@ class _UpdateMetadata:
 
 UPDATE_RESOLVER_TIMEOUT_SECONDS = 120
 UPDATE_OPERATION_TIMEOUT_SECONDS = 600
+LOADER_MIGRATION_TIMEOUT_SECONDS = 300
+LOADER_MIGRATION_PROCESS_TIMEOUT_SECONDS = 120
 PACKWIZ_GENERATED_PATHS = {Path("index.toml"), Path("pack.toml")}
 
 
@@ -3111,6 +3125,228 @@ def _content_changes(
         for path in sorted(before.keys() | after.keys())
         if before.get(path) != after.get(path)
     )
+
+
+class LoaderMigrationCancelled(HuroshikiError):
+    pass
+
+
+class LoaderMigrationDeadlineExceeded(HuroshikiError):
+    pass
+
+
+class LoaderMigrationOperation:
+    def __init__(
+        self,
+        project_key: str,
+        requested_version: str,
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        kind, _ = split_project_key(project_key)
+        if kind != "pack":
+            raise HuroshikiError("Loader migration is available only for packs")
+        if not requested_version or requested_version != requested_version.strip():
+            raise HuroshikiError(
+                "Loader version must be non-empty and have no surrounding whitespace"
+            )
+        try:
+            packctl.validate_project_text("Loader version", requested_version)
+        except packctl.ConfigError as error:
+            raise HuroshikiError(str(error)) from error
+        self.project_key = project_key
+        self.requested_version = requested_version
+        self.deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + LOADER_MIGRATION_TIMEOUT_SECONDS
+        )
+        self.cancel_event = threading.Event()
+        self.done = threading.Event()
+        self.progress_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
+        self.preview: LoaderMigrationPreview | None = None
+        self.error: BaseException | None = None
+        self.transaction: PackTransaction | None = None
+        self.cancelled = False
+        self._started = False
+        self._finished = False
+        self._state_lock = threading.Lock()
+
+    def _checkpoint(self) -> None:
+        if self.cancel_event.is_set():
+            raise LoaderMigrationCancelled("Loader migration was cancelled")
+        if time.monotonic() >= self.deadline:
+            raise LoaderMigrationDeadlineExceeded("Loader migration deadline exceeded")
+
+    def _run_packwiz(self, command: list[str], step: str) -> None:
+        self._checkpoint()
+        self.progress_queue.put(step)
+        result = run_resolver_process(
+            command,
+            cwd=self.transaction.source if self.transaction is not None else ROOT,
+            cancel_event=self.cancel_event,
+            deadline=min(
+                self.deadline,
+                time.monotonic() + LOADER_MIGRATION_PROCESS_TIMEOUT_SECONDS,
+            ),
+        )
+        if result.termination_incomplete:
+            raise HuroshikiError(f"{step}: Packwiz process termination was incomplete")
+        if result.orphaned_descendants:
+            raise HuroshikiError(f"{step}: Packwiz left background processes")
+        if result.cancelled:
+            raise LoaderMigrationCancelled("Loader migration was cancelled")
+        if result.timed_out:
+            raise LoaderMigrationDeadlineExceeded(f"{step} timed out")
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            suffix = f": {detail}" if detail else ""
+            raise HuroshikiError(f"{step} failed with exit {result.returncode}{suffix}")
+        self._checkpoint()
+
+    def run(self) -> None:
+        with self._state_lock:
+            if self._started or self.done.is_set():
+                return
+            self._started = True
+        try:
+            self.progress_queue.put("Creating transaction")
+            self.transaction = PackTransaction.create(
+                self.project_key,
+                checkpoint=self._checkpoint,
+            )
+            before_versions = packctl.project_versions(self.transaction.source)
+            before = _file_content_snapshot(self.transaction.source, self._checkpoint)
+            self._run_packwiz(
+                [
+                    "packwiz",
+                    "--yes",
+                    "migrate",
+                    "loader",
+                    self.requested_version,
+                ],
+                "Loader migration",
+            )
+            self._run_packwiz(["packwiz", "refresh"], "Packwiz refresh")
+            ensure_safe_pack_source(self.transaction.source, checkpoint=self._checkpoint)
+            after_versions = packctl.project_versions(self.transaction.source)
+            if after_versions[0] != before_versions[0]:
+                raise HuroshikiError(
+                    "Loader migration changed the Minecraft version; transaction rejected"
+                )
+            if after_versions[1] != before_versions[1]:
+                raise HuroshikiError(
+                    "Loader migration changed the loader type; transaction rejected"
+                )
+            if not after_versions[2]:
+                raise HuroshikiError(
+                    "Loader migration produced an empty loader version; transaction rejected"
+                )
+            after = _file_content_snapshot(self.transaction.source, self._checkpoint)
+            warnings = (
+                ("URL MOD compatibility cannot be verified",)
+                if any(
+                    record.provider == "url"
+                    for record in _update_metadata_snapshot(
+                        self.transaction.source,
+                        self._checkpoint,
+                    ).values()
+                )
+                else ()
+            )
+            self.preview = LoaderMigrationPreview(
+                self.project_key,
+                before_versions[0],
+                before_versions[1],
+                before_versions[2],
+                after_versions[2],
+                _content_changes(before, after),
+                warnings,
+            )
+            self.progress_queue.put("Preview ready")
+        except LoaderMigrationCancelled:
+            self.cancelled = True
+        except BaseException as error:
+            self.error = error
+        finally:
+            if self.cancel_event.is_set():
+                self.cancelled = True
+            if self.cancelled or self.error is not None:
+                try:
+                    self._discard_once()
+                except BaseException as error:
+                    if self.error is None:
+                        self.error = error
+            self.done.set()
+
+    def apply(self) -> None:
+        with self._state_lock:
+            if (
+                not self.done.is_set()
+                or self.cancelled
+                or self.error is not None
+                or self.preview is None
+                or self.transaction is None
+                or self._finished
+            ):
+                raise HuroshikiError("Loader migration has no applicable preview")
+            self._finished = True
+        try:
+            if self.preview.changes:
+                self.transaction.apply(refresh=False)
+            else:
+                self.transaction.discard()
+        except BaseException:
+            self.transaction.discard()
+            raise
+
+    def _discard_once(self) -> None:
+        with self._state_lock:
+            if self._finished:
+                return
+            self._finished = True
+        if self.transaction is not None:
+            self.transaction.discard()
+
+    def discard(self) -> None:
+        self._discard_once()
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self.cancel_event.set()
+        if self.done.is_set() or not self._started:
+            self._discard_once()
+            self.done.set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self.done.wait(timeout)
+
+    def drain_progress(self) -> tuple[str, ...]:
+        values: list[str] = []
+        while True:
+            try:
+                values.append(self.progress_queue.get_nowait())
+            except queue.Empty:
+                return tuple(values)
+
+
+def prepare_loader_migration(
+    project_key: str,
+    requested_version: str,
+    *,
+    deadline: float | None = None,
+) -> LoaderMigrationOperation:
+    operation = LoaderMigrationOperation(
+        project_key,
+        requested_version,
+        deadline=deadline,
+    )
+    operation.run()
+    if operation.error is not None:
+        raise operation.error
+    if operation.cancelled or operation.preview is None:
+        raise LoaderMigrationCancelled("Loader migration was cancelled")
+    return operation
 
 
 def _update_metadata_record(relative_path: Path, contents: bytes) -> _UpdateMetadata:
