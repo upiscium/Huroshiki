@@ -66,6 +66,26 @@ DataTable {
     padding: 1 2;
 }
 
+#versions-settings-form {
+    height: 1fr;
+    padding: 1 2;
+}
+
+.readonly-setting {
+    height: 2;
+    margin: 0 2;
+    padding: 0 1;
+    color: $text-muted;
+}
+
+#loader-migration-status {
+    height: auto;
+    min-height: 3;
+    margin: 1 2;
+    padding: 1;
+    border: round $primary;
+}
+
 #public-pack-url-source {
     height: 2;
     padding: 0 1;

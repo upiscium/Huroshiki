@@ -168,6 +168,12 @@ class HuroshikiApp(App[None]):
         self.selected_project = project_key
         self.switch_screen(ClientDistributionScreen(project_key))
 
+    def open_versions(self, project_key: str) -> None:
+        if not self.project_is_usable(project_key):
+            return
+        self.selected_project = project_key
+        self.switch_screen(VersionsScreen(project_key))
+
     def open_templates(self, project_key: str) -> None:
         if not self.project_is_usable(project_key):
             return
@@ -1172,7 +1178,7 @@ class ProjectScreen(BaseScreen):
 class SettingsScreen(ProjectChildScreen, BaseScreen):
     screen_title = "Settings"
     help_text = "j/k: move  Enter: open  Esc: project"
-    actions = ("Deployment", "Client Distribution")
+    actions = ("Deployment", "Client Distribution", "Versions")
 
     def __init__(self, project_key: str) -> None:
         super().__init__()
@@ -1209,6 +1215,8 @@ class SettingsScreen(ProjectChildScreen, BaseScreen):
                 self.app.open_deployment_settings(self.project_key)
             elif self.actions[index] == "Client Distribution":
                 self.app.open_client_distribution_settings(self.project_key)
+            elif self.actions[index] == "Versions":
+                self.app.open_versions(self.project_key)
         elif event.key == "escape":
             self.return_to_project()
         else:
@@ -1467,6 +1475,174 @@ class ClientDistributionScreen(BaseScreen):
 
     def action_back(self) -> None:
         self.app.open_settings(self.project_key)
+
+
+class VersionsScreen(BaseScreen):
+    BINDINGS = [
+        Binding("ctrl+s", "prepare", "Preview", priority=True),
+        Binding("escape", "back", "Back", priority=True),
+    ]
+    help_text = "Enter / Ctrl+S: preview migration  Esc: settings"
+
+    def __init__(self, project_key: str) -> None:
+        super().__init__()
+        self.project_key = project_key
+        self.project = core.project_info(project_key)
+        self.screen_title = f"{self.project.display_name} / Settings / Versions"
+        self.operation: core.LoaderMigrationOperation | None = None
+        self.operation_thread: threading.Thread | None = None
+        self.operation_timer: Timer | None = None
+        self.leave_after_cancel = False
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        with Container(id="versions-settings-form"):
+            yield Static("Minecraft version", classes="section-label")
+            yield Static(self.project.minecraft, classes="readonly-setting")
+            yield Static("Loader", classes="section-label")
+            yield Static(self.project.loader, classes="readonly-setting")
+            yield Static("Loader version", classes="section-label")
+            yield Input(
+                value=self.project.loader_version,
+                placeholder="version / latest / recommended",
+                id="loader-version-input",
+            )
+            yield Static("Ready", id="loader-migration-status", markup=False)
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#loader-version-input", Input).focus()
+
+    @on(Input.Submitted, "#loader-version-input")
+    def submitted(self, _event: Input.Submitted) -> None:
+        self.action_prepare()
+
+    def action_prepare(self) -> None:
+        if self.operation is not None:
+            self.app.notify("A loader migration is already active", severity="warning")
+            return
+        value = self.query_one("#loader-version-input", Input).value
+        try:
+            operation = core.LoaderMigrationOperation(self.project_key, value)
+            self.operation = operation
+            self.query_one("#loader-version-input", Input).disabled = True
+            self.query_one("#loader-migration-status", Static).update(
+                "Preparing loader migration..."
+            )
+            self.operation_thread = threading.Thread(
+                target=operation.run,
+                name=f"huroshiki-loader-migration-{self.project_key}",
+                daemon=False,
+            )
+            self.operation_thread.start()
+            self.operation_timer = self.set_interval(0.05, self._poll_operation)
+        except Exception as error:
+            if self.operation is not None:
+                self.operation.cancel()
+                self.operation = None
+            self.query_one("#loader-version-input", Input).disabled = False
+            self.app.notify(str(error), severity="error")
+
+    def _poll_operation(self) -> None:
+        operation = self.operation
+        if operation is None:
+            return
+        progress = operation.drain_progress()
+        if progress:
+            self.query_one("#loader-migration-status", Static).update(progress[-1])
+        if not operation.done.is_set():
+            return
+        if self.operation_timer is not None:
+            self.operation_timer.pause()
+            self.operation_timer = None
+        self.operation_thread = None
+        self.query_one("#loader-version-input", Input).disabled = False
+        if operation.error is not None:
+            self.operation = None
+            self.query_one("#loader-migration-status", Static).update(str(operation.error))
+            self.app.notify(str(operation.error), severity="error")
+            if self.leave_after_cancel:
+                self.app.open_settings(self.project_key)
+            return
+        if operation.cancelled:
+            self.operation = None
+            if self.leave_after_cancel:
+                self.app.open_settings(self.project_key)
+            else:
+                self.query_one("#loader-migration-status", Static).update(
+                    "Loader migration cancelled"
+                )
+            return
+        preview = operation.preview
+        if preview is None:
+            operation.discard()
+            self.operation = None
+            self.app.notify("Loader migration produced no preview", severity="error")
+            return
+        lines = [
+            f"Minecraft: {preview.minecraft}",
+            f"Loader: {preview.loader}",
+            f"Loader version: {preview.old_version} -> {preview.new_version}",
+            "",
+            "Changed files:",
+            *(
+                (f"  {change.relative_path}" for change in preview.changes)
+                if preview.changes
+                else ("  (none)",)
+            ),
+        ]
+        if preview.warnings:
+            lines.extend(("", "Warnings:", *(f"  {item}" for item in preview.warnings)))
+        self.app.push_screen(
+            ConfirmModal("Apply loader migration?", lines),
+            self.preview_confirmed,
+        )
+
+    def preview_confirmed(self, confirmed: bool | None) -> None:
+        operation = self.operation
+        if operation is None:
+            return
+        if not confirmed:
+            operation.discard()
+            self.operation = None
+            self.query_one("#loader-migration-status", Static).update(
+                "Loader migration discarded"
+            )
+            self.query_one("#loader-version-input", Input).focus()
+            return
+        try:
+            with self.app.suspend():
+                operation.apply()
+            self.operation = None
+            self.app.notify("Loader migration applied")
+            self.app.open_versions(self.project_key)
+        except Exception as error:
+            self.operation = None
+            self.app.notify(str(error), severity="error")
+
+    def action_back(self) -> None:
+        operation = self.operation
+        if operation is not None and not operation.done.is_set():
+            self.leave_after_cancel = True
+            operation.cancel()
+            self.query_one("#loader-migration-status", Static).update(
+                "Cancelling loader migration before leaving..."
+            )
+            return
+        if operation is not None:
+            operation.discard()
+            self.operation = None
+        self.app.open_settings(self.project_key)
+
+    def on_unmount(self) -> None:
+        if self.operation_timer is not None:
+            self.operation_timer.pause()
+            self.operation_timer = None
+        if self.operation is not None:
+            if self.operation.done.is_set():
+                self.operation.discard()
+            else:
+                self.operation.cancel()
 
 
 class TemplateEditorScreen(ProjectChildScreen, BaseScreen):
