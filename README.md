@@ -371,3 +371,6 @@ nix flake check
 nix build .
 nix build .#huroshiki
 ```
+
+`nix flake check` includes the complete Python unit suite as a sandboxed derivation. GitHub pull
+requests must pass the `checks` CI status before merging to `main`.

@@ -73,8 +73,25 @@
             test ! -e ${huroshiki}/share/zsh/site-functions/_just
             touch "$out"
           '';
+          unitTests = pkgs.stdenvNoCC.mkDerivation {
+            pname = "huroshiki-unit-tests";
+            version = "0.1.0";
+            src = ./.;
+            nativeBuildInputs = [ python pkgs.git ] ++ runtimeInputs;
+            dontBuild = true;
+            doCheck = true;
+            checkPhase = ''
+              runHook preCheck
+              patchShebangs shared/scripts/huroshiki-launcher.sh
+              PYTHONPATH=shared/scripts ${python}/bin/python -m unittest discover -s tests -v
+              runHook postCheck
+            '';
+            installPhase = ''
+              touch "$out"
+            '';
+          };
         in
-        { inherit pkgs python huroshiki smoke; };
+        { inherit pkgs python huroshiki smoke unitTests; };
     in
     {
       packages = forAllSystems (system: {
@@ -98,6 +115,7 @@
       checks = forAllSystems (system: {
         huroshiki-package = (perSystem system).huroshiki;
         huroshiki-smoke = (perSystem system).smoke;
+        huroshiki-unit-tests = (perSystem system).unitTests;
       });
 
       devShells = forAllSystems (
