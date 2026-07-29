@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -31,6 +32,17 @@ hash = "00"
 [update.modrinth]
 mod-id = "{project_id}"
 version = "1"
+    '''.encode()
+
+
+def url_metadata(name: str, filename: str, url: str) -> bytes:
+    return f'''name = "{name}"
+filename = "{filename}"
+side = "both"
+[download]
+url = "{url}"
+hash-format = "sha256"
+hash = "00"
 '''.encode()
 
 
@@ -98,10 +110,36 @@ class TemplateImportCoreTest(unittest.TestCase):
         )
         return core.ResolvedModClosure(("modrinth", "root"), records)
 
+    def url_closure(self, actual_id: str = "actual") -> core.ResolvedModClosure:
+        record = core.ResolvedMetadata(
+            ("url", actual_id),
+            Path(f"mods/{actual_id}.pw.toml"),
+            f"{actual_id}.jar",
+            url_metadata(
+                "Actual Root",
+                f"{actual_id}.jar",
+                "https://mods.example/requested.jar",
+            ),
+            "url",
+            actual_id,
+        )
+        return core.ResolvedModClosure(("url", actual_id), (record,))
+
+    def use_url_template(self) -> None:
+        (self.template / "template.yaml").write_text(
+            "id: base\ndisplay_name: Base\nenabled: true\n"
+            "minecraft: 1.21.1\nloader: neoforge\n"
+            "reference_loader_version: 21.1.0\nmods:\n"
+            "  - name: Requested\n    provider: url\n"
+            "    project_id: logical\n    side: client\n"
+            "    url: https://mods.example/requested.jar\n",
+            encoding="utf-8",
+        )
+
     def operation(self) -> core.TemplateImportOperation:
-        plan = core.prepare_template_import_plan("pack:demo", ["base"])
-        resolved = resolve_template_import_plan(plan)
-        return core.TemplateImportOperation(plan, resolved)
+        session = core.TemplateImportSession.create("pack:demo", ["base"])
+        resolved = resolve_template_import_plan(session.plan)
+        return core.TemplateImportOperation(session, resolved)
 
     @staticmethod
     def refresh_ok(command: list[str], **_: object) -> core.ResolverProcessResult:
@@ -117,7 +155,10 @@ class TemplateImportCoreTest(unittest.TestCase):
         ):
             operation.run()
         self.assertIsNone(operation.error)
-        self.assertEqual([item.project_id for item in operation.preview.added_roots], ["root"])
+        self.assertEqual(
+            [item.actual_identity for item in operation.preview.added_roots],
+            [("modrinth", "root")],
+        )
         self.assertEqual(
             [item.project_id for item in operation.preview.added_dependencies],
             ["dependency"],
@@ -190,6 +231,17 @@ class TemplateImportCoreTest(unittest.TestCase):
         self.assertIn("resolution file", stderr.getvalue())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
+        args.json = True
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(packctl.cmd_apply_template(args), 2)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["plan_digest"], core.prepare_template_import_plan(
+            "pack:demo", ["base"]
+        ).plan_digest)
+        self.assertEqual(payload["conflicts"]["name"][0]["key"], "root")
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
     def test_resolution_digest_and_cli_parser_fail_closed(self) -> None:
         plan = core.prepare_template_import_plan("pack:demo", ["base"])
         resolution = self.root / "resolution.yaml"
@@ -205,6 +257,128 @@ class TemplateImportCoreTest(unittest.TestCase):
         self.assertIs(args.func, packctl.cmd_apply_template)
         self.assertEqual(args.templates, ["base"])
         self.assertTrue(args.apply)
+
+    def test_session_uses_transaction_source_as_only_pack_plan_source(self) -> None:
+        original = core.pack_import_candidates
+        observed: list[Path] = []
+
+        def inspect_source(source: Path, pack_id: str):
+            observed.append(source)
+            self.assertNotEqual(source, self.source)
+            self.assertTrue(packctl.project_lock_is_active("pack:demo"))
+            return original(source, pack_id)
+
+        with patch.object(core, "pack_import_candidates", side_effect=inspect_source):
+            session = core.TemplateImportSession.create("pack:demo", ["base"])
+        self.assertEqual(observed, [session.transaction.source])
+        session.discard()
+
+    def test_external_pack_change_after_session_creation_blocks_apply(self) -> None:
+        original = core.pack_import_candidates
+
+        def mutate_real_pack(source: Path, pack_id: str):
+            mods = self.source / "mods"
+            mods.mkdir(exist_ok=True)
+            (mods / "late.pw.toml").write_bytes(metadata("Late", "late", "late.jar"))
+            return original(source, pack_id)
+
+        with patch.object(
+            core,
+            "pack_import_candidates",
+            side_effect=mutate_real_pack,
+        ):
+            operation = self.operation()
+        self.assertEqual(operation.plan.pack_candidates, ())
+        with (
+            patch.object(core, "resolve_mod_closure", return_value=self.closure()),
+            patch.object(core, "run_resolver_process", side_effect=self.refresh_ok),
+        ):
+            operation.run()
+        with self.assertRaisesRegex(core.HuroshikiError, "real Packwiz source changed"):
+            operation.apply()
+        self.assertTrue((self.source / "mods/late.pw.toml").is_file())
+
+    def test_external_config_change_after_preview_blocks_apply(self) -> None:
+        operation = self.operation()
+        with (
+            patch.object(core, "resolve_mod_closure", return_value=self.closure()),
+            patch.object(core, "run_resolver_process", side_effect=self.refresh_ok),
+        ):
+            operation.run()
+        (self.pack / "pack.local.yaml").write_text(
+            "url_max_jar_size_bytes: 1024\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(core.HuroshikiError, "configuration changed"):
+            operation.apply()
+        self.assertFalse((self.source / "mods").exists())
+
+    def test_failed_session_creation_releases_project_lock(self) -> None:
+        with patch.object(
+            core,
+            "pack_import_candidates",
+            side_effect=core.HuroshikiError("failed"),
+        ), self.assertRaisesRegex(core.HuroshikiError, "failed"):
+            core.TemplateImportSession.create("pack:demo", ["base"])
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_url_policy_identity_and_cached_closure_reach_preview(self) -> None:
+        self.use_url_template()
+        (self.template / "template.local.yaml").write_text(
+            "url_max_jar_size_bytes: 1234\n"
+            "url_allow_private_networks: true\n",
+            encoding="utf-8",
+        )
+        closure = self.url_closure()
+        with patch.object(core, "resolve_mod_closure", return_value=closure) as resolver:
+            session = core.TemplateImportSession.create("pack:demo", ["base"])
+            resolved = resolve_template_import_plan(session.plan)
+            operation = core.TemplateImportOperation(session, resolved)
+            with patch.object(
+                core, "run_resolver_process", side_effect=self.refresh_ok
+            ):
+                operation.run()
+        self.assertEqual(resolver.call_count, 1)
+        self.assertEqual(resolver.call_args.kwargs["url_max_jar_size_bytes"], 1234)
+        self.assertTrue(resolver.call_args.kwargs["url_allow_private_networks"])
+        self.assertEqual(
+            operation.preview.added_roots[0].requested_identity,
+            ("url", "logical"),
+        )
+        self.assertEqual(
+            operation.preview.added_roots[0].actual_identity,
+            ("url", "actual"),
+        )
+        self.assertEqual(operation.preview.added_dependencies, ())
+        operation.discard()
+
+    def test_actual_identity_change_invalidates_resolution(self) -> None:
+        self.use_url_template()
+        with patch.object(
+            core, "resolve_mod_closure", return_value=self.url_closure("first")
+        ):
+            first = core.TemplateImportSession.create("pack:demo", ["base"])
+        first_digest = first.plan.plan_digest
+        first.discard()
+        with patch.object(
+            core, "resolve_mod_closure", return_value=self.url_closure("second")
+        ):
+            second = core.TemplateImportSession.create("pack:demo", ["base"])
+        self.assertNotEqual(first_digest, second.plan.plan_digest)
+        second.discard()
+
+    def test_removal_rechecks_actual_identity_before_unlink(self) -> None:
+        mods = self.source / "mods"
+        mods.mkdir()
+        path = mods / "installed.pw.toml"
+        path.write_bytes(metadata("Installed", "installed", "installed.jar"))
+        transaction = core.PackTransaction.create("pack:demo")
+        candidate = core.pack_import_candidates(transaction.source, "demo")[0]
+        staged = transaction.source / candidate.metadata_path
+        staged.write_bytes(metadata("Changed", "changed", "changed.jar"))
+        with self.assertRaisesRegex(core.HuroshikiError, "changed before removal"):
+            core._remove_import_candidates(transaction.source, (candidate,))
+        transaction.discard()
 
 
 if __name__ == "__main__":

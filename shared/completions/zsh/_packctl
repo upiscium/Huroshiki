@@ -55,7 +55,7 @@ _packctl() {
       'remove:remove installed mods'
       'update:update all mods'
       'loader-version:preview or apply a loader version migration'
-      'apply-template:preview or apply templates to an existing pack'
+      'apply-template:preview or apply verified templates to an existing pack'
       'show-url-policy:show effective URL policy for pack/template'
       'set-url-policy:update URL policy in local config'
       'show-template-loader-version:show template reference loader version'

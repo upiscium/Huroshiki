@@ -29,15 +29,33 @@ class ModCandidate:
     metadata_path: Path | None = None
     filename: str | None = None
     url: str | None = None
+    url_max_jar_size_bytes: int | None = None
+    url_allow_private_networks: bool = False
+    actual_provider: str | None = None
+    actual_project_id: str | None = None
 
     @property
-    def identity(self) -> tuple[str, str]:
+    def logical_identity(self) -> tuple[str, str]:
         return self.provider, self.project_id
+
+    @property
+    def selector_identity(self) -> tuple[str, str, str | None]:
+        return (
+            self.provider,
+            self.project_id,
+            self.url if self.provider == "url" else None,
+        )
+
+    @property
+    def actual_identity(self) -> tuple[str, str] | None:
+        if self.actual_provider is None or self.actual_project_id is None:
+            return None
+        return self.actual_provider, self.actual_project_id
 
     @property
     def candidate_key(self) -> str:
         base = f"{self.provider}:{self.project_id}"
-        return f"{base}@{self.url or ''}" if self.provider == "url" else base
+        return f"{base}@{self.url}" if self.provider == "url" else base
 
 
 @dataclass(frozen=True)
@@ -62,6 +80,33 @@ class CandidateNameConflict:
 
 
 @dataclass(frozen=True)
+class UrlSelectorConflict:
+    logical_identity: tuple[str, str]
+    candidates: tuple[ModCandidate, ...]
+
+    @property
+    def key(self) -> str:
+        return f"{self.logical_identity[0]}:{self.logical_identity[1]}"
+
+
+@dataclass(frozen=True)
+class ActualIdentityConflict:
+    actual_identity: tuple[str, str]
+    pack_candidate: ModCandidate | None
+    template_candidates: tuple[ModCandidate, ...]
+
+    @property
+    def key(self) -> str:
+        return f"{self.actual_identity[0]}:{self.actual_identity[1]}"
+
+    @property
+    def candidates(self) -> tuple[ModCandidate, ...]:
+        if self.pack_candidate is None:
+            return self.template_candidates
+        return (self.pack_candidate, *self.template_candidates)
+
+
+@dataclass(frozen=True)
 class TemplateImportPlan:
     pack_key: str
     template_ids: tuple[str, ...]
@@ -69,8 +114,18 @@ class TemplateImportPlan:
     existing_identities: tuple[ModCandidate, ...]
     side_conflicts: tuple[IdentitySideConflict, ...]
     name_conflicts: tuple[CandidateNameConflict, ...]
+    url_selector_conflicts: tuple[UrlSelectorConflict, ...]
+    actual_identity_conflicts: tuple[ActualIdentityConflict, ...]
     pack_candidates: tuple[ModCandidate, ...]
     plan_digest: str
+
+    @property
+    def requires_resolution(self) -> bool:
+        return bool(
+            self.name_conflicts
+            or self.url_selector_conflicts
+            or self.actual_identity_conflicts
+        )
 
 
 @dataclass(frozen=True)
@@ -90,6 +145,10 @@ def template_candidate(
     project_id: str,
     side: str,
     url: str | None = None,
+    url_max_jar_size_bytes: int | None = None,
+    url_allow_private_networks: bool = False,
+    actual_provider: str | None = None,
+    actual_project_id: str | None = None,
 ) -> ModCandidate:
     return ModCandidate(
         "template",
@@ -99,6 +158,10 @@ def template_candidate(
         project_id,
         side,
         url=url,
+        url_max_jar_size_bytes=url_max_jar_size_bytes,
+        url_allow_private_networks=url_allow_private_networks,
+        actual_provider=actual_provider,
+        actual_project_id=actual_project_id,
     )
 
 
@@ -110,31 +173,49 @@ def candidate_from_template_entry(entry: TemplateModEntry) -> ModCandidate:
         project_id=entry.project_id,
         side=entry.side,
         url=entry.url,
+        url_max_jar_size_bytes=entry.max_url_jar_size_bytes,
+        url_allow_private_networks=entry.url_allow_private_networks,
     )
 
 
-def _merged_template_identities(
+def merge_template_import_candidates(
     candidates: Sequence[ModCandidate],
 ) -> tuple[ModCandidate, ...]:
     merged: list[ModCandidate] = []
-    indexes: dict[tuple[str, str], int] = {}
+    indexes: dict[tuple[str, str, str | None], int] = {}
     for candidate in candidates:
-        index = indexes.get(candidate.identity)
+        index = indexes.get(candidate.selector_identity)
         if index is None:
-            indexes[candidate.identity] = len(merged)
+            indexes[candidate.selector_identity] = len(merged)
             merged.append(candidate)
         else:
             current = merged[index]
-            merged[index] = replace(current, side=union_side(current.side, candidate.side))
+            limits = tuple(
+                limit
+                for limit in (
+                    current.url_max_jar_size_bytes,
+                    candidate.url_max_jar_size_bytes,
+                )
+                if limit is not None
+            )
+            merged[index] = replace(
+                current,
+                side=union_side(current.side, candidate.side),
+                url_max_jar_size_bytes=min(limits) if limits else None,
+                url_allow_private_networks=(
+                    current.url_allow_private_networks
+                    and candidate.url_allow_private_networks
+                ),
+            )
     return tuple(merged)
 
 
 def _name_conflicts(candidates: Sequence[ModCandidate]) -> tuple[CandidateNameConflict, ...]:
-    identity_order: list[tuple[str, str]] = []
-    identity_candidates: dict[tuple[str, str], ModCandidate] = {}
-    aliases: dict[tuple[str, str], set[str]] = {}
+    identity_order: list[tuple[str, str, str | None]] = []
+    identity_candidates: dict[tuple[str, str, str | None], ModCandidate] = {}
+    aliases: dict[tuple[str, str, str | None], set[str]] = {}
     for candidate in candidates:
-        identity = candidate.identity
+        identity = candidate.selector_identity
         if identity not in identity_candidates:
             identity_order.append(identity)
             identity_candidates[identity] = candidate
@@ -172,6 +253,48 @@ def _name_conflicts(candidates: Sequence[ModCandidate]) -> tuple[CandidateNameCo
     )
 
 
+def _url_selector_conflicts(
+    candidates: Sequence[ModCandidate],
+) -> tuple[UrlSelectorConflict, ...]:
+    grouped: dict[tuple[str, str], list[ModCandidate]] = {}
+    for candidate in candidates:
+        if candidate.provider == "url":
+            grouped.setdefault(candidate.logical_identity, []).append(candidate)
+    return tuple(
+        UrlSelectorConflict(identity, tuple(group))
+        for identity, group in grouped.items()
+        if len({candidate.selector_identity for candidate in group}) > 1
+    )
+
+
+def _actual_identity_conflicts(
+    pack_candidates: Sequence[ModCandidate],
+    template_candidates: Sequence[ModCandidate],
+) -> tuple[ActualIdentityConflict, ...]:
+    pack_by_identity = {
+        candidate.actual_identity or candidate.logical_identity: candidate
+        for candidate in pack_candidates
+    }
+    grouped: dict[tuple[str, str], list[ModCandidate]] = {}
+    for candidate in template_candidates:
+        if candidate.actual_identity is not None:
+            grouped.setdefault(candidate.actual_identity, []).append(candidate)
+    conflicts: list[ActualIdentityConflict] = []
+    for identity, candidates in grouped.items():
+        pack_candidate = pack_by_identity.get(identity)
+        newly_discovered = any(
+            candidate.logical_identity != identity for candidate in candidates
+        )
+        selector_collision = len(
+            {candidate.selector_identity for candidate in candidates}
+        ) > 1
+        if (pack_candidate is not None and newly_discovered) or selector_collision:
+            conflicts.append(
+                ActualIdentityConflict(identity, pack_candidate, tuple(candidates))
+            )
+    return tuple(conflicts)
+
+
 def _plan_digest_payload(
     pack_key: str,
     template_ids: tuple[str, ...],
@@ -193,6 +316,10 @@ def _plan_digest_payload(
             ),
             "filename": candidate.filename,
             "url": candidate.url,
+            "url_max_jar_size_bytes": candidate.url_max_jar_size_bytes,
+            "url_allow_private_networks": candidate.url_allow_private_networks,
+            "actual_provider": candidate.actual_provider,
+            "actual_project_id": candidate.actual_project_id,
         }
 
     payload = {
@@ -242,7 +369,11 @@ def build_template_import_plan(
             raise TemplateMergeError(f"Invalid candidate side: {candidate.side}")
         if not candidate.name.strip() or not candidate.provider or not candidate.project_id:
             raise TemplateMergeError("Import candidates require name, provider, and project ID")
-    if len({candidate.identity for candidate in pack_candidates}) != len(pack_candidates):
+        if candidate.provider == "url" and not candidate.url:
+            raise TemplateMergeError("URL import candidates require a URL selector")
+    if len({candidate.logical_identity for candidate in pack_candidates}) != len(
+        pack_candidates
+    ):
         raise TemplateMergeError("Pack candidates contain duplicate identities")
     ordered_templates = [
         candidate
@@ -252,29 +383,35 @@ def build_template_import_plan(
     ]
     if len(ordered_templates) != len(template_candidates):
         raise TemplateMergeError("Template candidate references an unselected template")
-    merged_templates = _merged_template_identities(ordered_templates)
-    pack_by_identity = {candidate.identity: candidate for candidate in pack_candidates}
+    merged_templates = merge_template_import_candidates(ordered_templates)
+    pack_by_identity = {
+        candidate.logical_identity: candidate for candidate in pack_candidates
+    }
     new_roots = tuple(
         candidate
         for candidate in merged_templates
-        if candidate.identity not in pack_by_identity
+        if candidate.logical_identity not in pack_by_identity
     )
     existing = tuple(
-        pack_by_identity[candidate.identity]
+        pack_by_identity[candidate.logical_identity]
         for candidate in merged_templates
-        if candidate.identity in pack_by_identity
+        if candidate.logical_identity in pack_by_identity
     )
     side_conflicts = tuple(
         IdentitySideConflict(
-            candidate.identity,
-            pack_by_identity[candidate.identity].side,
+            candidate.logical_identity,
+            pack_by_identity[candidate.logical_identity].side,
             candidate.side,
         )
         for candidate in merged_templates
-        if candidate.identity in pack_by_identity
-        and pack_by_identity[candidate.identity].side != candidate.side
+        if candidate.logical_identity in pack_by_identity
+        and pack_by_identity[candidate.logical_identity].side != candidate.side
     )
     name_conflicts = _name_conflicts((*pack_candidates, *merged_templates))
+    url_selector_conflicts = _url_selector_conflicts(merged_templates)
+    actual_identity_conflicts = _actual_identity_conflicts(
+        pack_candidates, merged_templates
+    )
     return TemplateImportPlan(
         pack_key,
         ordered_ids,
@@ -282,6 +419,8 @@ def build_template_import_plan(
         existing,
         side_conflicts,
         name_conflicts,
+        url_selector_conflicts,
+        actual_identity_conflicts,
         tuple(pack_candidates),
         _plan_digest_payload(
             pack_key,
@@ -296,6 +435,8 @@ def resolve_template_import_plan(
     plan: TemplateImportPlan,
     *,
     name_resolutions: Mapping[str, ConflictResolution] | None = None,
+    url_selector_resolutions: Mapping[str, ConflictResolution] | None = None,
+    actual_identity_resolutions: Mapping[str, ConflictResolution] | None = None,
     side_decisions: Mapping[tuple[str, str], SideDecision] | None = None,
 ) -> ResolvedTemplateImportPlan:
     supplied_names = dict(name_resolutions or {})
@@ -307,7 +448,10 @@ def resolve_template_import_plan(
         raise TemplateMergeError(
             "Unresolved or stale import name conflict(s): " + ", ".join(details)
         )
-    selected_keys: set[str] = set()
+    selected_keys = {
+        candidate.candidate_key
+        for candidate in (*plan.pack_candidates, *plan.new_roots)
+    }
     warnings: list[str] = []
     for conflict in plan.name_conflicts:
         resolution = supplied_names[conflict.key]
@@ -320,7 +464,7 @@ def resolve_template_import_plan(
                 f"Conflict {conflict.name!r} retains multiple candidates without "
                 "acknowledging duplicate MOD risk"
             )
-        selected_keys.update(keys)
+        selected_keys.difference_update(available - set(keys))
         if len(keys) > 1:
             warnings.append(
                 f"{conflict.name}: multiple sources retained; duplicate MOD risk acknowledged"
@@ -331,6 +475,53 @@ def resolve_template_import_plan(
         for conflict in plan.name_conflicts
         for candidate in conflict.candidates
     }
+    supplied_urls = dict(url_selector_resolutions or {})
+    expected_urls = {conflict.key for conflict in plan.url_selector_conflicts}
+    if set(supplied_urls) != expected_urls:
+        details = sorted(
+            (expected_urls - set(supplied_urls))
+            | (set(supplied_urls) - expected_urls)
+        )
+        raise TemplateMergeError(
+            "Unresolved or stale URL selector conflict(s): " + ", ".join(details)
+        )
+    for conflict in plan.url_selector_conflicts:
+        resolution = supplied_urls[conflict.key]
+        keys = tuple(resolution.candidate_keys)
+        available = {candidate.candidate_key for candidate in conflict.candidates}
+        if not keys or len(set(keys)) != len(keys) or not set(keys) <= available:
+            raise TemplateMergeError(f"Invalid resolution for {conflict.key}")
+        if len(keys) > 1 and not resolution.acknowledge_duplicate_risk:
+            raise TemplateMergeError(
+                f"Conflict {conflict.key!r} retains multiple URL selectors without "
+                "acknowledging duplicate MOD risk"
+            )
+        selected_keys.difference_update(available - set(keys))
+        conflict_keys.update(available)
+        if len(keys) > 1:
+            warnings.append(
+                f"{conflict.key}: multiple URL selectors retained; duplicate MOD risk acknowledged"
+            )
+    supplied_actual = dict(actual_identity_resolutions or {})
+    expected_actual = {conflict.key for conflict in plan.actual_identity_conflicts}
+    if set(supplied_actual) != expected_actual:
+        details = sorted(
+            (expected_actual - set(supplied_actual))
+            | (set(supplied_actual) - expected_actual)
+        )
+        raise TemplateMergeError(
+            "Unresolved or stale actual identity conflict(s): " + ", ".join(details)
+        )
+    for conflict in plan.actual_identity_conflicts:
+        resolution = supplied_actual[conflict.key]
+        keys = tuple(resolution.candidate_keys)
+        available = {candidate.candidate_key for candidate in conflict.candidates}
+        if len(keys) != 1 or keys[0] not in available:
+            raise TemplateMergeError(
+                f"Actual identity conflict {conflict.key} requires exactly one candidate"
+            )
+        selected_keys.difference_update(available - set(keys))
+        conflict_keys.update(available)
     selected_new = tuple(
         candidate
         for candidate in plan.new_roots

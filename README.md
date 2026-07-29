@@ -267,10 +267,14 @@ worker, displays progress and changed files, and completes cancellation cleanup 
 
 `packctl apply-template <pack> <template> [<template> ...]` prepares a one-shot import into an
 existing pack. The default is a dry run; `--apply` publishes the staged closure. Name conflicts
-require a versioned `--resolution` YAML file containing the displayed plan digest, while identity
-side conflicts default to keeping the installed pack side. Template order is significant, Packwiz
-dependencies are shown separately, and no persistent template association or content overlay is
-created.
+and URL selector or resolved-identity conflicts require a versioned `--resolution` YAML file
+containing the displayed plan digest, while identity side conflicts default to keeping the installed
+pack side. Planning starts by locking and copying the Pack transaction, and reads installed metadata
+only from that transaction source. Template order, each complete URL, effective URL size/private-
+network policy, and the MOD identity verified from each URL JAR are bound into the digest. Verified
+URL closures are reused for execution, roots are reported by both requested and actual identity, and
+new conflicts discovered during verification fail closed. Packwiz dependencies are shown separately,
+and no persistent template association or content overlay is created.
 
 The settings commands pin the managed collection and project directory, snapshot both committed and
 local configuration, validate the prospective merged project entirely in memory, and publish through
