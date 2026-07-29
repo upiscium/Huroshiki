@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import textwrap
 import unittest
@@ -35,6 +36,8 @@ mods: []
             binary_dir = root / "bin"
             binary_dir.mkdir()
             binary = binary_dir / "packwiz"
+            bash = shutil.which("bash")
+            self.assertIsNotNone(bash)
             binary.write_text(
                 textwrap.dedent(
                     r"""
@@ -59,7 +62,7 @@ mods: []
                     version = "version-id"
                     EOF
                     """
-                ).lstrip(),
+                ).lstrip().replace("#!/usr/bin/env bash", f"#!{bash}"),
                 encoding="utf-8",
             )
             binary.chmod(0o755)

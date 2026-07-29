@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 permissions:
@@ -28,9 +30,6 @@ jobs:
 
       - name: Check flake
         run: nix flake check
-
-      - name: Run test suite
-        run: nix develop --command just test-huroshiki
 
       - name: Validate repository data
         run: nix develop --command packctl validate

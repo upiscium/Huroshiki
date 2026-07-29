@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import textwrap
 import unittest
@@ -16,6 +17,8 @@ class PackwizPtySessionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             binary = root / "packwiz"
+            bash = shutil.which("bash")
+            self.assertIsNotNone(bash)
             binary.write_text(
                 textwrap.dedent(
                     """\
@@ -31,7 +34,7 @@ class PackwizPtySessionTest(unittest.TestCase):
                     [[ "$answer" =~ ^[Yy]?$ ]]
                     printf '\\r\\nProject successfully added!\\r\\n'
                     """
-                ),
+                ).replace("#!/usr/bin/env bash", f"#!{bash}"),
                 encoding="utf-8",
             )
             binary.chmod(0o755)
