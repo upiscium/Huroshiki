@@ -10,7 +10,6 @@ if TYPE_CHECKING:
     from huroshiki_core import ResolvedModClosure
 
 from template_merge import (
-    ConflictResolution,
     TemplateMergeError,
     TemplateModEntry,
     normalize_name,
@@ -59,6 +58,16 @@ class ModCandidate:
     def candidate_key(self) -> str:
         base = f"{self.provider}:{self.project_id}"
         return f"{base}@{self.url}" if self.provider == "url" else base
+
+    @property
+    def selection_key(self) -> str:
+        if self.origin_kind == "pack":
+            if self.metadata_path is None:
+                raise TemplateMergeError(
+                    "Pack selection candidate requires a metadata path"
+                )
+            return f"pack:{self.origin_id}:{self.metadata_path.as_posix()}"
+        return f"template:{self.candidate_key}"
 
 
 @dataclass(frozen=True)
@@ -141,6 +150,12 @@ class ImportCandidateVerification:
     @property
     def succeeded(self) -> bool:
         return self.error is None and self.actual_identity is not None
+
+
+@dataclass(frozen=True)
+class ImportConflictResolution:
+    selection_keys: tuple[str, ...]
+    acknowledge_duplicate_risk: bool = False
 
 
 @dataclass(frozen=True)
@@ -388,6 +403,8 @@ def _plan_digest_payload(
             "url_allow_private_networks": candidate.url_allow_private_networks,
             "actual_provider": candidate.actual_provider,
             "actual_project_id": candidate.actual_project_id,
+            "candidate_key": candidate.candidate_key,
+            "selection_key": candidate.selection_key,
         }
 
     payload = {
@@ -470,6 +487,14 @@ def build_template_import_plan(
     if len(ordered_templates) != len(template_candidates):
         raise TemplateMergeError("Template candidate references an unselected template")
     merged_templates = merge_template_import_candidates(ordered_templates)
+    selection_keys = [
+        candidate.selection_key
+        for candidate in (*pack_candidates, *merged_templates)
+    ]
+    if len(selection_keys) != len(set(selection_keys)):
+        raise TemplateMergeError(
+            "Template import candidates contain duplicate selection keys"
+        )
     verification_by_selector = {
         item.selector_identity: item for item in verifications
     }
@@ -546,10 +571,10 @@ def build_template_import_plan(
 def resolve_template_import_plan(
     plan: TemplateImportPlan,
     *,
-    name_resolutions: Mapping[str, ConflictResolution] | None = None,
-    url_selector_resolutions: Mapping[str, ConflictResolution] | None = None,
-    logical_identity_resolutions: Mapping[str, ConflictResolution] | None = None,
-    actual_identity_resolutions: Mapping[str, ConflictResolution] | None = None,
+    name_resolutions: Mapping[str, ImportConflictResolution] | None = None,
+    url_selector_resolutions: Mapping[str, ImportConflictResolution] | None = None,
+    logical_identity_resolutions: Mapping[str, ImportConflictResolution] | None = None,
+    actual_identity_resolutions: Mapping[str, ImportConflictResolution] | None = None,
     side_decisions: Mapping[tuple[str, str], SideDecision] | None = None,
 ) -> ResolvedTemplateImportPlan:
     requirements: dict[str, bool] = {}
@@ -559,8 +584,8 @@ def resolve_template_import_plan(
     def checked_resolutions(
         kind: str,
         conflicts: Sequence[object],
-        supplied: Mapping[str, ConflictResolution] | None,
-    ) -> dict[str, ConflictResolution]:
+        supplied: Mapping[str, ImportConflictResolution] | None,
+    ) -> dict[str, ImportConflictResolution]:
         values = dict(supplied or {})
         expected = {getattr(conflict, "key") for conflict in conflicts}
         if set(values) != expected:
@@ -575,11 +600,11 @@ def resolve_template_import_plan(
         kind: str,
         key: str,
         candidates: Sequence[ModCandidate],
-        resolution: ConflictResolution,
+        resolution: ImportConflictResolution,
         cardinality: Literal["one-or-more", "exactly-one"],
     ) -> None:
-        keys = tuple(resolution.candidate_keys)
-        available_keys = tuple(candidate.candidate_key for candidate in candidates)
+        keys = tuple(resolution.selection_keys)
+        available_keys = tuple(candidate.selection_key for candidate in candidates)
         available = set(available_keys)
         if len(available) != len(available_keys):
             raise TemplateMergeError(f"Conflict {kind} {key!r} has duplicate candidate keys")
@@ -595,19 +620,23 @@ def resolve_template_import_plan(
             )
         selected = set(keys)
         source = f'{kind} conflict "{key}"'
-        for candidate_key in available_keys:
-            required = candidate_key in selected
-            previous = requirements.get(candidate_key)
+        candidate_by_selection = {
+            candidate.selection_key: candidate for candidate in candidates
+        }
+        for selection_key in available_keys:
+            required = selection_key in selected
+            previous = requirements.get(selection_key)
             if previous is not None and previous != required:
-                previous_source = sources[candidate_key][-1]
+                previous_source = sources[selection_key][-1]
                 action = "selected" if previous else "rejected"
                 opposite = "selected" if required else "rejected"
+                candidate = candidate_by_selection[selection_key]
                 raise TemplateMergeError(
-                    f"Candidate {candidate_key} is {action} by {previous_source} "
-                    f"but {opposite} by {source}"
+                    f"Selection {selection_key} ({candidate.candidate_key}) is "
+                    f"{action} by {previous_source} but {opposite} by {source}"
                 )
-            requirements[candidate_key] = required
-            sources.setdefault(candidate_key, []).append(source)
+            requirements[selection_key] = required
+            sources.setdefault(selection_key, []).append(source)
 
     conflict_groups = (
         (
@@ -656,16 +685,16 @@ def resolve_template_import_plan(
             )
 
     selected_keys = {
-        candidate.candidate_key
+        candidate.selection_key
         for candidate in (*plan.pack_candidates, *plan.template_candidates)
-        if requirements.get(candidate.candidate_key, True)
+        if requirements.get(candidate.selection_key, True)
     }
     for kind, conflicts, resolutions, cardinality in conflict_groups:
         for conflict in conflicts:
             final_keys = tuple(
-                candidate.candidate_key
+                candidate.selection_key
                 for candidate in conflict.candidates
-                if candidate.candidate_key in selected_keys
+                if candidate.selection_key in selected_keys
             )
             if cardinality == "exactly-one" and len(final_keys) != 1:
                 raise TemplateMergeError(
@@ -689,12 +718,12 @@ def resolve_template_import_plan(
     selected_templates = tuple(
         candidate
         for candidate in plan.template_candidates
-        if candidate.candidate_key in selected_keys
+        if candidate.selection_key in selected_keys
     )
     retained_pack = tuple(
         candidate
         for candidate in plan.pack_candidates
-        if candidate.candidate_key in selected_keys
+        if candidate.selection_key in selected_keys
     )
     verification_by_selector = {
         item.selector_identity: item for item in plan.verifications
@@ -718,7 +747,7 @@ def resolve_template_import_plan(
     removed_pack = tuple(
         candidate
         for candidate in plan.pack_candidates
-        if candidate.candidate_key not in selected_keys
+        if candidate.selection_key not in selected_keys
     )
     all_conflicts = tuple(
         conflict
