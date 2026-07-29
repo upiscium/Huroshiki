@@ -410,7 +410,7 @@ def _plan_digest_payload(
         }
 
     payload = {
-        "version": 2,
+        "version": 3,
         "pack_key": pack_key,
         "template_ids": template_ids,
         "pack_candidates": [record(item) for item in pack_candidates],

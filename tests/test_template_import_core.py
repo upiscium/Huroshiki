@@ -398,6 +398,10 @@ class TemplateImportCoreTest(unittest.TestCase):
             ("url", "logical"),
         )
         self.assertEqual(
+            operation.preview.added_roots[0].selection_key,
+            session.plan.template_candidates[0].selection_key,
+        )
+        self.assertEqual(
             operation.preview.added_roots[0].actual_identity,
             ("url", "actual"),
         )
