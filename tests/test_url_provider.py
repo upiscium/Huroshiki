@@ -319,6 +319,32 @@ loader_version: 21.1.234
 
         self.assertTrue(result.success, result.message)
 
+    def test_closure_resolver_passes_url_policy_to_downloader(self) -> None:
+        artifact = core.UrlArtifact(
+            "Private MOD",
+            "private_mod",
+            "1.0.0",
+            "private.jar",
+            "https://mods.example/private.jar",
+            "00",
+            ("neoforge",),
+        )
+        with patch.object(
+            core, "download_url_artifact", return_value=artifact
+        ) as download:
+            closure = core.resolve_mod_closure(
+                provider="url",
+                selector="https://mods.example/private.jar",
+                minecraft="1.21.1",
+                loader="neoforge",
+                loader_version="21.1.234",
+                url_max_jar_size_bytes=1234,
+                url_allow_private_networks=True,
+            )
+        self.assertEqual(closure.root_identity, ("url", "private_mod"))
+        self.assertEqual(download.call_args.args[4], 1234)
+        self.assertTrue(download.call_args.kwargs["allow_private_networks"])
+
     def test_url_add_and_new_url_replace_same_metadata(self) -> None:
         public = self.root / "public" / "private-mod"
         write_neoforge_jar(public / "1.0.0" / "private-mod-1.0.0.jar", "1.0.0")

@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from typing import Callable, Iterable, Literal, Mapping
+from typing import Callable, Iterable, Literal, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
@@ -61,6 +61,7 @@ from template_import import (
     TemplateCompatibility,
     TemplateImportPlan,
     build_template_import_plan,
+    merge_template_import_candidates,
     resolve_template_import_plan,
     template_candidate,
 )
@@ -68,6 +69,7 @@ from packwiz_parser import ParserEvent
 from packwiz_pty import PackwizPtySession, PtyResult
 from url_artifacts import (
     DEFAULT_URL_MAX_JAR_SIZE_BYTES,
+    DEFAULT_URL_TOTAL_TIMEOUT_SECONDS,
     HuroshikiError,
     URL_CHUNK_SIZE,
     URL_USER_AGENT,
@@ -5006,6 +5008,8 @@ def resolve_mod_closure(
     canonical_project_id: str | None = None,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
+    url_max_jar_size_bytes: int | None = None,
+    url_allow_private_networks: bool = False,
 ) -> ResolvedModClosure:
     if cancel_event is not None and cancel_event.is_set():
         raise HuroshikiError("MOD resolution was cancelled")
@@ -5048,13 +5052,27 @@ def resolve_mod_closure(
             loader_version=loader_version,
         )
         if normalized_provider == "url":
+            remaining = (
+                deadline - time.monotonic() if deadline is not None else None
+            )
+            if remaining is not None and remaining <= 0:
+                raise HuroshikiError("URL resolver deadline exceeded")
             artifact = download_url_artifact(
                 normalized_selector,
                 cancel_event or threading.Event(),
                 Path(directory) / "logs",
                 loader,
-                DEFAULT_URL_MAX_JAR_SIZE_BYTES,
-                allow_private_networks=False,
+                (
+                    url_max_jar_size_bytes
+                    if url_max_jar_size_bytes is not None
+                    else DEFAULT_URL_MAX_JAR_SIZE_BYTES
+                ),
+                allow_private_networks=url_allow_private_networks,
+                total_timeout_seconds=(
+                    min(DEFAULT_URL_TOTAL_TIMEOUT_SECONDS, remaining)
+                    if remaining is not None
+                    else DEFAULT_URL_TOTAL_TIMEOUT_SECONDS
+                ),
             )
             identity = ("url", artifact.mod_id)
             write_url_metadata(
@@ -5433,8 +5451,25 @@ def _merge_resolved_template_roots(
 
 
 @dataclass(frozen=True)
+class VerifiedImportCandidate:
+    candidate: ModCandidate
+    actual_identity: tuple[str, str]
+    cached_closure: ResolvedModClosure | None = None
+
+
+@dataclass(frozen=True)
+class ImportedRootPreview:
+    candidate_key: str
+    requested_name: str
+    requested_identity: tuple[str, str]
+    actual_identity: tuple[str, str]
+    relative_path: Path
+    filename: str
+
+
+@dataclass(frozen=True)
 class TemplateImportPreview:
-    added_roots: tuple[ModCandidate, ...]
+    added_roots: tuple[ImportedRootPreview, ...]
     added_dependencies: tuple[ModInfo, ...]
     side_changes: tuple[tuple[tuple[str, str], str, str], ...]
     removed: tuple[ModCandidate, ...]
@@ -5443,38 +5478,59 @@ class TemplateImportPreview:
     warnings: tuple[str, ...]
 
 
-def prepare_template_import_plan(
-    pack_key: str,
-    template_ids: Sequence[str],
-) -> TemplateImportPlan:
-    kind, _ = split_project_key(pack_key)
-    if kind != "pack":
-        raise HuroshikiError("Templates can be imported only into packs")
-    minecraft, loader, _ = packctl.project_versions(project_source(pack_key))
-    pack_candidates = tuple(
+def pack_import_candidates(source: Path, pack_id: str) -> tuple[ModCandidate, ...]:
+    return tuple(
         ModCandidate(
-            "pack",
-            split_project_key(pack_key)[1],
-            mod.name,
-            canonical_provider(mod.provider),
-            mod.project_id,
-            mod.side,
-            mod.relative_path,
-            mod.filename,
-            mod.source_url or None,
+            origin_kind="pack",
+            origin_id=pack_id,
+            name=mod.name,
+            provider=canonical_provider(mod.provider),
+            project_id=mod.project_id,
+            side=mod.side,
+            metadata_path=mod.relative_path,
+            filename=mod.filename,
+            url=mod.source_url or None,
+            actual_provider=canonical_provider(mod.provider),
+            actual_project_id=mod.project_id,
         )
-        for mod in list_mods(pack_key)
+        for mod in list_mods_from_source(source)
     )
+
+
+def _template_import_inputs(
+    template_ids: Sequence[str],
+) -> tuple[
+    dict[str, TemplateCompatibility],
+    tuple[ModCandidate, ...],
+    dict[str, dict[str, str]],
+]:
     compatibilities: dict[str, TemplateCompatibility] = {}
     candidates: list[ModCandidate] = []
+    baselines: dict[str, dict[str, str]] = {}
     for template_id in template_ids:
+        root = packctl.get_template_root(template_id)
+        baselines[template_id] = template_config_snapshot(root)
+        config = packctl.load_template_config(template_id)
         template_minecraft, template_loader, _ = packctl.template_versions(template_id)
         compatibilities[template_id] = TemplateCompatibility(
             template_id,
             template_minecraft,
             template_loader,
         )
-        for entry in packctl.template_mods(template_id):
+        max_size = url_max_jar_size_bytes(config)
+        allow_private = url_allow_private_networks(config)
+        raw_mods = config.get("mods", [])
+        if raw_mods is None:
+            raw_mods = []
+        if not isinstance(raw_mods, list):
+            raise HuroshikiError(
+                f"templates/{template_id}/template.yaml mods must be a list"
+            )
+        for index, raw_entry in enumerate(raw_mods):
+            entry = packctl.normalize_template_mod(
+                raw_entry,
+                f"templates/{template_id}/mods[{index}]",
+            )
             candidates.append(
                 template_candidate(
                     template_id,
@@ -5483,49 +5539,292 @@ def prepare_template_import_plan(
                     project_id=entry["project_id"],
                     side=entry["side"],
                     url=entry.get("url"),
+                    url_max_jar_size_bytes=max_size,
+                    url_allow_private_networks=allow_private,
                 )
             )
+    return compatibilities, tuple(candidates), baselines
+
+
+def _verify_import_candidates(
+    candidates: Sequence[ModCandidate],
+    *,
+    minecraft: str,
+    loader: str,
+    loader_version: str,
+    cancel_event: threading.Event,
+    deadline: float,
+) -> tuple[VerifiedImportCandidate, ...]:
+    verified: list[VerifiedImportCandidate] = []
+    for candidate in candidates:
+        if candidate.provider == "url":
+            if candidate.url is None:
+                raise HuroshikiError(
+                    f"URL candidate {candidate.candidate_key} has no URL selector"
+                )
+            closure = resolve_mod_closure(
+                provider="url",
+                selector=candidate.url,
+                minecraft=minecraft,
+                loader=loader,
+                loader_version=loader_version,
+                cancel_event=cancel_event,
+                deadline=min(
+                    deadline,
+                    time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+                ),
+                url_max_jar_size_bytes=candidate.url_max_jar_size_bytes,
+                url_allow_private_networks=candidate.url_allow_private_networks,
+            )
+            actual_identity = closure.root_identity
+            cached_closure = closure
+        else:
+            actual_identity = candidate.logical_identity
+            cached_closure = None
+        verified_candidate = replace(
+            candidate,
+            actual_provider=actual_identity[0],
+            actual_project_id=actual_identity[1],
+        )
+        verified.append(
+            VerifiedImportCandidate(
+                verified_candidate,
+                actual_identity,
+                cached_closure,
+            )
+        )
+    return tuple(verified)
+
+
+def build_verified_template_import_plan(
+    *,
+    pack_key: str,
+    pack_versions: tuple[str, str, str],
+    template_ids: Sequence[str],
+    compatibilities: Mapping[str, TemplateCompatibility],
+    pack_candidates: Sequence[ModCandidate],
+    template_candidates: Sequence[ModCandidate],
+    verified_candidates: Sequence[VerifiedImportCandidate],
+) -> TemplateImportPlan:
+    actual_by_selector = {
+        item.candidate.selector_identity: item.actual_identity
+        for item in verified_candidates
+    }
+    final_candidates = tuple(
+        replace(
+            candidate,
+            actual_provider=actual_by_selector[candidate.selector_identity][0],
+            actual_project_id=actual_by_selector[candidate.selector_identity][1],
+        )
+        for candidate in template_candidates
+    )
     try:
         return build_template_import_plan(
             pack_key=pack_key,
-            pack_minecraft=minecraft,
-            pack_loader=loader,
+            pack_minecraft=pack_versions[0],
+            pack_loader=pack_versions[1],
             template_ids=template_ids,
             compatibilities=compatibilities,
             pack_candidates=pack_candidates,
-            template_candidates=candidates,
+            template_candidates=final_candidates,
         )
     except TemplateMergeError as error:
         raise HuroshikiError(str(error)) from error
 
 
+class TemplateImportSession:
+    def __init__(
+        self,
+        transaction: PackTransaction,
+        template_ids: tuple[str, ...],
+        template_baselines: Mapping[str, dict[str, str]],
+        verified_candidates: tuple[VerifiedImportCandidate, ...],
+        plan: TemplateImportPlan,
+        cancel_event: threading.Event,
+        deadline: float,
+    ) -> None:
+        self.transaction = transaction
+        self.template_ids = template_ids
+        self.template_baselines = dict(template_baselines)
+        self.verified_candidates = verified_candidates
+        self.plan = plan
+        self.cancel_event = cancel_event
+        self.deadline = deadline
+        self.finished = False
+
+    @classmethod
+    def create(
+        cls,
+        pack_key: str,
+        template_ids: Sequence[str],
+        *,
+        cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> "TemplateImportSession":
+        kind, pack_id = split_project_key(pack_key)
+        if kind != "pack":
+            raise HuroshikiError("Templates can be imported only into packs")
+        operation_cancel = cancel_event or threading.Event()
+        operation_deadline = deadline or time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS
+
+        def checkpoint() -> None:
+            if operation_cancel.is_set():
+                raise LoaderMigrationCancelled("Template import was cancelled")
+            if time.monotonic() >= operation_deadline:
+                raise LoaderMigrationDeadlineExceeded("Template import deadline exceeded")
+
+        transaction = PackTransaction.create(pack_key, checkpoint=checkpoint)
+        try:
+            checkpoint()
+            pack_versions = packctl.project_versions(transaction.source)
+            pack_candidates = pack_import_candidates(transaction.source, pack_id)
+            compatibilities, raw_candidates, baselines = _template_import_inputs(
+                template_ids
+            )
+            ordered_candidates = tuple(
+                candidate
+                for template_id in template_ids
+                for candidate in raw_candidates
+                if candidate.origin_id == template_id
+            )
+            merged_candidates = merge_template_import_candidates(ordered_candidates)
+            verified = _verify_import_candidates(
+                merged_candidates,
+                minecraft=pack_versions[0],
+                loader=pack_versions[1],
+                loader_version=pack_versions[2],
+                cancel_event=operation_cancel,
+                deadline=operation_deadline,
+            )
+            if not all(
+                template_config_snapshot(packctl.get_template_root(template_id))
+                == baseline
+                for template_id, baseline in baselines.items()
+            ):
+                raise HuroshikiError("Template manifest changed during import planning")
+            plan = build_verified_template_import_plan(
+                pack_key=pack_key,
+                pack_versions=pack_versions,
+                template_ids=template_ids,
+                compatibilities=compatibilities,
+                pack_candidates=pack_candidates,
+                template_candidates=raw_candidates,
+                verified_candidates=verified,
+            )
+            return cls(
+                transaction,
+                tuple(template_ids),
+                baselines,
+                verified,
+                plan,
+                operation_cancel,
+                operation_deadline,
+            )
+        except BaseException:
+            transaction.discard()
+            raise
+
+    def templates_unchanged(self) -> bool:
+        return all(
+            template_config_snapshot(packctl.get_template_root(template_id)) == baseline
+            for template_id, baseline in self.template_baselines.items()
+        )
+
+    def discard(self) -> None:
+        if self.finished:
+            return
+        self.transaction.discard()
+        self.finished = True
+
+
+def prepare_template_import_plan(
+    pack_key: str,
+    template_ids: Sequence[str],
+) -> TemplateImportPlan:
+    session = TemplateImportSession.create(pack_key, template_ids)
+    try:
+        return session.plan
+    finally:
+        session.discard()
+
+
+def _remove_import_candidates(
+    source: Path,
+    candidates: Sequence[ModCandidate],
+) -> None:
+    for candidate in candidates:
+        if candidate.metadata_path is None or candidate.actual_identity is None:
+            raise HuroshikiError("Pack removal candidate has incomplete identity data")
+        current = read_mod(source, candidate.metadata_path)
+        current_identity = (canonical_provider(current.provider), current.project_id)
+        if current_identity != candidate.actual_identity:
+            raise HuroshikiError("Pack candidate changed before removal")
+        safe_child(source, candidate.metadata_path).unlink()
+
+
+def _apply_import_side_changes(
+    source: Path,
+    side_changes: Sequence[tuple[tuple[str, str], str, str]],
+) -> None:
+    for identity, _old, new_side in side_changes:
+        matching = [
+            mod
+            for mod in list_mods_from_source(source)
+            if (canonical_provider(mod.provider), mod.project_id) == identity
+        ]
+        if len(matching) != 1:
+            raise HuroshikiError(
+                f"Side change identity must resolve exactly once: {identity[0]}:{identity[1]}"
+            )
+        path = safe_child(source, matching[0].relative_path)
+        path.write_bytes(_metadata_contents_with_side(path.read_bytes(), new_side))
+
+
+def _preflight_import_closures(
+    transaction: PackTransaction,
+    resolved_roots: Sequence[tuple[ModCandidate, ResolvedModClosure]],
+    removed: Sequence[ModCandidate],
+    side_changes: Sequence[tuple[tuple[str, str], str, str]],
+) -> None:
+    preflight_source = transaction.root / "import-preflight"
+    try:
+        copy_transaction_source(transaction.source, preflight_source)
+        _remove_import_candidates(preflight_source, removed)
+        for candidate, closure in resolved_roots:
+            merge_metadata_closure(
+                preflight_source,
+                closure,
+                requested_side=candidate.side,
+            )
+        _apply_import_side_changes(preflight_source, side_changes)
+    finally:
+        shutil.rmtree(preflight_source, ignore_errors=True)
+
+
 class TemplateImportOperation:
     def __init__(
         self,
-        plan: TemplateImportPlan,
+        session: TemplateImportSession,
         resolved: ResolvedTemplateImportPlan,
         *,
         deadline: float | None = None,
     ) -> None:
-        if resolved.plan_digest != plan.plan_digest:
+        if resolved.plan_digest != session.plan.plan_digest:
             raise HuroshikiError("Template import resolution has a stale plan digest")
-        self.plan = plan
+        self.session = session
+        self.plan = session.plan
         self.resolved = resolved
-        self.deadline = deadline or time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS
-        self.cancel_event = threading.Event()
+        self.deadline = min(session.deadline, deadline or session.deadline)
+        self.cancel_event = session.cancel_event
         self.done = threading.Event()
         self.progress_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
-        self.transaction: PackTransaction | None = None
+        self.transaction = session.transaction
         self.preview: TemplateImportPreview | None = None
         self.error: BaseException | None = None
         self.cancelled = False
         self._finished = False
         self._started = False
         self._lock = threading.Lock()
-        self.template_baselines = {
-            template_id: template_config_snapshot(packctl.get_template_root(template_id))
-            for template_id in plan.template_ids
-        }
 
     def _checkpoint(self) -> None:
         if self.cancel_event.is_set():
@@ -5533,11 +5832,15 @@ class TemplateImportOperation:
         if time.monotonic() >= self.deadline:
             raise LoaderMigrationDeadlineExceeded("Template import deadline exceeded")
 
-    def _templates_unchanged(self) -> bool:
-        return all(
-            template_config_snapshot(packctl.get_template_root(template_id)) == baseline
-            for template_id, baseline in self.template_baselines.items()
-        )
+    def _verified_candidate(self, candidate: ModCandidate) -> VerifiedImportCandidate:
+        matches = [
+            item
+            for item in self.session.verified_candidates
+            if item.candidate.selector_identity == candidate.selector_identity
+        ]
+        if len(matches) != 1 or matches[0].actual_identity != candidate.actual_identity:
+            raise HuroshikiError("Template import URL verification cache is inconsistent")
+        return matches[0]
 
     def run(self) -> None:
         with self._lock:
@@ -5545,14 +5848,12 @@ class TemplateImportOperation:
                 return
             self._started = True
         try:
-            current = prepare_template_import_plan(self.plan.pack_key, self.plan.template_ids)
-            if current.plan_digest != self.plan.plan_digest:
-                raise HuroshikiError("Template import plan changed before execution")
-            self.progress_queue.put("Creating transaction")
-            self.transaction = PackTransaction.create(
-                self.plan.pack_key,
-                checkpoint=self._checkpoint,
-            )
+            self.transaction.ensure_active()
+            self._checkpoint()
+            if self.resolved.plan_digest != self.session.plan.plan_digest:
+                raise HuroshikiError("Template import resolution has a stale plan digest")
+            if not self.session.templates_unchanged():
+                raise HuroshikiError("Template manifest changed before import execution")
             before_files = _file_content_snapshot(self.transaction.source, self._checkpoint)
             before_identities = {
                 (canonical_provider(mod.provider), mod.project_id)
@@ -5561,49 +5862,56 @@ class TemplateImportOperation:
             minecraft, loader, loader_version = packctl.project_versions(
                 self.transaction.source
             )
+            resolved_roots: list[tuple[ModCandidate, ResolvedModClosure]] = []
             for index, candidate in enumerate(self.resolved.selected_new_roots, 1):
                 self._checkpoint()
                 self.progress_queue.put(
                     f"Resolving {index}/{len(self.resolved.selected_new_roots)}: {candidate.name}"
                 )
-                closure = resolve_mod_closure(
-                    provider=candidate.provider,
-                    selector=candidate.url or candidate.project_id,
-                    minecraft=minecraft,
-                    loader=loader,
-                    loader_version=loader_version,
-                    canonical_project_id=(
-                        candidate.project_id if candidate.provider != "url" else None
-                    ),
-                    cancel_event=self.cancel_event,
-                    deadline=min(
-                        self.deadline,
-                        time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
-                    ),
-                )
+                verified = self._verified_candidate(candidate)
+                if candidate.provider == "url":
+                    closure = verified.cached_closure
+                    if closure is None:
+                        raise HuroshikiError("Verified URL closure is unavailable")
+                else:
+                    closure = resolve_mod_closure(
+                        provider=candidate.provider,
+                        selector=candidate.project_id,
+                        minecraft=minecraft,
+                        loader=loader,
+                        loader_version=loader_version,
+                        canonical_project_id=candidate.project_id,
+                        cancel_event=self.cancel_event,
+                        deadline=min(
+                            self.deadline,
+                            time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+                        ),
+                    )
+                if closure.root_identity != verified.actual_identity:
+                    raise HuroshikiError(
+                        f"Resolved root identity changed for {candidate.candidate_key}"
+                    )
+                resolved_roots.append((candidate, closure))
+            _preflight_import_closures(
+                self.transaction,
+                resolved_roots,
+                self.resolved.removed_pack_candidates,
+                self.resolved.side_changes,
+            )
+            _remove_import_candidates(
+                self.transaction.source,
+                self.resolved.removed_pack_candidates,
+            )
+            for candidate, closure in resolved_roots:
                 merge_metadata_closure(
                     self.transaction.source,
                     closure,
                     requested_side=candidate.side,
                 )
-            for candidate in self.resolved.removed_pack_candidates:
-                if candidate.metadata_path is not None:
-                    safe_child(self.transaction.source, candidate.metadata_path).unlink()
-            for identity, _old, new_side in self.resolved.side_changes:
-                matching = next(
-                    (
-                        mod
-                        for mod in list_mods_from_source(self.transaction.source)
-                        if (canonical_provider(mod.provider), mod.project_id) == identity
-                    ),
-                    None,
-                )
-                if matching is None:
-                    raise HuroshikiError(
-                        f"Side change identity disappeared: {identity[0]}:{identity[1]}"
-                    )
-                client, server = flags_from_side(new_side)
-                self.transaction.set_side(matching.relative_path, client, server)
+            _apply_import_side_changes(
+                self.transaction.source,
+                self.resolved.side_changes,
+            )
             refresh = run_resolver_process(
                 ["packwiz", "refresh"],
                 cwd=self.transaction.source,
@@ -5622,19 +5930,47 @@ class TemplateImportOperation:
             ):
                 raise HuroshikiError("Template import Packwiz refresh failed")
             ensure_safe_pack_source(self.transaction.source, checkpoint=self._checkpoint)
-            if not self._templates_unchanged():
+            if not self.session.templates_unchanged():
                 raise HuroshikiError("Template manifest changed during import")
             after_mods = list_mods_from_source(self.transaction.source)
+            selected_by_actual = {
+                candidate.actual_identity: candidate
+                for candidate in self.resolved.selected_new_roots
+                if candidate.actual_identity is not None
+            }
+            imported_roots: list[ImportedRootPreview] = []
+            for actual_identity, candidate in selected_by_actual.items():
+                matching = [
+                    mod
+                    for mod in after_mods
+                    if (canonical_provider(mod.provider), mod.project_id)
+                    == actual_identity
+                ]
+                if len(matching) != 1:
+                    raise HuroshikiError(
+                        f"Imported root must resolve exactly once: {actual_identity[0]}:{actual_identity[1]}"
+                    )
+                mod = matching[0]
+                imported_roots.append(
+                    ImportedRootPreview(
+                        candidate.candidate_key,
+                        candidate.name,
+                        candidate.logical_identity,
+                        actual_identity,
+                        mod.relative_path,
+                        mod.filename,
+                    )
+                )
             added = tuple(
                 mod
                 for mod in after_mods
                 if (canonical_provider(mod.provider), mod.project_id)
                 not in before_identities
                 and (canonical_provider(mod.provider), mod.project_id)
-                not in {item.identity for item in self.resolved.selected_new_roots}
+                not in selected_by_actual
             )
             self.preview = TemplateImportPreview(
-                self.resolved.selected_new_roots,
+                tuple(imported_roots),
                 added,
                 self.resolved.side_changes,
                 self.resolved.removed_pack_candidates,
@@ -5666,18 +6002,24 @@ class TemplateImportOperation:
                 or self.cancelled
                 or self.error is not None
                 or self._finished
-                or self.transaction is None
                 or self.preview is None
             ):
                 raise HuroshikiError("Template import has no applicable preview")
             self._finished = True
-        if not self._templates_unchanged():
-            self.transaction.discard()
-            raise HuroshikiError("Template manifest changed after preview")
+        if (
+            not self.session.templates_unchanged()
+            or self.resolved.plan_digest != self.session.plan.plan_digest
+        ):
+            self.session.discard()
+            raise HuroshikiError(
+                "Template manifest changed or import plan became stale after preview"
+            )
         try:
+            self.transaction.ensure_active()
             self.transaction.apply(refresh=False)
+            self.session.finished = True
         except BaseException:
-            self.transaction.discard()
+            self.session.discard()
             raise
 
     def discard(self) -> None:
@@ -5685,8 +6027,7 @@ class TemplateImportOperation:
             if self._finished:
                 return
             self._finished = True
-        if self.transaction is not None:
-            self.transaction.discard()
+        self.session.discard()
 
     def cancel(self) -> None:
         self.cancelled = True

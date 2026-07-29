@@ -343,6 +343,62 @@ class TemplateImportPlannerTest(unittest.TestCase):
         self.assertNotEqual(base.plan_digest, reordered.plan_digest)
         self.assertNotEqual(base.plan_digest, changed.plan_digest)
 
+    def test_actual_identity_conflict_requires_exactly_one_candidate(self) -> None:
+        installed = pack_candidate("Installed", "actual", provider="url")
+        installed = installed.__class__(
+            **{
+                **installed.__dict__,
+                "url": "https://mods.example/installed.jar",
+                "actual_provider": "url",
+                "actual_project_id": "actual",
+            }
+        )
+        incoming = template_candidate(
+            "base",
+            name="Requested",
+            provider="url",
+            project_id="logical",
+            side="both",
+            url="https://mods.example/requested.jar",
+            actual_provider="url",
+            actual_project_id="actual",
+        )
+        plan = build(["base"], [installed], [incoming])
+        self.assertEqual(plan.actual_identity_conflicts[0].key, "url:actual")
+        with self.assertRaisesRegex(TemplateMergeError, "actual identity"):
+            resolve_template_import_plan(plan)
+        resolved = resolve_template_import_plan(
+            plan,
+            actual_identity_resolutions={
+                "url:actual": ConflictResolution((incoming.candidate_key,))
+            },
+        )
+        self.assertEqual(resolved.selected_new_roots, (incoming,))
+        self.assertEqual(resolved.removed_pack_candidates, (installed,))
+
+    def test_actual_identity_changes_plan_digest(self) -> None:
+        candidate = template_candidate(
+            "base",
+            name="Requested",
+            provider="url",
+            project_id="logical",
+            side="both",
+            url="https://mods.example/requested.jar",
+            actual_provider="url",
+            actual_project_id="first",
+        )
+        first = build(["base"], [], [candidate])
+        second = build(
+            ["base"],
+            [],
+            [
+                candidate.__class__(
+                    **{**candidate.__dict__, "actual_project_id": "second"}
+                )
+            ],
+        )
+        self.assertNotEqual(first.plan_digest, second.plan_digest)
+
     def test_plan_digest_changes_with_template_order_or_candidate_data(self) -> None:
         a = template_candidate(
             "a", name="A", provider="modrinth", project_id="a", side="both"
