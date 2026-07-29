@@ -20,6 +20,7 @@ import zipfile
 import huroshiki_core as core
 import packctl
 import url_artifacts
+from template_import import template_candidate
 
 
 PACK_TOML = '''name = "Demo"
@@ -344,6 +345,29 @@ loader_version: 21.1.234
         self.assertEqual(closure.root_identity, ("url", "private_mod"))
         self.assertEqual(download.call_args.args[4], 1234)
         self.assertTrue(download.call_args.kwargs["allow_private_networks"])
+
+    def test_import_private_network_rejection_is_candidate_local(self) -> None:
+        payload = self.jar_bytes()
+        with serve_bytes(payload) as url:
+            candidate = template_candidate(
+                "base",
+                name="Private",
+                provider="url",
+                project_id="private",
+                side="both",
+                url=url,
+                url_allow_private_networks=False,
+            )
+            results = core.verify_import_candidates(
+                (candidate,),
+                minecraft="1.21.1",
+                loader="neoforge",
+                loader_version="21.1.234",
+                cancel_event=threading.Event(),
+                deadline=time.monotonic() + 30,
+            )
+        self.assertFalse(results[0].succeeded)
+        self.assertIn("private", results[0].error.lower())
 
     def test_url_add_and_new_url_replace_same_metadata(self) -> None:
         public = self.root / "public" / "private-mod"

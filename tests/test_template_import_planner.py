@@ -544,6 +544,49 @@ class TemplateImportPlannerTest(unittest.TestCase):
                 },
             )
 
+    def test_logical_and_actual_resolution_disagreement_is_rejected(self) -> None:
+        logical_pack = pack_candidate("Logical", "logical", provider="url")
+        logical_pack = logical_pack.__class__(
+            **{**logical_pack.__dict__, "url": "https://mods.example/logical.jar"}
+        )
+        actual_pack = pack_candidate("Actual", "shared", provider="url")
+        actual_pack = actual_pack.__class__(
+            **{**actual_pack.__dict__, "url": "https://mods.example/shared.jar"}
+        )
+        incoming = template_candidate(
+            "base",
+            name="Incoming",
+            provider="url",
+            project_id="logical",
+            side="both",
+            url="https://mods.example/incoming.jar",
+            actual_provider="url",
+            actual_project_id="shared",
+        )
+        plan = build(["base"], [logical_pack, actual_pack], [incoming])
+        with self.assertRaisesRegex(TemplateMergeError, "logical identity conflict"):
+            resolve_template_import_plan(
+                plan,
+                logical_identity_resolutions={
+                    "url:logical": ConflictResolution((incoming.candidate_key,))
+                },
+                actual_identity_resolutions={
+                    "url:shared": ConflictResolution((actual_pack.candidate_key,))
+                },
+            )
+
+    def test_pack_candidate_cannot_be_removed_without_template_replacement(self) -> None:
+        first = pack_candidate("Same", "first")
+        second = pack_candidate("same", "second")
+        plan = build(["base"], [first, second], [])
+        with self.assertRaisesRegex(TemplateMergeError, "no selected replacement"):
+            resolve_template_import_plan(
+                plan,
+                name_resolutions={
+                    "same": ConflictResolution((first.candidate_key,))
+                },
+            )
+
     def test_actual_identity_changes_plan_digest(self) -> None:
         candidate = template_candidate(
             "base",

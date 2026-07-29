@@ -244,6 +244,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         with redirect_stderr(stderr):
             self.assertEqual(packctl.cmd_apply_template(args), 2)
         self.assertIn("resolution file", stderr.getvalue())
+        self.assertIn("version: 2", stderr.getvalue())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
         args.json = True
@@ -265,6 +266,12 @@ class TemplateImportCoreTest(unittest.TestCase):
             encoding="utf-8",
         )
         with self.assertRaisesRegex(packctl.ConfigError, "stale plan digest"):
+            packctl._template_import_resolution(resolution, plan)
+        resolution.write_text(
+            "version: 1\nplan_digest: stale\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(packctl.ConfigError, "no longer supported"):
             packctl._template_import_resolution(resolution, plan)
         args = packctl.parser().parse_args(
             ["apply-template", "demo", "base", "--apply", "--json"]
@@ -408,6 +415,15 @@ class TemplateImportCoreTest(unittest.TestCase):
             [item.succeeded for item in session.plan.verifications],
             [True, False],
         )
+        payload = packctl._template_import_conflict_payload(session.plan)
+        self.assertEqual(
+            [item["status"] for item in payload["url_selector"][0]["candidates"]],
+            ["verified", "failed"],
+        )
+        self.assertEqual(
+            payload["url_selector"][0]["candidates"][1]["error"],
+            "HTTP 404",
+        )
         good, bad = session.plan.template_candidates
         resolved = resolve_template_import_plan(
             session.plan,
@@ -508,6 +524,64 @@ class TemplateImportCoreTest(unittest.TestCase):
         )
         self.assertNotEqual(first_digest, second.plan.plan_digest)
         second.discard()
+
+    def test_verification_success_changes_digest_from_failure(self) -> None:
+        self.use_url_template()
+        with patch.object(
+            core, "resolve_mod_closure", return_value=self.url_closure("actual")
+        ):
+            succeeded = core.TemplateImportSession.create("pack:demo", ["base"])
+        success_digest = succeeded.plan.plan_digest
+        succeeded.discard()
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=core.HuroshikiError("HTTP 404"),
+        ):
+            failed = core.TemplateImportSession.create("pack:demo", ["base"])
+        self.assertNotEqual(success_digest, failed.plan.plan_digest)
+        self.assertEqual(failed.plan.verifications[0].error, "HTTP 404")
+        failed.discard()
+
+    def test_all_failed_url_candidates_are_reported(self) -> None:
+        self.use_url_conflict_template()
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=(
+                core.HuroshikiError("HTTP 404"),
+                core.HuroshikiError("invalid JAR"),
+            ),
+        ):
+            session = core.TemplateImportSession.create("pack:demo", ["base"])
+        self.assertEqual(
+            [item.error for item in session.plan.verifications],
+            ["HTTP 404", "invalid JAR"],
+        )
+        session.discard()
+
+    def test_cli_failed_non_conflicting_candidate_returns_one_and_unlocks(self) -> None:
+        self.use_url_template()
+        args = type(
+            "Args",
+            (),
+            {
+                "pack": "demo",
+                "templates": ["base"],
+                "resolution": None,
+                "apply": False,
+                "json": False,
+            },
+        )()
+        stderr = StringIO()
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=core.HuroshikiError("HTTP 404"),
+        ), redirect_stderr(stderr):
+            self.assertEqual(packctl.cmd_apply_template(args), 1)
+        self.assertIn("HTTP 404", stderr.getvalue())
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
     def test_logical_divergence_template_selection_replaces_atomically(self) -> None:
         self.use_url_template()
