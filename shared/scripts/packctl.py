@@ -2837,17 +2837,23 @@ def _template_import_resolution(path: Path, plan: Any) -> Any:
     from template_merge import ConflictResolution, TemplateMergeError
 
     data = load_yaml(path)
-    if data.get("version") != 1:
-        raise ConfigError("Template import resolution version must be 1")
+    if data.get("version") == 1:
+        raise ConfigError(
+            "Template import resolution version 1 is no longer supported; "
+            "regenerate the resolution against the current verified plan"
+        )
+    if data.get("version") != 2:
+        raise ConfigError("Template import resolution version must be 2")
     if data.get("plan_digest") != plan.plan_digest:
         raise ConfigError("Template import resolution has a stale plan digest")
     raw_names = data.get("name_conflicts", {})
     raw_urls = data.get("url_selector_conflicts", {})
+    raw_logical = data.get("logical_identity_conflicts", {})
     raw_actual = data.get("actual_identity_conflicts", {})
     raw_sides = data.get("side_conflicts", {})
     if not all(
         isinstance(value, dict)
-        for value in (raw_names, raw_urls, raw_actual, raw_sides)
+        for value in (raw_names, raw_urls, raw_logical, raw_actual, raw_sides)
     ):
         raise ConfigError("Template import resolution conflicts must be mappings")
 
@@ -2869,6 +2875,7 @@ def _template_import_resolution(path: Path, plan: Any) -> Any:
 
     names = selections(raw_names)
     urls = selections(raw_urls)
+    logical = selections(raw_logical)
     actual = selections(raw_actual)
     sides = {}
     for key, decision in raw_sides.items():
@@ -2880,11 +2887,61 @@ def _template_import_resolution(path: Path, plan: Any) -> Any:
             plan,
             name_resolutions=names,
             url_selector_resolutions=urls,
+            logical_identity_resolutions=logical,
             actual_identity_resolutions=actual,
             side_decisions=sides,
         )
     except TemplateMergeError as error:
         raise ConfigError(str(error)) from error
+
+
+def _template_import_candidate_payload(plan: Any, candidate: Any) -> dict[str, Any]:
+    verification = next(
+        (
+            item
+            for item in plan.verifications
+            if item.selector_identity == candidate.selector_identity
+        ),
+        None,
+    )
+    if verification is None:
+        status = "installed"
+        actual_identity = candidate.actual_identity
+        error = None
+        fingerprint = None
+    else:
+        status = "verified" if verification.succeeded else "failed"
+        actual_identity = verification.actual_identity
+        error = verification.error
+        fingerprint = verification.closure_fingerprint
+    return {
+        "candidate_key": candidate.candidate_key,
+        "status": status,
+        "actual_identity": actual_identity,
+        "closure_fingerprint": fingerprint,
+        "error": error,
+    }
+
+
+def _template_import_conflict_payload(plan: Any) -> dict[str, list[dict[str, Any]]]:
+    return {
+        label: [
+            {
+                "key": conflict.key,
+                "candidates": [
+                    _template_import_candidate_payload(plan, candidate)
+                    for candidate in conflict.candidates
+                ],
+            }
+            for conflict in conflicts
+        ]
+        for label, conflicts in (
+            ("name", plan.name_conflicts),
+            ("url_selector", plan.url_selector_conflicts),
+            ("logical_identity", plan.logical_identity_conflicts),
+            ("actual_identity", plan.actual_identity_conflicts),
+        )
+    }
 
 
 def cmd_apply_template(args: argparse.Namespace) -> int:
@@ -2902,45 +2959,15 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
         plan = session.plan
         if args.resolution is None:
             if plan.requires_resolution:
-                conflict_payload = {
-                    "name": [
-                        {
-                            "key": conflict.key,
-                            "candidates": [
-                                candidate.candidate_key
-                                for candidate in conflict.candidates
-                            ],
-                        }
-                        for conflict in plan.name_conflicts
-                    ],
-                    "url_selector": [
-                        {
-                            "key": conflict.key,
-                            "candidates": [
-                                candidate.candidate_key
-                                for candidate in conflict.candidates
-                            ],
-                        }
-                        for conflict in plan.url_selector_conflicts
-                    ],
-                    "actual_identity": [
-                        {
-                            "key": conflict.key,
-                            "candidates": [
-                                candidate.candidate_key
-                                for candidate in conflict.candidates
-                            ],
-                        }
-                        for conflict in plan.actual_identity_conflicts
-                    ],
-                }
+                conflict_payload = _template_import_conflict_payload(plan)
                 if args.json:
                     print(
                         json.dumps(
                             {
                                 "plan_digest": plan.plan_digest,
                                 "requested_roots": [
-                                    item.candidate_key for item in plan.new_roots
+                                    item.candidate_key
+                                    for item in plan.template_candidates
                                 ],
                                 "resolved_roots": [],
                                 "added_dependencies": [],
@@ -2953,11 +2980,15 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                     )
                     return 2
                 print("Template import conflicts require a resolution file:", file=sys.stderr)
-                print("version: 1", file=sys.stderr)
+                print("version: 2", file=sys.stderr)
                 print(f'plan_digest: "{plan.plan_digest}"', file=sys.stderr)
                 for label, conflicts in (
                     ("name_conflicts", plan.name_conflicts),
                     ("url_selector_conflicts", plan.url_selector_conflicts),
+                    (
+                        "logical_identity_conflicts",
+                        plan.logical_identity_conflicts,
+                    ),
                     ("actual_identity_conflicts", plan.actual_identity_conflicts),
                 ):
                     print(f"{label}:", file=sys.stderr)
@@ -2967,6 +2998,13 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                         print(f'  "{conflict.key}":', file=sys.stderr)
                         print("    candidates:", file=sys.stderr)
                         for candidate in conflict.candidates:
+                            status = _template_import_candidate_payload(plan, candidate)
+                            detail = status["status"]
+                            if status["actual_identity"] is not None:
+                                detail += ":" + ":".join(status["actual_identity"])
+                            if status["error"] is not None:
+                                detail += f": {status['error']}"
+                            print(f"    # {candidate.candidate_key}: {detail}", file=sys.stderr)
                             print(f'      - "{candidate.candidate_key}"', file=sys.stderr)
                         print(
                             "    acknowledge_duplicate_risk: false",
@@ -2995,7 +3033,7 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                     {
                         "plan_digest": plan.plan_digest,
                         "requested_roots": [
-                            item.candidate_key for item in plan.new_roots
+                            item.candidate_key for item in plan.template_candidates
                         ],
                         "resolved_roots": [
                             {
@@ -3017,15 +3055,7 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                             str(item.relative_path) for item in preview.changes
                         ],
                         "warnings": preview.warnings,
-                        "conflicts": {
-                            "name": [item.key for item in plan.name_conflicts],
-                            "url_selector": [
-                                item.key for item in plan.url_selector_conflicts
-                            ],
-                            "actual_identity": [
-                                item.key for item in plan.actual_identity_conflicts
-                            ],
-                        },
+                        "conflicts": _template_import_conflict_payload(plan),
                     },
                     ensure_ascii=False,
                 )
