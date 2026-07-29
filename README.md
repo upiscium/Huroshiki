@@ -262,6 +262,8 @@ becomes effective again.
 and prints the resulting loader version and changed files without modifying the real pack. Add
 `--apply` to publish the reviewed transaction. Minecraft version and loader type remain fixed;
 migration or refresh failures and concurrent pack changes leave the real source untouched.
+The same flow is available under `Settings` then `Versions`; preparation runs in a background
+worker, displays progress and changed files, and completes cancellation cleanup before navigation.
 
 The settings commands pin the managed collection and project directory, snapshot both committed and
 local configuration, validate the prospective merged project entirely in memory, and publish through
