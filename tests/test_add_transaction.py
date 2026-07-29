@@ -306,34 +306,26 @@ class AddTransactionTest(unittest.TestCase):
                 (self.source / "mods/second-root.pw.toml").unlink()
                 shared.unlink()
 
-    def test_interactive_add_merges_isolated_complete_closure(self) -> None:
+    def test_resolved_add_operation_merges_complete_closure(self) -> None:
         shared = self.source / "mods/shared.pw.toml"
         shared.write_text(metadata("Shared", "shared", "client"), encoding="utf-8")
         transaction = core.PackTransaction.create(self.key)
         try:
-            operation = transaction.begin_add(
-                "modrinth",
-                "second-root",
-                client=False,
-                server=True,
+            operation = transaction.begin_resolved_add(
+                provider="modrinth",
+                selector="second-root",
+                canonical_project_id="second-root",
+                side="server",
             )
-            (operation.resolver_source / "mods/second-root.pw.toml").write_text(
-                metadata("second-root", "second-root"), encoding="utf-8"
-            )
-            (operation.resolver_source / "mods/shared.pw.toml").write_text(
-                metadata("Shared", "shared"), encoding="utf-8"
-            )
-            pty_result = core.PtyResult(
-                0,
-                operation.log_dir / "raw.log",
-                operation.log_dir / "events.jsonl",
-                operation.log_dir / "output.log",
-                "",
-            )
-            assert operation.session is not None
-            with patch.object(operation.session, "run", return_value=pty_result):
+            closure = self.closure("second-root", ("shared", "shared.jar"))
+            with patch.object(
+                core, "resolve_mod_closure", return_value=closure
+            ) as resolve:
                 result = operation.run()
 
+            self.assertEqual(
+                resolve.call_args.kwargs["canonical_project_id"], "second-root"
+            )
             self.assertTrue(result.success, result.message)
             staged_shared = transaction.source / "mods/shared.pw.toml"
             self.assertEqual(packctl.read_toml(staged_shared)["side"], "both")
@@ -552,49 +544,59 @@ class AddTransactionTest(unittest.TestCase):
                     )
                 run.assert_not_called()
 
-    def test_interactive_selection_requires_canonical_identity(self) -> None:
-        for selection, succeeds in (
-            (
-                core.ResolverSelection(
-                    1, "Root - Project ID: 12345", "curseforge", "12345"
-                ),
-                True,
-            ),
-            (core.ResolverSelection(1, "Root display only", "curseforge", None), False),
-        ):
-            with self.subTest(selection=selection):
-                transaction = core.PackTransaction.create(self.key)
-                try:
-                    operation = transaction.begin_add(
-                        "curseforge", "search terms", client=True, server=True
-                    )
-                    operation.selection = selection
-                    project_id = "12345" if succeeds else "dependency"
-                    text = metadata("Root display only", project_id)
-                    if succeeds:
-                        text = text.replace(
-                            "update.modrinth", "update.curseforge"
-                        ).replace(
-                            f'mod-id = "{project_id}"', f"project-id = {project_id}"
-                        )
-                    (operation.resolver_source / "mods/root.pw.toml").write_text(
-                        text, encoding="utf-8"
-                    )
-                    pty_result = core.PtyResult(
-                        0,
-                        operation.log_dir / "raw.log",
-                        operation.log_dir / "events.jsonl",
-                        operation.log_dir / "output.log",
-                        "",
-                    )
-                    assert operation.session is not None
-                    with patch.object(operation.session, "run", return_value=pty_result):
-                        result = operation.run()
-                    self.assertEqual(result.success, succeeds, result.message)
-                    if not succeeds:
-                        self.assertIn("no canonical project ID", result.message)
-                finally:
-                    transaction.discard()
+    def test_resolved_add_failure_restores_existing_staged_changes(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        try:
+            staged = transaction.source / "mods/staged.pw.toml"
+            staged.write_text(metadata("Staged", "staged"), encoding="utf-8")
+            before = staged.read_bytes()
+            operation = transaction.begin_resolved_add(
+                provider="curseforge",
+                selector="12345",
+                canonical_project_id="12345",
+                side="both",
+            )
+            with patch.object(
+                core, "resolve_mod_closure", side_effect=core.HuroshikiError("failed")
+            ):
+                result = operation.run()
+            self.assertFalse(result.success)
+            self.assertEqual(staged.read_bytes(), before)
+            self.assertTrue(transaction.active)
+        finally:
+            transaction.discard()
+
+    def test_resolved_add_cancel_preserves_existing_staged_changes(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        started = threading.Event()
+        try:
+            staged = transaction.source / "mods/staged.pw.toml"
+            staged.write_text(metadata("Staged", "staged"), encoding="utf-8")
+            before = staged.read_bytes()
+            operation = transaction.begin_resolved_add(
+                provider="modrinth",
+                selector="Sodium Extra",
+                canonical_project_id="canonical",
+                side="client",
+            )
+
+            def resolve(*_, cancel_event, **__):
+                started.set()
+                cancel_event.wait(2)
+                raise core.HuroshikiError("MOD resolution was cancelled")
+
+            with patch.object(core, "resolve_mod_closure", side_effect=resolve):
+                worker = threading.Thread(target=operation.run)
+                worker.start()
+                self.assertTrue(started.wait(1))
+                operation.cancel()
+                worker.join(2)
+            self.assertFalse(worker.is_alive())
+            assert operation.result is not None
+            self.assertTrue(operation.result.cancelled)
+            self.assertEqual(staged.read_bytes(), before)
+        finally:
+            transaction.discard()
 
     def test_changed_invalid_baseline_side_is_not_silently_reclassified(self) -> None:
         existing = self.source / "mods/existing.pw.toml"

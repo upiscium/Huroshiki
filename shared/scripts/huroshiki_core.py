@@ -394,6 +394,14 @@ class ProviderProject:
 
 
 @dataclass(frozen=True)
+class InstallSearchResult:
+    provider: str
+    project_id: str
+    title: str
+    subtitle: str
+
+
+@dataclass(frozen=True)
 class ResolverProcessResult:
     returncode: int
     stdout: str
@@ -409,12 +417,151 @@ class ProcessGroupMember:
     state: str
 
 
-@dataclass(frozen=True)
-class ResolverSelection:
-    index: int
-    label: str
-    provider: str
-    canonical_project_id: str | None
+class ProviderSearchOperation:
+    def __init__(
+        self,
+        *,
+        provider: str,
+        query: str,
+        minecraft: str,
+        loader: str,
+    ) -> None:
+        self.provider = provider
+        self.query = query
+        self.minecraft = minecraft
+        self.loader = loader
+        self.cancel_event = threading.Event()
+        self.done = threading.Event()
+        self.cancelled = False
+        self.results: tuple[ProviderProject, ...] = ()
+        self.error: str | None = None
+
+    def run(self) -> tuple[ProviderProject, ...]:
+        try:
+            self.results = search_provider_projects(
+                self.provider,
+                self.query,
+                minecraft=self.minecraft,
+                loader=self.loader,
+                cancel_event=self.cancel_event,
+            )
+        except Exception as error:
+            self.error = str(error)
+        finally:
+            self.done.set()
+        return self.results
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self.cancel_event.set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self.done.wait(timeout)
+
+
+class ResolvedAddOperation:
+    def __init__(
+        self,
+        transaction: "PackTransaction",
+        *,
+        provider: str,
+        selector: str,
+        canonical_project_id: str | None,
+        side: str,
+    ) -> None:
+        self.transaction = transaction
+        self.provider, self.selector = normalize_add_selector(provider, selector)
+        self.canonical_project_id = canonical_project_id
+        self.side = packctl.normalize_side(side)
+        self.cancel_event = threading.Event()
+        self.done = threading.Event()
+        self.cancelled = False
+        self.result: AddOperationResult | None = None
+        self.checkpoint = transaction.root / f"checkpoint-{uuid4().hex}"
+        self.resolver_root = transaction.root / f"resolved-{uuid4().hex}"
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        self.log_dir = (
+            ROOT
+            / ".huroshiki"
+            / "logs"
+            / transaction.project_key.replace(":", "-")
+            / f"{timestamp}-{uuid4().hex[:8]}"
+        )
+
+    def run(self) -> AddOperationResult:
+        raw_log, text_log, event_log = url_log_paths(self.log_dir)
+        try:
+            if self.cancel_event.is_set():
+                raise HuroshikiError("MOD resolution was cancelled")
+            with self.transaction._lock:
+                if not self.transaction.active or self.transaction._operation is not self:
+                    raise HuroshikiError("Transaction was closed before MOD resolution started")
+                copy_transaction_source(
+                    self.transaction.source,
+                    self.checkpoint,
+                )
+            minecraft, loader, loader_version = packctl.project_versions(
+                self.transaction.source
+            )
+            closure = resolve_mod_closure(
+                provider=self.provider,
+                selector=self.selector,
+                minecraft=minecraft,
+                loader=loader,
+                loader_version=loader_version,
+                canonical_project_id=self.canonical_project_id,
+                cancel_event=self.cancel_event,
+            )
+            with self.transaction._lock:
+                if self.cancel_event.is_set():
+                    raise HuroshikiError("MOD resolution was cancelled")
+                if not self.transaction.active or self.transaction._operation is not self:
+                    raise HuroshikiError(
+                        "Transaction was closed before MOD resolution completed"
+                    )
+                changed = merge_metadata_closure(
+                    self.transaction.source,
+                    closure,
+                    requested_side=self.side,
+                )
+                self.transaction.batches.append(
+                    TransactionBatch(
+                        provider=self.provider,
+                        query=self.selector,
+                        changed_files=changed,
+                    )
+                )
+                shutil.rmtree(self.checkpoint, ignore_errors=True)
+                self.transaction._operation = None
+            self.result = AddOperationResult(
+                0,
+                changed,
+                raw_log,
+                text_log,
+                event_log,
+                f"Staged {self.provider}:{closure.root_identity[1]} and dependencies",
+            )
+        except Exception as error:
+            self.transaction._rollback_add(self)
+            self.result = AddOperationResult(
+                130 if self.cancelled else 1,
+                (),
+                raw_log,
+                text_log,
+                event_log,
+                str(error),
+                self.cancelled,
+            )
+        finally:
+            self.done.set()
+        return self.result
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self.cancel_event.set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self.done.wait(timeout)
 
 
 class PackwizAddOperation:
@@ -437,8 +584,8 @@ class PackwizAddOperation:
         self.cancel_event = threading.Event()
         self.done = threading.Event()
         self.result: AddOperationResult | None = None
-        self.menu_items: dict[int, ResolverSelection] = {}
-        self.selection: ResolverSelection | None = None
+        self.menu_items: dict[int, str] = {}
+        self.selection: str | None = None
         self.checkpoint = transaction.root / f"checkpoint-{uuid4().hex}"
         copy_transaction_source(transaction.source, self.checkpoint)
         self.resolver_root = transaction.root / f"resolver-{uuid4().hex}"
@@ -467,18 +614,7 @@ class PackwizAddOperation:
         if self.provider != "url":
             def record_event(event: ParserEvent) -> None:
                 if event.kind == "search_results":
-                    self.menu_items = {
-                        item.index: ResolverSelection(
-                            item.index,
-                            item.label,
-                            self.provider,
-                            item.canonical_project_id
-                            or canonical_project_id_from_label(
-                                self.provider, item.label
-                            ),
-                        )
-                        for item in event.items
-                    }
+                    self.menu_items = {item.index: item.label for item in event.items}
                 if self.on_event is not None:
                     self.on_event(event)
 
@@ -567,7 +703,9 @@ class PackTransaction:
     selected_update_changes: tuple[UpdateChange, ...] = field(default_factory=tuple)
     active: bool = True
     _project_lock: packctl.ProjectLock | None = field(default=None, init=False, repr=False)
-    _operation: PackwizAddOperation | None = field(default=None, init=False, repr=False)
+    _operation: PackwizAddOperation | ResolvedAddOperation | None = field(
+        default=None, init=False, repr=False
+    )
     _lock: threading.RLock = field(
         default_factory=threading.RLock, init=False, repr=False
     )
@@ -705,6 +843,28 @@ class PackTransaction:
             self._operation = operation
             return operation
 
+    def begin_resolved_add(
+        self,
+        *,
+        provider: str,
+        selector: str,
+        canonical_project_id: str | None,
+        side: str,
+    ) -> ResolvedAddOperation:
+        self.ensure_active()
+        with self._lock:
+            if self._operation is not None and not self._operation.done.is_set():
+                raise HuroshikiError("Another add operation is already running")
+            operation = ResolvedAddOperation(
+                self,
+                provider=provider,
+                selector=selector,
+                canonical_project_id=canonical_project_id,
+                side=side,
+            )
+            self._operation = operation
+            return operation
+
     def add(self, provider: str, query: str) -> subprocess.CompletedProcess[str]:
         """Compatibility path for synchronous add callers."""
         self.ensure_active()
@@ -831,22 +991,12 @@ class PackTransaction:
                 )
 
             metadata = _read_resolver_metadata(operation.resolver_source)
-            project_id = (
-                operation.selection.canonical_project_id
-                if operation.selection is not None
-                else None
-            )
-            if project_id is None:
-                selected = (
-                    operation.selection.label
-                    if operation.selection is not None
-                    else operation.query
-                )
-                project_id = resolve_project_selector(
-                    operation.provider,
-                    selected,
-                    cancel_event=operation.cancel_event,
-                ).canonical_project_id
+            selected = operation.selection or operation.query
+            project_id = resolve_project_selector(
+                operation.provider,
+                selected,
+                cancel_event=operation.cancel_event,
+            ).canonical_project_id
             if project_id is None:
                 raise HuroshikiError(
                     "Selected Packwiz result has no canonical project ID; "
@@ -954,7 +1104,9 @@ class PackTransaction:
                 cancelled=operation.cancelled,
             )
 
-    def _rollback_add(self, operation: PackwizAddOperation) -> None:
+    def _rollback_add(
+        self, operation: PackwizAddOperation | ResolvedAddOperation
+    ) -> None:
         with self._lock:
             if operation.checkpoint.exists():
                 shutil.rmtree(self.source, ignore_errors=True)
@@ -1581,21 +1733,6 @@ def search_provider_projects(
         identities.add(project.project_id)
         projects.append(project)
     return tuple(projects)
-
-
-def canonical_project_id_from_label(provider: str, label: str) -> str | None:
-    if canonical_provider(provider) != "curseforge":
-        return None
-    value = label.strip()
-    if value.isdecimal():
-        return value
-    for pattern in (
-        r"(?i)\b(?:project|addon)[ -]?id\s*[:=#]?\s*(\d+)\b",
-    ):
-        match = re.search(pattern, value)
-        if match is not None:
-            return match.group(1)
-    return None
 
 
 def url_max_jar_size_bytes(config: dict[str, object]) -> int:

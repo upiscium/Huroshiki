@@ -54,7 +54,6 @@ except ModuleNotFoundError as error:
     raise
 
 import huroshiki_core as core
-from packwiz_parser import MenuItem, ParserEvent, visible_menu_items
 
 
 def enabled_marker(enabled: bool) -> str:
@@ -1694,13 +1693,19 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         self.providers = ("modrinth", "curseforge", "url")
         self.default_client = True
         self.default_server = True
-        self.search_results: list[MenuItem] = []
+        self.search_results: list[core.InstallSearchResult] = []
         self.staged: list[core.ModInfo] = []
-        self.operation: core.PackwizAddOperation | None = None
+        self.operation: (
+            core.ProviderSearchOperation
+            | core.ResolvedAddOperation
+            | core.PackwizAddOperation
+            | None
+        ) = None
         self.operation_thread: threading.Thread | None = None
+        self.state = "idle"
         self._closing = False
         self._pending_navigation: Callable[[], None] | None = None
-        self._pending_operation: core.PackwizAddOperation | None = None
+        self._pending_operation: object | None = None
         self._navigation_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
@@ -1722,7 +1727,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         results = self.query_one("#search-results-table", DataTable)
         results.cursor_type = "row"
         results.zebra_stripes = True
-        results.add_columns("#", "MOD")
+        results.add_columns("MOD", "Provider", "Project ID", "Details")
 
         staged = self.query_one("#staged-table", DataTable)
         staged.cursor_type = "row"
@@ -1738,7 +1743,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             self.operation.cancel()
 
     def on_resize(self, event: events.Resize) -> None:
-        if self.operation is not None and not self.operation.done.is_set():
+        if isinstance(self.operation, core.PackwizAddOperation) and not self.operation.done.is_set():
             self.operation.resize(event.size.width, event.size.height)
 
     def transaction(self) -> core.PackTransaction:
@@ -1770,8 +1775,12 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         table = self.query_one("#search-results-table", DataTable)
         table.clear()
         for item in self.search_results:
-            marker = "*" if item.is_default else ""
-            table.add_row(str(item.index), f"{marker}{item.label}")
+            table.add_row(
+                item.title,
+                item.provider,
+                item.project_id,
+                item.subtitle,
+            )
 
     def update_side_label(self) -> None:
         self.query_one("#install-side-label", Static).update(
@@ -1798,7 +1807,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         }
         placeholders = {
             "modrinth": "Search, slug, project ID, or Modrinth URL",
-            "curseforge": "Search, slug, addon ID, or CurseForge URL",
+            "curseforge": "Numeric CurseForge project ID",
             "url": "Public URL of the self-hosted MOD JAR",
         }
         self.query_one("#provider-label", Static).update(
@@ -1870,19 +1879,11 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
     def discard_search_results(self) -> None:
         if not self.search_results:
             return
-
-        operation = self.operation
         self.search_results = []
         self.refresh_search_results()
-        self.set_status("Discarding Packwiz search results...")
-
-        if operation is not None and not operation.done.is_set():
-            try:
-                operation.cancel_menu()
-            except Exception as error:
-                self.app.notify(str(error), severity="error")
-        else:
-            self.query_one("#mod-search", Input).focus()
+        self.state = "idle"
+        self.set_status("Search results discarded")
+        self.query_one("#mod-search", Input).focus()
 
     @on(Input.Submitted, "#mod-search")
     def start_search(self, event: Input.Submitted) -> None:
@@ -1893,41 +1894,162 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             self.app.notify("Enter a search term", severity="warning")
             return
         if self.operation is not None and not self.operation.done.is_set():
-            self.app.notify("A Packwiz search is already running", severity="warning")
+            self.app.notify("An install operation is already running", severity="warning")
             return
 
         self.search_results = []
         self.refresh_search_results()
-        if self.provider == "url":
-            self.set_status("Downloading and staging the self-hosted MOD URL...")
-        else:
-            self.set_status(f"Starting Packwiz {self.provider} search...")
-        event.input.disabled = True
-
         try:
-            operation = self.transaction().begin_add(
-                self.provider,
-                query,
-                client=self.default_client,
-                server=self.default_server,
-                on_event=self._parser_event_from_worker,
+            normalized_provider, normalized_query = core.normalize_add_selector(
+                self.provider, query
             )
         except Exception as error:
-            event.input.disabled = False
             self.set_status(str(error))
             self.app.notify(str(error), severity="error")
             return
 
-        self.operation = operation
+        if normalized_provider == "curseforge" and not normalized_query.isdecimal():
+            message = (
+                "CurseForge search is unavailable. "
+                "Enter a numeric CurseForge project ID."
+            )
+            self.set_status(message)
+            self.app.notify(message, severity="warning")
+            return
+
+        event.input.disabled = True
+        if normalized_provider == "modrinth" and any(
+            character.isspace() for character in normalized_query
+        ):
+            minecraft, loader, _ = core.packctl.project_versions(
+                self.transaction().source
+            )
+            operation = core.ProviderSearchOperation(
+                provider="modrinth",
+                query=normalized_query,
+                minecraft=minecraft,
+                loader=loader,
+            )
+            self.operation = operation
+            self.state = "searching"
+            self.set_status("Searching Modrinth...")
+            target = self._run_search
+        else:
+            canonical_id = (
+                normalized_query if normalized_provider == "curseforge" else None
+            )
+            try:
+                self._start_resolved_operation(
+                    provider=normalized_provider,
+                    selector=normalized_query,
+                    canonical_project_id=canonical_id,
+                )
+            except Exception as error:
+                event.input.disabled = False
+                self.state = "idle"
+                self.set_status(str(error))
+                self.app.notify(str(error), severity="error")
+            return
+
         self.operation_thread = threading.Thread(
-            target=self._run_operation,
+            target=target,
             args=(operation,),
-            name=f"huroshiki-packwiz-{self.project_key}",
+            name=f"huroshiki-provider-search-{self.project_key}",
             daemon=True,
         )
         self.operation_thread.start()
 
-    def _run_operation(self, operation: core.PackwizAddOperation) -> None:
+    def _start_resolved_operation(
+        self,
+        *,
+        provider: str,
+        selector: str,
+        canonical_project_id: str | None,
+    ) -> None:
+        side = core.side_from_flags(self.default_client, self.default_server)
+        if provider == "url":
+            operation: core.ResolvedAddOperation | core.PackwizAddOperation = (
+                self.transaction().begin_add(
+                    provider,
+                    selector,
+                    client=self.default_client,
+                    server=self.default_server,
+                )
+            )
+            status = "Downloading and staging the self-hosted MOD URL..."
+        else:
+            operation = self.transaction().begin_resolved_add(
+                provider=provider,
+                selector=selector,
+                canonical_project_id=canonical_project_id,
+                side=side,
+            )
+            label = canonical_project_id or selector
+            status = f"Resolving {label} and dependencies..."
+        self.operation = operation
+        self.state = "resolving"
+        self.set_status(status)
+        self.query_one("#mod-search", Input).disabled = True
+        self.operation_thread = threading.Thread(
+            target=self._run_operation,
+            args=(operation,),
+            name=f"huroshiki-resolved-add-{self.project_key}",
+            daemon=True,
+        )
+        self.operation_thread.start()
+
+    def _run_search(self, operation: core.ProviderSearchOperation) -> None:
+        operation.run()
+        try:
+            self.app.call_from_thread(self._search_finished, operation)
+        except Exception:
+            pass
+
+    def _search_finished(self, operation: core.ProviderSearchOperation) -> None:
+        if self.operation is not operation:
+            return
+        self.operation = None
+        self.operation_thread = None
+        if self._closing:
+            return
+        search = self.query_one("#mod-search", Input)
+        search.disabled = False
+        if operation.cancelled:
+            self.state = "idle"
+            self.set_status("Provider search cancelled")
+            search.focus()
+            return
+        if operation.error is not None:
+            self.state = "idle"
+            self.set_status(operation.error)
+            self.app.notify(operation.error, severity="warning")
+            search.focus()
+            return
+        self.search_results = [
+            core.InstallSearchResult(
+                project.provider,
+                project.project_id,
+                project.title,
+                " - ".join(
+                    part for part in (project.author, project.description) if part
+                ),
+            )
+            for project in operation.results
+        ]
+        self.refresh_search_results()
+        self.state = "showing_results"
+        if self.search_results:
+            self.set_status(
+                f"{len(self.search_results)} canonical result(s); select with j/k and Enter"
+            )
+            self.query_one("#search-results-table", DataTable).focus()
+        else:
+            self.set_status("Modrinth returned no matching projects")
+            search.focus()
+
+    def _run_operation(
+        self, operation: core.ResolvedAddOperation | core.PackwizAddOperation
+    ) -> None:
         result = operation.run()
         try:
             self.app.call_from_thread(self._operation_finished, operation, result)
@@ -1935,48 +2057,9 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             # The app or this screen may already be shutting down.
             pass
 
-    def _parser_event_from_worker(self, event: ParserEvent) -> None:
-        operation = self.operation
-        if event.kind == "confirmation" and operation is not None:
-            # The command runs only against a disposable transaction copy.
-            # Required dependencies are accepted here and reviewed before apply.
-            try:
-                operation.confirm(True)
-            except (OSError, RuntimeError):
-                pass
-
-        try:
-            self.app.call_from_thread(self._handle_parser_event, event)
-        except Exception:
-            pass
-
-    def _handle_parser_event(self, event: ParserEvent) -> None:
-        if self._closing:
-            return
-        if event.kind == "search_started":
-            self.set_status(f"Searching {event.message}...")
-        elif event.kind == "search_results":
-            self.search_results = list(visible_menu_items(event.items))
-            self.refresh_search_results()
-            if self.search_results:
-                self.set_status(
-                    f"{len(self.search_results)} result(s); select with j/k and Enter"
-                )
-                self.query_one("#search-results-table", DataTable).focus()
-            else:
-                self.set_status("Packwiz returned no selectable results")
-        elif event.kind == "confirmation":
-            self.set_status("Packwiz dependency confirmation accepted in staging")
-        elif event.kind == "diagnostic":
-            self.set_status(event.message)
-        elif event.kind == "output":
-            message = event.message.strip()
-            if message and not message[0].isdigit():
-                self.set_status(message)
-
     def _operation_finished(
         self,
-        operation: core.PackwizAddOperation,
+        operation: core.ResolvedAddOperation | core.PackwizAddOperation,
         result: core.AddOperationResult,
     ) -> None:
         if self.operation is not operation:
@@ -1988,6 +2071,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
 
         search = self.query_one("#mod-search", Input)
         search.disabled = False
+        self.state = "idle"
         self.search_results = []
         self.refresh_search_results()
         self.refresh_staged()
@@ -2003,20 +2087,23 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             self.app.notify(result.message, severity="warning")
         search.focus()
 
-    def current_search_result(self) -> MenuItem | None:
+    def current_search_result(self) -> core.InstallSearchResult | None:
         table = self.query_one("#search-results-table", DataTable)
         index = self.current_index(table, len(self.search_results))
         return None if index is None else self.search_results[index]
 
     def choose_search_result(self) -> None:
         item = self.current_search_result()
-        operation = self.operation
-        if item is None or operation is None:
-            self.app.notify("No Packwiz result is selected", severity="warning")
+        if item is None:
+            self.app.notify("No provider result is selected", severity="warning")
             return
         try:
-            operation.send_selection(item.index)
-            self.set_status(f"Installing {item.label} into the staged transaction...")
+            self._start_resolved_operation(
+                provider=item.provider,
+                selector=item.project_id,
+                canonical_project_id=item.project_id,
+            )
+            self.set_status(f"Resolving {item.title} and dependencies...")
             self.search_results = []
             self.refresh_search_results()
         except Exception as error:
@@ -2103,7 +2190,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
 
     def review(self) -> None:
         if self.operation is not None and not self.operation.done.is_set():
-            self.app.notify("Wait for Packwiz to finish", severity="warning")
+            self.app.notify("Wait for the install operation to finish", severity="warning")
             return
         self.refresh_staged()
         if not self.staged:
