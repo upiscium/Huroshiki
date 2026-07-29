@@ -2837,13 +2837,13 @@ def _template_import_resolution(path: Path, plan: Any) -> Any:
     from template_merge import TemplateMergeError
 
     data = load_yaml(path)
-    if data.get("version") in {1, 2}:
+    if data.get("version") in {1, 2, 3}:
         raise ConfigError(
             f"Template import resolution version {data.get('version')} is no longer "
-            "supported; regenerate the resolution against the current plan"
+            "supported; regenerate the resolution against the current option-based plan"
         )
-    if data.get("version") != 3:
-        raise ConfigError("Template import resolution version must be 3")
+    if data.get("version") != 4:
+        raise ConfigError("Template import resolution version must be 4")
     if data.get("plan_digest") != plan.plan_digest:
         raise ConfigError("Template import resolution has a stale plan digest")
     raw_names = data.get("name_conflicts", {})
@@ -2857,26 +2857,26 @@ def _template_import_resolution(path: Path, plan: Any) -> Any:
     ):
         raise ConfigError("Template import resolution conflicts must be mappings")
 
-    def selections(raw_conflicts: dict[object, object]) -> dict[str, Any]:
+    def options(raw_conflicts: dict[object, object]) -> dict[str, Any]:
         result = {}
         for key, value in raw_conflicts.items():
             if not isinstance(key, str) or not isinstance(value, dict):
                 raise ConfigError("Invalid template import conflict resolution")
-            selections = value.get("selections")
-            if not isinstance(selections, list) or not all(
-                isinstance(item, str) for item in selections
+            option_keys = value.get("options")
+            if not isinstance(option_keys, list) or not all(
+                isinstance(item, str) for item in option_keys
             ):
-                raise ConfigError("Template import conflict selections must be strings")
+                raise ConfigError("Template import conflict options must be strings")
             result[key] = ImportConflictResolution(
-                tuple(selections),
+                tuple(option_keys),
                 value.get("acknowledge_duplicate_risk") is True,
             )
         return result
 
-    names = selections(raw_names)
-    urls = selections(raw_urls)
-    logical = selections(raw_logical)
-    actual = selections(raw_actual)
+    names = options(raw_names)
+    urls = options(raw_urls)
+    logical = options(raw_logical)
+    actual = options(raw_actual)
     sides = {}
     for key, decision in raw_sides.items():
         if not isinstance(key, str) or ":" not in key or not isinstance(decision, str):
@@ -2935,9 +2935,15 @@ def _template_import_conflict_payload(plan: Any) -> dict[str, list[dict[str, Any
         label: [
             {
                 "key": conflict.key,
-                "candidates": [
-                    _template_import_candidate_payload(plan, candidate)
-                    for candidate in conflict.candidates
+                "options": [
+                    {
+                        "option_key": option.option_key,
+                        "candidates": [
+                            _template_import_candidate_payload(plan, candidate)
+                            for candidate in option.candidates
+                        ],
+                    }
+                    for option in conflict.options
                 ],
             }
             for conflict in conflicts
@@ -2987,7 +2993,7 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                     )
                     return 2
                 print("Template import conflicts require a resolution file:", file=sys.stderr)
-                print("version: 3", file=sys.stderr)
+                print("version: 4", file=sys.stderr)
                 print(f'plan_digest: "{plan.plan_digest}"', file=sys.stderr)
                 for label, conflicts in (
                     ("name_conflicts", plan.name_conflicts),
@@ -3003,17 +3009,25 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                         print("  {}", file=sys.stderr)
                     for conflict in conflicts:
                         print(f'  "{conflict.key}":', file=sys.stderr)
-                        print("    selections:", file=sys.stderr)
-                        for candidate in conflict.candidates:
-                            status = _template_import_candidate_payload(plan, candidate)
-                            detail = status["status"]
-                            if status["actual_identity"] is not None:
-                                detail += ":" + ":".join(status["actual_identity"])
-                            if status["error"] is not None:
-                                detail += f": {status['error']}"
-                            print(f"    # {detail}", file=sys.stderr)
-                            print(f"    # candidate: {candidate.candidate_key}", file=sys.stderr)
-                            print(f'      - "{candidate.selection_key}"', file=sys.stderr)
+                        print("    options:", file=sys.stderr)
+                        for option in conflict.options:
+                            print("    # source option members:", file=sys.stderr)
+                            for candidate in option.candidates:
+                                status = _template_import_candidate_payload(plan, candidate)
+                                detail = status["status"]
+                                if status["actual_identity"] is not None:
+                                    detail += ":" + ":".join(status["actual_identity"])
+                                if status["error"] is not None:
+                                    detail += f": {status['error']}"
+                                print(
+                                    f"    # - {candidate.selection_key}: {detail}",
+                                    file=sys.stderr,
+                                )
+                                print(
+                                    f"    #   candidate: {candidate.candidate_key}",
+                                    file=sys.stderr,
+                                )
+                            print(f'      - "{option.option_key}"', file=sys.stderr)
                         print(
                             "    acknowledge_duplicate_risk: false",
                             file=sys.stderr,
@@ -3043,6 +3057,7 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                 json.dumps(
                     {
                         "plan_digest": plan.plan_digest,
+                        "selected_options": resolved.selected_option_keys,
                         "requested_roots": [
                             item.candidate_key for item in plan.template_candidates
                         ],

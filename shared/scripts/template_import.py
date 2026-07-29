@@ -717,11 +717,11 @@ def resolve_template_import_plan(
             raise TemplateMergeError(f"Invalid resolution for {kind} conflict {key!r}")
         if cardinality == "exactly-one" and len(keys) != 1:
             raise TemplateMergeError(
-                f"{kind.capitalize()} conflict {key!r} requires exactly one candidate"
+                f"{kind.capitalize()} conflict {key!r} requires exactly one option"
             )
         if cardinality == "one-or-more" and not keys:
             raise TemplateMergeError(
-                f"{kind.capitalize()} conflict {key!r} requires at least one candidate"
+                f"{kind.capitalize()} conflict {key!r} requires at least one option"
             )
         selected = set(keys)
         source = f'{kind} conflict "{key}"'
@@ -799,11 +799,11 @@ def resolve_template_import_plan(
             )
             if cardinality == "exactly-one" and len(final_keys) != 1:
                 raise TemplateMergeError(
-                    f"{kind.capitalize()} conflict {conflict.key!r} must retain exactly one candidate"
+                    f"{kind.capitalize()} conflict {conflict.key!r} must retain exactly one option"
                 )
             if cardinality == "one-or-more" and not final_keys:
                 raise TemplateMergeError(
-                    f"{kind.capitalize()} conflict {conflict.key!r} must retain a candidate"
+                    f"{kind.capitalize()} conflict {conflict.key!r} must retain an option"
                 )
             resolution = resolutions[conflict.key]
             if len(final_keys) > 1 and not resolution.acknowledge_duplicate_risk:

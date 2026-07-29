@@ -268,7 +268,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         with redirect_stderr(stderr):
             self.assertEqual(packctl.cmd_apply_template(args), 2)
         self.assertIn("resolution file", stderr.getvalue())
-        self.assertIn("version: 3", stderr.getvalue())
+        self.assertIn("version: 4", stderr.getvalue())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
         args.json = True
@@ -286,7 +286,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         plan = core.prepare_template_import_plan("pack:demo", ["base"])
         resolution = self.root / "resolution.yaml"
         resolution.write_text(
-            "version: 3\nplan_digest: stale\nname_conflicts: {}\nside_conflicts: {}\n",
+            "version: 4\nplan_digest: stale\nname_conflicts: {}\nside_conflicts: {}\n",
             encoding="utf-8",
         )
         with self.assertRaisesRegex(packctl.ConfigError, "stale plan digest"):
@@ -302,6 +302,12 @@ class TemplateImportCoreTest(unittest.TestCase):
             encoding="utf-8",
         )
         with self.assertRaisesRegex(packctl.ConfigError, "version 2.*no longer"):
+            packctl._template_import_resolution(resolution, plan)
+        resolution.write_text(
+            "version: 3\nplan_digest: stale\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(packctl.ConfigError, "version 3.*no longer"):
             packctl._template_import_resolution(resolution, plan)
         args = packctl.parser().parse_args(
             ["apply-template", "demo", "base", "--apply", "--json"]
@@ -454,20 +460,25 @@ class TemplateImportCoreTest(unittest.TestCase):
         )
         payload = packctl._template_import_conflict_payload(session.plan)
         self.assertEqual(
-            [item["status"] for item in payload["url_selector"][0]["candidates"]],
+            [
+                option["candidates"][0]["status"]
+                for option in payload["url_selector"][0]["options"]
+            ],
             ["verified", "failed"],
         )
         self.assertEqual(
-            payload["url_selector"][0]["candidates"][1]["error"],
+            payload["url_selector"][0]["options"][1]["candidates"][0]["error"],
             "HTTP 404",
         )
         self.assertTrue(
-            payload["url_selector"][0]["candidates"][0]["selection_key"].startswith(
-                "template:"
-            )
+            payload["url_selector"][0]["options"][0]["candidates"][0][
+                "selection_key"
+            ].startswith("template:")
         )
         self.assertEqual(
-            payload["url_selector"][0]["candidates"][0]["origin_kind"],
+            payload["url_selector"][0]["options"][0]["candidates"][0][
+                "origin_kind"
+            ],
             "template",
         )
         good, bad = session.plan.template_candidates
@@ -581,7 +592,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         self.assertEqual(core.tree_digest_snapshot(self.source), before)
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
-    def test_same_selector_resolution_v3_round_trip_and_validation(self) -> None:
+    def test_same_selector_resolution_v4_round_trip_and_validation(self) -> None:
         self.install_logical_url()
         self.use_url_template()
         with patch.object(
@@ -593,17 +604,17 @@ class TemplateImportCoreTest(unittest.TestCase):
         incoming = conflict.template_candidates[0]
         self.assertEqual(installed.candidate_key, incoming.candidate_key)
         self.assertNotEqual(installed.selection_key, incoming.selection_key)
-        resolution = self.root / "resolution-v3.yaml"
+        resolution = self.root / "resolution-v4.yaml"
 
         def write_selection(lines: list[str]) -> None:
             resolution.write_text(
-                "version: 3\n"
+                "version: 4\n"
                 f'plan_digest: "{session.plan.plan_digest}"\n'
                 "name_conflicts: {}\n"
                 "url_selector_conflicts: {}\n"
                 "logical_identity_conflicts:\n"
                 "  \"url:logical\":\n"
-                "    selections:\n"
+                "    options:\n"
                 + "".join(f'      - "{item}"\n' for item in lines)
                 + "    acknowledge_duplicate_risk: false\n"
                 "actual_identity_conflicts: {}\n"
@@ -625,7 +636,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         with self.assertRaisesRegex(packctl.ConfigError, "Invalid resolution"):
             packctl._template_import_resolution(resolution, session.plan)
         resolution.write_text(
-            "version: 3\n"
+            "version: 4\n"
             f'plan_digest: "{session.plan.plan_digest}"\n'
             "name_conflicts: {}\n"
             "url_selector_conflicts: {}\n"
@@ -636,7 +647,7 @@ class TemplateImportCoreTest(unittest.TestCase):
             "side_conflicts: {}\n",
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(packctl.ConfigError, "selections must be strings"):
+        with self.assertRaisesRegex(packctl.ConfigError, "options must be strings"):
             packctl._template_import_resolution(resolution, session.plan)
         session.discard()
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
@@ -734,6 +745,104 @@ class TemplateImportCoreTest(unittest.TestCase):
             ["HTTP 404", "invalid JAR"],
         )
         session.discard()
+
+    def test_group_option_payload_lists_every_source_origin(self) -> None:
+        mods = self.source / "mods"
+        mods.mkdir()
+        (mods / "shared.pw.toml").write_bytes(
+            metadata("Same", "shared", "shared.jar")
+        )
+        (self.template / "template.yaml").write_text(
+            "id: base\ndisplay_name: Base\nenabled: true\n"
+            "minecraft: 1.21.1\nloader: neoforge\n"
+            "reference_loader_version: 21.1.0\nmods:\n"
+            "  - name: Same\n    provider: modrinth\n"
+            "    project_id: shared\n    side: client\n"
+            "  - name: Same\n    provider: curseforge\n"
+            "    project_id: '2'\n    side: client\n",
+            encoding="utf-8",
+        )
+        session = core.TemplateImportSession.create("pack:demo", ["base"])
+        payload = packctl._template_import_conflict_payload(session.plan)
+        options = payload["name"][0]["options"]
+        grouped = next(option for option in options if option["option_key"].startswith("group:"))
+        self.assertEqual(
+            [candidate["origin_kind"] for candidate in grouped["candidates"]],
+            ["pack", "template"],
+        )
+        self.assertEqual(
+            len({candidate["selection_key"] for candidate in grouped["candidates"]}),
+            2,
+        )
+        resolution = self.root / "group-resolution.yaml"
+        resolution.write_text(
+            "version: 4\n"
+            f'plan_digest: "{session.plan.plan_digest}"\n'
+            "name_conflicts:\n"
+            "  \"same\":\n"
+            "    options:\n"
+            f'      - "{grouped["option_key"]}"\n'
+            "    acknowledge_duplicate_risk: false\n"
+            "url_selector_conflicts: {}\n"
+            "logical_identity_conflicts: {}\n"
+            "actual_identity_conflicts: {}\n"
+            "side_conflicts: {}\n",
+            encoding="utf-8",
+        )
+        resolved = packctl._template_import_resolution(resolution, session.plan)
+        self.assertEqual(resolved.removed_pack_candidates, ())
+        self.assertEqual(len(resolved.selected_option_keys), 1)
+        self.assertEqual(
+            resolved.selected_template_candidates[0].project_id,
+            "shared",
+        )
+        self.assertEqual(resolved.selected_new_roots, ())
+        session.discard()
+
+    def test_multiple_failed_url_replacements_allow_pack_keep_path(self) -> None:
+        self.install_logical_url()
+        (self.template / "template.yaml").write_text(
+            "id: base\ndisplay_name: Base\nenabled: true\n"
+            "minecraft: 1.21.1\nloader: neoforge\n"
+            "reference_loader_version: 21.1.0\nmods:\n"
+            "  - name: Failed A\n    provider: url\n"
+            "    project_id: logical\n    side: client\n"
+            "    url: https://mods.example/a.jar\n"
+            "  - name: Failed B\n    provider: url\n"
+            "    project_id: logical\n    side: client\n"
+            "    url: https://mods.example/b.jar\n",
+            encoding="utf-8",
+        )
+        before = core.tree_digest_snapshot(self.source)
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=core.UrlCandidateVerificationError("HTTP 404"),
+        ):
+            session = core.TemplateImportSession.create("pack:demo", ["base"])
+        self.assertEqual(len(session.plan.logical_identity_conflicts), 1)
+        self.assertEqual(session.plan.url_selector_conflicts, ())
+        conflict = session.plan.logical_identity_conflicts[0]
+        pack_option = next(
+            option
+            for option in conflict.options
+            if any(candidate.origin_kind == "pack" for candidate in option.candidates)
+        )
+        resolved = resolve_template_import_plan(
+            session.plan,
+            logical_identity_resolutions={
+                conflict.key: ImportConflictResolution((pack_option.option_key,))
+            },
+        )
+        self.assertEqual(resolved.selected_template_candidates, ())
+        operation = core.TemplateImportOperation(session, resolved)
+        with patch.object(
+            core, "run_resolver_process", side_effect=self.refresh_ok
+        ):
+            operation.run()
+            operation.discard()
+        self.assertEqual(core.tree_digest_snapshot(self.source), before)
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
     def test_cli_failed_non_conflicting_candidate_returns_one_and_unlocks(self) -> None:
         self.use_url_template()
