@@ -243,6 +243,12 @@ normalized non-root POSIX absolute paths without `.` or `..` components. Compose
 contain only letters, digits, `_`, `.`, and `-`, and must start with a letter or digit. SSH execution
 uses an explicit `--` option terminator.
 
+For packs, open `Settings` and then `Deployment` in the TUI to edit the effective SSH host, stack
+directory, Compose service, and the host/path components of the rsync target. Changes are reviewed
+before they are written to `pack.local.yaml`; unchanged fields retain their committed or local
+source. The equivalent noninteractive commands are `packctl show-deployment <pack>` and
+`packctl set-deployment <pack> [options]`.
+
 The settings commands pin the managed collection and project directory, snapshot both committed and
 local configuration, validate the prospective merged project entirely in memory, and publish through
 Linux `renameat2` compare-and-swap. The directory identities are rechecked before and after

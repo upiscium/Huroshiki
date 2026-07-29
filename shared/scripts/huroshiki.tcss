@@ -49,6 +49,18 @@ DataTable {
     max-height: 14;
 }
 
+#settings-actions {
+    width: 46;
+    height: auto;
+    max-height: 14;
+}
+
+#deployment-settings-form {
+    height: 1fr;
+    overflow-y: auto;
+    padding-bottom: 1;
+}
+
 #update-options {
     width: 1fr;
     height: 1fr;

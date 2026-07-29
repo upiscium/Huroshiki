@@ -150,6 +150,18 @@ class HuroshikiApp(App[None]):
         self.selected_project = project_key
         self.switch_screen(UpdateScreen(project_key))
 
+    def open_settings(self, project_key: str) -> None:
+        if not self.project_is_usable(project_key):
+            return
+        self.selected_project = project_key
+        self.switch_screen(SettingsScreen(project_key))
+
+    def open_deployment_settings(self, project_key: str) -> None:
+        if not self.project_is_usable(project_key):
+            return
+        self.selected_project = project_key
+        self.switch_screen(DeploymentSettingsScreen(project_key))
+
     def open_templates(self, project_key: str) -> None:
         if not self.project_is_usable(project_key):
             return
@@ -942,8 +954,9 @@ class ProjectScreen(BaseScreen):
         )
         self.actions = core.project_actions(project_key)
         if self.project.kind == "pack":
+            self.actions = (*self.actions, "settings")
             self.help_text = (
-                "i: install  l: list  u: update  t: files  "
+                "i: install  l: list  u: update  t: files  s: settings  "
                 "j/k: move  Enter: run  Esc: main"
             )
         else:
@@ -973,6 +986,9 @@ class ProjectScreen(BaseScreen):
         if index is None:
             return
         action = self.actions[index]
+        if action == "settings":
+            self.app.open_settings(self.project_key)
+            return
         if action == "create MODPACK":
             self.app.push_screen(
                 CreateFromTemplateModal(self.project),
@@ -1104,11 +1120,174 @@ class ProjectScreen(BaseScreen):
                     "Templates store MOD entries only",
                     severity="warning",
                 )
+        elif key == "s" and self.project.kind == "pack":
+            self.app.open_settings(self.project_key)
         elif key == "escape":
             self.app.go_main()
         else:
             return
         event.stop()
+
+
+class SettingsScreen(ProjectChildScreen, BaseScreen):
+    screen_title = "Settings"
+    help_text = "j/k: move  Enter: open  Esc: project"
+    actions = ("Deployment",)
+
+    def __init__(self, project_key: str) -> None:
+        super().__init__()
+        self.project_key = project_key
+        project = core.project_info(project_key)
+        self.screen_title = f"{project.display_name} / Settings"
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        with Container(id="project-actions-container"):
+            yield DataTable(id="settings-actions")
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#settings-actions", DataTable)
+        table.cursor_type = "row"
+        table.show_header = False
+        table.add_column("Settings")
+        for action in self.actions:
+            table.add_row(action)
+        table.focus()
+
+    def on_key(self, event: events.Key) -> None:
+        table = self.query_one("#settings-actions", DataTable)
+        if event.key == "j":
+            self.move_table(table, len(self.actions), 1)
+        elif event.key == "k":
+            self.move_table(table, len(self.actions), -1)
+        elif event.key == "enter":
+            index = self.current_index(table, len(self.actions))
+            if index is not None and self.actions[index] == "Deployment":
+                self.app.open_deployment_settings(self.project_key)
+        elif event.key == "escape":
+            self.return_to_project()
+        else:
+            return
+        event.stop()
+
+
+class DeploymentSettingsScreen(BaseScreen):
+    BINDINGS = [
+        Binding("ctrl+s", "save", "Save", priority=True),
+        Binding("escape", "back", "Back", priority=True),
+    ]
+    FIELD_IDS = (
+        "deployment-ssh-host",
+        "deployment-stack-dir",
+        "deployment-service",
+        "deployment-rsync-host",
+        "deployment-rsync-path",
+    )
+    help_text = "Tab: next field  Ctrl+S: review changes  Esc: settings"
+
+    def __init__(self, project_key: str) -> None:
+        super().__init__()
+        self.project_key = project_key
+        project = core.project_info(project_key)
+        self.screen_title = f"{project.display_name} / Settings / Deployment"
+        self.baseline = core.deployment_settings_baseline(project_key)
+        self.settings = self.baseline.settings
+        self.rsync_parts = core.split_rsync_target(self.settings.rsync_target)
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        with Container(id="deployment-settings-form"):
+            yield Static("SSH host", classes="section-label")
+            yield Input(value=self.settings.ssh_host, id="deployment-ssh-host")
+            yield Static("Stack directory", classes="section-label")
+            yield Input(value=self.settings.stack_dir, id="deployment-stack-dir")
+            yield Static("Compose service", classes="section-label")
+            yield Input(value=self.settings.service, id="deployment-service")
+            yield Static("Rsync host", classes="section-label")
+            yield Input(value=self.rsync_parts.host, id="deployment-rsync-host")
+            yield Static("Rsync path", classes="section-label")
+            yield Input(value=self.rsync_parts.path, id="deployment-rsync-path")
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#deployment-ssh-host", Input).focus()
+
+    @on(Input.Submitted)
+    def submitted(self, event: Input.Submitted) -> None:
+        inputs = [self.query_one(f"#{field_id}", Input) for field_id in self.FIELD_IDS]
+        index = inputs.index(event.input)
+        if index < len(inputs) - 1:
+            inputs[index + 1].focus()
+        else:
+            self.action_save()
+
+    def proposed_settings(self) -> core.DeploymentSettings:
+        return core.proposed_deployment_settings(
+            ssh_host=self.query_one("#deployment-ssh-host", Input).value,
+            stack_dir=self.query_one("#deployment-stack-dir", Input).value,
+            service=self.query_one("#deployment-service", Input).value,
+            rsync_host=self.query_one("#deployment-rsync-host", Input).value,
+            rsync_path=self.query_one("#deployment-rsync-path", Input).value,
+        )
+
+    def action_save(self) -> None:
+        try:
+            proposed = self.proposed_settings()
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+            return
+        if proposed == self.settings:
+            self.app.notify("Deployment settings are unchanged")
+            return
+        labels = (
+            ("SSH host", self.settings.ssh_host, proposed.ssh_host),
+            ("Stack directory", self.settings.stack_dir, proposed.stack_dir),
+            ("Compose service", self.settings.service, proposed.service),
+            ("Rsync target", self.settings.rsync_target, proposed.rsync_target),
+        )
+        lines = ["Save to: pack.local.yaml"]
+        lines.extend(
+            f"{label}: {before} -> {after}"
+            for label, before, after in labels
+            if before != after
+        )
+        self.app.push_screen(
+            ConfirmModal("Save deployment settings?", lines),
+            lambda confirmed: self.save_confirmed(proposed, confirmed),
+        )
+
+    def save_confirmed(
+        self,
+        proposed: core.DeploymentSettings,
+        confirmed: bool | None,
+    ) -> None:
+        if not confirmed:
+            return
+        try:
+            core.update_deployment_settings(
+                self.project_key,
+                proposed,
+                expected_baseline=self.baseline,
+            )
+            self.baseline = core.deployment_settings_baseline(self.project_key)
+            self.settings = self.baseline.settings
+            self.rsync_parts = core.split_rsync_target(self.settings.rsync_target)
+            values = (
+                self.settings.ssh_host,
+                self.settings.stack_dir,
+                self.settings.service,
+                self.rsync_parts.host,
+                self.rsync_parts.path,
+            )
+            for field_id, value in zip(self.FIELD_IDS, values, strict=True):
+                self.query_one(f"#{field_id}", Input).value = value
+            self.app.notify("Deployment settings saved")
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+
+    def action_back(self) -> None:
+        self.app.open_settings(self.project_key)
 
 
 class TemplateEditorScreen(ProjectChildScreen, BaseScreen):
