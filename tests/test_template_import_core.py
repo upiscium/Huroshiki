@@ -797,6 +797,16 @@ class TemplateImportCoreTest(unittest.TestCase):
             "shared",
         )
         self.assertEqual(resolved.selected_new_roots, ())
+        member_key = grouped["candidates"][0]["selection_key"]
+        resolution.write_text(
+            resolution.read_text(encoding="utf-8").replace(
+                grouped["option_key"], member_key
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(packctl.ConfigError, "Invalid resolution"):
+            packctl._template_import_resolution(resolution, session.plan)
+        self.assertTrue((self.source / "mods/shared.pw.toml").is_file())
         session.discard()
 
     def test_multiple_failed_url_replacements_allow_pack_keep_path(self) -> None:
