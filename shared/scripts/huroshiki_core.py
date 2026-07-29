@@ -5802,12 +5802,18 @@ def _preflight_import_closures(
     resolved_roots: Sequence[tuple[ModCandidate, ResolvedModClosure]],
     removed: Sequence[ModCandidate],
     side_changes: Sequence[tuple[tuple[str, str], str, str]],
+    checkpoint: Callable[[], None],
 ) -> None:
     preflight_source = transaction.root / "import-preflight"
     try:
-        copy_transaction_source(transaction.source, preflight_source)
+        copy_transaction_source(
+            transaction.source,
+            preflight_source,
+            checkpoint=checkpoint,
+        )
         _remove_import_candidates(preflight_source, removed)
         for candidate, closure in resolved_roots:
+            checkpoint()
             merge_metadata_closure(
                 preflight_source,
                 closure,
@@ -5914,6 +5920,7 @@ class TemplateImportOperation:
                 resolved_roots,
                 self.resolved.removed_pack_candidates,
                 self.resolved.side_changes,
+                self._checkpoint,
             )
             _remove_import_candidates(
                 self.transaction.source,
