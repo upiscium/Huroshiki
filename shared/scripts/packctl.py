@@ -2833,17 +2833,17 @@ def cmd_loader_version(args: argparse.Namespace) -> int:
 
 
 def _template_import_resolution(path: Path, plan: Any) -> Any:
-    from template_import import resolve_template_import_plan
-    from template_merge import ConflictResolution, TemplateMergeError
+    from template_import import ImportConflictResolution, resolve_template_import_plan
+    from template_merge import TemplateMergeError
 
     data = load_yaml(path)
-    if data.get("version") == 1:
+    if data.get("version") in {1, 2}:
         raise ConfigError(
-            "Template import resolution version 1 is no longer supported; "
-            "regenerate the resolution against the current verified plan"
+            f"Template import resolution version {data.get('version')} is no longer "
+            "supported; regenerate the resolution against the current plan"
         )
-    if data.get("version") != 2:
-        raise ConfigError("Template import resolution version must be 2")
+    if data.get("version") != 3:
+        raise ConfigError("Template import resolution version must be 3")
     if data.get("plan_digest") != plan.plan_digest:
         raise ConfigError("Template import resolution has a stale plan digest")
     raw_names = data.get("name_conflicts", {})
@@ -2862,13 +2862,13 @@ def _template_import_resolution(path: Path, plan: Any) -> Any:
         for key, value in raw_conflicts.items():
             if not isinstance(key, str) or not isinstance(value, dict):
                 raise ConfigError("Invalid template import conflict resolution")
-            candidates = value.get("candidates")
-            if not isinstance(candidates, list) or not all(
-                isinstance(item, str) for item in candidates
+            selections = value.get("selections")
+            if not isinstance(selections, list) or not all(
+                isinstance(item, str) for item in selections
             ):
-                raise ConfigError("Template import conflict candidates must be strings")
-            result[key] = ConflictResolution(
-                tuple(candidates),
+                raise ConfigError("Template import conflict selections must be strings")
+            result[key] = ImportConflictResolution(
+                tuple(selections),
                 value.get("acknowledge_duplicate_risk") is True,
             )
         return result
@@ -2919,7 +2919,10 @@ def _template_import_candidate_payload(plan: Any, candidate: Any) -> dict[str, A
         error = verification.error
         fingerprint = verification.closure_fingerprint
     return {
+        "selection_key": candidate.selection_key,
         "candidate_key": candidate.candidate_key,
+        "origin_kind": candidate.origin_kind,
+        "origin_id": candidate.origin_id,
         "status": status,
         "actual_identity": actual_identity,
         "closure_fingerprint": fingerprint,
@@ -2984,7 +2987,7 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                     )
                     return 2
                 print("Template import conflicts require a resolution file:", file=sys.stderr)
-                print("version: 2", file=sys.stderr)
+                print("version: 3", file=sys.stderr)
                 print(f'plan_digest: "{plan.plan_digest}"', file=sys.stderr)
                 for label, conflicts in (
                     ("name_conflicts", plan.name_conflicts),
@@ -3000,7 +3003,7 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                         print("  {}", file=sys.stderr)
                     for conflict in conflicts:
                         print(f'  "{conflict.key}":', file=sys.stderr)
-                        print("    candidates:", file=sys.stderr)
+                        print("    selections:", file=sys.stderr)
                         for candidate in conflict.candidates:
                             status = _template_import_candidate_payload(plan, candidate)
                             detail = status["status"]
@@ -3008,8 +3011,9 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                                 detail += ":" + ":".join(status["actual_identity"])
                             if status["error"] is not None:
                                 detail += f": {status['error']}"
-                            print(f"    # {candidate.candidate_key}: {detail}", file=sys.stderr)
-                            print(f'      - "{candidate.candidate_key}"', file=sys.stderr)
+                            print(f"    # {detail}", file=sys.stderr)
+                            print(f"    # candidate: {candidate.candidate_key}", file=sys.stderr)
+                            print(f'      - "{candidate.selection_key}"', file=sys.stderr)
                         print(
                             "    acknowledge_duplicate_risk: false",
                             file=sys.stderr,
@@ -3044,6 +3048,7 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                         ],
                         "resolved_roots": [
                             {
+                                "selection_key": item.selection_key,
                                 "candidate_key": item.candidate_key,
                                 "requested_identity": item.requested_identity,
                                 "actual_identity": item.actual_identity,

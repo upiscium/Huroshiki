@@ -5465,6 +5465,7 @@ def _merge_resolved_template_roots(
 
 @dataclass(frozen=True)
 class ImportedRootPreview:
+    selection_key: str
     candidate_key: str
     requested_name: str
     requested_identity: tuple[str, str]
@@ -6108,6 +6109,7 @@ class TemplateImportOperation:
                 mod = matching[0]
                 imported_roots.append(
                     ImportedRootPreview(
+                        candidate.selection_key,
                         candidate.candidate_key,
                         candidate.name,
                         candidate.logical_identity,

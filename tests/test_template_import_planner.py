@@ -5,6 +5,7 @@ import unittest
 
 from template_import import (
     ImportCandidateVerification,
+    ImportConflictResolution,
     ModCandidate,
     TemplateCompatibility,
     build_template_import_plan,
@@ -13,7 +14,7 @@ from template_import import (
     resolve_template_import_plan,
     template_candidate,
 )
-from template_merge import ConflictResolution, TemplateMergeError, TemplateModEntry
+from template_merge import TemplateMergeError, TemplateModEntry
 
 
 def pack_candidate(
@@ -127,6 +128,43 @@ class TemplateImportPlannerTest(unittest.TestCase):
         )
         self.assertEqual(candidate.url, "https://mods.example/private.jar")
 
+    def test_pack_and_template_same_candidate_key_have_unique_selection_keys(self) -> None:
+        url = "https://mods.example/mod.jar"
+        installed = pack_candidate("Installed", "logical", provider="url")
+        installed = installed.__class__(**{**installed.__dict__, "url": url})
+        incoming = template_candidate(
+            "base",
+            name="Replacement",
+            provider="url",
+            project_id="logical",
+            side="both",
+            url=url,
+            actual_provider="url",
+            actual_project_id="new-id",
+        )
+        plan = build(["base"], [installed], [incoming])
+        pack = plan.pack_candidates[0]
+        template = plan.template_candidates[0]
+        self.assertEqual(pack.candidate_key, template.candidate_key)
+        self.assertNotEqual(pack.selection_key, template.selection_key)
+        conflict = plan.logical_identity_conflicts[0]
+        keep = resolve_template_import_plan(
+            plan,
+            logical_identity_resolutions={
+                conflict.key: ImportConflictResolution((pack.selection_key,))
+            },
+        )
+        self.assertEqual(keep.removed_pack_candidates, ())
+        self.assertEqual(keep.selected_new_roots, ())
+        replace_plan = resolve_template_import_plan(
+            plan,
+            logical_identity_resolutions={
+                conflict.key: ImportConflictResolution((template.selection_key,))
+            },
+        )
+        self.assertEqual(replace_plan.removed_pack_candidates, (pack,))
+        self.assertEqual(replace_plan.selected_new_roots, (template,))
+
     def test_single_and_multiple_templates_preserve_selection_order(self) -> None:
         candidates = [
             template_candidate(
@@ -226,7 +264,7 @@ class TemplateImportPlannerTest(unittest.TestCase):
         resolved = resolve_template_import_plan(
             plan,
             name_resolutions={
-                conflict.key: ConflictResolution((incoming.candidate_key,))
+                conflict.key: ImportConflictResolution((incoming.selection_key,))
             },
         )
         self.assertEqual(
@@ -252,15 +290,15 @@ class TemplateImportPlannerTest(unittest.TestCase):
         ]
         plan = build(["a", "b", "c"], [], candidates)
         conflict = plan.name_conflicts[0]
-        selected = (candidates[0].candidate_key, candidates[2].candidate_key)
+        selected = (candidates[0].selection_key, candidates[2].selection_key)
         with self.assertRaisesRegex(TemplateMergeError, "acknowledging"):
             resolve_template_import_plan(
                 plan,
-                name_resolutions={conflict.key: ConflictResolution(selected)},
+                name_resolutions={conflict.key: ImportConflictResolution(selected)},
             )
         resolved = resolve_template_import_plan(
             plan,
-            name_resolutions={conflict.key: ConflictResolution(selected, True)},
+            name_resolutions={conflict.key: ImportConflictResolution(selected, True)},
         )
         self.assertEqual(
             [item.project_id for item in resolved.selected_new_roots], ["a", "c"]
@@ -364,15 +402,15 @@ class TemplateImportPlannerTest(unittest.TestCase):
             resolve_template_import_plan(
                 plan,
                 url_selector_resolutions={
-                    "url:private": ConflictResolution(
-                        tuple(candidate.candidate_key for candidate in candidates)
+                    "url:private": ImportConflictResolution(
+                        tuple(candidate.selection_key for candidate in candidates)
                     )
                 },
             )
         resolved = resolve_template_import_plan(
             plan,
             url_selector_resolutions={
-                "url:private": ConflictResolution((candidates[0].candidate_key,))
+                "url:private": ImportConflictResolution((candidates[0].selection_key,))
             },
         )
         self.assertEqual(
@@ -436,7 +474,7 @@ class TemplateImportPlannerTest(unittest.TestCase):
         resolved = resolve_template_import_plan(
             plan,
             actual_identity_resolutions={
-                "url:actual": ConflictResolution((incoming.candidate_key,))
+                "url:actual": ImportConflictResolution((incoming.selection_key,))
             },
         )
         self.assertEqual(resolved.selected_new_roots, (incoming,))
@@ -456,7 +494,7 @@ class TemplateImportPlannerTest(unittest.TestCase):
         keep = resolve_template_import_plan(
             plan,
             logical_identity_resolutions={
-                "url:logical": ConflictResolution((installed.candidate_key,))
+                "url:logical": ImportConflictResolution((installed.selection_key,))
             },
         )
         self.assertEqual(keep.selected_new_roots, ())
@@ -464,7 +502,7 @@ class TemplateImportPlannerTest(unittest.TestCase):
         replace_plan = resolve_template_import_plan(
             plan,
             logical_identity_resolutions={
-                "url:logical": ConflictResolution((incoming.candidate_key,))
+                "url:logical": ImportConflictResolution((incoming.selection_key,))
             },
         )
         self.assertEqual(
@@ -498,19 +536,19 @@ class TemplateImportPlannerTest(unittest.TestCase):
             resolve_template_import_plan(
                 plan,
                 name_resolutions={
-                    "same": ConflictResolution((installed.candidate_key,))
+                    "same": ImportConflictResolution((installed.selection_key,))
                 },
                 actual_identity_resolutions={
-                    "url:shared": ConflictResolution((incoming.candidate_key,))
+                    "url:shared": ImportConflictResolution((incoming.selection_key,))
                 },
             )
         resolved = resolve_template_import_plan(
             plan,
             name_resolutions={
-                "same": ConflictResolution((incoming.candidate_key,))
+                "same": ImportConflictResolution((incoming.selection_key,))
             },
             actual_identity_resolutions={
-                "url:shared": ConflictResolution((incoming.candidate_key,))
+                "url:shared": ImportConflictResolution((incoming.selection_key,))
             },
         )
         self.assertEqual(resolved.removed_pack_candidates, (installed,))
@@ -537,10 +575,10 @@ class TemplateImportPlannerTest(unittest.TestCase):
             resolve_template_import_plan(
                 plan,
                 name_resolutions={
-                    "same": ConflictResolution((candidates[0].candidate_key,))
+                    "same": ImportConflictResolution((candidates[0].selection_key,))
                 },
                 url_selector_resolutions={
-                    "url:logical": ConflictResolution((candidates[1].candidate_key,))
+                    "url:logical": ImportConflictResolution((candidates[1].selection_key,))
                 },
             )
 
@@ -568,10 +606,10 @@ class TemplateImportPlannerTest(unittest.TestCase):
             resolve_template_import_plan(
                 plan,
                 logical_identity_resolutions={
-                    "url:logical": ConflictResolution((incoming.candidate_key,))
+                    "url:logical": ImportConflictResolution((incoming.selection_key,))
                 },
                 actual_identity_resolutions={
-                    "url:shared": ConflictResolution((actual_pack.candidate_key,))
+                    "url:shared": ImportConflictResolution((actual_pack.selection_key,))
                 },
             )
 
@@ -583,7 +621,7 @@ class TemplateImportPlannerTest(unittest.TestCase):
             resolve_template_import_plan(
                 plan,
                 name_resolutions={
-                    "same": ConflictResolution((first.candidate_key,))
+                    "same": ImportConflictResolution((first.selection_key,))
                 },
             )
 
@@ -602,7 +640,7 @@ class TemplateImportPlannerTest(unittest.TestCase):
             resolve_template_import_plan(
                 plan,
                 name_resolutions={
-                    "same": ConflictResolution((incoming.candidate_key,))
+                    "same": ImportConflictResolution((retained.selection_key,))
                 },
             )
 
@@ -626,7 +664,7 @@ class TemplateImportPlannerTest(unittest.TestCase):
         resolved = resolve_template_import_plan(
             plan,
             name_resolutions={
-                "same": ConflictResolution((replacement.candidate_key,))
+                "same": ImportConflictResolution((replacement.selection_key,))
             },
             side_decisions={("modrinth", "shared"): "use_template"},
         )
@@ -681,8 +719,8 @@ class TemplateImportPlannerTest(unittest.TestCase):
             resolve_template_import_plan(
                 plan,
                 actual_identity_resolutions={
-                    "url:shared_actual": ConflictResolution(
-                        tuple(candidate.candidate_key for candidate in candidates),
+                    "url:shared_actual": ImportConflictResolution(
+                        tuple(candidate.selection_key for candidate in candidates),
                         True,
                     )
                 },
@@ -720,7 +758,9 @@ class TemplateImportPlannerTest(unittest.TestCase):
         with self.assertRaisesRegex(TemplateMergeError, "stale"):
             resolve_template_import_plan(
                 plan,
-                name_resolutions={"stale": ConflictResolution(("curseforge:2",))},
+                name_resolutions={
+                    "stale": ImportConflictResolution(("template:curseforge:2",))
+                },
             )
 
 
