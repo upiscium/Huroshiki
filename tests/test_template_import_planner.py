@@ -64,7 +64,11 @@ class TemplateImportPlannerTest(unittest.TestCase):
             )
         )
         self.assertEqual(candidate.origin_kind, "template")
-        self.assertEqual(candidate.identity, ("url", "private"))
+        self.assertEqual(candidate.logical_identity, ("url", "private"))
+        self.assertEqual(
+            candidate.selector_identity,
+            ("url", "private", "https://mods.example/private.jar"),
+        )
         self.assertEqual(candidate.url, "https://mods.example/private.jar")
 
     def test_single_and_multiple_templates_preserve_selection_order(self) -> None:
@@ -245,6 +249,99 @@ class TemplateImportPlannerTest(unittest.TestCase):
         self.assertEqual(len(plan.new_roots), 1)
         self.assertEqual(plan.new_roots[0].origin_id, "a")
         self.assertEqual(plan.new_roots[0].side, "both")
+
+    def test_same_url_selector_merges_with_conservative_policy(self) -> None:
+        first = template_candidate(
+            "a",
+            name="Private",
+            provider="url",
+            project_id="private",
+            side="client",
+            url="https://mods.example/private.jar",
+            url_max_jar_size_bytes=20,
+            url_allow_private_networks=True,
+        )
+        second = template_candidate(
+            "b",
+            name="Private",
+            provider="url",
+            project_id="private",
+            side="server",
+            url="https://mods.example/private.jar",
+            url_max_jar_size_bytes=10,
+            url_allow_private_networks=False,
+        )
+        plan = build(["a", "b"], [], [first, second])
+        self.assertEqual(len(plan.new_roots), 1)
+        self.assertEqual(plan.new_roots[0].side, "both")
+        self.assertEqual(plan.new_roots[0].url_max_jar_size_bytes, 10)
+        self.assertFalse(plan.new_roots[0].url_allow_private_networks)
+        self.assertEqual(plan.url_selector_conflicts, ())
+
+    def test_same_url_logical_id_with_different_urls_requires_resolution(self) -> None:
+        candidates = [
+            template_candidate(
+                template,
+                name=name,
+                provider="url",
+                project_id="private",
+                side="both",
+                url=url,
+            )
+            for template, name, url in (
+                ("a", "First", "https://a.example/private.jar"),
+                ("b", "Second", "https://b.example/private.jar"),
+            )
+        ]
+        plan = build(["a", "b"], [], candidates)
+        self.assertEqual(len(plan.new_roots), 2)
+        self.assertEqual(plan.url_selector_conflicts[0].key, "url:private")
+        with self.assertRaisesRegex(TemplateMergeError, "URL selector"):
+            resolve_template_import_plan(plan)
+        with self.assertRaisesRegex(TemplateMergeError, "acknowledging"):
+            resolve_template_import_plan(
+                plan,
+                url_selector_resolutions={
+                    "url:private": ConflictResolution(
+                        tuple(candidate.candidate_key for candidate in candidates)
+                    )
+                },
+            )
+        resolved = resolve_template_import_plan(
+            plan,
+            url_selector_resolutions={
+                "url:private": ConflictResolution((candidates[0].candidate_key,))
+            },
+        )
+        self.assertEqual(resolved.selected_new_roots, (candidates[0],))
+
+    def test_url_selector_order_and_policy_change_plan_digest(self) -> None:
+        first = template_candidate(
+            "a",
+            name="Private",
+            provider="url",
+            project_id="private",
+            side="both",
+            url="https://a.example/private.jar",
+            url_max_jar_size_bytes=10,
+        )
+        second = template_candidate(
+            "b",
+            name="Private B",
+            provider="url",
+            project_id="private",
+            side="both",
+            url="https://b.example/private.jar",
+        )
+        base = build(["a", "b"], [], [first, second])
+        reordered = build(["b", "a"], [], [first, second])
+        changed = build(
+            ["a", "b"],
+            [],
+            [first.__class__(**{**first.__dict__, "url_max_jar_size_bytes": 11}), second],
+        )
+        self.assertNotEqual(base.plan_digest, reordered.plan_digest)
+        self.assertNotEqual(base.plan_digest, changed.plan_digest)
 
     def test_plan_digest_changes_with_template_order_or_candidate_data(self) -> None:
         a = template_candidate(
