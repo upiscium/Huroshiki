@@ -872,7 +872,6 @@ class TemplateImportCoreTest(unittest.TestCase):
         )
         self.assertFalse((self.source / "mods/root.pw.toml").exists())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
-        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
     def test_cli_failed_non_conflicting_candidate_returns_one_and_unlocks(self) -> None:
         self.use_url_template()
