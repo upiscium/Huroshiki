@@ -95,7 +95,9 @@ same cancellation, absolute deadline, and orphan-process checks used for Packwiz
 connection, TLS, and response waits. CurseForge provider search is not available; use its numeric ID.
 The Install screen searches Modrinth through that provider API and displays each canonical project
 ID before selection. It then gives the selected ID to the noninteractive closure resolver; Packwiz
-menu labels are never interpreted as identities. CurseForge Install accepts numeric IDs only.
+menu labels are never interpreted as identities. Bare Modrinth input is always a search query,
+including a single word; use `mr:<ID-or-slug>` or a Modrinth project URL for exact lookup.
+CurseForge Install accepts numeric IDs only.
 Noninteractive Modrinth and CurseForge closure resolvers run in isolated process groups: cancellation
 or their monotonic deadline stops the whole group with SIGTERM and then SIGKILL after a bounded grace
 period. URL roots keep their existing interruptible download cancellation and network timeouts; the

@@ -426,6 +426,63 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
             transaction.resolved_calls[0]["canonical_project_id"], "canonical-one"
         )
 
+    async def test_bare_single_word_modrinth_input_uses_provider_search(self) -> None:
+        projects = (
+            core.ProviderProject(
+                "modrinth", "canonical", "sodium", "Sodium", "Renderer", "author"
+            ),
+        )
+        transaction = _InstallTransaction()
+        with self.patches(), patch.object(
+            huroshiki.core.packctl,
+            "project_versions",
+            return_value=("1.21.1", "neoforge", "21.1.0"),
+        ), patch.object(
+            huroshiki.core, "search_provider_projects", return_value=projects
+        ) as search:
+            screen = huroshiki.InstallScreen("pack:demo")
+            app = _NavigationApp(screen)
+            app.transactions["pack:demo"] = transaction
+            async with app.run_test() as pilot:
+                field = screen.query_one("#mod-search", Input)
+                field.value = "sodium"
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+
+                self.assertEqual(screen.state, "showing_results")
+                self.assertEqual(screen.search_results[0].project_id, "canonical")
+
+        self.assertEqual(search.call_args.args[:2], ("modrinth", "sodium"))
+        self.assertEqual(transaction.resolved_calls, [])
+
+    async def test_explicit_modrinth_selectors_bypass_provider_search(self) -> None:
+        cases = (
+            ("mr:sodium", "sodium"),
+            ("https://modrinth.com/mod/sodium", "https://modrinth.com/mod/sodium"),
+        )
+        for query, selector in cases:
+            with self.subTest(query=query):
+                transaction = _InstallTransaction()
+                with self.patches(), patch.object(
+                    huroshiki.core, "search_provider_projects"
+                ) as search:
+                    screen = huroshiki.InstallScreen("pack:demo")
+                    app = _NavigationApp(screen)
+                    app.transactions["pack:demo"] = transaction
+                    async with app.run_test() as pilot:
+                        field = screen.query_one("#mod-search", Input)
+                        field.value = query
+                        await pilot.press("enter")
+                        await pilot.pause(0.2)
+
+                search.assert_not_called()
+                self.assertEqual(len(transaction.resolved_calls), 1)
+                self.assertEqual(transaction.resolved_calls[0]["provider"], "modrinth")
+                self.assertEqual(transaction.resolved_calls[0]["selector"], selector)
+                self.assertIsNone(
+                    transaction.resolved_calls[0]["canonical_project_id"]
+                )
+
     async def test_install_search_cancel_waits_before_navigation(self) -> None:
         transaction = _InstallTransaction()
         started = threading.Event()
