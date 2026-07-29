@@ -80,11 +80,27 @@ class _InstallTransaction(_Transaction):
         return _ResolvedOperation()
 
 class _UpdateTransaction:
-    def prepare_updates(self) -> list[core.UpdateCandidate]:
+    def __init__(self) -> None:
+        self.discarded = False
+
+    def prepare_updates(self, **_) -> list[core.UpdateCandidate]:
         return []
 
     def discard(self) -> None:
-        pass
+        self.discarded = True
+
+
+class _BlockingUpdateTransaction(_UpdateTransaction):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+
+    def prepare_updates(self, *, cancel_event, on_progress, **_) -> list[core.UpdateCandidate]:
+        self.started.set()
+        on_progress(core.UpdateProgress("normalizing", 0, 1))
+        cancel_event.wait(2)
+        on_progress(core.UpdateProgress("cancelled", 0, 1))
+        raise core.UpdatePreparationCancelled("cancelled")
 
 
 class _NavigationApp(App[None]):
@@ -174,6 +190,26 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause()
                     self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
                     self.assertEqual(app.screen.project_key, "pack:demo")
+
+    async def test_update_worker_cancel_blocks_other_navigation_and_cleans_up(self) -> None:
+        transaction = _BlockingUpdateTransaction()
+        with self.patches(), patch.object(
+            huroshiki.core.PackTransaction,
+            "create",
+            return_value=transaction,
+        ):
+            screen = huroshiki.UpdateScreen("pack:demo")
+            app = _NavigationApp(screen)
+            async with app.run_test() as pilot:
+                self.assertTrue(transaction.started.wait(1))
+                self.assertTrue(screen.preparing)
+                await pilot.press("l", "space", "enter")
+                await pilot.pause()
+                self.assertIs(app.screen, screen)
+                await pilot.press("escape")
+                await pilot.pause(0.2)
+                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+        self.assertTrue(transaction.discarded)
 
     async def test_project_escape_stays_main_and_main_escape_stays_main(self) -> None:
         with self.patches():

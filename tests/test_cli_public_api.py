@@ -709,6 +709,20 @@ class PublicCliTest(unittest.TestCase):
         build_mock.assert_not_called()
         self.assertIn("Skipping build", stderr.getvalue())
 
+    def test_update_keyboard_interrupt_returns_130_without_build(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {"pack": "demo", "build": True, "allow_partial": False},
+        )()
+        stderr = StringIO()
+        with patch(
+            "huroshiki_core.update_all", side_effect=KeyboardInterrupt
+        ), patch.object(packctl, "build_pack") as build, redirect_stderr(stderr):
+            self.assertEqual(packctl.cmd_update(args), 130)
+        build.assert_not_called()
+        self.assertIn("cancelled", stderr.getvalue())
+
     def test_serve_builds_then_runs_server_for_pack_dist(self) -> None:
         args = type("Args", (), {"pack": "demo", "port": 9090})()
         server = MagicMock()
