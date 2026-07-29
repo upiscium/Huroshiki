@@ -37,6 +37,92 @@ class ResolverProcessTest(unittest.TestCase):
             deadline=deadline,
         )
 
+    @staticmethod
+    def assert_not_live(pid: int) -> None:
+        stat_path = Path(f"/proc/{pid}/stat")
+        deadline = time.monotonic() + 2
+        while stat_path.exists() and time.monotonic() < deadline:
+            fields = stat_path.read_text().split()
+            if len(fields) > 2 and fields[2] in {"Z", "X", "x"}:
+                return
+            time.sleep(0.02)
+        if stat_path.exists():
+            fields = stat_path.read_text().split()
+            if len(fields) > 2:
+                raise AssertionError(f"process {pid} remains live in state {fields[2]}")
+
+    def test_parent_success_with_live_child_is_stopped_and_reported(self) -> None:
+        child_pid_file = self.cwd / "post-exit-child.pid"
+        result = self.run_python(
+            "import pathlib,subprocess,sys; "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+            f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid))"
+        )
+        child_pid = int(child_pid_file.read_text())
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(result.orphaned_descendants)
+        self.assert_not_live(child_pid)
+
+    def test_parent_and_child_normal_exit_has_no_orphan(self) -> None:
+        result = self.run_python(
+            "import subprocess,sys; "
+            "subprocess.run([sys.executable,'-c','raise SystemExit(0)'], check=True)"
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(result.orphaned_descendants)
+
+    def test_post_exit_child_ignoring_sigterm_is_killed(self) -> None:
+        child_pid_file = self.cwd / "stubborn-child.pid"
+        source = (
+            "import pathlib,subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable,'-c',"
+            "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(60)']); "
+            f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid)); "
+            "time.sleep(0.2)"
+        )
+        with patch.object(core, "RESOLVER_TERMINATE_GRACE_SECONDS", 0.15):
+            result = self.run_python(source)
+        child_pid = int(child_pid_file.read_text())
+        self.assertTrue(result.orphaned_descendants)
+        self.assert_not_live(child_pid)
+
+    def test_zombie_only_group_member_is_not_live(self) -> None:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "raise SystemExit(0)"],
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 2
+        stat_path = Path(f"/proc/{process.pid}/stat")
+        while time.monotonic() < deadline:
+            if stat_path.exists() and stat_path.read_text().split()[2] == "Z":
+                break
+            time.sleep(0.02)
+        self.assertEqual(core.live_process_group_members(process.pid), ())
+        process.wait()
+
+    def test_parent_exit_races_have_single_consistent_outcome(self) -> None:
+        source = (
+            "import subprocess,sys,time; "
+            "subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+            "time.sleep(0.1)"
+        )
+        cancel = threading.Event()
+        timer = threading.Timer(0.1, cancel.set)
+        timer.start()
+        try:
+            cancelled = self.run_python(source, cancel_event=cancel)
+        finally:
+            timer.cancel()
+        self.assertNotEqual(cancelled.cancelled, cancelled.orphaned_descendants)
+
+        deadline_result = self.run_python(
+            source, deadline=time.monotonic() + 0.1
+        )
+        self.assertNotEqual(
+            deadline_result.timed_out, deadline_result.orphaned_descendants
+        )
+
     def test_normal_and_nonzero_results_preserve_output(self) -> None:
         success = self.run_python("print('success')")
         self.assertEqual(success.returncode, 0)

@@ -94,6 +94,9 @@ Noninteractive Modrinth and CurseForge closure resolvers run in isolated process
 or their monotonic deadline stops the whole group with SIGTERM and then SIGKILL after a bounded grace
 period. URL roots keep their existing interruptible download cancellation and network timeouts; the
 Packwiz resolver deadline does not replace the URL download timeout.
+After a resolver parent exits, Huroshiki also checks the Linux process table for live members of its
+process group. Background descendants are terminated and make the resolver result fail closed;
+zombie-only groups are not treated as running work.
 
 ### Navigation
 
