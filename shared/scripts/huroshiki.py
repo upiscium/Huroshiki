@@ -1712,7 +1712,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         yield from self.compose_header()
         yield Static("Provider: Modrinth", id="provider-label")
         yield Input(
-            placeholder="Search, slug, project ID, or Modrinth URL",
+            placeholder="Search; use mr:<ID-or-slug> or a Modrinth URL for exact lookup",
             id="mod-search",
         )
         yield Static("Install side: C +  S +", id="install-side-label")
@@ -1806,7 +1806,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             "url": "URL",
         }
         placeholders = {
-            "modrinth": "Search, slug, project ID, or Modrinth URL",
+            "modrinth": "Search; use mr:<ID-or-slug> or a Modrinth URL for exact lookup",
             "curseforge": "Numeric CurseForge project ID",
             "url": "Public URL of the self-hosted MOD JAR",
         }
@@ -1899,6 +1899,10 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
 
         self.search_results = []
         self.refresh_search_results()
+        lowered_query = query.lower()
+        exact_modrinth_selector = lowered_query.startswith("mr:") or (
+            "modrinth.com/" in lowered_query
+        )
         try:
             normalized_provider, normalized_query = core.normalize_add_selector(
                 self.provider, query
@@ -1918,9 +1922,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             return
 
         event.input.disabled = True
-        if normalized_provider == "modrinth" and any(
-            character.isspace() for character in normalized_query
-        ):
+        if normalized_provider == "modrinth" and not exact_modrinth_selector:
             minecraft, loader, _ = core.packctl.project_versions(
                 self.transaction().source
             )
