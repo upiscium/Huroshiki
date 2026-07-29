@@ -90,6 +90,9 @@ roots continue to use bounded downloads and do not acquire an implicit Packwiz d
 Modrinth IDs, slugs, and project URLs are resolved through the Modrinth API before Packwiz runs.
 CurseForge automation requires a numeric project ID; an interactive result without an explicit
 project/addon ID fails closed rather than guessing from its display name.
+Modrinth identity and search requests run through the isolated `provider_lookup.py` helper, so the
+same cancellation, absolute deadline, and orphan-process checks used for Packwiz also bound DNS,
+connection, TLS, and response waits. CurseForge provider search is not available; use its numeric ID.
 Noninteractive Modrinth and CurseForge closure resolvers run in isolated process groups: cancellation
 or their monotonic deadline stops the whole group with SIGTERM and then SIGKILL after a bounded grace
 period. URL roots keep their existing interruptible download cancellation and network timeouts; the
