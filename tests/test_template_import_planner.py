@@ -587,6 +587,52 @@ class TemplateImportPlannerTest(unittest.TestCase):
                 },
             )
 
+    def test_selected_existing_template_identity_cannot_justify_removal(self) -> None:
+        removed = pack_candidate("Same", "removed")
+        retained = pack_candidate("same", "retained")
+        incoming = template_candidate(
+            "base",
+            name="Same",
+            provider="modrinth",
+            project_id="retained",
+            side="both",
+        )
+        plan = build(["base"], [removed, retained], [incoming])
+        with self.assertRaisesRegex(TemplateMergeError, "no selected replacement"):
+            resolve_template_import_plan(
+                plan,
+                name_resolutions={
+                    "same": ConflictResolution((incoming.candidate_key,))
+                },
+            )
+
+    def test_removed_identity_does_not_receive_side_change(self) -> None:
+        installed = pack_candidate("Same", "shared", side="client")
+        same_identity = template_candidate(
+            "base",
+            name="same",
+            provider="modrinth",
+            project_id="shared",
+            side="server",
+        )
+        replacement = template_candidate(
+            "base",
+            name="Same",
+            provider="curseforge",
+            project_id="2",
+            side="both",
+        )
+        plan = build(["base"], [installed], [same_identity, replacement])
+        resolved = resolve_template_import_plan(
+            plan,
+            name_resolutions={
+                "same": ConflictResolution((replacement.candidate_key,))
+            },
+            side_decisions={("modrinth", "shared"): "use_template"},
+        )
+        self.assertEqual(resolved.side_changes, ())
+        self.assertEqual(resolved.removed_pack_candidates, (installed,))
+
     def test_actual_identity_changes_plan_digest(self) -> None:
         candidate = template_candidate(
             "base",

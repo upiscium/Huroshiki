@@ -707,6 +707,14 @@ def resolve_template_import_plan(
                 f"{verification.error}"
             )
 
+    retained_actual = {
+        candidate.actual_identity for candidate in retained_pack
+    }
+    selected_new = tuple(
+        candidate
+        for candidate in selected_templates
+        if candidate.actual_identity not in retained_actual
+    )
     removed_pack = tuple(
         candidate
         for candidate in plan.pack_candidates
@@ -720,11 +728,7 @@ def resolve_template_import_plan(
     for removed in removed_pack:
         replacing = any(
             removed in conflict.candidates
-            and any(
-                candidate.origin_kind == "template"
-                and candidate.candidate_key in selected_keys
-                for candidate in conflict.candidates
-            )
+            and any(candidate in selected_new for candidate in conflict.candidates)
             for conflict in all_conflicts
         )
         if not replacing:
@@ -732,22 +736,21 @@ def resolve_template_import_plan(
                 f"Removing {removed.candidate_key} leaves no selected replacement"
             )
 
-    retained_actual = {
-        candidate.actual_identity for candidate in retained_pack
-    }
-    selected_new = tuple(
-        candidate
-        for candidate in selected_templates
-        if candidate.actual_identity not in retained_actual
-    )
-
     supplied_sides = dict(side_decisions or {})
     expected_sides = {conflict.identity for conflict in plan.side_conflicts}
     stale_sides = set(supplied_sides) - expected_sides
     if stale_sides:
         raise TemplateMergeError("Unknown or stale side conflict decision")
     side_changes: list[tuple[tuple[str, str], str, str]] = []
+    selected_template_actual = {
+        candidate.actual_identity for candidate in selected_templates
+    }
     for conflict in plan.side_conflicts:
+        if (
+            conflict.identity not in retained_actual
+            or conflict.identity not in selected_template_actual
+        ):
+            continue
         decision = supplied_sides.get(conflict.identity, "keep_pack")
         if decision == "keep_pack":
             result = conflict.pack_side
