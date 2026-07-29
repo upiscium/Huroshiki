@@ -2421,6 +2421,9 @@ def cmd_update(args: argparse.Namespace) -> int:
         if not args.build:
             return 0
         return build_pack(args.pack)
+    except KeyboardInterrupt:
+        print("Update preparation cancelled.", file=sys.stderr)
+        return 130
     except huroshiki_core.HuroshikiError as error:
         raise ConfigError(str(error)) from error
 

@@ -5,6 +5,8 @@ import os
 import stat
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -514,6 +516,83 @@ url = "https://example.invalid/manual.jar"
         self.assertEqual(report.selected, ())
         self.assertEqual(report.failures, ())
         self.assertEqual(target.read_bytes(), original)
+
+    def test_update_preparation_reports_ordered_progress(self) -> None:
+        self.write_mod("first")
+        self.write_mod("second")
+        progress: list[core.UpdateProgress] = []
+
+        def run(command, *, cwd, **_):
+            if command[:3] == ["packwiz", "--yes", "update"]:
+                slug = command[3]
+                (cwd / "mods" / f"{slug}.pw.toml").write_text(
+                    metadata(slug.title(), slug, "v2"), encoding="utf-8"
+                )
+            return self.completed(command)
+
+        transaction = core.PackTransaction.create(self.key)
+        try:
+            with patch.object(core.subprocess, "run", side_effect=run):
+                candidates = transaction.prepare_updates(on_progress=progress.append)
+        finally:
+            transaction.discard()
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(progress[0].phase, "normalizing")
+        self.assertEqual(
+            [item.mod_name for item in progress if item.phase == "resolving"],
+            ["First", "Second"],
+        )
+        self.assertEqual(progress[-1].phase, "complete")
+        self.assertEqual(progress[-1].completed, progress[-1].total)
+
+    def test_update_preparation_cancel_cleans_resolvers_and_preserves_source(self) -> None:
+        target = self.write_mod("first")
+        original = target.read_bytes()
+        cancel = threading.Event()
+        progress: list[core.UpdateProgress] = []
+
+        def cancelled(*_, **__):
+            cancel.set()
+            return core.ResolverProcessResult(-15, "", "", True, False)
+
+        transaction = core.PackTransaction.create(self.key)
+        with patch.object(core, "run_resolver_process", side_effect=cancelled):
+            with self.assertRaises(core.UpdatePreparationCancelled):
+                transaction.prepare_updates(
+                    cancel_event=cancel,
+                    on_progress=progress.append,
+                )
+        self.assertFalse((transaction.root / "update-resolvers").exists())
+        transaction.discard()
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(progress[-1].phase, "cancelled")
+        with packctl.ProjectLock(self.key, "verify cancellation cleanup"):
+            pass
+
+    def test_update_operation_and_resolver_deadlines_are_distinct(self) -> None:
+        self.write_mod("first")
+        transaction = core.PackTransaction.create(self.key)
+        try:
+            with patch.object(core, "run_resolver_process") as runner:
+                candidates = transaction.prepare_updates(deadline=time.monotonic() - 1)
+            runner.assert_not_called()
+            self.assertEqual(candidates[0].error_kind, "operation_deadline")
+
+            results = iter(
+                (
+                    core.ResolverProcessResult(0, "", "", False, False),
+                    core.ResolverProcessResult(-15, "", "", False, True),
+                )
+            )
+            with patch.object(
+                core, "run_resolver_process", side_effect=lambda *_, **__: next(results)
+            ):
+                candidates = transaction.prepare_updates(
+                    deadline=time.monotonic() + 30
+                )
+            self.assertEqual(candidates[0].error_kind, "resolver")
+        finally:
+            transaction.discard()
 
     def test_update_failure_leaves_real_source_unchanged(self) -> None:
         target = self.write_mod("first")

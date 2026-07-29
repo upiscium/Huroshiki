@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Literal, Mapping
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
@@ -242,6 +242,7 @@ class UpdateCandidate:
     added_dependencies: int = 0
     error: str | None = None
     error_returncode: int | None = None
+    error_kind: str | None = None
 
     @property
     def relative_path(self) -> Path:
@@ -263,6 +264,20 @@ class UpdateRunReport:
     failures: tuple[UpdateCandidate, ...]
     applied: bool
     partial: bool
+
+
+@dataclass(frozen=True)
+class UpdateProgress:
+    phase: Literal["normalizing", "resolving", "complete", "failed", "cancelled"]
+    completed: int
+    total: int
+    mod_name: str = ""
+    provider: str = ""
+    message: str = ""
+
+
+class UpdatePreparationCancelled(HuroshikiError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -1192,7 +1207,13 @@ class PackTransaction:
                     )
             self.batches = remaining_batches
 
-    def prepare_updates(self) -> list[UpdateCandidate]:
+    def prepare_updates(
+        self,
+        *,
+        cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
+        on_progress: Callable[[UpdateProgress], None] | None = None,
+    ) -> list[UpdateCandidate]:
         self.ensure_active()
         kind, _ = split_project_key(self.project_key)
         if kind != "pack":
@@ -1207,6 +1228,9 @@ class PackTransaction:
             self.source,
             self.root,
             self.baseline_contents,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            on_progress=on_progress,
         )
         self.update_candidates = tuple(candidates)
         return candidates
@@ -2624,6 +2648,7 @@ class _UpdateMetadata:
 
 
 UPDATE_RESOLVER_TIMEOUT_SECONDS = 120
+UPDATE_OPERATION_TIMEOUT_SECONDS = 600
 PACKWIZ_GENERATED_PATHS = {Path("index.toml"), Path("pack.toml")}
 
 
@@ -2708,6 +2733,7 @@ def _candidate_error(
     data: dict[str, object],
     message: str,
     returncode: int | None = None,
+    error_kind: str = "resolver",
 ) -> UpdateCandidate:
     provider = canonical_provider(mod.provider)
     return UpdateCandidate(
@@ -2721,6 +2747,7 @@ def _candidate_error(
         status="unavailable",
         error=message,
         error_returncode=returncode,
+        error_kind=error_kind,
     )
 
 
@@ -2728,18 +2755,40 @@ def _prepare_update_candidates(
     source: Path,
     transaction_root: Path,
     baseline_contents: dict[Path, bytes],
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    on_progress: Callable[[UpdateProgress], None] | None = None,
 ) -> list[UpdateCandidate]:
+    effective_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS
+    )
+
+    def progress(value: UpdateProgress) -> None:
+        if on_progress is not None:
+            on_progress(value)
+
+    def check_cancel(completed: int, total: int) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            progress(UpdateProgress("cancelled", completed, total))
+            raise UpdatePreparationCancelled("Update preparation was cancelled")
+
     parsed: list[tuple[Path, bytes, dict[str, object], ModInfo]] = []
     slugs: dict[str, list[Path]] = {}
     for relative_path, original in sorted(baseline_contents.items()):
+        check_cancel(len(parsed), len(baseline_contents))
         old_data = tomllib.loads(original.decode("utf-8"))
         old_mod = read_mod_data(relative_path, old_data)
         parsed.append((relative_path, original, old_data, old_mod))
         slugs.setdefault(old_mod.slug, []).append(relative_path)
     ambiguous = {slug: paths for slug, paths in slugs.items() if len(paths) > 1}
+    total = len(parsed)
     candidates: list[UpdateCandidate] = []
     eligible: list[tuple[Path, bytes, dict[str, object], ModInfo]] = []
     for relative_path, original, old_data, old_mod in parsed:
+        check_cancel(len(candidates), total)
         provider = canonical_provider(old_mod.provider)
         key = f"{provider}:{old_mod.project_id}"
         common = dict(
@@ -2774,6 +2823,7 @@ def _prepare_update_candidates(
         eligible.append((relative_path, original, old_data, old_mod))
 
     if not eligible:
+        progress(UpdateProgress("complete", total, total))
         return sorted(candidates, key=lambda item: item.root)
 
     resolver_root = transaction_root / "update-resolvers"
@@ -2781,18 +2831,44 @@ def _prepare_update_candidates(
     normalized = resolver_root / "normalized-source"
     normalization_returncode: int | None = None
     try:
+        progress(UpdateProgress("normalizing", len(candidates), total))
+        check_cancel(len(candidates), total)
+        if time.monotonic() >= effective_deadline:
+            message = "Update preparation operation deadline exceeded"
+            for relative_path, _, old_data, old_mod in eligible:
+                candidates.append(
+                    _candidate_error(
+                        relative_path,
+                        old_mod,
+                        old_data,
+                        message,
+                        error_kind="operation_deadline",
+                    )
+                )
+            progress(UpdateProgress("failed", total, total, message=message))
+            shutil.rmtree(resolver_root, ignore_errors=True)
+            return sorted(candidates, key=lambda item: item.root)
         copy_transaction_source(source, normalized)
+        check_cancel(len(candidates), total)
         normalization = run_resolver_process(
             ["packwiz", "refresh"],
             cwd=normalized,
-            cancel_event=None,
-            deadline=time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+            cancel_event=cancel_event,
+            deadline=min(
+                effective_deadline,
+                time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+            ),
         )
+        if normalization.cancelled:
+            progress(UpdateProgress("cancelled", len(candidates), total))
+            raise UpdatePreparationCancelled("Update preparation was cancelled")
         if normalization.orphaned_descendants:
             normalization_error = (
                 "disposable baseline normalization left background processes "
                 "after completion"
             )
+        elif normalization.timed_out and time.monotonic() >= effective_deadline:
+            normalization_error = "Update preparation operation deadline exceeded"
         elif normalization.timed_out:
             normalization_error = (
                 "disposable baseline normalization deadline exceeded after "
@@ -2807,6 +2883,11 @@ def _prepare_update_candidates(
                 + concise_process_error(normalization)
             )
         if normalization_error is not None:
+            error_kind = (
+                "operation_deadline"
+                if normalization_error == "Update preparation operation deadline exceeded"
+                else "resolver"
+            )
             for relative_path, _, old_data, old_mod in eligible:
                 candidates.append(
                     _candidate_error(
@@ -2815,21 +2896,62 @@ def _prepare_update_candidates(
                         old_data,
                         normalization_error,
                         normalization_returncode,
+                        error_kind,
                     )
                 )
+            progress(
+                UpdateProgress("failed", total, total, message=normalization_error)
+            )
             shutil.rmtree(resolver_root, ignore_errors=True)
             return sorted(candidates, key=lambda item: item.root)
+        check_cancel(len(candidates), total)
         ensure_safe_pack_source(normalized)
         before_files = _file_content_snapshot(normalized)
         baseline_records = _update_metadata_snapshot(normalized)
+    except UpdatePreparationCancelled:
+        shutil.rmtree(resolver_root, ignore_errors=True)
+        raise
     except (OSError, HuroshikiError) as error:
         message = f"disposable baseline normalization failed: {error}"
         for relative_path, _, old_data, old_mod in eligible:
             candidates.append(_candidate_error(relative_path, old_mod, old_data, message))
         shutil.rmtree(resolver_root, ignore_errors=True)
+        progress(UpdateProgress("failed", total, total, message=message))
         return sorted(candidates, key=lambda item: item.root)
 
-    for relative_path, original, old_data, old_mod in eligible:
+    initially_completed = total - len(eligible)
+    for eligible_index, (relative_path, original, old_data, old_mod) in enumerate(
+        eligible
+    ):
+        completed = initially_completed + eligible_index
+        try:
+            check_cancel(completed, total)
+        except UpdatePreparationCancelled:
+            shutil.rmtree(resolver_root, ignore_errors=True)
+            raise
+        if time.monotonic() >= effective_deadline:
+            message = "Update preparation operation deadline exceeded"
+            for pending_path, _, pending_data, pending_mod in eligible[eligible_index:]:
+                candidates.append(
+                    _candidate_error(
+                        pending_path,
+                        pending_mod,
+                        pending_data,
+                        message,
+                        error_kind="operation_deadline",
+                    )
+                )
+            progress(UpdateProgress("failed", completed, total, message=message))
+            break
+        progress(
+            UpdateProgress(
+                "resolving",
+                completed,
+                total,
+                old_mod.name,
+                old_mod.provider,
+            )
+        )
         provider = canonical_provider(old_mod.provider)
         key = f"{provider}:{old_mod.project_id}"
         common = dict(
@@ -2847,12 +2969,20 @@ def _prepare_update_candidates(
             ) as directory:
                 resolver = Path(directory) / "source"
                 copy_transaction_source(normalized, resolver)
+                check_cancel(completed, total)
                 result = run_resolver_process(
                     ["packwiz", "--yes", "update", old_mod.slug],
                     cwd=resolver,
-                    cancel_event=None,
-                    deadline=time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+                    cancel_event=cancel_event,
+                    deadline=min(
+                        effective_deadline,
+                        time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+                    ),
                 )
+                if result.cancelled:
+                    raise UpdatePreparationCancelled(
+                        "Update preparation was cancelled"
+                    )
                 if result.orphaned_descendants:
                     candidates.append(
                         _candidate_error(
@@ -2864,15 +2994,50 @@ def _prepare_update_candidates(
                     )
                     continue
                 if result.timed_out:
+                    operation_deadline = time.monotonic() >= effective_deadline
                     candidates.append(
                         _candidate_error(
                             relative_path,
                             old_mod,
                             old_data,
-                            f"resolver deadline exceeded after "
-                            f"{UPDATE_RESOLVER_TIMEOUT_SECONDS} seconds",
+                            (
+                                "Update preparation operation deadline exceeded"
+                                if operation_deadline
+                                else f"resolver deadline exceeded after "
+                                f"{UPDATE_RESOLVER_TIMEOUT_SECONDS} seconds"
+                            ),
+                            error_kind=(
+                                "operation_deadline"
+                                if operation_deadline
+                                else "resolver"
+                            ),
                         )
                     )
+                    if operation_deadline:
+                        for (
+                            pending_path,
+                            _,
+                            pending_data,
+                            pending_mod,
+                        ) in eligible[eligible_index + 1 :]:
+                            candidates.append(
+                                _candidate_error(
+                                    pending_path,
+                                    pending_mod,
+                                    pending_data,
+                                    "Update preparation operation deadline exceeded",
+                                    error_kind="operation_deadline",
+                                )
+                            )
+                        progress(
+                            UpdateProgress(
+                                "failed",
+                                completed,
+                                total,
+                                message="Update preparation operation deadline exceeded",
+                            )
+                        )
+                        break
                     continue
                 if result.returncode != 0:
                     candidates.append(
@@ -2885,12 +3050,17 @@ def _prepare_update_candidates(
                         )
                     )
                     continue
+                check_cancel(completed, total)
                 ensure_safe_pack_source(resolver)
                 resolved_records = _update_metadata_snapshot(resolver)
                 changes = _content_changes(
                     before_files,
                     _file_content_snapshot(resolver),
                 )
+        except UpdatePreparationCancelled:
+            progress(UpdateProgress("cancelled", completed, total))
+            shutil.rmtree(resolver_root, ignore_errors=True)
+            raise
         except (OSError, HuroshikiError) as error:
             candidates.append(
                 _candidate_error(relative_path, old_mod, old_data, str(error))
@@ -2927,7 +3097,14 @@ def _prepare_update_candidates(
                 added_dependencies=added_dependencies,
             )
         )
+    try:
+        check_cancel(total, total)
+    except UpdatePreparationCancelled:
+        shutil.rmtree(resolver_root, ignore_errors=True)
+        raise
     shutil.rmtree(resolver_root)
+    if not any(candidate.error_kind == "operation_deadline" for candidate in candidates):
+        progress(UpdateProgress("complete", total, total))
     return sorted(candidates, key=lambda item: item.root)
 
 
@@ -3671,7 +3848,12 @@ def update_all(
         )
     transaction = PackTransaction.create(project_key_value)
     try:
-        candidates = tuple(transaction.prepare_updates())
+        candidates = tuple(
+            transaction.prepare_updates(
+                cancel_event=threading.Event(),
+                deadline=time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS,
+            )
+        )
         available = tuple(candidate for candidate in candidates if candidate.available)
         failures = tuple(candidate for candidate in candidates if candidate.error)
         for candidate in failures:

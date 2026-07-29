@@ -167,6 +167,10 @@ failed resolve, closure merge, or refresh leaves the pack's real `source/` uncha
 first resolver error code (or `1`). `--allow-partial` explicitly applies only resolvable candidates
 and returns `2`; `--build` is skipped after that partial result. The TUI keeps resolver failures
 unavailable while allowing the user to review and explicitly select successful candidates.
+Update candidate preparation runs off the Textual event loop and reports normalization plus
+per-MOD progress. One cancellation event covers baseline refresh and every resolver; a 10-minute
+operation deadline bounds the complete preparation while each resolver remains capped at 2 minutes.
+Esc waits for process cleanup and transaction discard before returning to the Project screen.
 
 Build and distribute:
 
