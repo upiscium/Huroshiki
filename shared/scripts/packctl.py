@@ -2896,13 +2896,17 @@ def _template_import_resolution(path: Path, plan: Any) -> Any:
 
 
 def _template_import_candidate_payload(plan: Any, candidate: Any) -> dict[str, Any]:
-    verification = next(
-        (
-            item
-            for item in plan.verifications
-            if item.selector_identity == candidate.selector_identity
-        ),
-        None,
+    verification = (
+        None
+        if candidate.origin_kind == "pack"
+        else next(
+            (
+                item
+                for item in plan.verifications
+                if item.selector_identity == candidate.selector_identity
+            ),
+            None,
+        )
     )
     if verification is None:
         status = "installed"
@@ -3024,7 +3028,10 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
         operation.run()
         if operation.error is not None:
             raise operation.error
-        if operation.cancelled or operation.preview is None:
+        if operation.cancelled:
+            print("Template import cancelled.", file=sys.stderr)
+            return 130
+        if operation.preview is None:
             raise ConfigError("Template import was cancelled")
         preview = operation.preview
         if args.json:
@@ -3088,6 +3095,9 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
             operation.cancel()
         elif session is not None:
             session.cancel_event.set()
+        print("Template import cancelled.", file=sys.stderr)
+        return 130
+    except huroshiki_core.LoaderMigrationCancelled:
         print("Template import cancelled.", file=sys.stderr)
         return 130
     except (huroshiki_core.HuroshikiError, ConfigError, TemplateMergeError) as error:

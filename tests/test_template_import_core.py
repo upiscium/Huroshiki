@@ -583,6 +583,25 @@ class TemplateImportCoreTest(unittest.TestCase):
         self.assertIn("HTTP 404", stderr.getvalue())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
+    def test_cli_explicit_cancellation_returns_130(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "pack": "demo",
+                "templates": ["base"],
+                "resolution": None,
+                "apply": False,
+                "json": False,
+            },
+        )()
+        with patch.object(
+            core.TemplateImportSession,
+            "create",
+            side_effect=core.LoaderMigrationCancelled("cancelled"),
+        ), redirect_stderr(StringIO()):
+            self.assertEqual(packctl.cmd_apply_template(args), 130)
+
     def test_logical_divergence_template_selection_replaces_atomically(self) -> None:
         self.use_url_template()
         mods = self.source / "mods"
