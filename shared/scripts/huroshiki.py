@@ -162,6 +162,12 @@ class HuroshikiApp(App[None]):
         self.selected_project = project_key
         self.switch_screen(DeploymentSettingsScreen(project_key))
 
+    def open_client_distribution_settings(self, project_key: str) -> None:
+        if not self.project_is_usable(project_key):
+            return
+        self.selected_project = project_key
+        self.switch_screen(ClientDistributionScreen(project_key))
+
     def open_templates(self, project_key: str) -> None:
         if not self.project_is_usable(project_key):
             return
@@ -245,6 +251,40 @@ class MessageModal(ModalScreen[None]):
             yield Static("Enter / Esc: close", classes="modal-help")
 
     def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class PublicPackUrlEditModal(ModalScreen[str | None]):
+    BINDINGS = [
+        Binding("ctrl+enter", "submit", "Review"),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, value: str | None) -> None:
+        super().__init__()
+        self.value = value or ""
+
+    def compose(self) -> ComposeResult:
+        with Container(id="modal-dialog", classes="form-dialog"):
+            yield Static("Edit Public Pack URL", classes="modal-title")
+            yield Static("HTTPS URL ending in /pack.toml")
+            yield Input(value=self.value, id="public-pack-url-input")
+            yield Static(
+                "Enter / Ctrl+Enter: review    Esc: cancel",
+                classes="modal-help",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#public-pack-url-input", Input).focus()
+
+    @on(Input.Submitted, "#public-pack-url-input")
+    def submitted(self, _event: Input.Submitted) -> None:
+        self.action_submit()
+
+    def action_submit(self) -> None:
+        self.dismiss(self.query_one("#public-pack-url-input", Input).value)
+
+    def action_cancel(self) -> None:
         self.dismiss(None)
 
 
@@ -1132,7 +1172,7 @@ class ProjectScreen(BaseScreen):
 class SettingsScreen(ProjectChildScreen, BaseScreen):
     screen_title = "Settings"
     help_text = "j/k: move  Enter: open  Esc: project"
-    actions = ("Deployment",)
+    actions = ("Deployment", "Client Distribution")
 
     def __init__(self, project_key: str) -> None:
         super().__init__()
@@ -1163,8 +1203,12 @@ class SettingsScreen(ProjectChildScreen, BaseScreen):
             self.move_table(table, len(self.actions), -1)
         elif event.key == "enter":
             index = self.current_index(table, len(self.actions))
-            if index is not None and self.actions[index] == "Deployment":
+            if index is None:
+                return
+            if self.actions[index] == "Deployment":
                 self.app.open_deployment_settings(self.project_key)
+            elif self.actions[index] == "Client Distribution":
+                self.app.open_client_distribution_settings(self.project_key)
         elif event.key == "escape":
             self.return_to_project()
         else:
@@ -1283,6 +1327,141 @@ class DeploymentSettingsScreen(BaseScreen):
             for field_id, value in zip(self.FIELD_IDS, values, strict=True):
                 self.query_one(f"#{field_id}", Input).value = value
             self.app.notify("Deployment settings saved")
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+
+    def action_back(self) -> None:
+        self.app.open_settings(self.project_key)
+
+
+class ClientDistributionScreen(BaseScreen):
+    BINDINGS = [
+        Binding("e", "edit", "Edit", priority=True),
+        Binding("c", "clear", "Clear local", priority=True),
+        Binding("escape", "back", "Back", priority=True),
+    ]
+    help_text = "e: edit  c: clear local override  Esc: settings"
+
+    def __init__(self, project_key: str) -> None:
+        super().__init__()
+        self.project_key = project_key
+        project = core.project_info(project_key)
+        self.screen_title = f"{project.display_name} / Settings / Client Distribution"
+        self.baseline = core.public_pack_url_baseline(project_key)
+
+    @property
+    def info(self) -> core.PublicPackUrlInfo:
+        return self.baseline.info
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        with Container(id="client-distribution-content"):
+            yield Static(
+                f"Source: {self.info.source}",
+                id="public-pack-url-source",
+                markup=False,
+            )
+            yield Static("Public Pack URL", classes="section-label")
+            yield TextArea(
+                self.info.value or "not configured",
+                read_only=True,
+                show_cursor=False,
+                id="public-pack-url-display",
+            )
+            yield Static("Installer command", classes="section-label")
+            yield TextArea(
+                self.info.installer_command or "not configured",
+                read_only=True,
+                show_cursor=False,
+                id="public-pack-command-display",
+            )
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#public-pack-url-display", TextArea).focus()
+
+    def reload_info(self) -> None:
+        self.baseline = core.public_pack_url_baseline(self.project_key)
+        self.query_one("#public-pack-url-source", Static).update(
+            f"Source: {self.info.source}"
+        )
+        self.query_one("#public-pack-url-display", TextArea).text = (
+            self.info.value or "not configured"
+        )
+        self.query_one("#public-pack-command-display", TextArea).text = (
+            self.info.installer_command or "not configured"
+        )
+
+    def action_edit(self) -> None:
+        self.app.push_screen(
+            PublicPackUrlEditModal(self.info.value),
+            self.review_edit,
+        )
+
+    def review_edit(self, value: str | None) -> None:
+        if value is None:
+            return
+        try:
+            value = core.validate_public_pack_url(value)
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+            return
+        if value == self.info.value:
+            self.app.notify("Public Pack URL is unchanged")
+            return
+        self.app.push_screen(
+            ConfirmModal(
+                "Save Public Pack URL?",
+                (
+                    "Save to: pack.local.yaml",
+                    f"Old: {self.info.value or 'not configured'}",
+                    f"New: {value}",
+                ),
+            ),
+            lambda confirmed: self.save_edit(value, confirmed),
+        )
+
+    def save_edit(self, value: str, confirmed: bool | None) -> None:
+        if not confirmed:
+            return
+        try:
+            core.set_public_pack_url(
+                self.project_key,
+                value,
+                expected_baseline=self.baseline,
+            )
+            self.reload_info()
+            self.app.notify("Public Pack URL saved")
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+
+    def action_clear(self) -> None:
+        if self.info.source != "local":
+            self.app.notify("No local Public Pack URL override is configured")
+            return
+        fallback = self.baseline.committed_value or "not configured"
+        self.app.push_screen(
+            ConfirmModal(
+                "Clear local Public Pack URL?",
+                (
+                    "Remove from: pack.local.yaml",
+                    f"Old: {self.info.value}",
+                    f"New: {fallback}",
+                ),
+            ),
+            self.clear_confirmed,
+        )
+
+    def clear_confirmed(self, confirmed: bool | None) -> None:
+        if not confirmed:
+            return
+        try:
+            core.clear_local_public_pack_url(
+                self.project_key,
+                expected_baseline=self.baseline,
+            )
+            self.reload_info()
+            self.app.notify("Local Public Pack URL override cleared")
         except Exception as error:
             self.app.notify(str(error), severity="error")
 

@@ -222,6 +222,7 @@ other keys.
 ```yaml
 distribution:
   rsync_target: user@host:/srv/packs/demo
+  public_pack_url: https://packs.example/demo/pack.toml
 minecraft_server:
   ssh_host: user@host
   stack_dir: /srv/demo
@@ -230,7 +231,8 @@ url_max_jar_size_bytes: 268435456
 url_allow_private_networks: false
 ```
 
-The exact allowed paths are `distribution.rsync_target`, `minecraft_server.ssh_host`,
+The exact allowed paths are `distribution.rsync_target`, `distribution.public_pack_url`,
+`minecraft_server.ssh_host`,
 `minecraft_server.stack_dir`, `minecraft_server.service`, `url_max_jar_size_bytes`, and
 `url_allow_private_networks`. Identity,
 display, enablement, Minecraft/loader versions, MOD data, and every unknown top-level or nested key
@@ -248,6 +250,13 @@ directory, Compose service, and the host/path components of the rsync target. Ch
 before they are written to `pack.local.yaml`; unchanged fields retain their committed or local
 source. The equivalent noninteractive commands are `packctl show-deployment <pack>` and
 `packctl set-deployment <pack> [options]`.
+
+`Settings` then `Client Distribution` shows the effective Public Pack URL, whether it came from
+committed or local configuration, and the Packwiz Installer command. Public Pack URLs must use
+HTTPS, contain no credentials or fragment, and end in `/pack.toml`; query strings are allowed.
+Use `packctl show-pack-url <pack> [--raw]`, `packctl set-pack-url <pack> <url>`, or
+`packctl clear-pack-url <pack>`. Clearing removes only the local override, so a committed URL
+becomes effective again.
 
 The settings commands pin the managed collection and project directory, snapshot both committed and
 local configuration, validate the prospective merged project entirely in memory, and publish through

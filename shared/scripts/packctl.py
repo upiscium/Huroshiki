@@ -99,7 +99,7 @@ TEMPLATE_LOCAL_KEYS = frozenset(
     {"url_max_jar_size_bytes", "url_allow_private_networks"}
 )
 PACK_LOCAL_KEYS = {
-    "distribution": frozenset({"rsync_target"}),
+    "distribution": frozenset({"rsync_target", "public_pack_url"}),
     "minecraft_server": frozenset({"ssh_host", "stack_dir", "service"}),
     "url_max_jar_size_bytes": None,
     "url_allow_private_networks": None,
@@ -197,6 +197,20 @@ class DeploymentSettingsSources:
 @dataclass(frozen=True)
 class DeploymentSettingsBaseline:
     settings: DeploymentSettings
+    snapshot: ProjectConfigSnapshot
+
+
+@dataclass(frozen=True)
+class PublicPackUrlInfo:
+    value: str | None
+    source: Literal["local", "committed", "unset"]
+    installer_command: str | None
+
+
+@dataclass(frozen=True)
+class PublicPackUrlBaseline:
+    info: PublicPackUrlInfo
+    committed_value: str | None
     snapshot: ProjectConfigSnapshot
 
 
@@ -1094,6 +1108,36 @@ def validate_compose_service(value: str) -> str:
     return service
 
 
+def validate_public_pack_url(value: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ConfigError("Public Pack URL must be a non-empty string")
+    if value != value.strip():
+        raise ConfigError("Public Pack URL must not have surrounding whitespace")
+    if any(unicodedata.category(character) in {"Cc", "Zl", "Zp"} for character in value):
+        raise ConfigError("Public Pack URL must not contain control characters")
+    if any(character.isspace() for character in value):
+        raise ConfigError("Public Pack URL must not contain whitespace")
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        parsed.port
+    except ValueError as error:
+        raise ConfigError("Public Pack URL is malformed") from error
+    if parsed.scheme != "https":
+        raise ConfigError("Public Pack URL must use https")
+    if not hostname:
+        raise ConfigError("Public Pack URL must include a hostname")
+    if username is not None or password is not None:
+        raise ConfigError("Public Pack URL must not include credentials")
+    if "#" in value:
+        raise ConfigError("Public Pack URL must not include a fragment")
+    if not parsed.path.endswith("/pack.toml"):
+        raise ConfigError("Public Pack URL path must end with /pack.toml")
+    return value
+
+
 def validate_url_policy(config: dict[str, Any], context: str) -> None:
     value = config.get("url_max_jar_size_bytes")
     if "url_max_jar_size_bytes" in config and (
@@ -1152,6 +1196,11 @@ def validate_local_config(kind: str, path: Path, local: dict[str, Any]) -> None:
                 try:
                     validate_rsync_target(nested_value)
                 except ValueError as error:
+                    raise ConfigError(f"{context}: {error}") from error
+            elif key == "distribution" and nested_key == "public_pack_url":
+                try:
+                    validate_public_pack_url(nested_value)
+                except ConfigError as error:
                     raise ConfigError(f"{context}: {error}") from error
             elif key == "minecraft_server" and nested_key == "ssh_host":
                 try:
@@ -1287,6 +1336,13 @@ def _validate_prospective_deployment(config: dict[str, Any], context: str) -> No
                     f"{context}.distribution.rsync_target must be a non-empty string"
                 )
             validate_rsync_target(target)
+            public_url = distribution.get("public_pack_url")
+            if public_url is not None:
+                if not isinstance(public_url, str):
+                    raise ConfigError(
+                        f"{context}.distribution.public_pack_url must be a string"
+                    )
+                validate_public_pack_url(public_url)
         except (ConfigError, ValueError) as error:
             errors.append(str(error))
     try:
@@ -1328,6 +1384,14 @@ def prospective_pack_config(
         )
     if committed.get("id") != pack_id:
         raise ConfigError(f"{committed_path} must contain id: {pack_id}")
+    committed_distribution = committed.get("distribution")
+    if isinstance(committed_distribution, dict) and "public_pack_url" in committed_distribution:
+        committed_public_url = committed_distribution["public_pack_url"]
+        if not isinstance(committed_public_url, str):
+            raise ConfigError(
+                f"{committed_path}.distribution.public_pack_url must be a string"
+            )
+        validate_public_pack_url(committed_public_url)
     config = merge(committed, local)
     _prospective_text(config, "display_name", str(committed_path))
     if not isinstance(config.get("enabled"), bool):
@@ -2290,6 +2354,20 @@ def deployment_settings_sources(pack_id: str) -> DeploymentSettingsSources:
     )
 
 
+def _check_expected_project_config(
+    snapshot: ProjectConfigSnapshot,
+    expected: ProjectConfigSnapshot | None,
+    operation: str,
+) -> None:
+    if expected is not None and (
+        not _same_config_snapshot(snapshot.committed, expected.committed)
+        or not _same_config_snapshot(snapshot.local, expected.local)
+    ):
+        raise ConfigError(
+            f"{operation} configuration changed after it was loaded; retry the operation"
+        )
+
+
 def update_deployment_settings(
     pack_id: str,
     *,
@@ -2322,16 +2400,11 @@ def update_deployment_settings(
         root = get_pack_root(pack_id)
         with open_config_directory(root) as directory:
             snapshot = project_config_snapshot(directory, "pack")
-            if expected_baseline is not None and (
-                not _same_config_snapshot(
-                    snapshot.committed,
-                    expected_baseline.committed,
-                )
-                or not _same_config_snapshot(snapshot.local, expected_baseline.local)
-            ):
-                raise ConfigError(
-                    "Deployment configuration changed after it was loaded; retry the operation"
-                )
+            _check_expected_project_config(
+                snapshot,
+                expected_baseline,
+                "Deployment",
+            )
             committed = parse_yaml_snapshot(snapshot.committed)
             local = parse_yaml_snapshot(snapshot.local)
             current = _deployment_settings_from_config(
@@ -2380,6 +2453,122 @@ def update_deployment_settings(
             return result
 
 
+def _public_pack_url_info_from_configs(
+    pack_id: str,
+    committed: dict[str, Any],
+    local: dict[str, Any],
+) -> tuple[PublicPackUrlInfo, str | None]:
+    config = prospective_pack_config(pack_id, committed, local)
+    distribution = require_mapping(config, "distribution", pack_id)
+    value = distribution.get("public_pack_url")
+    if value is not None:
+        if not isinstance(value, str):
+            raise ConfigError(f"{pack_id}.distribution.public_pack_url must be a string")
+        value = validate_public_pack_url(value)
+
+    committed_distribution = committed.get("distribution", {})
+    local_distribution = local.get("distribution", {})
+    committed_value = (
+        committed_distribution.get("public_pack_url")
+        if isinstance(committed_distribution, dict)
+        else None
+    )
+    if committed_value is not None and not isinstance(committed_value, str):
+        raise ConfigError(f"{pack_id}.distribution.public_pack_url must be a string")
+    if isinstance(local_distribution, dict) and "public_pack_url" in local_distribution:
+        source: Literal["local", "committed", "unset"] = "local"
+    elif value is not None:
+        source = "committed"
+    else:
+        source = "unset"
+    command = (
+        f"java -jar packwiz-installer-bootstrap.jar {shlex.quote(value)}"
+        if value is not None
+        else None
+    )
+    return PublicPackUrlInfo(value, source, command), committed_value
+
+
+def public_pack_url_baseline(pack_id: str) -> PublicPackUrlBaseline:
+    root = get_pack_root(pack_id)
+    with open_config_directory(root) as directory:
+        snapshot = project_config_snapshot(directory, "pack")
+        info, committed_value = _public_pack_url_info_from_configs(
+            pack_id,
+            parse_yaml_snapshot(snapshot.committed),
+            parse_yaml_snapshot(snapshot.local),
+        )
+        return PublicPackUrlBaseline(info, committed_value, snapshot)
+
+
+def public_pack_url_info(pack_id: str) -> PublicPackUrlInfo:
+    return public_pack_url_baseline(pack_id).info
+
+
+def set_public_pack_url(
+    pack_id: str,
+    url: str,
+    *,
+    expected_baseline: PublicPackUrlBaseline | None = None,
+) -> PublicPackUrlInfo:
+    normalized = validate_public_pack_url(url)
+    with ProjectLock(f"pack:{pack_id}", "set Public Pack URL"):
+        root = get_pack_root(pack_id)
+        with open_config_directory(root) as directory:
+            snapshot = project_config_snapshot(directory, "pack")
+            _check_expected_project_config(
+                snapshot,
+                expected_baseline.snapshot if expected_baseline is not None else None,
+                "Public Pack URL",
+            )
+            committed = parse_yaml_snapshot(snapshot.committed)
+            local = parse_yaml_snapshot(snapshot.local)
+            current, _ = _public_pack_url_info_from_configs(pack_id, committed, local)
+            if current.value == normalized:
+                return current
+            local.setdefault("distribution", {})["public_pack_url"] = normalized
+            result, _ = _public_pack_url_info_from_configs(pack_id, committed, local)
+            _write_yaml_atomic(
+                directory,
+                local,
+                expected_snapshot=snapshot.local,
+                guard_snapshots=(snapshot.committed, snapshot.local),
+            )
+            return result
+
+
+def clear_local_public_pack_url(
+    pack_id: str,
+    *,
+    expected_baseline: PublicPackUrlBaseline | None = None,
+) -> PublicPackUrlInfo:
+    with ProjectLock(f"pack:{pack_id}", "clear local Public Pack URL"):
+        root = get_pack_root(pack_id)
+        with open_config_directory(root) as directory:
+            snapshot = project_config_snapshot(directory, "pack")
+            _check_expected_project_config(
+                snapshot,
+                expected_baseline.snapshot if expected_baseline is not None else None,
+                "Public Pack URL",
+            )
+            committed = parse_yaml_snapshot(snapshot.committed)
+            local = parse_yaml_snapshot(snapshot.local)
+            distribution = local.get("distribution")
+            if not isinstance(distribution, dict) or "public_pack_url" not in distribution:
+                return _public_pack_url_info_from_configs(pack_id, committed, local)[0]
+            del distribution["public_pack_url"]
+            if not distribution:
+                del local["distribution"]
+            result, _ = _public_pack_url_info_from_configs(pack_id, committed, local)
+            _write_yaml_atomic(
+                directory,
+                local,
+                expected_snapshot=snapshot.local,
+                guard_snapshots=(snapshot.committed, snapshot.local),
+            )
+            return result
+
+
 def cmd_show_deployment(args: argparse.Namespace) -> int:
     settings = deployment_settings(args.pack)
     print("distribution:")
@@ -2410,6 +2599,43 @@ def cmd_set_deployment(args: argparse.Namespace) -> int:
         service=UNSET if args.service is None else args.service,
     )
     print(f"Updated {display_path(get_pack_root(args.pack) / 'pack.local.yaml')}")
+    return 0
+
+
+def _print_public_pack_url_info(info: PublicPackUrlInfo) -> None:
+    print(f"Public Pack URL: {info.value or 'not configured'}")
+    print(f"Source: {info.source}")
+    if info.installer_command is not None:
+        print(f"Installer command: {info.installer_command}")
+
+
+def cmd_show_pack_url(args: argparse.Namespace) -> int:
+    info = public_pack_url_info(args.pack)
+    if args.raw:
+        if info.value is None:
+            return 1
+        print(info.value)
+    else:
+        _print_public_pack_url_info(info)
+    return 0
+
+
+def cmd_set_pack_url(args: argparse.Namespace) -> int:
+    info = set_public_pack_url(args.pack, args.url)
+    _print_public_pack_url_info(info)
+    return 0
+
+
+def cmd_clear_pack_url(args: argparse.Namespace) -> int:
+    baseline = public_pack_url_baseline(args.pack)
+    info = clear_local_public_pack_url(args.pack, expected_baseline=baseline)
+    if baseline.info.source == "local" and info.source == "committed":
+        print("Cleared local override; using committed Public Pack URL.")
+    elif baseline.info.source == "local":
+        print("Cleared local Public Pack URL override.")
+    else:
+        print("No local Public Pack URL override was configured.")
+    _print_public_pack_url_info(info)
     return 0
 
 
@@ -4023,6 +4249,17 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--stack-dir")
     item.add_argument("--service")
     item.set_defaults(func=cmd_set_deployment)
+    item = sub.add_parser("show-pack-url")
+    item.add_argument("pack")
+    item.add_argument("--raw", action="store_true")
+    item.set_defaults(func=cmd_show_pack_url)
+    item = sub.add_parser("set-pack-url")
+    item.add_argument("pack")
+    item.add_argument("url")
+    item.set_defaults(func=cmd_set_pack_url)
+    item = sub.add_parser("clear-pack-url")
+    item.add_argument("pack")
+    item.set_defaults(func=cmd_clear_pack_url)
     item = sub.add_parser("new")
     item.add_argument("pack")
     item.add_argument("display_name")

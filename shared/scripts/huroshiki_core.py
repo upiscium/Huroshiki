@@ -94,6 +94,8 @@ DeploymentSettings = packctl.DeploymentSettings
 DeploymentSettingsSources = packctl.DeploymentSettingsSources
 DeploymentSettingsBaseline = packctl.DeploymentSettingsBaseline
 RsyncTargetParts = packctl.RsyncTargetParts
+PublicPackUrlInfo = packctl.PublicPackUrlInfo
+PublicPackUrlBaseline = packctl.PublicPackUrlBaseline
 
 
 def project_key(kind: str, project_id: str) -> str:
@@ -257,6 +259,59 @@ def update_deployment_settings(
             expected_baseline=(
                 expected_baseline.snapshot if expected_baseline is not None else None
             ),
+        )
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def public_pack_url_baseline(key: str) -> PublicPackUrlBaseline:
+    kind, project_id = split_project_key(key)
+    if kind != "pack":
+        raise HuroshikiError("Public Pack URLs are available only for packs")
+    try:
+        return packctl.public_pack_url_baseline(project_id)
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def validate_public_pack_url(value: str) -> str:
+    try:
+        return packctl.validate_public_pack_url(value)
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def set_public_pack_url(
+    key: str,
+    url: str,
+    *,
+    expected_baseline: PublicPackUrlBaseline | None = None,
+) -> PublicPackUrlInfo:
+    kind, project_id = split_project_key(key)
+    if kind != "pack":
+        raise HuroshikiError("Public Pack URLs are available only for packs")
+    try:
+        return packctl.set_public_pack_url(
+            project_id,
+            url,
+            expected_baseline=expected_baseline,
+        )
+    except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def clear_local_public_pack_url(
+    key: str,
+    *,
+    expected_baseline: PublicPackUrlBaseline | None = None,
+) -> PublicPackUrlInfo:
+    kind, project_id = split_project_key(key)
+    if kind != "pack":
+        raise HuroshikiError("Public Pack URLs are available only for packs")
+    try:
+        return packctl.clear_local_public_pack_url(
+            project_id,
+            expected_baseline=expected_baseline,
         )
     except packctl.ConfigError as error:
         raise HuroshikiError(str(error)) from error

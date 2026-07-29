@@ -61,6 +61,24 @@ DataTable {
     padding-bottom: 1;
 }
 
+#client-distribution-content {
+    height: 1fr;
+    padding: 1 2;
+}
+
+#public-pack-url-source {
+    height: 2;
+    padding: 0 1;
+    color: $text-muted;
+}
+
+#public-pack-url-display,
+#public-pack-command-display {
+    height: 5;
+    margin: 0 2 1 2;
+    border: round $primary;
+}
+
 #update-options {
     width: 1fr;
     height: 1fr;
@@ -75,6 +93,7 @@ DataTable {
 
 ConfirmModal,
 MessageModal,
+PublicPackUrlEditModal,
 NewPackModal,
 CreateFromTemplateModal,
 NewTemplateModal {
