@@ -5954,6 +5954,7 @@ def _assert_removed_identities_absent(
     source: Path,
     removed: Sequence[ModCandidate],
 ) -> None:
+    ensure_safe_pack_source(source)
     removed_identities = {
         candidate.actual_identity
         for candidate in removed
