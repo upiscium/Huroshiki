@@ -281,14 +281,19 @@ class UpdatePreparationCancelled(HuroshikiError):
     pass
 
 
+class UpdatePreparationDeadlineExceeded(HuroshikiError):
+    pass
+
+
 class UpdatePreparationOperation:
     def __init__(
         self,
-        transaction: "PackTransaction",
+        project_key: str,
         *,
         deadline: float | None = None,
     ) -> None:
-        self.transaction = transaction
+        self.project_key = project_key
+        self.transaction: PackTransaction | None = None
         self.cancel_event = threading.Event()
         self.done = threading.Event()
         self.candidates: tuple[UpdateCandidate, ...] = ()
@@ -311,6 +316,10 @@ class UpdatePreparationOperation:
                 return
             self._started = True
         try:
+            self.transaction = PackTransaction.create(
+                self.project_key,
+                checkpoint=self._checkpoint,
+            )
             self.candidates = tuple(
                 self.transaction.prepare_updates(
                     cancel_event=self.cancel_event,
@@ -331,11 +340,20 @@ class UpdatePreparationOperation:
                     self._discard_recording_error()
                 self.done.set()
 
+    def _checkpoint(self) -> None:
+        if self.cancel_event.is_set():
+            raise UpdatePreparationCancelled("Update preparation was cancelled")
+        if time.monotonic() >= self.deadline:
+            raise UpdatePreparationDeadlineExceeded(
+                "Update preparation operation deadline exceeded"
+            )
+
     def _discard_once(self) -> None:
         if self._discarded:
             return
         self._discarded = True
-        self.transaction.discard()
+        if self.transaction is not None:
+            self.transaction.discard()
 
     def _discard_recording_error(self) -> None:
         try:
@@ -359,6 +377,7 @@ class UpdatePreparationOperation:
                 or self.cancelled
                 or self.error is not None
                 or self._discarded
+                or self.transaction is None
             ):
                 raise HuroshikiError("Update preparation has no successful transaction")
             self._claimed = True
@@ -830,7 +849,12 @@ class PackTransaction:
     )
 
     @classmethod
-    def create(cls, project_key_value: str) -> "PackTransaction":
+    def create(
+        cls,
+        project_key_value: str,
+        *,
+        checkpoint: Callable[[], None] | None = None,
+    ) -> "PackTransaction":
         kind, project_id = split_project_key(project_key_value)
         try:
             project_lock = packctl.ProjectLock(
@@ -862,13 +886,25 @@ class PackTransaction:
                     raise HuroshikiError(
                         f"Missing Packwiz source directory: {real_source}"
                     )
-                ensure_safe_pack_source(real_source)
+                ensure_safe_pack_source(real_source, checkpoint=checkpoint)
                 verified_config = pack_config_snapshot(real_root)
-                verified_baseline = tree_digest_snapshot(real_source)
-                copy_transaction_source(real_source, tx_source)
+                checkpoint_arguments = (
+                    {"checkpoint": checkpoint} if checkpoint is not None else {}
+                )
+                verified_baseline = tree_digest_snapshot(
+                    real_source,
+                    **checkpoint_arguments,
+                )
+                copy_transaction_source(
+                    real_source,
+                    tx_source,
+                    **checkpoint_arguments,
+                )
                 if (
-                    tree_digest_snapshot(real_source) != verified_baseline
-                    or tree_digest_snapshot(tx_source) != verified_baseline
+                    tree_digest_snapshot(real_source, **checkpoint_arguments)
+                    != verified_baseline
+                    or tree_digest_snapshot(tx_source, **checkpoint_arguments)
+                    != verified_baseline
                     or pack_config_snapshot(real_root) != verified_config
                 ):
                     raise HuroshikiError(
@@ -879,8 +915,14 @@ class PackTransaction:
                     project_key=project_key_value,
                     root=tx_root,
                     source=tx_source,
-                    baseline=metadata_digest_snapshot(tx_source),
-                    baseline_contents=metadata_content_snapshot(tx_source),
+                    baseline=metadata_digest_snapshot(
+                        tx_source,
+                        **checkpoint_arguments,
+                    ),
+                    baseline_contents=metadata_content_snapshot(
+                        tx_source,
+                        **checkpoint_arguments,
+                    ),
                     real_source_baseline=verified_baseline,
                     pack_config_baseline=verified_config,
                 )
@@ -1324,7 +1366,27 @@ class PackTransaction:
             raise HuroshikiError(
                 "Template entries resolve compatible versions during MODPACK creation"
             )
-        if tree_digest_snapshot(self.source) != self.real_source_baseline:
+        def checkpoint() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise UpdatePreparationCancelled(
+                    "Update preparation was cancelled"
+                )
+            if deadline is not None and time.monotonic() >= deadline:
+                raise UpdatePreparationDeadlineExceeded(
+                    "Update preparation operation deadline exceeded"
+                )
+
+        try:
+            current_source = tree_digest_snapshot(
+                self.source,
+                checkpoint=checkpoint,
+            )
+        except UpdatePreparationDeadlineExceeded:
+            current_source = None
+        if (
+            current_source is not None
+            and current_source != self.real_source_baseline
+        ):
             raise HuroshikiError(
                 "Updates must be prepared before other transaction changes are staged"
             )
@@ -2073,12 +2135,52 @@ def delete_template(
         raise HuroshikiError(str(error)) from error
 
 
-def file_digest(path: Path) -> str:
+def _run_checkpoint(checkpoint: Callable[[], None] | None) -> None:
+    if checkpoint is not None:
+        checkpoint()
+
+
+def file_digest(
+    path: Path,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        while True:
+            _run_checkpoint(checkpoint)
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _read_file_bytes(
+    path: Path,
+    checkpoint: Callable[[], None] | None = None,
+) -> bytes:
+    chunks: list[bytes] = []
+    with path.open("rb") as handle:
+        while True:
+            _run_checkpoint(checkpoint)
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+
+
+def _checkpointed_paths(
+    source: Path,
+    pattern: str,
+    checkpoint: Callable[[], None] | None,
+) -> list[Path]:
+    paths: list[Path] = []
+    _run_checkpoint(checkpoint)
+    for path in source.rglob(pattern):
+        _run_checkpoint(checkpoint)
+        paths.append(path)
+    return sorted(paths)
 
 
 _SOURCE_DIRECTORY_FLAGS = (
@@ -2139,9 +2241,16 @@ def _open_pinned_source(source: Path) -> tuple[int, os.stat_result]:
     return source_fd, opened
 
 
-def _digest_fd(file_fd: int) -> str:
+def _digest_fd(
+    file_fd: int,
+    checkpoint: Callable[[], None] | None = None,
+) -> str:
     digest = hashlib.sha256()
-    while chunk := os.read(file_fd, 1024 * 1024):
+    while True:
+        _run_checkpoint(checkpoint)
+        chunk = os.read(file_fd, 1024 * 1024)
+        if not chunk:
+            break
         digest.update(chunk)
     return digest.hexdigest()
 
@@ -2149,16 +2258,23 @@ def _digest_fd(file_fd: int) -> str:
 def _source_fd_snapshot(
     directory_fd: int,
     relative: Path = Path("."),
+    checkpoint: Callable[[], None] | None = None,
 ) -> dict[Path, str]:
     snapshot: dict[Path, str] = {}
+    _run_checkpoint(checkpoint)
     try:
         with os.scandir(directory_fd) as iterator:
-            names = sorted(entry.name for entry in iterator)
+            names = []
+            for entry in iterator:
+                _run_checkpoint(checkpoint)
+                names.append(entry.name)
+            names.sort()
     except OSError as error:
         raise HuroshikiError(
             f"Unsafe Packwiz source at {relative}: could not list directory: {error}"
         ) from error
     for name in names:
+        _run_checkpoint(checkpoint)
         item_relative = relative / name
         if item_relative.parts[0] == ".":
             item_relative = Path(*item_relative.parts[1:])
@@ -2182,7 +2298,9 @@ def _source_fd_snapshot(
                         f"Unsafe Packwiz source at {item_relative}: replaced while opening"
                     )
                 snapshot[item_relative] = "directory"
-                snapshot.update(_source_fd_snapshot(child_fd, item_relative))
+                snapshot.update(
+                    _source_fd_snapshot(child_fd, item_relative, checkpoint)
+                )
                 current = os.stat(
                     name, dir_fd=directory_fd, follow_symlinks=False
                 )
@@ -2210,7 +2328,7 @@ def _source_fd_snapshot(
                 raise HuroshikiError(
                     f"Unsafe Packwiz source at {item_relative}: replaced while opening"
                 )
-            snapshot[item_relative] = _digest_fd(file_fd)
+            snapshot[item_relative] = _digest_fd(file_fd, checkpoint)
             after_read = os.fstat(file_fd)
             current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             if (
@@ -2231,11 +2349,18 @@ def _copy_source_fd(
     source_fd: int,
     destination_fd: int,
     relative: Path = Path("."),
+    checkpoint: Callable[[], None] | None = None,
 ) -> dict[Path, str]:
     snapshot: dict[Path, str] = {}
+    _run_checkpoint(checkpoint)
     with os.scandir(source_fd) as iterator:
-        names = sorted(entry.name for entry in iterator)
+        names = []
+        for entry in iterator:
+            _run_checkpoint(checkpoint)
+            names.append(entry.name)
+        names.sort()
     for name in names:
+        _run_checkpoint(checkpoint)
         item_relative = relative / name
         if item_relative.parts[0] == ".":
             item_relative = Path(*item_relative.parts[1:])
@@ -2258,7 +2383,9 @@ def _copy_source_fd(
                 os.mkdir(name, source_mode | stat.S_IRWXU, dir_fd=destination_fd)
                 output_fd = os.open(name, _SOURCE_DIRECTORY_FLAGS, dir_fd=destination_fd)
                 snapshot[item_relative] = "directory"
-                snapshot.update(_copy_source_fd(child_fd, output_fd, item_relative))
+                snapshot.update(
+                    _copy_source_fd(child_fd, output_fd, item_relative, checkpoint)
+                )
                 current = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
                 if not stat.S_ISDIR(current.st_mode) or not _same_entry(opened, current):
                     raise HuroshikiError(
@@ -2304,10 +2431,15 @@ def _copy_source_fd(
                 dir_fd=destination_fd,
             )
             digest = hashlib.sha256()
-            while chunk := os.read(file_fd, 1024 * 1024):
+            while True:
+                _run_checkpoint(checkpoint)
+                chunk = os.read(file_fd, 1024 * 1024)
+                if not chunk:
+                    break
                 digest.update(chunk)
                 view = memoryview(chunk)
                 while view:
+                    _run_checkpoint(checkpoint)
                     written = os.write(output_fd, view)
                     view = view[written:]
             os.fchmod(output_fd, stat.S_IMODE(opened.st_mode))
@@ -2339,20 +2471,36 @@ def _copy_source_fd(
     return snapshot
 
 
-def copy_transaction_source(source: Path, destination: Path) -> None:
+def copy_transaction_source(
+    source: Path,
+    destination: Path,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> None:
+    _run_checkpoint(checkpoint)
     source_fd, source_metadata = _open_pinned_source(source)
     parent_fd = destination_fd = -1
     try:
-        issues = packctl.pack_source_fd_entry_issues(source_fd)
+        issues = (
+            packctl.pack_source_fd_entry_issues(source_fd, checkpoint)
+            if checkpoint is not None
+            else packctl.pack_source_fd_entry_issues(source_fd)
+        )
         if issues:
             details = "; ".join(f"{relative}: {message}" for relative, message in issues)
             raise HuroshikiError(f"Unsafe Packwiz source {source}: {details}")
+        _run_checkpoint(checkpoint)
         parent_fd = os.open(destination.parent, _SOURCE_DIRECTORY_FLAGS)
         os.mkdir(destination.name, 0o700, dir_fd=parent_fd)
         destination_fd = os.open(
             destination.name, _SOURCE_DIRECTORY_FLAGS, dir_fd=parent_fd
         )
-        copied = _copy_source_fd(source_fd, destination_fd)
+        copied = _copy_source_fd(
+            source_fd,
+            destination_fd,
+            checkpoint=checkpoint,
+        )
+        _run_checkpoint(checkpoint)
         try:
             current = os.stat(source, follow_symlinks=False)
             current_destination = os.stat(
@@ -2371,8 +2519,8 @@ def copy_transaction_source(source: Path, destination: Path) -> None:
                 "The transaction destination was replaced while the copy was being created"
             )
         if (
-            _source_fd_snapshot(source_fd) != copied
-            or _source_fd_snapshot(destination_fd) != copied
+            _source_fd_snapshot(source_fd, checkpoint=checkpoint) != copied
+            or _source_fd_snapshot(destination_fd, checkpoint=checkpoint) != copied
         ):
             raise HuroshikiError(
                 "The pack source changed while the transaction copy was being created"
@@ -2395,8 +2543,16 @@ def copy_transaction_source(source: Path, destination: Path) -> None:
         os.close(source_fd)
 
 
-def ensure_safe_pack_source(source: Path) -> None:
-    issues = packctl.pack_source_entry_issues(source)
+def ensure_safe_pack_source(
+    source: Path,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> None:
+    issues = (
+        packctl.pack_source_entry_issues(source, checkpoint)
+        if checkpoint is not None
+        else packctl.pack_source_entry_issues(source)
+    )
     if not issues:
         return
     details = "; ".join(
@@ -2523,10 +2679,16 @@ def pack_config_snapshot(root: Path) -> dict[str, str]:
     return snapshot
 
 
-def tree_digest_snapshot(source: Path) -> dict[Path, str]:
+def tree_digest_snapshot(
+    source: Path,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> dict[Path, str]:
+    _run_checkpoint(checkpoint)
     source_fd, source_metadata = _open_pinned_source(source)
     try:
-        snapshot = _source_fd_snapshot(source_fd)
+        snapshot = _source_fd_snapshot(source_fd, checkpoint=checkpoint)
+        _run_checkpoint(checkpoint)
         current = os.stat(source, follow_symlinks=False)
         if not _same_entry(source_metadata, current):
             raise HuroshikiError(
@@ -2537,20 +2699,34 @@ def tree_digest_snapshot(source: Path) -> dict[Path, str]:
         os.close(source_fd)
 
 
-def metadata_digest_snapshot(source: Path) -> dict[Path, str]:
-    return {
-        path.relative_to(source): file_digest(path)
-        for path in sorted(source.rglob("*.pw.toml"))
-        if path.is_file()
-    }
+def metadata_digest_snapshot(
+    source: Path,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> dict[Path, str]:
+    snapshot: dict[Path, str] = {}
+    for path in _checkpointed_paths(source, "*.pw.toml", checkpoint):
+        _run_checkpoint(checkpoint)
+        if path.is_file():
+            snapshot[path.relative_to(source)] = file_digest(
+                path,
+                checkpoint=checkpoint,
+            )
+    return snapshot
 
 
-def metadata_content_snapshot(source: Path) -> dict[Path, bytes]:
-    return {
-        path.relative_to(source): path.read_bytes()
-        for path in sorted(source.rglob("*.pw.toml"))
-        if path.is_file()
-    }
+def metadata_content_snapshot(
+    source: Path,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> dict[Path, bytes]:
+    snapshot: dict[Path, bytes] = {}
+    for path in _checkpointed_paths(source, "*.pw.toml", checkpoint):
+        _run_checkpoint(checkpoint)
+        if path.is_file():
+            snapshot[path.relative_to(source)] = _read_file_bytes(path, checkpoint)
+    _run_checkpoint(checkpoint)
+    return snapshot
 
 
 def changed_paths(
@@ -2758,12 +2934,16 @@ UPDATE_OPERATION_TIMEOUT_SECONDS = 600
 PACKWIZ_GENERATED_PATHS = {Path("index.toml"), Path("pack.toml")}
 
 
-def _file_content_snapshot(source: Path) -> dict[Path, bytes]:
-    return {
-        path.relative_to(source): path.read_bytes()
-        for path in sorted(source.rglob("*"))
-        if path.is_file() and not path.is_symlink()
-    }
+def _file_content_snapshot(
+    source: Path,
+    checkpoint: Callable[[], None] | None = None,
+) -> dict[Path, bytes]:
+    snapshot: dict[Path, bytes] = {}
+    for path in _checkpointed_paths(source, "*", checkpoint):
+        _run_checkpoint(checkpoint)
+        if path.is_file() and not path.is_symlink():
+            snapshot[path.relative_to(source)] = _read_file_bytes(path, checkpoint)
+    return snapshot
 
 
 def _content_changes(
@@ -2799,14 +2979,21 @@ def _update_metadata_record(relative_path: Path, contents: bytes) -> _UpdateMeta
     )
 
 
-def _update_metadata_snapshot(source: Path) -> dict[tuple[str, str], _UpdateMetadata]:
+def _update_metadata_snapshot(
+    source: Path,
+    checkpoint: Callable[[], None] | None = None,
+) -> dict[tuple[str, str], _UpdateMetadata]:
     records: dict[tuple[str, str], _UpdateMetadata] = {}
     paths: dict[str, tuple[str, str]] = {}
     filenames: dict[str, tuple[str, str]] = {}
-    for path in sorted(source.rglob("*.pw.toml")):
+    for path in _checkpointed_paths(source, "*.pw.toml", checkpoint):
+        _run_checkpoint(checkpoint)
         if not path.is_file() or path.is_symlink():
             continue
-        record = _update_metadata_record(path.relative_to(source), path.read_bytes())
+        record = _update_metadata_record(
+            path.relative_to(source),
+            _read_file_bytes(path, checkpoint),
+        )
         path_key = portable_relative_path_key(record.relative_path)
         filename_key = portable_basename_key(record.filename)
         if record.identity in records:
@@ -2881,6 +3068,13 @@ def _prepare_update_candidates(
             progress(UpdateProgress("cancelled", completed, total))
             raise UpdatePreparationCancelled("Update preparation was cancelled")
 
+    def copy_checkpoint(completed: int, total: int) -> None:
+        check_cancel(completed, total)
+        if time.monotonic() >= effective_deadline:
+            raise UpdatePreparationDeadlineExceeded(
+                "Update preparation operation deadline exceeded"
+            )
+
     parsed: list[tuple[Path, bytes, dict[str, object], ModInfo]] = []
     slugs: dict[str, list[Path]] = {}
     for relative_path, original in sorted(baseline_contents.items()):
@@ -2954,7 +3148,11 @@ def _prepare_update_candidates(
             progress(UpdateProgress("failed", total, total, message=message))
             shutil.rmtree(resolver_root, ignore_errors=True)
             return sorted(candidates, key=lambda item: item.root)
-        copy_transaction_source(source, normalized)
+        copy_transaction_source(
+            source,
+            normalized,
+            checkpoint=lambda: copy_checkpoint(len(candidates), total),
+        )
         check_cancel(len(candidates), total)
         normalization = run_resolver_process(
             ["packwiz", "refresh"],
@@ -3015,12 +3213,36 @@ def _prepare_update_candidates(
             shutil.rmtree(resolver_root, ignore_errors=True)
             return sorted(candidates, key=lambda item: item.root)
         check_cancel(len(candidates), total)
-        ensure_safe_pack_source(normalized)
-        before_files = _file_content_snapshot(normalized)
-        baseline_records = _update_metadata_snapshot(normalized)
+        ensure_safe_pack_source(
+            normalized,
+            checkpoint=lambda: copy_checkpoint(len(candidates), total),
+        )
+        before_files = _file_content_snapshot(
+            normalized,
+            lambda: copy_checkpoint(len(candidates), total),
+        )
+        baseline_records = _update_metadata_snapshot(
+            normalized,
+            lambda: copy_checkpoint(len(candidates), total),
+        )
     except UpdatePreparationCancelled:
         shutil.rmtree(resolver_root, ignore_errors=True)
         raise
+    except UpdatePreparationDeadlineExceeded as error:
+        message = str(error)
+        for relative_path, _, old_data, old_mod in eligible:
+            candidates.append(
+                _candidate_error(
+                    relative_path,
+                    old_mod,
+                    old_data,
+                    message,
+                    error_kind="operation_deadline",
+                )
+            )
+        shutil.rmtree(resolver_root, ignore_errors=True)
+        progress(UpdateProgress("failed", total, total, message=message))
+        return sorted(candidates, key=lambda item: item.root)
     except (OSError, HuroshikiError) as error:
         message = f"disposable baseline normalization failed: {error}"
         for relative_path, _, old_data, old_mod in eligible:
@@ -3078,7 +3300,11 @@ def _prepare_update_candidates(
                 prefix=f"{old_mod.slug}-", dir=resolver_root
             ) as directory:
                 resolver = Path(directory) / "source"
-                copy_transaction_source(normalized, resolver)
+                copy_transaction_source(
+                    normalized,
+                    resolver,
+                    checkpoint=lambda: copy_checkpoint(completed, total),
+                )
                 check_cancel(completed, total)
                 result = run_resolver_process(
                     ["packwiz", "--yes", "update", old_mod.slug],
@@ -3171,16 +3397,39 @@ def _prepare_update_candidates(
                     )
                     continue
                 check_cancel(completed, total)
-                ensure_safe_pack_source(resolver)
-                resolved_records = _update_metadata_snapshot(resolver)
+                ensure_safe_pack_source(
+                    resolver,
+                    checkpoint=lambda: copy_checkpoint(completed, total),
+                )
+                resolved_records = _update_metadata_snapshot(
+                    resolver,
+                    lambda: copy_checkpoint(completed, total),
+                )
                 changes = _content_changes(
                     before_files,
-                    _file_content_snapshot(resolver),
+                    _file_content_snapshot(
+                        resolver,
+                        lambda: copy_checkpoint(completed, total),
+                    ),
                 )
         except UpdatePreparationCancelled:
             progress(UpdateProgress("cancelled", completed, total))
             shutil.rmtree(resolver_root, ignore_errors=True)
             raise
+        except UpdatePreparationDeadlineExceeded as error:
+            message = str(error)
+            for pending_path, _, pending_data, pending_mod in eligible[eligible_index:]:
+                candidates.append(
+                    _candidate_error(
+                        pending_path,
+                        pending_mod,
+                        pending_data,
+                        message,
+                        error_kind="operation_deadline",
+                    )
+                )
+            progress(UpdateProgress("failed", completed, total, message=message))
+            break
         except (OSError, HuroshikiError) as error:
             candidates.append(
                 _candidate_error(relative_path, old_mod, old_data, str(error))
@@ -3966,12 +4215,24 @@ def update_all(
         raise HuroshikiError(
             "Template entries always resolve the newest compatible file when a MODPACK is created"
         )
-    transaction = PackTransaction.create(project_key_value)
+    cancel_event = threading.Event()
+    deadline = time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS
+
+    def checkpoint() -> None:
+        if time.monotonic() >= deadline:
+            raise UpdatePreparationDeadlineExceeded(
+                "Update preparation operation deadline exceeded"
+            )
+
+    transaction = PackTransaction.create(
+        project_key_value,
+        checkpoint=checkpoint,
+    )
     try:
         candidates = tuple(
             transaction.prepare_updates(
-                cancel_event=threading.Event(),
-                deadline=time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS,
+                cancel_event=cancel_event,
+                deadline=deadline,
             )
         )
         available = tuple(candidate for candidate in candidates if candidate.available)

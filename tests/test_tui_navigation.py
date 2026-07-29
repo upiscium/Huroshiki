@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager, ExitStack, nullcontext
 from pathlib import Path
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -211,20 +212,42 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
         self.assertTrue(transaction.discarded)
 
-    async def test_update_thread_start_failure_discards_transaction(self) -> None:
-        transaction = _UpdateTransaction()
+    async def test_update_thread_start_failure_does_not_create_transaction(self) -> None:
         with self.patches(), patch.object(
             huroshiki.core.PackTransaction,
             "create",
-            return_value=transaction,
-        ), patch.object(threading.Thread, "start", side_effect=RuntimeError("start failed")):
+        ) as create, patch.object(
+            threading.Thread, "start", side_effect=RuntimeError("start failed")
+        ):
             screen = huroshiki.UpdateScreen("pack:demo")
             app = _NavigationApp(screen)
             async with app.run_test() as pilot:
                 await pilot.pause()
 
-        self.assertTrue(transaction.discarded)
+        create.assert_not_called()
         self.assertTrue(screen.operation.done.is_set())
+
+    async def test_update_escape_cancels_transaction_copy_before_navigation(self) -> None:
+        started = threading.Event()
+
+        def create(_, *, checkpoint):
+            started.set()
+            while True:
+                checkpoint()
+                time.sleep(0.01)
+
+        with self.patches(), patch.object(
+            huroshiki.core.PackTransaction,
+            "create",
+            side_effect=create,
+        ):
+            screen = huroshiki.UpdateScreen("pack:demo")
+            app = _NavigationApp(screen)
+            async with app.run_test() as pilot:
+                self.assertTrue(started.wait(1))
+                await pilot.press("escape")
+                await pilot.pause(0.2)
+                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
 
     async def test_project_escape_stays_main_and_main_escape_stays_main(self) -> None:
         with self.patches():

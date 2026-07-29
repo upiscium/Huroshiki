@@ -128,9 +128,19 @@ class UpdatePreparationOperationTest(unittest.TestCase):
         def discard(self) -> None:
             self.discard_calls += 1
 
+    def operation(self, transaction) -> core.UpdatePreparationOperation:
+        create = patch.object(
+            core.PackTransaction,
+            "create",
+            return_value=transaction,
+        )
+        create.start()
+        self.addCleanup(create.stop)
+        return core.UpdatePreparationOperation("pack:demo")
+
     def test_success_is_claimed_without_discard(self) -> None:
         transaction = self.Transaction()
-        operation = core.UpdatePreparationOperation(transaction)
+        operation = self.operation(transaction)
 
         operation.run()
 
@@ -144,7 +154,7 @@ class UpdatePreparationOperationTest(unittest.TestCase):
             raise RuntimeError("failed")
 
         transaction = self.Transaction(fail)
-        operation = core.UpdatePreparationOperation(transaction)
+        operation = self.operation(transaction)
 
         operation.run()
         operation.cancel()
@@ -157,7 +167,7 @@ class UpdatePreparationOperationTest(unittest.TestCase):
             raise KeyboardInterrupt
 
         transaction = self.Transaction(interrupt)
-        operation = core.UpdatePreparationOperation(transaction)
+        operation = self.operation(transaction)
 
         operation.run()
 
@@ -168,15 +178,15 @@ class UpdatePreparationOperationTest(unittest.TestCase):
 
     def test_cancel_before_run_discards_without_preparing(self) -> None:
         transaction = self.Transaction()
-        operation = core.UpdatePreparationOperation(transaction)
+        with patch.object(core.PackTransaction, "create") as create:
+            operation = core.UpdatePreparationOperation("pack:demo")
 
-        operation.cancel()
-        operation.run()
+            operation.cancel()
+            operation.run()
 
         self.assertTrue(operation.done.is_set())
         self.assertTrue(operation.cancelled)
-        self.assertEqual(transaction.prepare_calls, 0)
-        self.assertEqual(transaction.discard_calls, 1)
+        create.assert_not_called()
 
     def test_running_cancel_waits_for_worker_cleanup(self) -> None:
         started = threading.Event()
@@ -187,7 +197,7 @@ class UpdatePreparationOperationTest(unittest.TestCase):
             raise core.UpdatePreparationCancelled("cancelled")
 
         transaction = self.Transaction(block)
-        operation = core.UpdatePreparationOperation(transaction)
+        operation = self.operation(transaction)
         worker = threading.Thread(target=operation.run)
         worker.start()
         self.assertTrue(started.wait(1))
@@ -202,7 +212,7 @@ class UpdatePreparationOperationTest(unittest.TestCase):
 
     def test_cancel_after_success_before_claim_discards_once(self) -> None:
         transaction = self.Transaction()
-        operation = core.UpdatePreparationOperation(transaction)
+        operation = self.operation(transaction)
         operation.run()
 
         operation.cancel()
@@ -212,8 +222,80 @@ class UpdatePreparationOperationTest(unittest.TestCase):
         with self.assertRaises(core.HuroshikiError):
             operation.claim_transaction()
 
+    def test_cancel_interrupts_transaction_creation_checkpoint(self) -> None:
+        started = threading.Event()
+
+        def create(_, *, checkpoint):
+            started.set()
+            while True:
+                checkpoint()
+                time.sleep(0.01)
+
+        operation = core.UpdatePreparationOperation("pack:demo")
+        with patch.object(core.PackTransaction, "create", side_effect=create):
+            worker = threading.Thread(target=operation.run)
+            worker.start()
+            self.assertTrue(started.wait(1))
+            operation.cancel()
+            self.assertTrue(operation.wait(1))
+            worker.join(1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(operation.cancelled)
+        self.assertIsNone(operation.transaction)
+
 
 class UpdateTransactionTest(TransactionTestCase):
+    def test_copy_checkpoint_removes_partial_destination(self) -> None:
+        destination = self.root / "copy"
+        calls = 0
+
+        def checkpoint() -> None:
+            nonlocal calls
+            calls += 1
+            if calls >= 12:
+                raise RuntimeError("cancel copy")
+
+        with self.assertRaisesRegex(RuntimeError, "cancel copy"):
+            core.copy_transaction_source(
+                self.source,
+                destination,
+                checkpoint=checkpoint,
+            )
+
+        self.assertGreaterEqual(calls, 12)
+        self.assertFalse(destination.exists())
+
+    def test_tree_snapshot_checkpoint_interrupts_file_hashing(self) -> None:
+        (self.source / "large.bin").write_bytes(b"x" * (2 * 1024 * 1024))
+        calls = 0
+
+        def checkpoint() -> None:
+            nonlocal calls
+            calls += 1
+            if calls >= 8:
+                raise RuntimeError("cancel snapshot")
+
+        with self.assertRaisesRegex(RuntimeError, "cancel snapshot"):
+            core.tree_digest_snapshot(self.source, checkpoint=checkpoint)
+        self.assertGreaterEqual(calls, 8)
+
+    def test_transaction_creation_checkpoint_cleans_state_and_lock(self) -> None:
+        calls = 0
+
+        def checkpoint() -> None:
+            nonlocal calls
+            calls += 1
+            if calls >= 5:
+                raise RuntimeError("cancel transaction copy")
+
+        with self.assertRaisesRegex(RuntimeError, "cancel transaction copy"):
+            core.PackTransaction.create(self.key, checkpoint=checkpoint)
+
+        transaction_root = self.root / ".huroshiki" / "transactions"
+        self.assertEqual(list(transaction_root.iterdir()), [])
+        self.assertFalse(packctl.project_lock_is_active(self.key))
+
     def test_transaction_copy_preserves_read_only_root_mode(self) -> None:
         self.source.chmod(0o555)
         transaction = None
@@ -264,8 +346,12 @@ class UpdateTransactionTest(TransactionTestCase):
         target = self.write_mod("first")
         original_copy = core.copy_transaction_source
 
-        def racing_copy(source, destination):
-            result = original_copy(source, destination)
+        def racing_copy(source, destination, *, checkpoint=None):
+            result = original_copy(
+                source,
+                destination,
+                checkpoint=checkpoint,
+            )
             target.write_text(metadata("First", "first", "external"), encoding="utf-8")
             return result
 
@@ -667,6 +753,23 @@ url = "https://example.invalid/manual.jar"
         self.assertEqual(progress[-1].phase, "cancelled")
         with packctl.ProjectLock(self.key, "verify cancellation cleanup"):
             pass
+
+    def test_update_preparation_cancel_interrupts_normalization_copy(self) -> None:
+        self.write_mod("first")
+        cancel = threading.Event()
+        transaction = core.PackTransaction.create(self.key)
+
+        def cancel_copy(*_, checkpoint, **__):
+            cancel.set()
+            checkpoint()
+
+        with patch.object(core, "copy_transaction_source", side_effect=cancel_copy):
+            with self.assertRaises(core.UpdatePreparationCancelled):
+                transaction.prepare_updates(cancel_event=cancel)
+
+        self.assertFalse((transaction.root / "update-resolvers").exists())
+        transaction.discard()
+        self.assertFalse(packctl.project_lock_is_active(self.key))
 
     def test_update_operation_and_resolver_deadlines_are_distinct(self) -> None:
         self.write_mod("first")

@@ -2549,8 +2549,7 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
             "Use", "MOD", "Provider", "Current", "New", "Files", "Status"
         )
         try:
-            transaction = core.PackTransaction.create(self.project_key)
-            self.operation = core.UpdatePreparationOperation(transaction)
+            self.operation = core.UpdatePreparationOperation(self.project_key)
             self.query_one("#update-message", Static).update("Preparing updates...")
             self.operation_thread = threading.Thread(
                 target=self.operation.run,

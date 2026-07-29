@@ -22,7 +22,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 import unicodedata
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
@@ -2689,8 +2689,13 @@ def validate_packwiz_versions(source: Path, errors: list[str]) -> None:
             )
 
 
-def pack_source_entry_issues(source: Path) -> list[tuple[Path, str]]:
+def pack_source_entry_issues(
+    source: Path,
+    checkpoint: Callable[[], None] | None = None,
+) -> list[tuple[Path, str]]:
     """Inspect a Packwiz source without following any filesystem links."""
+    if checkpoint is not None:
+        checkpoint()
     try:
         root_metadata = os.stat(source, follow_symlinks=False)
     except FileNotFoundError:
@@ -2720,7 +2725,11 @@ def pack_source_entry_issues(source: Path) -> list[tuple[Path, str]]:
             root_metadata.st_ino,
         ):
             return [(Path("."), "source was replaced while being opened")]
-        issues = pack_source_fd_entry_issues(root_fd)
+        issues = (
+            pack_source_fd_entry_issues(root_fd, checkpoint)
+            if checkpoint is not None
+            else pack_source_fd_entry_issues(root_fd)
+        )
         try:
             current = os.stat(source, follow_symlinks=False)
         except OSError as error:
@@ -2736,20 +2745,32 @@ def pack_source_entry_issues(source: Path) -> list[tuple[Path, str]]:
         os.close(root_fd)
 
 
-def pack_source_fd_entry_issues(root_fd: int) -> list[tuple[Path, str]]:
+def pack_source_fd_entry_issues(
+    root_fd: int,
+    checkpoint: Callable[[], None] | None = None,
+) -> list[tuple[Path, str]]:
     """Inspect an already pinned Packwiz source directory."""
     issues: list[tuple[Path, str]] = []
     if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
         return [(Path("."), "source must be an ordinary directory")]
 
     def scan(directory_fd: int, relative: Path) -> None:
+        if checkpoint is not None:
+            checkpoint()
         try:
             with os.scandir(directory_fd) as iterator:
-                names = sorted(entry.name for entry in iterator)
+                names = []
+                for entry in iterator:
+                    if checkpoint is not None:
+                        checkpoint()
+                    names.append(entry.name)
+                names.sort()
         except OSError as error:
             issues.append((relative, f"could not inspect safely: {error}"))
             return
         for name in names:
+            if checkpoint is not None:
+                checkpoint()
             item_relative = relative / name
             try:
                 metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
