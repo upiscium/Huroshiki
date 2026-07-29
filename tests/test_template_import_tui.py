@@ -365,6 +365,58 @@ class TemplateImportTuiTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.15)
                 self.assertEqual(app.opened_projects, ["pack:demo"])
 
+    async def test_planning_failure_stays_on_selection_without_navigation(self) -> None:
+        with (
+            patch.object(core, "project_info", return_value=PACK),
+            patch.object(core, "compatible_templates", return_value=[template_project("base")]),
+            patch.object(
+                core.TemplateImportSession,
+                "create",
+                side_effect=core.HuroshikiError("planning failed"),
+            ),
+        ):
+            app = _ScreenApp(huroshiki.TemplateImportSelectionScreen("pack:demo"))
+            async with app.run_test() as pilot:
+                await pilot.press("space", "enter")
+                await pilot.pause(0.15)
+                self.assertIsInstance(app.screen, huroshiki.TemplateImportSelectionScreen)
+                self.assertIsNone(app.screen.worker_thread)
+                self.assertEqual(app.opened_projects, [])
+                self.assertIn(
+                    "planning failed",
+                    str(app.screen.query_one("#template-import-status", Static).content),
+                )
+
+    async def test_no_conflict_plan_still_calls_core_resolver_with_empty_mappings(self) -> None:
+        session = FakeSession()
+        resolved = resolve_template_import_plan(session.plan)
+        operation = FakeImportOperation(session, preview=None)
+        with (
+            patch.object(core, "project_info", return_value=PACK),
+            patch.object(
+                core,
+                "resolve_template_import_plan",
+                return_value=resolved,
+            ) as resolve,
+            patch.object(core, "TemplateImportOperation", return_value=operation),
+        ):
+            app = _ScreenApp(
+                huroshiki.TemplateImportConflictScreen("pack:demo", session)
+            )
+            async with app.run_test() as pilot:
+                self.assertEqual(app.screen.rows, [])
+                await pilot.press("enter")
+                await pilot.pause(0.15)
+                self.assertIsInstance(app.screen, huroshiki.TemplateImportExecutionScreen)
+                resolve.assert_called_once_with(
+                    session.plan,
+                    name_resolutions={},
+                    url_selector_resolutions={},
+                    logical_identity_resolutions={},
+                    actual_identity_resolutions={},
+                    side_decisions={},
+                )
+
     async def test_conflicts_use_option_keys_acknowledge_multiple_and_keep_errors(self) -> None:
         first = template_candidate(
             "base",

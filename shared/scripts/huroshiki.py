@@ -2656,7 +2656,9 @@ class TemplateImportExecutionScreen(BaseScreen):
         self.resolved = resolved
         project = core.project_info(project_key)
         self.screen_title = f"{project.display_name} / Template import preview"
-        self.operation = core.TemplateImportOperation(session, resolved)
+        self.operation: core.TemplateImportOperation | None = core.TemplateImportOperation(
+            session, resolved
+        )
         self.worker_thread: threading.Thread | None = None
         self.worker_timer: Timer | None = None
         self.leave_after_cancel = False
@@ -2670,6 +2672,8 @@ class TemplateImportExecutionScreen(BaseScreen):
         yield from self.compose_footer()
 
     def on_mount(self) -> None:
+        if self.operation is None:
+            return
         self.worker_thread = threading.Thread(
             target=self.operation.run,
             name=f"huroshiki-template-import-run-{self.project_key}",
@@ -2680,22 +2684,27 @@ class TemplateImportExecutionScreen(BaseScreen):
             self.worker_timer = self.set_interval(0.05, self._poll_operation)
         except Exception as error:
             self.operation.cancel()
+            self.ownership_finished = True
             self.worker_thread = None
             self.query_one("#template-import-execution-status", Static).update(str(error))
             self.app.notify(str(error), severity="error")
 
     def _poll_operation(self) -> None:
-        progress = self.operation.drain_progress()
+        operation = self.operation
+        if operation is None:
+            return
+        progress = operation.drain_progress()
         if progress:
             self.query_one("#template-import-execution-status", Static).update(progress[-1])
-        if not self.operation.done.is_set():
+        if not operation.done.is_set():
             return
         if self.worker_timer is not None:
             self.worker_timer.stop()
             self.worker_timer = None
         self.worker_thread = None
-        if self.operation.error is not None:
-            message = str(self.operation.error)
+        if operation.error is not None:
+            self.ownership_finished = True
+            message = str(operation.error)
             self.query_one("#template-import-execution-status", Static).update(message)
             self.app.notify(message, severity="error")
             if self.leave_after_cancel:
@@ -2703,7 +2712,8 @@ class TemplateImportExecutionScreen(BaseScreen):
                 self.operation = None
                 self.app.open_project(self.project_key)
             return
-        if self.operation.cancelled:
+        if operation.cancelled:
+            self.ownership_finished = True
             self.query_one("#template-import-execution-status", Static).update(
                 "Template import cancelled"
             )
@@ -2712,14 +2722,14 @@ class TemplateImportExecutionScreen(BaseScreen):
                 self.operation = None
                 self.app.open_project(self.project_key)
             return
-        if self.operation.preview is None:
-            self.operation.discard()
+        if operation.preview is None:
+            operation.discard()
             self.ownership_finished = True
             self.query_one("#template-import-execution-status", Static).update(
                 "Template import produced no preview"
             )
             return
-        self.preview_lines = self._build_preview_lines(self.operation.preview)
+        self.preview_lines = self._build_preview_lines(operation.preview)
         self.query_one("#template-import-preview", Static).update(
             "\n".join(self.preview_lines)
         )
@@ -2793,10 +2803,14 @@ class TemplateImportExecutionScreen(BaseScreen):
         return lines
 
     def request_apply(self) -> None:
-        if self.worker_thread is not None or not self.operation.done.is_set():
+        operation = self.operation
+        if operation is None:
+            self.app.notify("There is no applicable Template import preview", severity="warning")
+            return
+        if self.worker_thread is not None or not operation.done.is_set():
             self.app.notify("Template import execution is still running", severity="warning")
             return
-        if self.operation.preview is None or self.operation.error is not None:
+        if operation.preview is None or operation.error is not None:
             self.app.notify("There is no applicable Template import preview", severity="warning")
             return
         self.app.push_screen(
@@ -2809,6 +2823,8 @@ class TemplateImportExecutionScreen(BaseScreen):
             self.discard_and_leave()
             return
         try:
+            if self.operation is None:
+                raise core.HuroshikiError("Template import operation is unavailable")
             with self.app.suspend():
                 self.operation.apply()
             self.ownership_finished = True
@@ -2816,18 +2832,25 @@ class TemplateImportExecutionScreen(BaseScreen):
             self.app.notify("Template import applied atomically")
             self.app.open_project(self.project_key)
         except Exception as error:
+            self.ownership_finished = True
             self.app.notify(str(error), severity="error")
             self.query_one("#template-import-execution-status", Static).update(str(error))
 
     def discard_and_leave(self) -> None:
-        if self.worker_thread is not None and not self.operation.done.is_set():
+        operation = self.operation
+        if operation is None or self.ownership_finished:
+            self.operation = None
+            if not self.app.open_project(self.project_key):
+                self.app.go_main()
+            return
+        if self.worker_thread is not None and not operation.done.is_set():
             self.leave_after_cancel = True
-            self.operation.cancel()
+            operation.cancel()
             self.query_one("#template-import-execution-status", Static).update(
                 "Cancelling execution and cleaning up..."
             )
             return
-        self.operation.discard()
+        operation.discard()
         self.ownership_finished = True
         self.operation = None
         if not self.app.open_project(self.project_key):
@@ -2845,7 +2868,11 @@ class TemplateImportExecutionScreen(BaseScreen):
             self.operation.discard()
 
     def on_key(self, event: events.Key) -> None:
-        if self.worker_thread is not None and not self.operation.done.is_set():
+        if (
+            self.worker_thread is not None
+            and self.operation is not None
+            and not self.operation.done.is_set()
+        ):
             if event.key == "escape":
                 self.discard_and_leave()
             else:
