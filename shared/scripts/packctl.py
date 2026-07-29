@@ -2832,6 +2832,122 @@ def cmd_loader_version(args: argparse.Namespace) -> int:
             operation.discard()
 
 
+def _template_import_resolution(path: Path, plan: Any) -> Any:
+    from template_import import resolve_template_import_plan
+    from template_merge import ConflictResolution, TemplateMergeError
+
+    data = load_yaml(path)
+    if data.get("version") != 1:
+        raise ConfigError("Template import resolution version must be 1")
+    if data.get("plan_digest") != plan.plan_digest:
+        raise ConfigError("Template import resolution has a stale plan digest")
+    raw_names = data.get("name_conflicts", {})
+    raw_sides = data.get("side_conflicts", {})
+    if not isinstance(raw_names, dict) or not isinstance(raw_sides, dict):
+        raise ConfigError("Template import resolution conflicts must be mappings")
+    names = {}
+    for key, value in raw_names.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            raise ConfigError("Invalid template import name conflict resolution")
+        candidates = value.get("candidates")
+        if not isinstance(candidates, list) or not all(
+            isinstance(item, str) for item in candidates
+        ):
+            raise ConfigError("Template import conflict candidates must be strings")
+        names[key] = ConflictResolution(
+            tuple(candidates),
+            value.get("acknowledge_duplicate_risk") is True,
+        )
+    sides = {}
+    for key, decision in raw_sides.items():
+        if not isinstance(key, str) or ":" not in key or not isinstance(decision, str):
+            raise ConfigError("Invalid template import side conflict resolution")
+        sides[tuple(key.split(":", 1))] = decision
+    try:
+        return resolve_template_import_plan(
+            plan,
+            name_resolutions=names,
+            side_decisions=sides,
+        )
+    except TemplateMergeError as error:
+        raise ConfigError(str(error)) from error
+
+
+def cmd_apply_template(args: argparse.Namespace) -> int:
+    import huroshiki_core
+    from template_import import resolve_template_import_plan
+    from template_merge import TemplateMergeError
+
+    plan = huroshiki_core.prepare_template_import_plan(
+        huroshiki_core.project_key("pack", args.pack),
+        args.templates,
+    )
+    if args.resolution is None:
+        if plan.name_conflicts:
+            print("Template import conflicts require a resolution file:", file=sys.stderr)
+            for conflict in plan.name_conflicts:
+                print(f"  {conflict.key}", file=sys.stderr)
+            return 2
+        try:
+            resolved = resolve_template_import_plan(plan)
+        except TemplateMergeError as error:
+            raise ConfigError(str(error)) from error
+    else:
+        resolved = _template_import_resolution(Path(args.resolution), plan)
+    operation = huroshiki_core.TemplateImportOperation(plan, resolved)
+    try:
+        operation.run()
+        if operation.error is not None:
+            raise operation.error
+        if operation.cancelled or operation.preview is None:
+            raise ConfigError("Template import was cancelled")
+        preview = operation.preview
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "plan_digest": plan.plan_digest,
+                        "added_roots": [item.candidate_key for item in preview.added_roots],
+                        "added_dependencies": [
+                            f"{item.provider}:{item.project_id}"
+                            for item in preview.added_dependencies
+                        ],
+                        "side_changes": preview.side_changes,
+                        "removed": [item.candidate_key for item in preview.removed],
+                        "changed_files": [
+                            str(item.relative_path) for item in preview.changes
+                        ],
+                        "warnings": preview.warnings,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            print(f"Template import plan: {plan.plan_digest}")
+            print("Added roots:")
+            for item in preview.added_roots:
+                print(f"  {item.name} ({item.candidate_key})")
+            print("Added dependencies:")
+            for item in preview.added_dependencies:
+                print(f"  {item.name} ({item.provider}:{item.project_id})")
+            print("Changed files:")
+            for item in preview.changes:
+                print(f"  {item.relative_path}")
+        if args.apply:
+            operation.apply()
+            if not args.json:
+                print("Template import applied.")
+        else:
+            operation.discard()
+            if not args.json:
+                print("Dry run only; no files were changed.")
+        return 0
+    except huroshiki_core.HuroshikiError as error:
+        raise ConfigError(str(error)) from error
+    finally:
+        operation.discard()
+
+
 def cmd_side(args: argparse.Namespace) -> int:
     with ProjectLock(f"pack:{args.pack}", "side"):
         side = normalize_side(args.side)
@@ -4346,6 +4462,13 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("version")
     item.add_argument("--apply", action="store_true")
     item.set_defaults(func=cmd_loader_version)
+    item = sub.add_parser("apply-template")
+    item.add_argument("pack")
+    item.add_argument("templates", nargs="+")
+    item.add_argument("--resolution")
+    item.add_argument("--apply", action="store_true")
+    item.add_argument("--json", action="store_true")
+    item.set_defaults(func=cmd_apply_template)
     item = sub.add_parser("side")
     item.add_argument("pack")
     item.add_argument("metadata_file")

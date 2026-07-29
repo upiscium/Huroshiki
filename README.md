@@ -265,6 +265,13 @@ migration or refresh failures and concurrent pack changes leave the real source 
 The same flow is available under `Settings` then `Versions`; preparation runs in a background
 worker, displays progress and changed files, and completes cancellation cleanup before navigation.
 
+`packctl apply-template <pack> <template> [<template> ...]` prepares a one-shot import into an
+existing pack. The default is a dry run; `--apply` publishes the staged closure. Name conflicts
+require a versioned `--resolution` YAML file containing the displayed plan digest, while identity
+side conflicts default to keeping the installed pack side. Template order is significant, Packwiz
+dependencies are shown separately, and no persistent template association or content overlay is
+created.
+
 The settings commands pin the managed collection and project directory, snapshot both committed and
 local configuration, validate the prospective merged project entirely in memory, and publish through
 Linux `renameat2` compare-and-swap. The directory identities are rechecked before and after
