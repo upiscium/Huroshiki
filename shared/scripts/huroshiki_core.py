@@ -53,6 +53,17 @@ from template_merge import (
     resolve_composition,
     union_side,
 )
+from template_import import (
+    CandidateNameConflict,
+    ModCandidate,
+    ResolvedTemplateImportPlan,
+    SideDecision,
+    TemplateCompatibility,
+    TemplateImportPlan,
+    build_template_import_plan,
+    resolve_template_import_plan,
+    template_candidate,
+)
 from packwiz_parser import ParserEvent
 from packwiz_pty import PackwizPtySession, PtyResult
 from url_artifacts import (
@@ -4149,6 +4160,10 @@ def list_mods(project_key_value: str) -> list[ModInfo]:
             )
         ]
     source = project_source(project_key_value)
+    return list_mods_from_source(source)
+
+
+def list_mods_from_source(source: Path) -> list[ModInfo]:
     return [
         read_mod(source, path.relative_to(source))
         for path in sorted(source.rglob("*.pw.toml"))
@@ -5415,6 +5430,278 @@ def _merge_resolved_template_roots(
         )
 
     return tuple(merged.values()), tuple(retained), tuple(failures)
+
+
+@dataclass(frozen=True)
+class TemplateImportPreview:
+    added_roots: tuple[ModCandidate, ...]
+    added_dependencies: tuple[ModInfo, ...]
+    side_changes: tuple[tuple[tuple[str, str], str, str], ...]
+    removed: tuple[ModCandidate, ...]
+    unchanged: tuple[ModCandidate, ...]
+    changes: tuple[UpdateChange, ...]
+    warnings: tuple[str, ...]
+
+
+def prepare_template_import_plan(
+    pack_key: str,
+    template_ids: Sequence[str],
+) -> TemplateImportPlan:
+    kind, _ = split_project_key(pack_key)
+    if kind != "pack":
+        raise HuroshikiError("Templates can be imported only into packs")
+    minecraft, loader, _ = packctl.project_versions(project_source(pack_key))
+    pack_candidates = tuple(
+        ModCandidate(
+            "pack",
+            split_project_key(pack_key)[1],
+            mod.name,
+            canonical_provider(mod.provider),
+            mod.project_id,
+            mod.side,
+            mod.relative_path,
+            mod.filename,
+            mod.source_url or None,
+        )
+        for mod in list_mods(pack_key)
+    )
+    compatibilities: dict[str, TemplateCompatibility] = {}
+    candidates: list[ModCandidate] = []
+    for template_id in template_ids:
+        template_minecraft, template_loader, _ = packctl.template_versions(template_id)
+        compatibilities[template_id] = TemplateCompatibility(
+            template_id,
+            template_minecraft,
+            template_loader,
+        )
+        for entry in packctl.template_mods(template_id):
+            candidates.append(
+                template_candidate(
+                    template_id,
+                    name=entry["name"],
+                    provider=canonical_provider(entry["provider"]),
+                    project_id=entry["project_id"],
+                    side=entry["side"],
+                    url=entry.get("url"),
+                )
+            )
+    try:
+        return build_template_import_plan(
+            pack_key=pack_key,
+            pack_minecraft=minecraft,
+            pack_loader=loader,
+            template_ids=template_ids,
+            compatibilities=compatibilities,
+            pack_candidates=pack_candidates,
+            template_candidates=candidates,
+        )
+    except TemplateMergeError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+class TemplateImportOperation:
+    def __init__(
+        self,
+        plan: TemplateImportPlan,
+        resolved: ResolvedTemplateImportPlan,
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        if resolved.plan_digest != plan.plan_digest:
+            raise HuroshikiError("Template import resolution has a stale plan digest")
+        self.plan = plan
+        self.resolved = resolved
+        self.deadline = deadline or time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS
+        self.cancel_event = threading.Event()
+        self.done = threading.Event()
+        self.progress_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
+        self.transaction: PackTransaction | None = None
+        self.preview: TemplateImportPreview | None = None
+        self.error: BaseException | None = None
+        self.cancelled = False
+        self._finished = False
+        self._started = False
+        self._lock = threading.Lock()
+        self.template_baselines = {
+            template_id: template_config_snapshot(packctl.get_template_root(template_id))
+            for template_id in plan.template_ids
+        }
+
+    def _checkpoint(self) -> None:
+        if self.cancel_event.is_set():
+            raise LoaderMigrationCancelled("Template import was cancelled")
+        if time.monotonic() >= self.deadline:
+            raise LoaderMigrationDeadlineExceeded("Template import deadline exceeded")
+
+    def _templates_unchanged(self) -> bool:
+        return all(
+            template_config_snapshot(packctl.get_template_root(template_id)) == baseline
+            for template_id, baseline in self.template_baselines.items()
+        )
+
+    def run(self) -> None:
+        with self._lock:
+            if self._started or self.done.is_set():
+                return
+            self._started = True
+        try:
+            current = prepare_template_import_plan(self.plan.pack_key, self.plan.template_ids)
+            if current.plan_digest != self.plan.plan_digest:
+                raise HuroshikiError("Template import plan changed before execution")
+            self.progress_queue.put("Creating transaction")
+            self.transaction = PackTransaction.create(
+                self.plan.pack_key,
+                checkpoint=self._checkpoint,
+            )
+            before_files = _file_content_snapshot(self.transaction.source, self._checkpoint)
+            before_identities = {
+                (canonical_provider(mod.provider), mod.project_id)
+                for mod in list_mods_from_source(self.transaction.source)
+            }
+            minecraft, loader, loader_version = packctl.project_versions(
+                self.transaction.source
+            )
+            for index, candidate in enumerate(self.resolved.selected_new_roots, 1):
+                self._checkpoint()
+                self.progress_queue.put(
+                    f"Resolving {index}/{len(self.resolved.selected_new_roots)}: {candidate.name}"
+                )
+                closure = resolve_mod_closure(
+                    provider=candidate.provider,
+                    selector=candidate.url or candidate.project_id,
+                    minecraft=minecraft,
+                    loader=loader,
+                    loader_version=loader_version,
+                    canonical_project_id=(
+                        candidate.project_id if candidate.provider != "url" else None
+                    ),
+                    cancel_event=self.cancel_event,
+                    deadline=min(
+                        self.deadline,
+                        time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+                    ),
+                )
+                merge_metadata_closure(
+                    self.transaction.source,
+                    closure,
+                    requested_side=candidate.side,
+                )
+            for candidate in self.resolved.removed_pack_candidates:
+                if candidate.metadata_path is not None:
+                    safe_child(self.transaction.source, candidate.metadata_path).unlink()
+            for identity, _old, new_side in self.resolved.side_changes:
+                matching = next(
+                    (
+                        mod
+                        for mod in list_mods_from_source(self.transaction.source)
+                        if (canonical_provider(mod.provider), mod.project_id) == identity
+                    ),
+                    None,
+                )
+                if matching is None:
+                    raise HuroshikiError(
+                        f"Side change identity disappeared: {identity[0]}:{identity[1]}"
+                    )
+                client, server = flags_from_side(new_side)
+                self.transaction.set_side(matching.relative_path, client, server)
+            refresh = run_resolver_process(
+                ["packwiz", "refresh"],
+                cwd=self.transaction.source,
+                cancel_event=self.cancel_event,
+                deadline=min(
+                    self.deadline,
+                    time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+                ),
+            )
+            if (
+                refresh.returncode != 0
+                or refresh.cancelled
+                or refresh.timed_out
+                or refresh.orphaned_descendants
+                or refresh.termination_incomplete
+            ):
+                raise HuroshikiError("Template import Packwiz refresh failed")
+            ensure_safe_pack_source(self.transaction.source, checkpoint=self._checkpoint)
+            if not self._templates_unchanged():
+                raise HuroshikiError("Template manifest changed during import")
+            after_mods = list_mods_from_source(self.transaction.source)
+            added = tuple(
+                mod
+                for mod in after_mods
+                if (canonical_provider(mod.provider), mod.project_id)
+                not in before_identities
+                and (canonical_provider(mod.provider), mod.project_id)
+                not in {item.identity for item in self.resolved.selected_new_roots}
+            )
+            self.preview = TemplateImportPreview(
+                self.resolved.selected_new_roots,
+                added,
+                self.resolved.side_changes,
+                self.resolved.removed_pack_candidates,
+                self.plan.existing_identities,
+                _content_changes(
+                    before_files,
+                    _file_content_snapshot(self.transaction.source, self._checkpoint),
+                ),
+                self.resolved.warnings,
+            )
+            self.progress_queue.put("Preview ready")
+        except LoaderMigrationCancelled:
+            self.cancelled = True
+        except BaseException as error:
+            self.error = error
+        finally:
+            if self.cancelled or self.error is not None or self.cancel_event.is_set():
+                try:
+                    self.discard()
+                except BaseException as error:
+                    if self.error is None:
+                        self.error = error
+            self.done.set()
+
+    def apply(self) -> None:
+        with self._lock:
+            if (
+                not self.done.is_set()
+                or self.cancelled
+                or self.error is not None
+                or self._finished
+                or self.transaction is None
+                or self.preview is None
+            ):
+                raise HuroshikiError("Template import has no applicable preview")
+            self._finished = True
+        if not self._templates_unchanged():
+            self.transaction.discard()
+            raise HuroshikiError("Template manifest changed after preview")
+        try:
+            self.transaction.apply(refresh=False)
+        except BaseException:
+            self.transaction.discard()
+            raise
+
+    def discard(self) -> None:
+        with self._lock:
+            if self._finished:
+                return
+            self._finished = True
+        if self.transaction is not None:
+            self.transaction.discard()
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self.cancel_event.set()
+        if not self._started or self.done.is_set():
+            self.discard()
+            self.done.set()
+
+    def drain_progress(self) -> tuple[str, ...]:
+        values: list[str] = []
+        while True:
+            try:
+                values.append(self.progress_queue.get_nowait())
+            except queue.Empty:
+                return tuple(values)
 
 
 def prepare_template_composition(
