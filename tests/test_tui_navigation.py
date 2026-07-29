@@ -55,6 +55,30 @@ class _Operation:
         self.done.set()
 
 
+class _ResolvedOperation(_Operation):
+    def run(self) -> core.AddOperationResult:
+        self.done.set()
+        return core.AddOperationResult(
+            0,
+            (Path("mods/root.pw.toml"),),
+            Path("raw.log"),
+            Path("output.log"),
+            Path("events.log"),
+            "staged",
+        )
+
+
+class _InstallTransaction(_Transaction):
+    source = Path("/fake/source")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.resolved_calls: list[dict[str, object]] = []
+
+    def begin_resolved_add(self, **kwargs):
+        self.resolved_calls.append(kwargs)
+        return _ResolvedOperation()
+
 class _UpdateTransaction:
     def prepare_updates(self) -> list[core.UpdateCandidate]:
         return []
@@ -289,6 +313,88 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                     transaction.changes,
                     ["rollback", "post-navigation edit"],
                 )
+
+    async def test_install_search_shows_canonical_ids_and_resolves_selection(self) -> None:
+        projects = (
+            core.ProviderProject(
+                "modrinth", "canonical-one", "sodium-extra", "Sodium Extra", "First", "A"
+            ),
+            core.ProviderProject(
+                "modrinth", "canonical-two", "other", "Sodium Extra", "Second", "B"
+            ),
+        )
+        transaction = _InstallTransaction()
+        with self.patches(), patch.object(
+            huroshiki.core.packctl,
+            "project_versions",
+            return_value=("1.21.1", "neoforge", "21.1.0"),
+        ), patch.object(
+            huroshiki.core, "search_provider_projects", return_value=projects
+        ):
+            screen = huroshiki.InstallScreen("pack:demo")
+            app = _NavigationApp(screen)
+            app.transactions["pack:demo"] = transaction
+            async with app.run_test() as pilot:
+                search = screen.query_one("#mod-search", Input)
+                search.value = "Sodium Extra"
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+                self.assertEqual(screen.state, "showing_results")
+                self.assertEqual(
+                    [item.project_id for item in screen.search_results],
+                    ["canonical-one", "canonical-two"],
+                )
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+
+        self.assertEqual(len(transaction.resolved_calls), 1)
+        self.assertEqual(
+            transaction.resolved_calls[0]["canonical_project_id"], "canonical-one"
+        )
+
+    async def test_install_search_cancel_waits_before_navigation(self) -> None:
+        transaction = _InstallTransaction()
+        started = threading.Event()
+
+        def search(*_, cancel_event, **__):
+            started.set()
+            cancel_event.wait(2)
+            raise core.HuroshikiError("Provider lookup was cancelled")
+
+        with self.patches(), patch.object(
+            huroshiki.core.packctl,
+            "project_versions",
+            return_value=("1.21.1", "neoforge", "21.1.0"),
+        ), patch.object(huroshiki.core, "search_provider_projects", side_effect=search):
+            screen = huroshiki.InstallScreen("pack:demo")
+            app = _NavigationApp(screen)
+            app.transactions["pack:demo"] = transaction
+            async with app.run_test() as pilot:
+                field = screen.query_one("#mod-search", Input)
+                field.value = "Sodium Extra"
+                await pilot.press("enter")
+                await pilot.pause(0.05)
+                self.assertTrue(started.is_set())
+                await pilot.press("escape")
+                await pilot.pause(0.2)
+                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+
+    async def test_curseforge_name_search_is_rejected_before_worker(self) -> None:
+        transaction = _InstallTransaction()
+        with self.patches(), patch.object(
+            huroshiki.core, "search_provider_projects"
+        ) as search:
+            screen = huroshiki.InstallScreen("pack:demo")
+            screen.provider = "curseforge"
+            app = _NavigationApp(screen)
+            app.transactions["pack:demo"] = transaction
+            async with app.run_test() as pilot:
+                field = screen.query_one("#mod-search", Input)
+                field.value = "Create"
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertIn("numeric CurseForge", str(screen.query_one("#packwiz-status").render()))
+        search.assert_not_called()
 
 
 if __name__ == "__main__":

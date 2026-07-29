@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import threading
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -9,7 +8,6 @@ from textual.app import App
 from textual.widgets import DataTable, Input
 
 import huroshiki
-from packwiz_parser import MenuItem
 
 
 class _InstallTestApp(App[None]):
@@ -21,20 +19,6 @@ class _InstallTestApp(App[None]):
 
     def on_mount(self) -> None:
         self.push_screen(huroshiki.InstallScreen("pack:demo"))
-
-
-class _FakeOperation:
-    def __init__(self) -> None:
-        self.done = threading.Event()
-        self.cancel_menu_called = False
-        self.cancel_called = False
-
-    def cancel_menu(self) -> None:
-        self.cancel_menu_called = True
-
-    def cancel(self) -> None:
-        self.cancel_called = True
-        self.done.set()
 
 
 class InstallControlsTest(unittest.IsolatedAsyncioTestCase):
@@ -64,7 +48,7 @@ class InstallControlsTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertEqual(screen.provider, "modrinth")
 
-    async def test_q_discards_visible_search_results_and_cancels_menu(self) -> None:
+    async def test_q_discards_visible_provider_search_results(self) -> None:
         with patch.object(
             huroshiki.core,
             "project_config",
@@ -73,10 +57,10 @@ class InstallControlsTest(unittest.IsolatedAsyncioTestCase):
             app = _InstallTestApp()
             async with app.run_test() as pilot:
                 screen = app.screen
-                operation = _FakeOperation()
-                screen.operation = operation
                 screen.search_results = [
-                    MenuItem(index=1, label="Example MOD", is_default=True)
+                    huroshiki.core.InstallSearchResult(
+                        "modrinth", "canonical", "Example MOD", "Details"
+                    )
                 ]
                 screen.refresh_search_results()
                 results = screen.query_one("#search-results-table", DataTable)
@@ -87,7 +71,6 @@ class InstallControlsTest(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(screen.search_results, [])
                 self.assertEqual(results.row_count, 0)
-                self.assertTrue(operation.cancel_menu_called)
 
 
 if __name__ == "__main__":
