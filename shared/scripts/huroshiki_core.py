@@ -5485,6 +5485,26 @@ class TemplateImportPreview:
     warnings: tuple[str, ...]
 
 
+def _resolved_unchanged_pack_candidates(
+    plan: TemplateImportPlan,
+    resolved: ResolvedTemplateImportPlan,
+) -> tuple[ModCandidate, ...]:
+    relevant_identities = {
+        candidate.actual_identity
+        for candidate in plan.existing_identities
+        if candidate.actual_identity is not None
+    }
+    side_changed_identities = {
+        identity for identity, _old, _new in resolved.side_changes
+    }
+    return tuple(
+        candidate
+        for candidate in resolved.retained_pack_candidates
+        if candidate.actual_identity in relevant_identities
+        and candidate.actual_identity not in side_changed_identities
+    )
+
+
 def pack_import_candidates(source: Path, pack_id: str) -> tuple[ModCandidate, ...]:
     return tuple(
         ModCandidate(
@@ -5913,6 +5933,74 @@ def _run_template_import_refresh(
         raise HuroshikiError("Template import Packwiz refresh failed")
 
 
+def _removed_identity_requirements(
+    resolved_roots: Sequence[tuple[ModCandidate, ResolvedModClosure]],
+    removed: Sequence[ModCandidate],
+) -> dict[tuple[str, str], tuple[ModCandidate, ...]]:
+    removed_identities = {
+        candidate.actual_identity
+        for candidate in removed
+        if candidate.actual_identity is not None
+    }
+    required_by: dict[tuple[str, str], list[ModCandidate]] = {}
+    for root, closure in resolved_roots:
+        closure_identities = {item.identity for item in closure.metadata}
+        for identity in removed_identities & closure_identities:
+            required_by.setdefault(identity, []).append(root)
+    return {identity: tuple(roots) for identity, roots in required_by.items()}
+
+
+def _assert_removed_identities_absent(
+    source: Path,
+    removed: Sequence[ModCandidate],
+) -> None:
+    removed_identities = {
+        candidate.actual_identity
+        for candidate in removed
+        if candidate.actual_identity is not None
+    }
+    present = {
+        (canonical_provider(mod.provider), mod.project_id)
+        for mod in list_mods_from_source(source)
+    }
+    reintroduced = removed_identities & present
+    if reintroduced:
+        details = ", ".join(
+            f"{provider}:{project_id}"
+            for provider, project_id in sorted(reintroduced)
+        )
+        raise HuroshikiError(
+            "Template import reintroduced Pack MODs removed by the resolution: "
+            + details
+        )
+
+
+def _apply_resolved_import_to_source(
+    source: Path,
+    *,
+    resolved_roots: Sequence[tuple[ModCandidate, ResolvedModClosure]],
+    removed: Sequence[ModCandidate],
+    side_changes: Sequence[tuple[tuple[str, str], str, str]],
+    checkpoint: Callable[[], None],
+    cancel_event: threading.Event,
+    deadline: float,
+) -> None:
+    checkpoint()
+    _remove_import_candidates(source, removed)
+    for candidate, closure in resolved_roots:
+        checkpoint()
+        merge_metadata_closure(source, closure, requested_side=candidate.side)
+    _assert_removed_identities_absent(source, removed)
+    _apply_import_side_changes(source, side_changes)
+    _run_template_import_refresh(
+        source,
+        cancel_event=cancel_event,
+        deadline=deadline,
+    )
+    _assert_removed_identities_absent(source, removed)
+    ensure_safe_pack_source(source, checkpoint=checkpoint)
+
+
 def _preflight_import_closures(
     transaction: PackTransaction,
     resolved_roots: Sequence[tuple[ModCandidate, ResolvedModClosure]],
@@ -5929,21 +6017,15 @@ def _preflight_import_closures(
             preflight_source,
             checkpoint=checkpoint,
         )
-        _remove_import_candidates(preflight_source, removed)
-        for candidate, closure in resolved_roots:
-            checkpoint()
-            merge_metadata_closure(
-                preflight_source,
-                closure,
-                requested_side=candidate.side,
-            )
-        _apply_import_side_changes(preflight_source, side_changes)
-        _run_template_import_refresh(
+        _apply_resolved_import_to_source(
             preflight_source,
+            resolved_roots=resolved_roots,
+            removed=removed,
+            side_changes=side_changes,
+            checkpoint=checkpoint,
             cancel_event=cancel_event,
             deadline=deadline,
         )
-        ensure_safe_pack_source(preflight_source, checkpoint=checkpoint)
     finally:
         shutil.rmtree(preflight_source, ignore_errors=True)
 
@@ -6057,6 +6139,20 @@ class TemplateImportOperation:
                         f"Resolved root identity changed for {candidate.candidate_key}"
                     )
                 resolved_roots.append((candidate, closure))
+            removed_requirements = _removed_identity_requirements(
+                resolved_roots,
+                self.resolved.removed_pack_candidates,
+            )
+            if removed_requirements:
+                details = "; ".join(
+                    f"{identity[0]}:{identity[1]} required by "
+                    + ", ".join(root.candidate_key for root in roots)
+                    for identity, roots in sorted(removed_requirements.items())
+                )
+                raise HuroshikiError(
+                    "Selected Template roots require Pack MODs that the resolution "
+                    f"removes: {details}"
+                )
             _preflight_import_closures(
                 self.transaction,
                 resolved_roots,
@@ -6066,26 +6162,15 @@ class TemplateImportOperation:
                 self.cancel_event,
                 self.deadline,
             )
-            _remove_import_candidates(
+            _apply_resolved_import_to_source(
                 self.transaction.source,
-                self.resolved.removed_pack_candidates,
-            )
-            for candidate, closure in resolved_roots:
-                merge_metadata_closure(
-                    self.transaction.source,
-                    closure,
-                    requested_side=candidate.side,
-                )
-            _apply_import_side_changes(
-                self.transaction.source,
-                self.resolved.side_changes,
-            )
-            _run_template_import_refresh(
-                self.transaction.source,
+                resolved_roots=resolved_roots,
+                removed=self.resolved.removed_pack_candidates,
+                side_changes=self.resolved.side_changes,
+                checkpoint=self._checkpoint,
                 cancel_event=self.cancel_event,
                 deadline=self.deadline,
             )
-            ensure_safe_pack_source(self.transaction.source, checkpoint=self._checkpoint)
             if not self.session.templates_unchanged():
                 raise HuroshikiError("Template manifest changed during import")
             after_mods = list_mods_from_source(self.transaction.source)
@@ -6126,12 +6211,37 @@ class TemplateImportOperation:
                 and (canonical_provider(mod.provider), mod.project_id)
                 not in selected_by_actual
             )
+            unchanged = _resolved_unchanged_pack_candidates(
+                self.plan,
+                self.resolved,
+            )
+            removed_keys = {
+                candidate.selection_key
+                for candidate in self.resolved.removed_pack_candidates
+            }
+            unchanged_keys = {candidate.selection_key for candidate in unchanged}
+            if removed_keys & unchanged_keys:
+                raise HuroshikiError(
+                    "Template import preview classifies a Pack candidate as both "
+                    "removed and unchanged"
+                )
+            side_changed_identities = {
+                identity for identity, _old, _new in self.resolved.side_changes
+            }
+            if any(
+                candidate.actual_identity in side_changed_identities
+                for candidate in unchanged
+            ):
+                raise HuroshikiError(
+                    "Template import preview classifies a side-modified candidate "
+                    "as unchanged"
+                )
             self.preview = TemplateImportPreview(
                 tuple(imported_roots),
                 added,
                 self.resolved.side_changes,
                 self.resolved.removed_pack_candidates,
-                self.plan.existing_identities,
+                unchanged,
                 _content_changes(
                     before_files,
                     _file_content_snapshot(self.transaction.source, self._checkpoint),
