@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import huroshiki_core as core
 
@@ -184,6 +184,52 @@ class ResolverProcessTest(unittest.TestCase):
         self.assertTrue(result.timed_out)
         self.assertFalse(result.cancelled)
         self.assertEqual(result.returncode, -signal.SIGTERM)
+
+    def test_incomplete_termination_is_reported_without_unbounded_wait(self) -> None:
+        cancel = threading.Event()
+        process = Mock(pid=12345, returncode=None)
+
+        def poll() -> None:
+            cancel.set()
+            return None
+
+        process.poll.side_effect = poll
+        cleanup = core.ResolverTerminationResult(
+            group_drained=False,
+            parent_reaped=False,
+            forced=True,
+        )
+        with patch.object(core.subprocess, "Popen", return_value=process), patch.object(
+            core, "stop_resolver_process_group", return_value=cleanup
+        ) as stop:
+            result = self.run_python("raise SystemExit(0)", cancel_event=cancel)
+
+        self.assertTrue(result.cancelled)
+        self.assertTrue(result.termination_incomplete)
+        self.assertIsNone(result.returncode)
+        stop.assert_called_once()
+        process.wait.assert_not_called()
+
+    def test_stop_process_group_reports_unreaped_live_parent(self) -> None:
+        parent = Mock()
+        parent.poll.return_value = None
+        parent.wait.side_effect = subprocess.TimeoutExpired("resolver", 0)
+        with patch.object(
+            core, "live_process_group_members", return_value=(12345,)
+        ), patch.object(core.os, "killpg") as killpg, patch.object(
+            core, "RESOLVER_TERMINATE_GRACE_SECONDS", 0.0
+        ), patch.object(core, "RESOLVER_KILL_GRACE_SECONDS", 0.0):
+            result = core.stop_resolver_process_group(
+                12345,
+                parent=parent,
+                cleanup_deadline=time.monotonic(),
+            )
+
+        self.assertFalse(result.group_drained)
+        self.assertFalse(result.parent_reaped)
+        self.assertTrue(result.forced)
+        self.assertEqual(killpg.call_count, 2)
+        parent.wait.assert_called_once()
 
     def test_keyboard_interrupt_stops_process_before_reraising(self) -> None:
         real_popen = subprocess.Popen

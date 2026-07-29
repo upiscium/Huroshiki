@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import signal
 import shlex
@@ -280,6 +281,101 @@ class UpdatePreparationCancelled(HuroshikiError):
     pass
 
 
+class UpdatePreparationOperation:
+    def __init__(
+        self,
+        transaction: "PackTransaction",
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        self.transaction = transaction
+        self.cancel_event = threading.Event()
+        self.done = threading.Event()
+        self.candidates: tuple[UpdateCandidate, ...] = ()
+        self.error: BaseException | None = None
+        self.cancelled = False
+        self.deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS
+        )
+        self._progress: queue.SimpleQueue[UpdateProgress] = queue.SimpleQueue()
+        self._discarded = False
+        self._claimed = False
+        self._started = False
+        self._state_lock = threading.Lock()
+
+    def run(self) -> None:
+        with self._state_lock:
+            if self.done.is_set():
+                return
+            self._started = True
+        try:
+            self.candidates = tuple(
+                self.transaction.prepare_updates(
+                    cancel_event=self.cancel_event,
+                    deadline=self.deadline,
+                    on_progress=self._progress.put,
+                )
+            )
+            if self.cancel_event.is_set():
+                self.cancelled = True
+        except UpdatePreparationCancelled:
+            self.cancelled = True
+        except BaseException as error:
+            self.error = error
+        finally:
+            with self._state_lock:
+                if self.cancelled or self.error is not None or self.cancel_event.is_set():
+                    self.cancelled = self.cancelled or self.cancel_event.is_set()
+                    self._discard_recording_error()
+                self.done.set()
+
+    def _discard_once(self) -> None:
+        if self._discarded:
+            return
+        self._discarded = True
+        self.transaction.discard()
+
+    def _discard_recording_error(self) -> None:
+        try:
+            self._discard_once()
+        except BaseException as error:
+            if self.error is None:
+                self.error = error
+
+    def cancel(self) -> None:
+        with self._state_lock:
+            self.cancelled = True
+            self.cancel_event.set()
+            if (not self._started or self.done.is_set()) and not self._claimed:
+                self._discard_recording_error()
+                self.done.set()
+
+    def claim_transaction(self) -> "PackTransaction":
+        with self._state_lock:
+            if (
+                not self.done.is_set()
+                or self.cancelled
+                or self.error is not None
+                or self._discarded
+            ):
+                raise HuroshikiError("Update preparation has no successful transaction")
+            self._claimed = True
+            return self.transaction
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self.done.wait(timeout)
+
+    def drain_progress(self) -> tuple[UpdateProgress, ...]:
+        values: list[UpdateProgress] = []
+        while True:
+            try:
+                values.append(self._progress.get_nowait())
+            except queue.Empty:
+                return tuple(values)
+
+
 @dataclass(frozen=True)
 class TemplateInfo:
     target: str
@@ -418,12 +514,20 @@ class InstallSearchResult:
 
 @dataclass(frozen=True)
 class ResolverProcessResult:
-    returncode: int
+    returncode: int | None
     stdout: str
     stderr: str
     cancelled: bool
     timed_out: bool
     orphaned_descendants: bool = False
+    termination_incomplete: bool = False
+
+
+@dataclass(frozen=True)
+class ResolverTerminationResult:
+    group_drained: bool
+    parent_reaped: bool
+    forced: bool
 
 
 @dataclass(frozen=True)
@@ -1655,6 +1759,8 @@ def _run_provider_lookup(
         raise HuroshikiError("Provider lookup was cancelled")
     if result.timed_out:
         raise HuroshikiError("Provider lookup deadline exceeded")
+    if result.termination_incomplete:
+        raise HuroshikiError("Provider lookup process termination was incomplete")
     if result.orphaned_descendants:
         raise HuroshikiError("Provider lookup left background processes after completion")
     if result.returncode != 0:
@@ -2862,7 +2968,11 @@ def _prepare_update_candidates(
         if normalization.cancelled:
             progress(UpdateProgress("cancelled", len(candidates), total))
             raise UpdatePreparationCancelled("Update preparation was cancelled")
-        if normalization.orphaned_descendants:
+        if normalization.termination_incomplete:
+            normalization_error = (
+                "disposable baseline normalization process termination was incomplete"
+            )
+        elif normalization.orphaned_descendants:
             normalization_error = (
                 "disposable baseline normalization left background processes "
                 "after completion"
@@ -2983,6 +3093,16 @@ def _prepare_update_candidates(
                     raise UpdatePreparationCancelled(
                         "Update preparation was cancelled"
                     )
+                if result.termination_incomplete:
+                    candidates.append(
+                        _candidate_error(
+                            relative_path,
+                            old_mod,
+                            old_data,
+                            "Packwiz resolver process termination was incomplete",
+                        )
+                    )
+                    continue
                 if result.orphaned_descendants:
                     candidates.append(
                         _candidate_error(
@@ -3912,6 +4032,8 @@ def concise_process_error(
 TEMPLATE_RESOLVER_TIMEOUT_SECONDS = 120
 RESOLVER_POLL_SECONDS = 0.05
 RESOLVER_TERMINATE_GRACE_SECONDS = 2.0
+RESOLVER_KILL_GRACE_SECONDS = 2.0
+RESOLVER_REAP_GRACE_SECONDS = 1.0
 
 
 def live_process_group_members(
@@ -3945,34 +4067,67 @@ def stop_resolver_process_group(
     process_group: int,
     *,
     parent: subprocess.Popen[bytes] | None = None,
-) -> None:
+    cleanup_deadline: float,
+) -> ResolverTerminationResult:
+    forced = False
     try:
         os.killpg(process_group, signal.SIGTERM)
     except ProcessLookupError:
         pass
-    grace_deadline = time.monotonic() + RESOLVER_TERMINATE_GRACE_SECONDS
+    grace_deadline = min(
+        cleanup_deadline,
+        time.monotonic() + RESOLVER_TERMINATE_GRACE_SECONDS,
+    )
     while (
         live_process_group_members(process_group)
         and time.monotonic() < grace_deadline
     ):
         if parent is not None:
             parent.poll()
-        time.sleep(RESOLVER_POLL_SECONDS)
+        time.sleep(
+            min(
+                RESOLVER_POLL_SECONDS,
+                max(0.0, grace_deadline - time.monotonic()),
+            )
+        )
     if live_process_group_members(process_group):
+        forced = True
         try:
             os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        kill_deadline = time.monotonic() + RESOLVER_TERMINATE_GRACE_SECONDS
+        kill_deadline = min(
+            cleanup_deadline,
+            time.monotonic() + RESOLVER_KILL_GRACE_SECONDS,
+        )
         while (
             live_process_group_members(process_group)
             and time.monotonic() < kill_deadline
         ):
             if parent is not None:
                 parent.poll()
-            time.sleep(RESOLVER_POLL_SECONDS)
+            time.sleep(
+                min(
+                    RESOLVER_POLL_SECONDS,
+                    max(0.0, kill_deadline - time.monotonic()),
+                )
+            )
+    group_drained = not live_process_group_members(process_group)
+    parent_reaped = parent is None
     if parent is not None:
-        parent.wait()
+        if parent.poll() is not None:
+            parent_reaped = True
+        else:
+            remaining = min(
+                RESOLVER_REAP_GRACE_SECONDS,
+                max(0.0, cleanup_deadline - time.monotonic()),
+            )
+            try:
+                parent.wait(timeout=remaining)
+                parent_reaped = True
+            except subprocess.TimeoutExpired:
+                parent_reaped = False
+    return ResolverTerminationResult(group_drained, parent_reaped, forced)
 
 
 def run_resolver_process(
@@ -3997,24 +4152,65 @@ def run_resolver_process(
         cancelled = False
         timed_out = False
         orphaned_descendants = False
+        termination_incomplete = False
         try:
             while process.poll() is None:
                 if cancel_event is not None and cancel_event.is_set():
                     cancelled = True
-                    stop_resolver_process_group(process.pid, parent=process)
+                    cleanup = stop_resolver_process_group(
+                        process.pid,
+                        parent=process,
+                        cleanup_deadline=(
+                            time.monotonic()
+                            + RESOLVER_TERMINATE_GRACE_SECONDS
+                            + RESOLVER_KILL_GRACE_SECONDS
+                            + RESOLVER_REAP_GRACE_SECONDS
+                        ),
+                    )
+                    termination_incomplete = not (
+                        cleanup.group_drained and cleanup.parent_reaped
+                    )
                     break
                 if deadline is not None and time.monotonic() >= deadline:
                     timed_out = True
-                    stop_resolver_process_group(process.pid, parent=process)
+                    cleanup = stop_resolver_process_group(
+                        process.pid,
+                        parent=process,
+                        cleanup_deadline=(
+                            time.monotonic()
+                            + RESOLVER_TERMINATE_GRACE_SECONDS
+                            + RESOLVER_KILL_GRACE_SECONDS
+                            + RESOLVER_REAP_GRACE_SECONDS
+                        ),
+                    )
+                    termination_incomplete = not (
+                        cleanup.group_drained and cleanup.parent_reaped
+                    )
                     break
                 time.sleep(RESOLVER_POLL_SECONDS)
         except KeyboardInterrupt:
-            stop_resolver_process_group(process.pid, parent=process)
+            stop_resolver_process_group(
+                process.pid,
+                parent=process,
+                cleanup_deadline=(
+                    time.monotonic()
+                    + RESOLVER_TERMINATE_GRACE_SECONDS
+                    + RESOLVER_KILL_GRACE_SECONDS
+                    + RESOLVER_REAP_GRACE_SECONDS
+                ),
+            )
             raise
-        process.wait()
         if not cancelled and not timed_out and live_process_group_members(process.pid):
             orphaned_descendants = True
-            stop_resolver_process_group(process.pid)
+            cleanup = stop_resolver_process_group(
+                process.pid,
+                cleanup_deadline=(
+                    time.monotonic()
+                    + RESOLVER_TERMINATE_GRACE_SECONDS
+                    + RESOLVER_KILL_GRACE_SECONDS
+                ),
+            )
+            termination_incomplete = not cleanup.group_drained
         stdout_file.seek(0)
         stderr_file.seek(0)
         stdout = stdout_file.read().decode("utf-8", errors="replace")
@@ -4026,6 +4222,7 @@ def run_resolver_process(
         cancelled,
         timed_out,
         orphaned_descendants,
+        termination_incomplete,
     )
 
 
@@ -4227,6 +4424,10 @@ def resolve_mod_closure(
             raise HuroshikiError("MOD resolution was cancelled")
         if process.timed_out:
             raise HuroshikiError("Packwiz resolver deadline exceeded")
+        if process.termination_incomplete:
+            raise HuroshikiError(
+                "Packwiz resolver process termination was incomplete"
+            )
         if process.orphaned_descendants:
             raise HuroshikiError(
                 "Packwiz resolver left background processes after completion"

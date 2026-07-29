@@ -114,6 +114,105 @@ class TransactionTestCase(unittest.TestCase):
         )
 
 
+class UpdatePreparationOperationTest(unittest.TestCase):
+    class Transaction:
+        def __init__(self, prepare=None) -> None:
+            self.prepare = prepare or (lambda **_: [])
+            self.prepare_calls = 0
+            self.discard_calls = 0
+
+        def prepare_updates(self, **kwargs):
+            self.prepare_calls += 1
+            return self.prepare(**kwargs)
+
+        def discard(self) -> None:
+            self.discard_calls += 1
+
+    def test_success_is_claimed_without_discard(self) -> None:
+        transaction = self.Transaction()
+        operation = core.UpdatePreparationOperation(transaction)
+
+        operation.run()
+
+        self.assertTrue(operation.done.is_set())
+        self.assertIs(operation.claim_transaction(), transaction)
+        operation.cancel()
+        self.assertEqual(transaction.discard_calls, 0)
+
+    def test_failure_discards_exactly_once(self) -> None:
+        def fail(**_):
+            raise RuntimeError("failed")
+
+        transaction = self.Transaction(fail)
+        operation = core.UpdatePreparationOperation(transaction)
+
+        operation.run()
+        operation.cancel()
+
+        self.assertIsInstance(operation.error, RuntimeError)
+        self.assertEqual(transaction.discard_calls, 1)
+
+    def test_base_exception_discards_and_cannot_be_claimed(self) -> None:
+        def interrupt(**_):
+            raise KeyboardInterrupt
+
+        transaction = self.Transaction(interrupt)
+        operation = core.UpdatePreparationOperation(transaction)
+
+        operation.run()
+
+        self.assertIsInstance(operation.error, KeyboardInterrupt)
+        self.assertEqual(transaction.discard_calls, 1)
+        with self.assertRaises(core.HuroshikiError):
+            operation.claim_transaction()
+
+    def test_cancel_before_run_discards_without_preparing(self) -> None:
+        transaction = self.Transaction()
+        operation = core.UpdatePreparationOperation(transaction)
+
+        operation.cancel()
+        operation.run()
+
+        self.assertTrue(operation.done.is_set())
+        self.assertTrue(operation.cancelled)
+        self.assertEqual(transaction.prepare_calls, 0)
+        self.assertEqual(transaction.discard_calls, 1)
+
+    def test_running_cancel_waits_for_worker_cleanup(self) -> None:
+        started = threading.Event()
+
+        def block(*, cancel_event, **_):
+            started.set()
+            cancel_event.wait(1)
+            raise core.UpdatePreparationCancelled("cancelled")
+
+        transaction = self.Transaction(block)
+        operation = core.UpdatePreparationOperation(transaction)
+        worker = threading.Thread(target=operation.run)
+        worker.start()
+        self.assertTrue(started.wait(1))
+
+        operation.cancel()
+        self.assertTrue(operation.wait(1))
+        worker.join(1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(operation.cancelled)
+        self.assertEqual(transaction.discard_calls, 1)
+
+    def test_cancel_after_success_before_claim_discards_once(self) -> None:
+        transaction = self.Transaction()
+        operation = core.UpdatePreparationOperation(transaction)
+        operation.run()
+
+        operation.cancel()
+        operation.cancel()
+
+        self.assertEqual(transaction.discard_calls, 1)
+        with self.assertRaises(core.HuroshikiError):
+            operation.claim_transaction()
+
+
 class UpdateTransactionTest(TransactionTestCase):
     def test_transaction_copy_preserves_read_only_root_mode(self) -> None:
         self.source.chmod(0o555)
@@ -632,6 +731,31 @@ url = "https://example.invalid/manual.jar"
         self.assertEqual(target.read_bytes(), original)
         with packctl.ProjectLock(self.key, "verify orphan cleanup"):
             pass
+
+    def test_incomplete_update_resolver_termination_is_unavailable(self) -> None:
+        target = self.write_mod("first")
+        original = target.read_bytes()
+        results = iter(
+            (
+                core.ResolverProcessResult(0, "", "", False, False),
+                core.ResolverProcessResult(
+                    None,
+                    "",
+                    "",
+                    False,
+                    False,
+                    termination_incomplete=True,
+                ),
+            )
+        )
+        with patch.object(
+            core, "run_resolver_process", side_effect=lambda *_, **__: next(results)
+        ):
+            report = core.update_all(self.key)
+
+        self.assertFalse(report.applied)
+        self.assertIn("termination was incomplete", report.failures[0].error or "")
+        self.assertEqual(target.read_bytes(), original)
 
     def test_update_all_fails_closed_unless_partial_is_explicit(self) -> None:
         first = self.write_mod("first")

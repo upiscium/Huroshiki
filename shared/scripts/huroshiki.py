@@ -5,7 +5,6 @@ import argparse
 from pathlib import Path
 import sys
 import threading
-import time
 from typing import Callable, Iterable
 
 from huroshiki_paths import resolve_root, set_import_root
@@ -2526,11 +2525,11 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
         self.display_name = str(config.get("display_name", core.split_project_key(project_key)[1]))
         self.screen_title = f"{self.display_name} / Update"
         self.transaction: core.PackTransaction | None = None
+        self.operation: core.UpdatePreparationOperation | None = None
         self.candidates: list[core.UpdateCandidate] = []
         self.selected_paths: set[Path] = set()
-        self.cancel_event = threading.Event()
-        self.worker_thread: threading.Thread | None = None
-        self.preparing = False
+        self.operation_thread: threading.Thread | None = None
+        self.operation_timer: Timer | None = None
         self.leave_after_cancel = False
 
     def compose(self) -> ComposeResult:
@@ -2550,53 +2549,23 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
             "Use", "MOD", "Provider", "Current", "New", "Files", "Status"
         )
         try:
-            self.transaction = core.PackTransaction.create(self.project_key)
-            self.preparing = True
+            transaction = core.PackTransaction.create(self.project_key)
+            self.operation = core.UpdatePreparationOperation(transaction)
             self.query_one("#update-message", Static).update("Preparing updates...")
-            self.worker_thread = threading.Thread(
-                target=self._prepare_candidates,
+            self.operation_thread = threading.Thread(
+                target=self.operation.run,
                 name=f"huroshiki-update-{self.project_key}",
-                daemon=True,
+                daemon=False,
             )
-            self.worker_thread.start()
+            self.operation_thread.start()
+            self.operation_timer = self.set_interval(0.05, self._poll_preparation)
         except Exception as error:
-            if self.transaction is not None:
-                self.transaction.discard()
-                self.transaction = None
+            if self.operation is not None:
+                self.operation.cancel()
             self.app.notify(str(error), severity="error")
         table.focus()
 
-    def _prepare_candidates(self) -> None:
-        candidates: list[core.UpdateCandidate] = []
-        error: Exception | None = None
-        try:
-            if self.transaction is None:
-                raise core.HuroshikiError("Update transaction is unavailable")
-            candidates = self.transaction.prepare_updates(
-                cancel_event=self.cancel_event,
-                deadline=time.monotonic() + core.UPDATE_OPERATION_TIMEOUT_SECONDS,
-                on_progress=self._progress_from_worker,
-            )
-        except Exception as caught:
-            error = caught
-        try:
-            self.app.call_from_thread(
-                self._preparation_finished,
-                candidates,
-                error,
-            )
-        except Exception:
-            pass
-
-    def _progress_from_worker(self, progress: core.UpdateProgress) -> None:
-        try:
-            self.app.call_from_thread(self._show_progress, progress)
-        except Exception:
-            pass
-
     def _show_progress(self, progress: core.UpdateProgress) -> None:
-        if not self.preparing:
-            return
         if progress.phase == "normalizing":
             message = f"Preparing updates: {progress.completed} / {progress.total} (normalizing)"
         elif progress.phase == "resolving":
@@ -2612,28 +2581,29 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
             )
         self.query_one("#update-message", Static).update(message)
 
-    def _preparation_finished(
-        self,
-        candidates: list[core.UpdateCandidate],
-        error: Exception | None,
-    ) -> None:
-        self.preparing = False
-        self.worker_thread = None
-        if isinstance(error, core.UpdatePreparationCancelled) or self.cancel_event.is_set():
-            if self.transaction is not None:
-                self.transaction.discard()
-                self.transaction = None
+    def _poll_preparation(self) -> None:
+        operation = self.operation
+        if operation is None:
+            return
+        for progress in operation.drain_progress():
+            self._show_progress(progress)
+        if not operation.done.is_set():
+            return
+        if self.operation_timer is not None:
+            self.operation_timer.pause()
+            self.operation_timer = None
+        self.operation_thread = None
+        self.operation = None
+        if operation.error is not None:
+            self.query_one("#update-message", Static).update(str(operation.error))
+            self.app.notify(str(operation.error), severity="error")
+            return
+        if operation.cancelled:
             if self.leave_after_cancel:
                 self.return_to_project()
             return
-        if error is not None:
-            if self.transaction is not None:
-                self.transaction.discard()
-                self.transaction = None
-            self.query_one("#update-message", Static).update(str(error))
-            self.app.notify(str(error), severity="error")
-            return
-        self.candidates = candidates
+        self.transaction = operation.claim_transaction()
+        self.candidates = list(operation.candidates)
         self.selected_paths = {
             candidate.relative_path
             for candidate in self.candidates
@@ -2665,7 +2635,7 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
             )
 
     def toggle_candidate(self) -> None:
-        if self.preparing:
+        if self.operation is not None:
             self.app.notify("Update preparation is still running", severity="warning")
             return
         table = self.query_one("#update-options", DataTable)
@@ -2686,7 +2656,7 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
         self.reload_candidates()
 
     def request_update(self) -> None:
-        if self.preparing:
+        if self.operation is not None:
             self.app.notify("Update preparation is still running", severity="warning")
             return
         selected = [
@@ -2733,9 +2703,9 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
             self.app.notify(str(error), severity="error")
 
     def discard_and_leave(self) -> None:
-        if self.preparing:
+        if self.operation is not None:
             self.leave_after_cancel = True
-            self.cancel_event.set()
+            self.operation.cancel()
             self.query_one("#update-message", Static).update(
                 "Cancelling update preparation..."
             )
@@ -2745,20 +2715,23 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
             self.transaction = None
         self.return_to_project()
 
-    def on_unmount(self) -> None:
-        self.cancel_event.set()
-        worker = self.worker_thread
-        if worker is not None and worker is not threading.current_thread():
-            worker.join()
-        self.worker_thread = None
+    def discard_and_navigate(self, destination: Callable[[], None]) -> None:
         if self.transaction is not None:
             self.transaction.discard()
             self.transaction = None
+        destination()
+
+    def on_unmount(self) -> None:
+        if self.operation_timer is not None:
+            self.operation_timer.pause()
+            self.operation_timer = None
+        if self.operation is not None:
+            self.operation.cancel()
 
     def on_key(self, event: events.Key) -> None:
         table = self.query_one("#update-options", DataTable)
         key = event.key
-        if self.preparing:
+        if self.operation is not None:
             if key in {"escape", "p"}:
                 self.discard_and_leave()
             else:
@@ -2777,11 +2750,15 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
         elif key == "enter":
             self.request_update()
         elif key == "i":
-            self.app.open_install(self.project_key)
+            self.discard_and_navigate(
+                lambda: self.app.open_install(self.project_key)
+            )
         elif key == "l":
-            self.app.open_list(self.project_key)
+            self.discard_and_navigate(lambda: self.app.open_list(self.project_key))
         elif key == "p":
-            self.app.open_project(self.project_key)
+            self.discard_and_navigate(
+                lambda: self.app.open_project(self.project_key)
+            )
         elif key == "escape":
             self.discard_and_leave()
         else:

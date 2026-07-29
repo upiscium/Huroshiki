@@ -102,7 +102,8 @@ period. URL roots keep their existing interruptible download cancellation and ne
 Packwiz resolver deadline does not replace the URL download timeout.
 After a resolver parent exits, Huroshiki also checks the Linux process table for live members of its
 process group. Background descendants are terminated and make the resolver result fail closed;
-zombie-only groups are not treated as running work.
+zombie-only groups are not treated as running work. Termination, forced killing, and parent reaping
+each have bounded waits; an undrained group or unreaped parent is reported as an integrity failure.
 
 ### Navigation
 
@@ -170,7 +171,9 @@ unavailable while allowing the user to review and explicitly select successful c
 Update candidate preparation runs off the Textual event loop and reports normalization plus
 per-MOD progress. One cancellation event covers baseline refresh and every resolver; a 10-minute
 operation deadline bounds the complete preparation while each resolver remains capped at 2 minutes.
-Esc waits for process cleanup and transaction discard before returning to the Project screen.
+The worker publishes progress through a queue that the Textual event loop polls; it does not call
+back into Textual or get joined by the event loop. Esc returns to the Project screen only after the
+operation has completed process cleanup and discarded its transaction.
 
 Build and distribute:
 
