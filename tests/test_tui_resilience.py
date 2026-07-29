@@ -400,7 +400,7 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                     search.value = "missing"
                     screen.reload_projects("missing")
                     self.assertEqual(table.row_count, 0)
-                    table.focus()
+                    self.assertIs(screen.focused, search)
                     await pilot.press("q")
                     await pilot.pause()
                     self.assertEqual(search.value, "")

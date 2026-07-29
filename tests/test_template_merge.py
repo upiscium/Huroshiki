@@ -23,6 +23,33 @@ def entry(
 
 
 class TemplateMergeTest(unittest.TestCase):
+    def test_nfc_nfd_conflicts_match_within_and_across_templates(self) -> None:
+        for second_template in ("a", "b"):
+            with self.subTest(second_template=second_template):
+                composition = compose_templates(
+                    ["a", "b"],
+                    [
+                        entry(
+                            "a",
+                            "Caf\N{LATIN SMALL LETTER E WITH ACUTE}",
+                            "modrinth",
+                            "a",
+                        ),
+                        entry(
+                            second_template,
+                            "Cafe\N{COMBINING ACUTE ACCENT}",
+                            "curseforge",
+                            "2",
+                        ),
+                    ],
+                )
+
+                self.assertEqual(len(composition.conflicts), 1)
+                self.assertEqual(
+                    composition.conflicts[0].key,
+                    "caf\N{LATIN SMALL LETTER E WITH ACUTE}",
+                )
+
     def test_unicode_normalization_and_casefold_produce_stable_conflict_keys(self) -> None:
         cases = [
             (
