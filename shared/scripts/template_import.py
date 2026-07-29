@@ -337,8 +337,10 @@ def _logical_identity_conflicts(
         pack_candidate = pack_by_logical.get(candidate.logical_identity)
         if (
             pack_candidate is not None
-            and candidate.actual_identity is not None
-            and candidate.actual_identity != pack_candidate.actual_identity
+            and (
+                candidate.actual_identity is None
+                or candidate.actual_identity != pack_candidate.actual_identity
+            )
         ):
             grouped.setdefault(candidate.logical_identity, []).append(candidate)
     return tuple(

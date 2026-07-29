@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import huroshiki_core as core
 import packctl
-from template_import import resolve_template_import_plan
+from template_import import ImportConflictResolution, resolve_template_import_plan
 
 
 PACK_TOML = """name = "Demo"
@@ -149,6 +149,30 @@ class TemplateImportCoreTest(unittest.TestCase):
             "    project_id: logical\n    side: client\n"
             "    url: https://mods.example/bad.jar\n",
             encoding="utf-8",
+        )
+
+    def use_failed_replacement_with_root_template(self) -> None:
+        (self.template / "template.yaml").write_text(
+            "id: base\ndisplay_name: Base\nenabled: true\n"
+            "minecraft: 1.21.1\nloader: neoforge\n"
+            "reference_loader_version: 21.1.0\nmods:\n"
+            "  - name: Failed Replacement\n    provider: url\n"
+            "    project_id: logical\n    side: client\n"
+            "    url: https://mods.example/requested.jar\n"
+            "  - name: Root\n    provider: modrinth\n"
+            "    project_id: root\n    side: client\n",
+            encoding="utf-8",
+        )
+
+    def install_logical_url(self) -> None:
+        mods = self.source / "mods"
+        mods.mkdir(exist_ok=True)
+        (mods / "logical.pw.toml").write_bytes(
+            url_metadata(
+                "Installed Logical",
+                "logical.jar",
+                "https://mods.example/requested.jar",
+            )
         )
 
     def operation(self) -> core.TemplateImportOperation:
@@ -431,7 +455,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         resolved = resolve_template_import_plan(
             session.plan,
             url_selector_resolutions={
-                "url:logical": core.ConflictResolution((good.candidate_key,))
+                "url:logical": ImportConflictResolution((good.selection_key,))
             },
         )
         operation = core.TemplateImportOperation(session, resolved)
@@ -463,7 +487,7 @@ class TemplateImportCoreTest(unittest.TestCase):
             resolve_template_import_plan(
                 session.plan,
                 url_selector_resolutions={
-                    "url:logical": core.ConflictResolution((bad.candidate_key,))
+                    "url:logical": ImportConflictResolution((bad.selection_key,))
                 },
             )
         session.discard()
@@ -481,6 +505,62 @@ class TemplateImportCoreTest(unittest.TestCase):
         with self.assertRaisesRegex(core.TemplateMergeError, "invalid JAR"):
             resolve_template_import_plan(session.plan)
         session.discard()
+
+    def test_failed_logical_replacement_can_keep_pack_and_import_other_root(self) -> None:
+        self.install_logical_url()
+        self.use_failed_replacement_with_root_template()
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=core.UrlCandidateVerificationError("HTTP 404"),
+        ):
+            session = core.TemplateImportSession.create("pack:demo", ["base"])
+        conflict = session.plan.logical_identity_conflicts[0]
+        installed = conflict.pack_candidate
+        failed = conflict.template_candidates[0]
+        self.assertEqual(installed.candidate_key, failed.candidate_key)
+        self.assertNotEqual(installed.selection_key, failed.selection_key)
+        resolved = resolve_template_import_plan(
+            session.plan,
+            logical_identity_resolutions={
+                conflict.key: ImportConflictResolution((installed.selection_key,))
+            },
+        )
+        self.assertNotIn(failed, resolved.selected_template_candidates)
+        self.assertEqual(resolved.removed_pack_candidates, ())
+        operation = core.TemplateImportOperation(session, resolved)
+        with (
+            patch.object(core, "resolve_mod_closure", return_value=self.closure()),
+            patch.object(core, "run_resolver_process", side_effect=self.refresh_ok),
+        ):
+            operation.run()
+            operation.apply()
+        self.assertTrue((self.source / "mods/logical.pw.toml").is_file())
+        self.assertTrue((self.source / "mods/root.pw.toml").is_file())
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_failed_logical_replacement_selection_is_rejected(self) -> None:
+        self.install_logical_url()
+        self.use_failed_replacement_with_root_template()
+        before = core.tree_digest_snapshot(self.source)
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=core.UrlCandidateVerificationError("HTTP 404"),
+        ):
+            session = core.TemplateImportSession.create("pack:demo", ["base"])
+        conflict = session.plan.logical_identity_conflicts[0]
+        failed = conflict.template_candidates[0]
+        with self.assertRaisesRegex(core.TemplateMergeError, "HTTP 404"):
+            resolve_template_import_plan(
+                session.plan,
+                logical_identity_resolutions={
+                    conflict.key: ImportConflictResolution((failed.selection_key,))
+                },
+            )
+        session.discard()
+        self.assertEqual(core.tree_digest_snapshot(self.source), before)
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
     def test_url_verification_cancellation_and_deadline_remain_global(self) -> None:
         self.use_url_template()
@@ -638,7 +718,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         resolved = resolve_template_import_plan(
             session.plan,
             logical_identity_resolutions={
-                conflict.key: core.ConflictResolution((incoming.candidate_key,))
+                conflict.key: ImportConflictResolution((incoming.selection_key,))
             },
         )
         operation = core.TemplateImportOperation(session, resolved)
