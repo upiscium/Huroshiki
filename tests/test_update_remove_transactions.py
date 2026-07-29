@@ -531,6 +531,29 @@ url = "https://example.invalid/manual.jar"
         self.assertEqual(report.failures[0].error_returncode, 7)
         self.assertEqual(target.read_bytes(), original)
 
+    def test_orphaned_update_resolver_is_unavailable_and_unlocks(self) -> None:
+        target = self.write_mod("first")
+        original = target.read_bytes()
+        results = iter(
+            (
+                core.ResolverProcessResult(0, "", "", False, False),
+                core.ResolverProcessResult(
+                    0, "", "", False, False, orphaned_descendants=True
+                ),
+            )
+        )
+        with patch.object(
+            core, "run_resolver_process", side_effect=lambda *_, **__: next(results)
+        ):
+            report = core.update_all(self.key)
+
+        self.assertFalse(report.applied)
+        self.assertEqual(len(report.failures), 1)
+        self.assertIn("left background processes", report.failures[0].error or "")
+        self.assertEqual(target.read_bytes(), original)
+        with packctl.ProjectLock(self.key, "verify orphan cleanup"):
+            pass
+
     def test_update_all_fails_closed_unless_partial_is_explicit(self) -> None:
         first = self.write_mod("first")
         second = self.write_mod("second")

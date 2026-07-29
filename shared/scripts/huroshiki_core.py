@@ -389,6 +389,13 @@ class ResolverProcessResult:
     stderr: str
     cancelled: bool
     timed_out: bool
+    orphaned_descendants: bool = False
+
+
+@dataclass(frozen=True)
+class ProcessGroupMember:
+    pid: int
+    state: str
 
 
 @dataclass(frozen=True)
@@ -2506,7 +2513,12 @@ def _prepare_update_candidates(
             cancel_event=None,
             deadline=time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
         )
-        if normalization.timed_out:
+        if normalization.orphaned_descendants:
+            normalization_error = (
+                "disposable baseline normalization left background processes "
+                "after completion"
+            )
+        elif normalization.timed_out:
             normalization_error = (
                 "disposable baseline normalization deadline exceeded after "
                 f"{UPDATE_RESOLVER_TIMEOUT_SECONDS} seconds"
@@ -2566,6 +2578,16 @@ def _prepare_update_candidates(
                     cancel_event=None,
                     deadline=time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
                 )
+                if result.orphaned_descendants:
+                    candidates.append(
+                        _candidate_error(
+                            relative_path,
+                            old_mod,
+                            old_data,
+                            "Packwiz resolver left background processes after completion",
+                        )
+                    )
+                    continue
                 if result.timed_out:
                     candidates.append(
                         _candidate_error(
@@ -3433,32 +3455,65 @@ RESOLVER_POLL_SECONDS = 0.05
 RESOLVER_TERMINATE_GRACE_SECONDS = 2.0
 
 
-def _resolver_group_exists(process_group: int) -> bool:
+def live_process_group_members(
+    process_group: int,
+) -> tuple[ProcessGroupMember, ...]:
+    members: list[ProcessGroupMember] = []
+    proc = Path("/proc")
     try:
-        os.killpg(process_group, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        entries = tuple(proc.iterdir())
+    except OSError:
+        return ()
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        try:
+            text = (entry / "stat").read_text(encoding="utf-8")
+            closing = text.rfind(") ")
+            if closing < 0:
+                continue
+            suffix = text[closing + 2 :].split()
+            state = suffix[0]
+            member_group = int(suffix[2])
+        except (OSError, ValueError, IndexError):
+            continue
+        if member_group == process_group and state not in {"Z", "X", "x"}:
+            members.append(ProcessGroupMember(int(entry.name), state))
+    return tuple(sorted(members, key=lambda member: member.pid))
 
 
-def _stop_resolver_process(process: subprocess.Popen[bytes]) -> None:
-    process_group = process.pid
+def stop_resolver_process_group(
+    process_group: int,
+    *,
+    parent: subprocess.Popen[bytes] | None = None,
+) -> None:
     try:
         os.killpg(process_group, signal.SIGTERM)
     except ProcessLookupError:
         pass
     grace_deadline = time.monotonic() + RESOLVER_TERMINATE_GRACE_SECONDS
-    while _resolver_group_exists(process_group) and time.monotonic() < grace_deadline:
-        process.poll()
+    while (
+        live_process_group_members(process_group)
+        and time.monotonic() < grace_deadline
+    ):
+        if parent is not None:
+            parent.poll()
         time.sleep(RESOLVER_POLL_SECONDS)
-    if _resolver_group_exists(process_group):
+    if live_process_group_members(process_group):
         try:
             os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
             pass
-    process.wait()
+        kill_deadline = time.monotonic() + RESOLVER_TERMINATE_GRACE_SECONDS
+        while (
+            live_process_group_members(process_group)
+            and time.monotonic() < kill_deadline
+        ):
+            if parent is not None:
+                parent.poll()
+            time.sleep(RESOLVER_POLL_SECONDS)
+    if parent is not None:
+        parent.wait()
 
 
 def run_resolver_process(
@@ -3482,21 +3537,25 @@ def run_resolver_process(
         )
         cancelled = False
         timed_out = False
+        orphaned_descendants = False
         try:
             while process.poll() is None:
                 if cancel_event is not None and cancel_event.is_set():
                     cancelled = True
-                    _stop_resolver_process(process)
+                    stop_resolver_process_group(process.pid, parent=process)
                     break
                 if deadline is not None and time.monotonic() >= deadline:
                     timed_out = True
-                    _stop_resolver_process(process)
+                    stop_resolver_process_group(process.pid, parent=process)
                     break
                 time.sleep(RESOLVER_POLL_SECONDS)
         except KeyboardInterrupt:
-            _stop_resolver_process(process)
+            stop_resolver_process_group(process.pid, parent=process)
             raise
         process.wait()
+        if not cancelled and not timed_out and live_process_group_members(process.pid):
+            orphaned_descendants = True
+            stop_resolver_process_group(process.pid)
         stdout_file.seek(0)
         stderr_file.seek(0)
         stdout = stdout_file.read().decode("utf-8", errors="replace")
@@ -3507,6 +3566,7 @@ def run_resolver_process(
         stderr,
         cancelled,
         timed_out,
+        orphaned_descendants,
     )
 
 
@@ -3703,6 +3763,10 @@ def resolve_mod_closure(
             raise HuroshikiError("MOD resolution was cancelled")
         if process.timed_out:
             raise HuroshikiError("Packwiz resolver deadline exceeded")
+        if process.orphaned_descendants:
+            raise HuroshikiError(
+                "Packwiz resolver left background processes after completion"
+            )
         if process.returncode != 0:
             raise HuroshikiError(concise_process_error(process))
         metadata = _read_resolver_metadata(source)
