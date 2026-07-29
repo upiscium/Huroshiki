@@ -445,19 +445,8 @@ def _logical_identity_conflicts(
         )
         if pack_option is None:
             continue
-        divergent = tuple(
-            option
-            for option in group
-            if option is not pack_option
-            and (
-                option.actual_identity is None
-                or option.actual_identity != pack_option.actual_identity
-            )
-        )
-        if divergent:
-            conflicts.append(
-                LogicalIdentityConflict(identity, (pack_option, *divergent))
-            )
+        if len(group) > 1:
+            conflicts.append(LogicalIdentityConflict(identity, tuple(group)))
     return tuple(conflicts)
 
 
@@ -649,8 +638,15 @@ def build_template_import_plan(
         and pack_by_actual[candidate.actual_identity].side != candidate.side
     )
     name_conflicts = _name_conflicts(selection_options)
-    url_selector_conflicts = _url_selector_conflicts(selection_options)
     logical_identity_conflicts = _logical_identity_conflicts(selection_options)
+    logical_conflict_identities = {
+        conflict.logical_identity for conflict in logical_identity_conflicts
+    }
+    url_selector_conflicts = tuple(
+        conflict
+        for conflict in _url_selector_conflicts(selection_options)
+        if conflict.logical_identity not in logical_conflict_identities
+    )
     actual_identity_conflicts = _actual_identity_conflicts(selection_options)
     return TemplateImportPlan(
         pack_key,

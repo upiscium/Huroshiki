@@ -462,6 +462,114 @@ class TemplateImportPlannerTest(unittest.TestCase):
             [candidates[0].candidate_key],
         )
 
+    def test_pack_with_multiple_url_selectors_uses_one_logical_conflict(self) -> None:
+        installed = pack_candidate("Installed", "logical", provider="url")
+        installed = installed.__class__(
+            **{**installed.__dict__, "url": "https://mods.example/installed.jar"}
+        )
+        first = template_candidate(
+            "base",
+            name="First",
+            provider="url",
+            project_id="logical",
+            side="both",
+            url="https://mods.example/a.jar",
+            actual_provider="url",
+            actual_project_id="a",
+        )
+        second = template_candidate(
+            "base",
+            name="Second",
+            provider="url",
+            project_id="logical",
+            side="both",
+            url="https://mods.example/b.jar",
+            actual_provider="url",
+            actual_project_id="b",
+        )
+        plan = build(["base"], [installed], [first, second])
+        self.assertEqual(len(plan.logical_identity_conflicts), 1)
+        self.assertEqual(plan.url_selector_conflicts, ())
+        conflict = plan.logical_identity_conflicts[0]
+        self.assertEqual(len(conflict.options), 3)
+        pack_option = next(
+            option for option in conflict.options if installed in option.candidates
+        )
+        first_option = next(
+            option for option in conflict.options if first in option.candidates
+        )
+        keep = resolve_template_import_plan(
+            plan,
+            logical_identity_resolutions={
+                conflict.key: ImportConflictResolution((pack_option.option_key,))
+            },
+        )
+        self.assertEqual(keep.retained_pack_candidates, (installed,))
+        self.assertEqual(keep.selected_template_candidates, ())
+        self.assertEqual(keep.selected_new_roots, ())
+        replace_plan = resolve_template_import_plan(
+            plan,
+            logical_identity_resolutions={
+                conflict.key: ImportConflictResolution((first_option.option_key,))
+            },
+        )
+        self.assertEqual(replace_plan.removed_pack_candidates, (installed,))
+        self.assertEqual(replace_plan.selected_template_candidates, (first,))
+        self.assertEqual(replace_plan.selected_new_roots, (first,))
+
+    def test_failed_url_options_still_allow_installed_pack_selection(self) -> None:
+        installed = pack_candidate("Installed", "logical", provider="url")
+        installed = installed.__class__(
+            **{**installed.__dict__, "url": "https://mods.example/installed.jar"}
+        )
+        failed = tuple(
+            template_candidate(
+                "base",
+                name=f"Failed {index}",
+                provider="url",
+                project_id="logical",
+                side="both",
+                url=f"https://mods.example/{index}.jar",
+            )
+            for index in (1, 2)
+        )
+        plan = build_template_import_plan(
+            pack_key="pack:demo",
+            pack_minecraft="1.21.1",
+            pack_loader="neoforge",
+            template_ids=["base"],
+            compatibilities={
+                "base": TemplateCompatibility("base", "1.21.1", "neoforge")
+            },
+            pack_candidates=[installed],
+            template_candidates=list(failed),
+            verifications=[
+                ImportCandidateVerification(
+                    candidate.selector_identity,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "HTTP 404",
+                )
+                for candidate in failed
+            ],
+        )
+        self.assertEqual(len(plan.logical_identity_conflicts), 1)
+        self.assertEqual(plan.url_selector_conflicts, ())
+        conflict = plan.logical_identity_conflicts[0]
+        pack_option = next(
+            option for option in conflict.options if installed in option.candidates
+        )
+        keep = resolve_template_import_plan(
+            plan,
+            logical_identity_resolutions={
+                conflict.key: ImportConflictResolution((pack_option.option_key,))
+            },
+        )
+        self.assertEqual(keep.retained_pack_candidates, (installed,))
+        self.assertEqual(keep.selected_template_candidates, ())
+
     def test_url_selector_order_and_policy_change_plan_digest(self) -> None:
         first = template_candidate(
             "a",
