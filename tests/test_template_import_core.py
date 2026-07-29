@@ -126,6 +126,22 @@ class TemplateImportCoreTest(unittest.TestCase):
         )
         return core.ResolvedModClosure(("url", actual_id), (record,))
 
+    def single_closure(
+        self,
+        provider: str,
+        project_id: str,
+        name: str,
+    ) -> core.ResolvedModClosure:
+        record = core.ResolvedMetadata(
+            (provider, project_id),
+            Path(f"mods/{project_id}.pw.toml"),
+            f"{project_id}.jar",
+            metadata(name, project_id, f"{project_id}.jar"),
+            provider,
+            project_id,
+        )
+        return core.ResolvedModClosure((provider, project_id), (record,))
+
     def use_url_template(self) -> None:
         (self.template / "template.yaml").write_text(
             "id: base\ndisplay_name: Base\nenabled: true\n"
@@ -218,6 +234,327 @@ class TemplateImportCoreTest(unittest.TestCase):
         self.assertTrue((self.source / "mods/root.pw.toml").is_file())
         self.assertTrue((self.source / "mods/dependency.pw.toml").is_file())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_removed_pack_identity_required_by_root_fails_before_preview(self) -> None:
+        mods = self.source / "mods"
+        mods.mkdir()
+        (mods / "dependency.pw.toml").write_bytes(
+            metadata("Root", "dependency", "dependency.jar")
+        )
+        before = core.tree_digest_snapshot(self.source)
+        session = core.TemplateImportSession.create("pack:demo", ["base"])
+        conflict = session.plan.name_conflicts[0]
+        root_option = next(
+            option
+            for option in conflict.options
+            if any(
+                candidate.origin_kind == "template"
+                and candidate.project_id == "root"
+                for candidate in option.candidates
+            )
+        )
+        resolved = resolve_template_import_plan(
+            session.plan,
+            name_resolutions={
+                conflict.key: ImportConflictResolution((root_option.option_key,))
+            },
+        )
+        operation = core.TemplateImportOperation(session, resolved)
+        with patch.object(core, "resolve_mod_closure", return_value=self.closure()):
+            operation.run()
+        self.assertIsInstance(operation.error, core.HuroshikiError)
+        self.assertIn(
+            "modrinth:dependency required by modrinth:root",
+            str(operation.error),
+        )
+        self.assertIsNone(operation.preview)
+        self.assertEqual(core.tree_digest_snapshot(self.source), before)
+        self.assertTrue((self.source / "mods/dependency.pw.toml").is_file())
+        self.assertFalse((self.source / "mods/root.pw.toml").exists())
+        self.assertFalse(operation.transaction.root.exists())
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_removed_requirement_reports_every_requiring_root(self) -> None:
+        removed = core.ModCandidate(
+            "pack",
+            "demo",
+            "Dependency",
+            "modrinth",
+            "dependency",
+            "both",
+            metadata_path=Path("mods/dependency.pw.toml"),
+            actual_provider="modrinth",
+            actual_project_id="dependency",
+        )
+        roots = tuple(
+            core.ModCandidate(
+                "template",
+                "base",
+                name,
+                "modrinth",
+                project_id,
+                "both",
+                actual_provider="modrinth",
+                actual_project_id=project_id,
+            )
+            for name, project_id in (("One", "one"), ("Two", "two"))
+        )
+        dependency = core.ResolvedMetadata(
+            ("modrinth", "dependency"),
+            Path("mods/dependency.pw.toml"),
+            "dependency.jar",
+            metadata("Dependency", "dependency", "dependency.jar"),
+            "modrinth",
+            "dependency",
+        )
+        resolved_roots = tuple(
+            (
+                root,
+                core.ResolvedModClosure(
+                    root.actual_identity,
+                    (
+                        core.ResolvedMetadata(
+                            root.actual_identity,
+                            Path(f"mods/{root.project_id}.pw.toml"),
+                            f"{root.project_id}.jar",
+                            metadata(root.name, root.project_id, f"{root.project_id}.jar"),
+                            "modrinth",
+                            root.project_id,
+                        ),
+                        dependency,
+                    ),
+                ),
+            )
+            for root in roots
+        )
+        requirements = core._removed_identity_requirements(
+            resolved_roots,
+            (removed,),
+        )
+        self.assertEqual(
+            [root.candidate_key for root in requirements[("modrinth", "dependency")]],
+            ["modrinth:one", "modrinth:two"],
+        )
+
+    def test_refresh_reintroduction_is_rejected_by_staged_postcondition(self) -> None:
+        mods = self.source / "mods"
+        mods.mkdir()
+        (mods / "shared.pw.toml").write_bytes(
+            metadata("Same", "shared", "shared.jar")
+        )
+        (self.template / "template.yaml").write_text(
+            "id: base\ndisplay_name: Base\nenabled: true\n"
+            "minecraft: 1.21.1\nloader: neoforge\n"
+            "reference_loader_version: 21.1.0\nmods:\n"
+            "  - name: Same\n    provider: modrinth\n"
+            "    project_id: alternate\n    side: both\n",
+            encoding="utf-8",
+        )
+        before = core.tree_digest_snapshot(self.source)
+        session = core.TemplateImportSession.create("pack:demo", ["base"])
+        conflict = session.plan.name_conflicts[0]
+        alternate = next(
+            option
+            for option in conflict.options
+            if any(candidate.origin_kind == "template" for candidate in option.candidates)
+        )
+        resolved = resolve_template_import_plan(
+            session.plan,
+            name_resolutions={
+                conflict.key: ImportConflictResolution((alternate.option_key,))
+            },
+        )
+        operation = core.TemplateImportOperation(session, resolved)
+
+        def refresh_reintroduces(_command: list[str], **kwargs: object):
+            source = Path(kwargs["cwd"])
+            (source / "mods/shared.pw.toml").write_bytes(
+                metadata("Same", "shared", "shared.jar")
+            )
+            return self.refresh_ok([])
+
+        with (
+            patch.object(
+                core,
+                "resolve_mod_closure",
+                return_value=self.single_closure("modrinth", "alternate", "Same"),
+            ),
+            patch.object(
+                core,
+                "run_resolver_process",
+                side_effect=refresh_reintroduces,
+            ),
+        ):
+            operation.run()
+        self.assertIn("reintroduced Pack MODs", str(operation.error))
+        self.assertIsNone(operation.preview)
+        self.assertEqual(core.tree_digest_snapshot(self.source), before)
+        self.assertFalse(operation.transaction.root.exists())
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_cli_dependency_reintroduction_returns_one_without_preview(self) -> None:
+        mods = self.source / "mods"
+        mods.mkdir()
+        (mods / "dependency.pw.toml").write_bytes(
+            metadata("Root", "dependency", "dependency.jar")
+        )
+        before = core.tree_digest_snapshot(self.source)
+        session = core.TemplateImportSession.create("pack:demo", ["base"])
+        conflict = session.plan.name_conflicts[0]
+        root_option = next(
+            option
+            for option in conflict.options
+            if any(candidate.origin_kind == "template" for candidate in option.candidates)
+        )
+        resolution = self.root / "reintroduction-resolution.yaml"
+        resolution.write_text(
+            "version: 4\n"
+            f'plan_digest: "{session.plan.plan_digest}"\n'
+            "name_conflicts:\n"
+            f'  "{conflict.key}":\n'
+            "    options:\n"
+            f'      - "{root_option.option_key}"\n'
+            "    acknowledge_duplicate_risk: false\n"
+            "url_selector_conflicts: {}\n"
+            "logical_identity_conflicts: {}\n"
+            "actual_identity_conflicts: {}\n"
+            "side_conflicts: {}\n",
+            encoding="utf-8",
+        )
+        session.discard()
+        args = packctl.parser().parse_args(
+            [
+                "apply-template",
+                "demo",
+                "base",
+                "--resolution",
+                str(resolution),
+                "--json",
+            ]
+        )
+        stdout = StringIO()
+        stderr = StringIO()
+        with (
+            patch.object(core, "resolve_mod_closure", return_value=self.closure()),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(packctl.cmd_apply_template(args), 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("required by modrinth:root", stderr.getvalue())
+        self.assertEqual(core.tree_digest_snapshot(self.source), before)
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_preview_removed_and_unchanged_are_resolution_disjoint(self) -> None:
+        mods = self.source / "mods"
+        mods.mkdir()
+        (mods / "shared.pw.toml").write_bytes(
+            metadata("Same", "shared", "shared.jar")
+        )
+        (self.template / "template.yaml").write_text(
+            "id: base\ndisplay_name: Base\nenabled: true\n"
+            "minecraft: 1.21.1\nloader: neoforge\n"
+            "reference_loader_version: 21.1.0\nmods:\n"
+            "  - name: Same\n    provider: modrinth\n"
+            "    project_id: shared\n    side: both\n"
+            "  - name: Same\n    provider: modrinth\n"
+            "    project_id: alternate\n    side: both\n",
+            encoding="utf-8",
+        )
+        session = core.TemplateImportSession.create("pack:demo", ["base"])
+        conflict = session.plan.name_conflicts[0]
+        alternate = next(
+            option
+            for option in conflict.options
+            if any(candidate.project_id == "alternate" for candidate in option.candidates)
+        )
+        resolved = resolve_template_import_plan(
+            session.plan,
+            name_resolutions={
+                conflict.key: ImportConflictResolution((alternate.option_key,))
+            },
+        )
+        operation = core.TemplateImportOperation(session, resolved)
+        with (
+            patch.object(
+                core,
+                "resolve_mod_closure",
+                return_value=self.single_closure("modrinth", "alternate", "Same"),
+            ),
+            patch.object(core, "run_resolver_process", side_effect=self.refresh_ok),
+        ):
+            operation.run()
+        self.assertIsNone(operation.error)
+        self.assertEqual(
+            [candidate.project_id for candidate in operation.preview.removed],
+            ["shared"],
+        )
+        self.assertEqual(operation.preview.unchanged, ())
+        self.assertFalse(
+            {candidate.selection_key for candidate in operation.preview.removed}
+            & {candidate.selection_key for candidate in operation.preview.unchanged}
+        )
+        operation.discard()
+
+    def test_retained_equivalent_source_is_reported_unchanged(self) -> None:
+        mods = self.source / "mods"
+        mods.mkdir()
+        (mods / "shared.pw.toml").write_bytes(
+            metadata("Shared", "shared", "shared.jar")
+        )
+        (self.template / "template.yaml").write_text(
+            "id: base\ndisplay_name: Base\nenabled: true\n"
+            "minecraft: 1.21.1\nloader: neoforge\n"
+            "reference_loader_version: 21.1.0\nmods:\n"
+            "  - name: Shared\n    provider: modrinth\n"
+            "    project_id: shared\n    side: both\n",
+            encoding="utf-8",
+        )
+        operation = self.operation()
+        with patch.object(
+            core, "run_resolver_process", side_effect=self.refresh_ok
+        ):
+            operation.run()
+        self.assertIsNone(operation.error)
+        self.assertEqual(
+            [candidate.project_id for candidate in operation.preview.unchanged],
+            ["shared"],
+        )
+        self.assertEqual(operation.preview.removed, ())
+        operation.discard()
+
+    def test_side_changed_candidate_is_not_reported_unchanged(self) -> None:
+        mods = self.source / "mods"
+        mods.mkdir()
+        installed = metadata("Shared", "shared", "shared.jar").replace(
+            b'side = "both"', b'side = "client"'
+        )
+        (mods / "shared.pw.toml").write_bytes(installed)
+        (self.template / "template.yaml").write_text(
+            "id: base\ndisplay_name: Base\nenabled: true\n"
+            "minecraft: 1.21.1\nloader: neoforge\n"
+            "reference_loader_version: 21.1.0\nmods:\n"
+            "  - name: Shared\n    provider: modrinth\n"
+            "    project_id: shared\n    side: server\n",
+            encoding="utf-8",
+        )
+        session = core.TemplateImportSession.create("pack:demo", ["base"])
+        resolved = resolve_template_import_plan(
+            session.plan,
+            side_decisions={("modrinth", "shared"): "use_template"},
+        )
+        operation = core.TemplateImportOperation(session, resolved)
+        with patch.object(
+            core, "run_resolver_process", side_effect=self.refresh_ok
+        ):
+            operation.run()
+        self.assertIsNone(operation.error)
+        self.assertEqual(operation.preview.unchanged, ())
+        self.assertEqual(
+            operation.preview.side_changes,
+            ((('modrinth', 'shared'), 'client', 'server'),),
+        )
+        operation.discard()
 
     def test_resolver_refresh_and_template_change_fail_closed(self) -> None:
         for failure in ("resolver", "refresh"):
