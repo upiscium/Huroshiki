@@ -55,6 +55,7 @@ from template_merge import (
 )
 from template_import import (
     CandidateNameConflict,
+    ImportCandidateVerification,
     ModCandidate,
     ResolvedTemplateImportPlan,
     SideDecision,
@@ -5451,13 +5452,6 @@ def _merge_resolved_template_roots(
 
 
 @dataclass(frozen=True)
-class VerifiedImportCandidate:
-    candidate: ModCandidate
-    actual_identity: tuple[str, str]
-    cached_closure: ResolvedModClosure | None = None
-
-
-@dataclass(frozen=True)
 class ImportedRootPreview:
     candidate_key: str
     requested_name: str
@@ -5546,7 +5540,29 @@ def _template_import_inputs(
     return compatibilities, tuple(candidates), baselines
 
 
-def _verify_import_candidates(
+def resolved_closure_fingerprint(closure: ResolvedModClosure) -> str:
+    payload = {
+        "root_identity": closure.root_identity,
+        "metadata": [
+            {
+                "identity": item.identity,
+                "relative_path": item.relative_path.as_posix(),
+                "filename": item.filename,
+                "contents_sha256": hashlib.sha256(item.contents).hexdigest(),
+            }
+            for item in closure.metadata
+        ],
+    }
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def verify_import_candidates(
     candidates: Sequence[ModCandidate],
     *,
     minecraft: str,
@@ -5554,58 +5570,102 @@ def _verify_import_candidates(
     loader_version: str,
     cancel_event: threading.Event,
     deadline: float,
-) -> tuple[VerifiedImportCandidate, ...]:
-    verified: list[VerifiedImportCandidate] = []
+) -> tuple[ImportCandidateVerification, ...]:
+    verified: list[ImportCandidateVerification] = []
     for candidate in candidates:
+        if cancel_event.is_set():
+            raise LoaderMigrationCancelled("Template import was cancelled")
+        if time.monotonic() >= deadline:
+            raise LoaderMigrationDeadlineExceeded("Template import deadline exceeded")
         if candidate.provider == "url":
             if candidate.url is None:
-                raise HuroshikiError(
-                    f"URL candidate {candidate.candidate_key} has no URL selector"
+                verified.append(
+                    ImportCandidateVerification(
+                        candidate.selector_identity,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "URL selector is missing",
+                    )
                 )
-            closure = resolve_mod_closure(
-                provider="url",
-                selector=candidate.url,
-                minecraft=minecraft,
-                loader=loader,
-                loader_version=loader_version,
-                cancel_event=cancel_event,
-                deadline=min(
-                    deadline,
-                    time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
-                ),
-                url_max_jar_size_bytes=candidate.url_max_jar_size_bytes,
-                url_allow_private_networks=candidate.url_allow_private_networks,
+                continue
+            candidate_deadline = min(
+                deadline,
+                time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
             )
+            try:
+                closure = resolve_mod_closure(
+                    provider="url",
+                    selector=candidate.url,
+                    minecraft=minecraft,
+                    loader=loader,
+                    loader_version=loader_version,
+                    cancel_event=cancel_event,
+                    deadline=candidate_deadline,
+                    url_max_jar_size_bytes=candidate.url_max_jar_size_bytes,
+                    url_allow_private_networks=candidate.url_allow_private_networks,
+                )
+            except (LoaderMigrationCancelled, LoaderMigrationDeadlineExceeded):
+                raise
+            except HuroshikiError as error:
+                if cancel_event.is_set():
+                    raise LoaderMigrationCancelled(
+                        "Template import was cancelled"
+                    ) from error
+                if time.monotonic() >= candidate_deadline:
+                    raise LoaderMigrationDeadlineExceeded(
+                        "Template import URL verification deadline exceeded"
+                    ) from error
+                verified.append(
+                    ImportCandidateVerification(
+                        candidate.selector_identity,
+                        None,
+                        None,
+                        None,
+                        None,
+                        str(error),
+                    )
+                )
+                continue
             actual_identity = closure.root_identity
             root_metadata = [
                 item for item in closure.metadata if item.identity == actual_identity
             ]
             if len(root_metadata) != 1:
-                raise HuroshikiError(
-                    f"Verified URL closure must contain exactly one root for "
-                    f"{candidate.candidate_key}"
+                verified.append(
+                    ImportCandidateVerification(
+                        candidate.selector_identity,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "Verified URL closure must contain exactly one root",
+                    )
                 )
-            cached_closure = closure
-        else:
-            actual_identity = candidate.logical_identity
-            root_metadata = []
-            cached_closure = None
-        verified_candidate = replace(
-            candidate,
-            metadata_path=(
-                root_metadata[0].relative_path if root_metadata else candidate.metadata_path
-            ),
-            filename=root_metadata[0].filename if root_metadata else candidate.filename,
-            actual_provider=actual_identity[0],
-            actual_project_id=actual_identity[1],
-        )
-        verified.append(
-            VerifiedImportCandidate(
-                verified_candidate,
-                actual_identity,
-                cached_closure,
+                continue
+            verified.append(
+                ImportCandidateVerification(
+                    candidate.selector_identity,
+                    actual_identity,
+                    root_metadata[0].relative_path,
+                    root_metadata[0].filename,
+                    resolved_closure_fingerprint(closure),
+                    None,
+                    closure,
+                )
             )
-        )
+        else:
+            verified.append(
+                ImportCandidateVerification(
+                    candidate.selector_identity,
+                    candidate.logical_identity,
+                    candidate.metadata_path,
+                    candidate.filename,
+                    None,
+                    None,
+                )
+            )
     return tuple(verified)
 
 
@@ -5617,21 +5677,28 @@ def build_verified_template_import_plan(
     compatibilities: Mapping[str, TemplateCompatibility],
     pack_candidates: Sequence[ModCandidate],
     template_candidates: Sequence[ModCandidate],
-    verified_candidates: Sequence[VerifiedImportCandidate],
+    verifications: Sequence[ImportCandidateVerification],
 ) -> TemplateImportPlan:
-    actual_by_selector = {
-        item.candidate.selector_identity: item
-        for item in verified_candidates
+    verification_by_selector = {
+        item.selector_identity: item for item in verifications
     }
     final_candidates = tuple(
         replace(
             candidate,
-            metadata_path=actual_by_selector[
-                candidate.selector_identity
-            ].candidate.metadata_path,
-            filename=actual_by_selector[candidate.selector_identity].candidate.filename,
-            actual_provider=actual_by_selector[candidate.selector_identity].actual_identity[0],
-            actual_project_id=actual_by_selector[candidate.selector_identity].actual_identity[1],
+            metadata_path=verification_by_selector[candidate.selector_identity].metadata_path,
+            filename=verification_by_selector[candidate.selector_identity].filename,
+            actual_provider=(
+                verification_by_selector[candidate.selector_identity].actual_identity[0]
+                if verification_by_selector[candidate.selector_identity].actual_identity
+                is not None
+                else None
+            ),
+            actual_project_id=(
+                verification_by_selector[candidate.selector_identity].actual_identity[1]
+                if verification_by_selector[candidate.selector_identity].actual_identity
+                is not None
+                else None
+            ),
         )
         for candidate in template_candidates
     )
@@ -5644,6 +5711,7 @@ def build_verified_template_import_plan(
             compatibilities=compatibilities,
             pack_candidates=pack_candidates,
             template_candidates=final_candidates,
+            verifications=verifications,
         )
     except TemplateMergeError as error:
         raise HuroshikiError(str(error)) from error
@@ -5655,7 +5723,7 @@ class TemplateImportSession:
         transaction: PackTransaction,
         template_ids: tuple[str, ...],
         template_baselines: Mapping[str, dict[str, str]],
-        verified_candidates: tuple[VerifiedImportCandidate, ...],
+        verifications: tuple[ImportCandidateVerification, ...],
         plan: TemplateImportPlan,
         cancel_event: threading.Event,
         deadline: float,
@@ -5663,7 +5731,7 @@ class TemplateImportSession:
         self.transaction = transaction
         self.template_ids = template_ids
         self.template_baselines = dict(template_baselines)
-        self.verified_candidates = verified_candidates
+        self.verifications = verifications
         self.plan = plan
         self.cancel_event = cancel_event
         self.deadline = deadline
@@ -5705,7 +5773,7 @@ class TemplateImportSession:
                 if candidate.origin_id == template_id
             )
             merged_candidates = merge_template_import_candidates(ordered_candidates)
-            verified = _verify_import_candidates(
+            verifications = verify_import_candidates(
                 merged_candidates,
                 minecraft=pack_versions[0],
                 loader=pack_versions[1],
@@ -5726,13 +5794,13 @@ class TemplateImportSession:
                 compatibilities=compatibilities,
                 pack_candidates=pack_candidates,
                 template_candidates=raw_candidates,
-                verified_candidates=verified,
+                verifications=verifications,
             )
             return cls(
                 transaction,
                 tuple(template_ids),
                 baselines,
-                verified,
+                verifications,
                 plan,
                 operation_cancel,
                 operation_deadline,
@@ -5797,12 +5865,39 @@ def _apply_import_side_changes(
         path.write_bytes(_metadata_contents_with_side(path.read_bytes(), new_side))
 
 
+def _run_template_import_refresh(
+    source: Path,
+    *,
+    cancel_event: threading.Event,
+    deadline: float,
+) -> None:
+    refresh = run_resolver_process(
+        ["packwiz", "refresh"],
+        cwd=source,
+        cancel_event=cancel_event,
+        deadline=min(
+            deadline,
+            time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+        ),
+    )
+    if (
+        refresh.returncode != 0
+        or refresh.cancelled
+        or refresh.timed_out
+        or refresh.orphaned_descendants
+        or refresh.termination_incomplete
+    ):
+        raise HuroshikiError("Template import Packwiz refresh failed")
+
+
 def _preflight_import_closures(
     transaction: PackTransaction,
     resolved_roots: Sequence[tuple[ModCandidate, ResolvedModClosure]],
     removed: Sequence[ModCandidate],
     side_changes: Sequence[tuple[tuple[str, str], str, str]],
     checkpoint: Callable[[], None],
+    cancel_event: threading.Event,
+    deadline: float,
 ) -> None:
     preflight_source = transaction.root / "import-preflight"
     try:
@@ -5820,6 +5915,12 @@ def _preflight_import_closures(
                 requested_side=candidate.side,
             )
         _apply_import_side_changes(preflight_source, side_changes)
+        _run_template_import_refresh(
+            preflight_source,
+            cancel_event=cancel_event,
+            deadline=deadline,
+        )
+        ensure_safe_pack_source(preflight_source, checkpoint=checkpoint)
     finally:
         shutil.rmtree(preflight_source, ignore_errors=True)
 
@@ -5855,13 +5956,19 @@ class TemplateImportOperation:
         if time.monotonic() >= self.deadline:
             raise LoaderMigrationDeadlineExceeded("Template import deadline exceeded")
 
-    def _verified_candidate(self, candidate: ModCandidate) -> VerifiedImportCandidate:
+    def _verification(
+        self, candidate: ModCandidate
+    ) -> ImportCandidateVerification:
         matches = [
             item
-            for item in self.session.verified_candidates
-            if item.candidate.selector_identity == candidate.selector_identity
+            for item in self.session.verifications
+            if item.selector_identity == candidate.selector_identity
         ]
-        if len(matches) != 1 or matches[0].actual_identity != candidate.actual_identity:
+        if (
+            len(matches) != 1
+            or not matches[0].succeeded
+            or matches[0].actual_identity != candidate.actual_identity
+        ):
             raise HuroshikiError("Template import URL verification cache is inconsistent")
         return matches[0]
 
@@ -5885,16 +5992,28 @@ class TemplateImportOperation:
             minecraft, loader, loader_version = packctl.project_versions(
                 self.transaction.source
             )
+            selected_actual_identities = [
+                candidate.actual_identity
+                for candidate in self.resolved.selected_new_roots
+            ]
+            if any(identity is None for identity in selected_actual_identities):
+                raise HuroshikiError(
+                    "Resolved template import contains an unverified root identity"
+                )
+            if len(set(selected_actual_identities)) != len(selected_actual_identities):
+                raise HuroshikiError(
+                    "Resolved template import contains duplicate actual root identities"
+                )
             resolved_roots: list[tuple[ModCandidate, ResolvedModClosure]] = []
             for index, candidate in enumerate(self.resolved.selected_new_roots, 1):
                 self._checkpoint()
                 self.progress_queue.put(
                     f"Resolving {index}/{len(self.resolved.selected_new_roots)}: {candidate.name}"
                 )
-                verified = self._verified_candidate(candidate)
+                verification = self._verification(candidate)
                 if candidate.provider == "url":
-                    closure = verified.cached_closure
-                    if closure is None:
+                    closure = verification.cached_closure
+                    if not isinstance(closure, ResolvedModClosure):
                         raise HuroshikiError("Verified URL closure is unavailable")
                 else:
                     closure = resolve_mod_closure(
@@ -5910,7 +6029,7 @@ class TemplateImportOperation:
                             time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
                         ),
                     )
-                if closure.root_identity != verified.actual_identity:
+                if closure.root_identity != verification.actual_identity:
                     raise HuroshikiError(
                         f"Resolved root identity changed for {candidate.candidate_key}"
                     )
@@ -5921,6 +6040,8 @@ class TemplateImportOperation:
                 self.resolved.removed_pack_candidates,
                 self.resolved.side_changes,
                 self._checkpoint,
+                self.cancel_event,
+                self.deadline,
             )
             _remove_import_candidates(
                 self.transaction.source,
@@ -5936,23 +6057,11 @@ class TemplateImportOperation:
                 self.transaction.source,
                 self.resolved.side_changes,
             )
-            refresh = run_resolver_process(
-                ["packwiz", "refresh"],
-                cwd=self.transaction.source,
+            _run_template_import_refresh(
+                self.transaction.source,
                 cancel_event=self.cancel_event,
-                deadline=min(
-                    self.deadline,
-                    time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
-                ),
+                deadline=self.deadline,
             )
-            if (
-                refresh.returncode != 0
-                or refresh.cancelled
-                or refresh.timed_out
-                or refresh.orphaned_descendants
-                or refresh.termination_incomplete
-            ):
-                raise HuroshikiError("Template import Packwiz refresh failed")
             ensure_safe_pack_source(self.transaction.source, checkpoint=self._checkpoint)
             if not self.session.templates_unchanged():
                 raise HuroshikiError("Template manifest changed during import")

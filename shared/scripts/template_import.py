@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 from pathlib import Path
-from typing import Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Literal, Mapping, Sequence
+
+if TYPE_CHECKING:
+    from huroshiki_core import ResolvedModClosure
 
 from template_merge import (
     ConflictResolution,
@@ -90,6 +93,21 @@ class UrlSelectorConflict:
 
 
 @dataclass(frozen=True)
+class LogicalIdentityConflict:
+    logical_identity: tuple[str, str]
+    pack_candidate: ModCandidate
+    template_candidates: tuple[ModCandidate, ...]
+
+    @property
+    def key(self) -> str:
+        return f"{self.logical_identity[0]}:{self.logical_identity[1]}"
+
+    @property
+    def candidates(self) -> tuple[ModCandidate, ...]:
+        return (self.pack_candidate, *self.template_candidates)
+
+
+@dataclass(frozen=True)
 class ActualIdentityConflict:
     actual_identity: tuple[str, str]
     pack_candidate: ModCandidate | None
@@ -107,16 +125,38 @@ class ActualIdentityConflict:
 
 
 @dataclass(frozen=True)
+class ImportCandidateVerification:
+    selector_identity: tuple[str, str, str | None]
+    actual_identity: tuple[str, str] | None
+    metadata_path: Path | None
+    filename: str | None
+    closure_fingerprint: str | None
+    error: str | None
+    cached_closure: ResolvedModClosure | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+
+    @property
+    def succeeded(self) -> bool:
+        return self.error is None and self.actual_identity is not None
+
+
+@dataclass(frozen=True)
 class TemplateImportPlan:
     pack_key: str
     template_ids: tuple[str, ...]
+    template_candidates: tuple[ModCandidate, ...]
+    pack_candidates: tuple[ModCandidate, ...]
     new_roots: tuple[ModCandidate, ...]
     existing_identities: tuple[ModCandidate, ...]
     side_conflicts: tuple[IdentitySideConflict, ...]
     name_conflicts: tuple[CandidateNameConflict, ...]
     url_selector_conflicts: tuple[UrlSelectorConflict, ...]
+    logical_identity_conflicts: tuple[LogicalIdentityConflict, ...]
     actual_identity_conflicts: tuple[ActualIdentityConflict, ...]
-    pack_candidates: tuple[ModCandidate, ...]
+    verifications: tuple[ImportCandidateVerification, ...]
     plan_digest: str
 
     @property
@@ -124,6 +164,7 @@ class TemplateImportPlan:
         return bool(
             self.name_conflicts
             or self.url_selector_conflicts
+            or self.logical_identity_conflicts
             or self.actual_identity_conflicts
         )
 
@@ -131,6 +172,8 @@ class TemplateImportPlan:
 @dataclass(frozen=True)
 class ResolvedTemplateImportPlan:
     plan_digest: str
+    selected_template_candidates: tuple[ModCandidate, ...]
+    retained_pack_candidates: tuple[ModCandidate, ...]
     selected_new_roots: tuple[ModCandidate, ...]
     removed_pack_candidates: tuple[ModCandidate, ...]
     side_changes: tuple[tuple[tuple[str, str], str, str], ...]
@@ -267,13 +310,36 @@ def _url_selector_conflicts(
     )
 
 
+def _logical_identity_conflicts(
+    pack_candidates: Sequence[ModCandidate],
+    template_candidates: Sequence[ModCandidate],
+) -> tuple[LogicalIdentityConflict, ...]:
+    pack_by_logical = {
+        candidate.logical_identity: candidate for candidate in pack_candidates
+    }
+    grouped: dict[tuple[str, str], list[ModCandidate]] = {}
+    for candidate in template_candidates:
+        pack_candidate = pack_by_logical.get(candidate.logical_identity)
+        if (
+            pack_candidate is not None
+            and candidate.actual_identity is not None
+            and candidate.actual_identity != pack_candidate.actual_identity
+        ):
+            grouped.setdefault(candidate.logical_identity, []).append(candidate)
+    return tuple(
+        LogicalIdentityConflict(identity, pack_by_logical[identity], tuple(candidates))
+        for identity, candidates in grouped.items()
+    )
+
+
 def _actual_identity_conflicts(
     pack_candidates: Sequence[ModCandidate],
     template_candidates: Sequence[ModCandidate],
 ) -> tuple[ActualIdentityConflict, ...]:
     pack_by_identity = {
-        candidate.actual_identity or candidate.logical_identity: candidate
+        candidate.actual_identity: candidate
         for candidate in pack_candidates
+        if candidate.actual_identity is not None
     }
     grouped: dict[tuple[str, str], list[ModCandidate]] = {}
     for candidate in template_candidates:
@@ -282,13 +348,14 @@ def _actual_identity_conflicts(
     conflicts: list[ActualIdentityConflict] = []
     for identity, candidates in grouped.items():
         pack_candidate = pack_by_identity.get(identity)
-        newly_discovered = any(
-            candidate.logical_identity != identity for candidate in candidates
-        )
         selector_collision = len(
             {candidate.selector_identity for candidate in candidates}
         ) > 1
-        if (pack_candidate is not None and newly_discovered) or selector_collision:
+        differs_from_pack_selector = pack_candidate is not None and any(
+            candidate.selector_identity != pack_candidate.selector_identity
+            for candidate in candidates
+        )
+        if differs_from_pack_selector or selector_collision:
             conflicts.append(
                 ActualIdentityConflict(identity, pack_candidate, tuple(candidates))
             )
@@ -300,6 +367,7 @@ def _plan_digest_payload(
     template_ids: tuple[str, ...],
     pack_candidates: Sequence[ModCandidate],
     template_candidates: Sequence[ModCandidate],
+    verifications: Sequence[ImportCandidateVerification],
 ) -> str:
     def record(candidate: ModCandidate) -> dict[str, object]:
         return {
@@ -323,11 +391,26 @@ def _plan_digest_payload(
         }
 
     payload = {
-        "version": 1,
+        "version": 2,
         "pack_key": pack_key,
         "template_ids": template_ids,
         "pack_candidates": [record(item) for item in pack_candidates],
         "template_candidates": [record(item) for item in template_candidates],
+        "verifications": [
+            {
+                "selector_identity": item.selector_identity,
+                "actual_identity": item.actual_identity,
+                "metadata_path": (
+                    item.metadata_path.as_posix()
+                    if item.metadata_path is not None
+                    else None
+                ),
+                "filename": item.filename,
+                "closure_fingerprint": item.closure_fingerprint,
+                "error": item.error,
+            }
+            for item in verifications
+        ],
     }
     serialized = json.dumps(
         payload,
@@ -347,6 +430,7 @@ def build_template_import_plan(
     compatibilities: Mapping[str, TemplateCompatibility],
     pack_candidates: Sequence[ModCandidate],
     template_candidates: Sequence[ModCandidate],
+    verifications: Sequence[ImportCandidateVerification],
 ) -> TemplateImportPlan:
     ordered_ids = tuple(template_ids)
     if not ordered_ids:
@@ -364,6 +448,8 @@ def build_template_import_plan(
     for candidate in pack_candidates:
         if candidate.origin_kind != "pack":
             raise TemplateMergeError("Pack candidates must have origin_kind='pack'")
+        if candidate.actual_identity is None:
+            raise TemplateMergeError("Pack candidates require an actual identity")
     for candidate in (*pack_candidates, *template_candidates):
         if candidate.side not in {"client", "server", "both"}:
             raise TemplateMergeError(f"Invalid candidate side: {candidate.side}")
@@ -384,49 +470,75 @@ def build_template_import_plan(
     if len(ordered_templates) != len(template_candidates):
         raise TemplateMergeError("Template candidate references an unselected template")
     merged_templates = merge_template_import_candidates(ordered_templates)
-    pack_by_identity = {
-        candidate.logical_identity: candidate for candidate in pack_candidates
+    verification_by_selector = {
+        item.selector_identity: item for item in verifications
+    }
+    if len(verification_by_selector) != len(verifications) or set(
+        verification_by_selector
+    ) != {candidate.selector_identity for candidate in merged_templates}:
+        raise TemplateMergeError("Template candidate verifications are incomplete or stale")
+    for candidate in merged_templates:
+        verification = verification_by_selector[candidate.selector_identity]
+        if candidate.actual_identity != verification.actual_identity:
+            raise TemplateMergeError("Template candidate verification identity mismatch")
+    pack_by_actual = {
+        candidate.actual_identity: candidate for candidate in pack_candidates
     }
     new_roots = tuple(
         candidate
         for candidate in merged_templates
-        if candidate.logical_identity not in pack_by_identity
+        if candidate.actual_identity is not None
+        and candidate.actual_identity not in pack_by_actual
     )
-    existing = tuple(
-        pack_by_identity[candidate.logical_identity]
+    existing_actual = {
+        candidate.actual_identity
         for candidate in merged_templates
-        if candidate.logical_identity in pack_by_identity
+        if candidate.actual_identity in pack_by_actual
+    }
+    existing = tuple(
+        candidate
+        for candidate in pack_candidates
+        if candidate.actual_identity in existing_actual
     )
     side_conflicts = tuple(
         IdentitySideConflict(
-            candidate.logical_identity,
-            pack_by_identity[candidate.logical_identity].side,
+            candidate.actual_identity,
+            pack_by_actual[candidate.actual_identity].side,
             candidate.side,
         )
         for candidate in merged_templates
-        if candidate.logical_identity in pack_by_identity
-        and pack_by_identity[candidate.logical_identity].side != candidate.side
+        if candidate.actual_identity in pack_by_actual
+        and candidate.selector_identity
+        == pack_by_actual[candidate.actual_identity].selector_identity
+        and pack_by_actual[candidate.actual_identity].side != candidate.side
     )
     name_conflicts = _name_conflicts((*pack_candidates, *merged_templates))
     url_selector_conflicts = _url_selector_conflicts(merged_templates)
+    logical_identity_conflicts = _logical_identity_conflicts(
+        pack_candidates, merged_templates
+    )
     actual_identity_conflicts = _actual_identity_conflicts(
         pack_candidates, merged_templates
     )
     return TemplateImportPlan(
         pack_key,
         ordered_ids,
+        merged_templates,
+        tuple(pack_candidates),
         new_roots,
         existing,
         side_conflicts,
         name_conflicts,
         url_selector_conflicts,
+        logical_identity_conflicts,
         actual_identity_conflicts,
-        tuple(pack_candidates),
+        tuple(verifications),
         _plan_digest_payload(
             pack_key,
             ordered_ids,
             pack_candidates,
             ordered_templates,
+            verifications,
         ),
     )
 
@@ -436,103 +548,197 @@ def resolve_template_import_plan(
     *,
     name_resolutions: Mapping[str, ConflictResolution] | None = None,
     url_selector_resolutions: Mapping[str, ConflictResolution] | None = None,
+    logical_identity_resolutions: Mapping[str, ConflictResolution] | None = None,
     actual_identity_resolutions: Mapping[str, ConflictResolution] | None = None,
     side_decisions: Mapping[tuple[str, str], SideDecision] | None = None,
 ) -> ResolvedTemplateImportPlan:
-    supplied_names = dict(name_resolutions or {})
-    expected_names = {conflict.key for conflict in plan.name_conflicts}
-    if set(supplied_names) != expected_names:
-        missing = expected_names - set(supplied_names)
-        stale = set(supplied_names) - expected_names
-        details = sorted(missing | stale)
-        raise TemplateMergeError(
-            "Unresolved or stale import name conflict(s): " + ", ".join(details)
-        )
-    selected_keys = {
-        candidate.candidate_key
-        for candidate in (*plan.pack_candidates, *plan.new_roots)
-    }
+    requirements: dict[str, bool] = {}
+    sources: dict[str, list[str]] = {}
     warnings: list[str] = []
-    for conflict in plan.name_conflicts:
-        resolution = supplied_names[conflict.key]
-        keys = tuple(resolution.candidate_keys)
-        available = {candidate.candidate_key for candidate in conflict.candidates}
-        if not keys or len(set(keys)) != len(keys) or not set(keys) <= available:
-            raise TemplateMergeError(f"Invalid resolution for {conflict.name}")
-        if len(keys) > 1 and not resolution.acknowledge_duplicate_risk:
+
+    def checked_resolutions(
+        kind: str,
+        conflicts: Sequence[object],
+        supplied: Mapping[str, ConflictResolution] | None,
+    ) -> dict[str, ConflictResolution]:
+        values = dict(supplied or {})
+        expected = {getattr(conflict, "key") for conflict in conflicts}
+        if set(values) != expected:
+            details = sorted((expected - set(values)) | (set(values) - expected))
             raise TemplateMergeError(
-                f"Conflict {conflict.name!r} retains multiple candidates without "
-                "acknowledging duplicate MOD risk"
+                f"Unresolved or stale {kind} conflict(s): " + ", ".join(details)
             )
-        selected_keys.difference_update(available - set(keys))
-        if len(keys) > 1:
-            warnings.append(
-                f"{conflict.name}: multiple sources retained; duplicate MOD risk acknowledged"
+        return values
+
+    def apply_constraints(
+        *,
+        kind: str,
+        key: str,
+        candidates: Sequence[ModCandidate],
+        resolution: ConflictResolution,
+        cardinality: Literal["one-or-more", "exactly-one"],
+    ) -> None:
+        keys = tuple(resolution.candidate_keys)
+        available_keys = tuple(candidate.candidate_key for candidate in candidates)
+        available = set(available_keys)
+        if len(available) != len(available_keys):
+            raise TemplateMergeError(f"Conflict {kind} {key!r} has duplicate candidate keys")
+        if len(set(keys)) != len(keys) or not set(keys) <= available:
+            raise TemplateMergeError(f"Invalid resolution for {kind} conflict {key!r}")
+        if cardinality == "exactly-one" and len(keys) != 1:
+            raise TemplateMergeError(
+                f"{kind.capitalize()} conflict {key!r} requires exactly one candidate"
+            )
+        if cardinality == "one-or-more" and not keys:
+            raise TemplateMergeError(
+                f"{kind.capitalize()} conflict {key!r} requires at least one candidate"
+            )
+        selected = set(keys)
+        source = f'{kind} conflict "{key}"'
+        for candidate_key in available_keys:
+            required = candidate_key in selected
+            previous = requirements.get(candidate_key)
+            if previous is not None and previous != required:
+                previous_source = sources[candidate_key][-1]
+                action = "selected" if previous else "rejected"
+                opposite = "selected" if required else "rejected"
+                raise TemplateMergeError(
+                    f"Candidate {candidate_key} is {action} by {previous_source} "
+                    f"but {opposite} by {source}"
+                )
+            requirements[candidate_key] = required
+            sources.setdefault(candidate_key, []).append(source)
+
+    conflict_groups = (
+        (
+            "name",
+            plan.name_conflicts,
+            checked_resolutions("name", plan.name_conflicts, name_resolutions),
+            "one-or-more",
+        ),
+        (
+            "URL selector",
+            plan.url_selector_conflicts,
+            checked_resolutions(
+                "URL selector", plan.url_selector_conflicts, url_selector_resolutions
+            ),
+            "one-or-more",
+        ),
+        (
+            "logical identity",
+            plan.logical_identity_conflicts,
+            checked_resolutions(
+                "logical identity",
+                plan.logical_identity_conflicts,
+                logical_identity_resolutions,
+            ),
+            "exactly-one",
+        ),
+        (
+            "actual identity",
+            plan.actual_identity_conflicts,
+            checked_resolutions(
+                "actual identity",
+                plan.actual_identity_conflicts,
+                actual_identity_resolutions,
+            ),
+            "exactly-one",
+        ),
+    )
+    for kind, conflicts, resolutions, cardinality in conflict_groups:
+        for conflict in conflicts:
+            apply_constraints(
+                kind=kind,
+                key=conflict.key,
+                candidates=conflict.candidates,
+                resolution=resolutions[conflict.key],
+                cardinality=cardinality,
             )
 
-    conflict_keys = {
+    selected_keys = {
         candidate.candidate_key
-        for conflict in plan.name_conflicts
-        for candidate in conflict.candidates
+        for candidate in (*plan.pack_candidates, *plan.template_candidates)
+        if requirements.get(candidate.candidate_key, True)
     }
-    supplied_urls = dict(url_selector_resolutions or {})
-    expected_urls = {conflict.key for conflict in plan.url_selector_conflicts}
-    if set(supplied_urls) != expected_urls:
-        details = sorted(
-            (expected_urls - set(supplied_urls))
-            | (set(supplied_urls) - expected_urls)
-        )
-        raise TemplateMergeError(
-            "Unresolved or stale URL selector conflict(s): " + ", ".join(details)
-        )
-    for conflict in plan.url_selector_conflicts:
-        resolution = supplied_urls[conflict.key]
-        keys = tuple(resolution.candidate_keys)
-        available = {candidate.candidate_key for candidate in conflict.candidates}
-        if not keys or len(set(keys)) != len(keys) or not set(keys) <= available:
-            raise TemplateMergeError(f"Invalid resolution for {conflict.key}")
-        if len(keys) > 1 and not resolution.acknowledge_duplicate_risk:
-            raise TemplateMergeError(
-                f"Conflict {conflict.key!r} retains multiple URL selectors without "
-                "acknowledging duplicate MOD risk"
+    for kind, conflicts, resolutions, cardinality in conflict_groups:
+        for conflict in conflicts:
+            final_keys = tuple(
+                candidate.candidate_key
+                for candidate in conflict.candidates
+                if candidate.candidate_key in selected_keys
             )
-        selected_keys.difference_update(available - set(keys))
-        conflict_keys.update(available)
-        if len(keys) > 1:
-            warnings.append(
-                f"{conflict.key}: multiple URL selectors retained; duplicate MOD risk acknowledged"
-            )
-    supplied_actual = dict(actual_identity_resolutions or {})
-    expected_actual = {conflict.key for conflict in plan.actual_identity_conflicts}
-    if set(supplied_actual) != expected_actual:
-        details = sorted(
-            (expected_actual - set(supplied_actual))
-            | (set(supplied_actual) - expected_actual)
-        )
-        raise TemplateMergeError(
-            "Unresolved or stale actual identity conflict(s): " + ", ".join(details)
-        )
-    for conflict in plan.actual_identity_conflicts:
-        resolution = supplied_actual[conflict.key]
-        keys = tuple(resolution.candidate_keys)
-        available = {candidate.candidate_key for candidate in conflict.candidates}
-        if len(keys) != 1 or keys[0] not in available:
-            raise TemplateMergeError(
-                f"Actual identity conflict {conflict.key} requires exactly one candidate"
-            )
-        selected_keys.difference_update(available - set(keys))
-        conflict_keys.update(available)
-    selected_new = tuple(
+            if cardinality == "exactly-one" and len(final_keys) != 1:
+                raise TemplateMergeError(
+                    f"{kind.capitalize()} conflict {conflict.key!r} must retain exactly one candidate"
+                )
+            if cardinality == "one-or-more" and not final_keys:
+                raise TemplateMergeError(
+                    f"{kind.capitalize()} conflict {conflict.key!r} must retain a candidate"
+                )
+            resolution = resolutions[conflict.key]
+            if len(final_keys) > 1 and not resolution.acknowledge_duplicate_risk:
+                raise TemplateMergeError(
+                    f"Conflict {conflict.key!r} retains multiple candidates without "
+                    "acknowledging duplicate MOD risk"
+                )
+            if len(final_keys) > 1:
+                warnings.append(
+                    f"{conflict.key}: multiple sources retained; duplicate MOD risk acknowledged"
+                )
+
+    selected_templates = tuple(
         candidate
-        for candidate in plan.new_roots
-        if candidate.candidate_key not in conflict_keys
-        or candidate.candidate_key in selected_keys
+        for candidate in plan.template_candidates
+        if candidate.candidate_key in selected_keys
     )
+    retained_pack = tuple(
+        candidate
+        for candidate in plan.pack_candidates
+        if candidate.candidate_key in selected_keys
+    )
+    verification_by_selector = {
+        item.selector_identity: item for item in plan.verifications
+    }
+    for candidate in selected_templates:
+        verification = verification_by_selector[candidate.selector_identity]
+        if not verification.succeeded:
+            raise TemplateMergeError(
+                f"Selected candidate {candidate.candidate_key} could not be verified: "
+                f"{verification.error}"
+            )
+
     removed_pack = tuple(
         candidate
         for candidate in plan.pack_candidates
-        if candidate.candidate_key in conflict_keys
-        and candidate.candidate_key not in selected_keys
+        if candidate.candidate_key not in selected_keys
+    )
+    all_conflicts = tuple(
+        conflict
+        for _kind, conflicts, _resolutions, _cardinality in conflict_groups
+        for conflict in conflicts
+    )
+    for removed in removed_pack:
+        replacing = any(
+            removed in conflict.candidates
+            and any(
+                candidate.origin_kind == "template"
+                and candidate.candidate_key in selected_keys
+                for candidate in conflict.candidates
+            )
+            for conflict in all_conflicts
+        )
+        if not replacing:
+            raise TemplateMergeError(
+                f"Removing {removed.candidate_key} leaves no selected replacement"
+            )
+
+    retained_actual = {
+        candidate.actual_identity for candidate in retained_pack
+    }
+    selected_new = tuple(
+        candidate
+        for candidate in selected_templates
+        if candidate.actual_identity not in retained_actual
     )
 
     supplied_sides = dict(side_decisions or {})
@@ -555,6 +761,8 @@ def resolve_template_import_plan(
             side_changes.append((conflict.identity, conflict.pack_side, result))
     return ResolvedTemplateImportPlan(
         plan.plan_digest,
+        selected_templates,
+        retained_pack,
         selected_new,
         removed_pack,
         tuple(side_changes),
