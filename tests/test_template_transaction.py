@@ -80,9 +80,14 @@ mods: []
                 patch.object(packctl, "ROOT", root),
                 patch.object(packctl, "TEMPLATES", templates),
                 patch.object(
-                    packctl,
-                    "resolve_modrinth_identity",
-                    return_value="example-id",
+                    core,
+                    "_run_provider_lookup",
+                    return_value={
+                        "provider": "modrinth",
+                        "project_id": "example-id",
+                        "slug": "example",
+                        "title": "Example MOD",
+                    },
                 ),
                 patch.dict(os.environ, environment, clear=True),
             ]

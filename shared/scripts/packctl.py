@@ -24,9 +24,7 @@ import tempfile
 import tomllib
 from typing import Any, Literal
 import unicodedata
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 import tomlkit
@@ -2465,23 +2463,36 @@ def modrinth_project_reference(selector: str) -> str:
 
 def resolve_modrinth_identity(selector: str) -> str:
     project = modrinth_project_reference(selector)
-    request = Request(
-        f"https://api.modrinth.com/v2/project/{quote(project, safe='')}",
-        headers={"User-Agent": "upiscium-packwiz-monorepo/1.0"},
-    )
     try:
-        with urlopen(request, timeout=30) as response:
-            data = json.load(response)
-    except HTTPError as error:
-        error.close()
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve().with_name("provider_lookup.py")),
+                "modrinth",
+                "resolve",
+                project,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=35,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
         raise ConfigError(
             f"Could not resolve Modrinth project {project!r}: {error}"
         ) from error
-    except (URLError, TimeoutError) as error:
-        raise ConfigError(
-            f"Could not resolve Modrinth project {project!r}: {error}"
-        ) from error
+    if result.returncode != 0:
+        message = (result.stderr or "provider lookup failed").strip()
+        raise ConfigError(f"Could not resolve Modrinth project {project!r}: {message}")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ConfigError("Provider lookup returned invalid JSON") from error
+    if not isinstance(data, dict):
+        raise ConfigError("Provider lookup returned a non-object response")
     project_id = data.get("id")
+    if project_id is None:
+        project_id = data.get("project_id")
     if not isinstance(project_id, str) or not project_id:
         raise ConfigError(f"No Modrinth project ID returned for {project!r}")
     return project_id

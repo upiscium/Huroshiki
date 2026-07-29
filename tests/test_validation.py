@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import packctl
+import provider_lookup
 
 
 PACK_TOML = '''name = "Demo"
@@ -113,7 +114,7 @@ class RepositoryValidationTest(unittest.TestCase):
     def test_validates_all_projects_successfully_without_side_effects(self) -> None:
         before = self.snapshot()
         with patch.object(packctl, "run") as run, patch.object(
-            packctl, "urlopen"
+            provider_lookup, "urlopen"
         ) as urlopen:
             result, stdout, stderr = self.validate_all()
 

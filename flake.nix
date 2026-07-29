@@ -63,6 +63,7 @@
             test -f ${huroshiki}/lib/huroshiki/huroshiki_core.py
             test -f ${huroshiki}/lib/huroshiki/overlay_policy.py
             test -f ${huroshiki}/lib/huroshiki/portable_paths.py
+            test -f ${huroshiki}/lib/huroshiki/provider_lookup.py
             test -f ${huroshiki}/lib/huroshiki/template_merge.py
             test -f ${huroshiki}/lib/huroshiki/huroshiki-launcher.sh
             test -x ${huroshiki}/lib/huroshiki/huroshiki-launcher.sh

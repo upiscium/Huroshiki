@@ -6,6 +6,7 @@ import ctypes
 from dataclasses import dataclass, field, replace
 import errno
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -380,6 +381,16 @@ class ResolvedSelector:
     original: str
     canonical_project_id: str | None
     display_label: str | None = None
+
+
+@dataclass(frozen=True)
+class ProviderProject:
+    provider: str
+    project_id: str
+    slug: str
+    title: str
+    description: str = ""
+    author: str = ""
 
 
 @dataclass(frozen=True)
@@ -832,7 +843,9 @@ class PackTransaction:
                     else operation.query
                 )
                 project_id = resolve_project_selector(
-                    operation.provider, selected
+                    operation.provider,
+                    selected,
+                    cancel_event=operation.cancel_event,
                 ).canonical_project_id
             if project_id is None:
                 raise HuroshikiError(
@@ -1426,23 +1439,148 @@ def _curseforge_project_reference(selector: str) -> tuple[str, str | None]:
     return value, None
 
 
-def resolve_project_selector(provider: str, selector: str) -> ResolvedSelector:
+PROVIDER_LOOKUP_TIMEOUT_SECONDS = 30
+
+
+def _provider_protocol_text(
+    record: object,
+    key: str,
+    *,
+    required: bool = True,
+) -> str:
+    if not isinstance(record, dict):
+        raise HuroshikiError("Provider lookup returned a non-object record")
+    value = record.get(key, "")
+    if not isinstance(value, str) or (required and not value):
+        raise HuroshikiError(f"Provider lookup returned invalid {key}")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise HuroshikiError(f"Provider lookup returned control characters in {key}")
+    return value
+
+
+def _run_provider_lookup(
+    arguments: list[str],
+    *,
+    cancel_event: threading.Event | None,
+    deadline: float | None,
+) -> object:
+    effective_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + PROVIDER_LOOKUP_TIMEOUT_SECONDS
+    )
+    result = run_resolver_process(
+        [sys.executable, str(SCRIPTS / "provider_lookup.py"), *arguments],
+        cwd=ROOT,
+        cancel_event=cancel_event,
+        deadline=effective_deadline,
+    )
+    if result.cancelled:
+        raise HuroshikiError("Provider lookup was cancelled")
+    if result.timed_out:
+        raise HuroshikiError("Provider lookup deadline exceeded")
+    if result.orphaned_descendants:
+        raise HuroshikiError("Provider lookup left background processes after completion")
+    if result.returncode != 0:
+        raise HuroshikiError(
+            concise_process_error(result).replace("Packwiz", "Provider lookup")
+        )
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise HuroshikiError("Provider lookup returned invalid JSON") from error
+
+
+def resolve_project_selector(
+    provider: str,
+    selector: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> ResolvedSelector:
+    if cancel_event is not None and cancel_event.is_set():
+        raise HuroshikiError("Provider lookup was cancelled")
     normalized_provider, normalized_selector = normalize_add_selector(provider, selector)
     if normalized_provider == "modrinth":
-        try:
-            project_id = packctl.resolve_modrinth_identity(normalized_selector)
-        except packctl.ConfigError as error:
-            raise HuroshikiError(str(error)) from error
+        record = _run_provider_lookup(
+            ["modrinth", "resolve", normalized_selector],
+            cancel_event=cancel_event,
+            deadline=deadline,
+        )
+        if not isinstance(record, dict) or record.get("provider") != "modrinth":
+            raise HuroshikiError("Provider lookup returned an invalid provider")
+        project_id = _provider_protocol_text(record, "project_id")
+        title = _provider_protocol_text(record, "title")
+        _provider_protocol_text(record, "slug")
         return ResolvedSelector(
             normalized_provider,
             selector,
             project_id,
-            normalized_selector,
+            title,
         )
     if normalized_provider == "curseforge":
         label, project_id = _curseforge_project_reference(normalized_selector)
         return ResolvedSelector(normalized_provider, selector, project_id, label)
     return ResolvedSelector(normalized_provider, selector, None, normalized_selector)
+
+
+def search_provider_projects(
+    provider: str,
+    query: str,
+    *,
+    minecraft: str,
+    loader: str,
+    limit: int = 20,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> tuple[ProviderProject, ...]:
+    normalized_provider = canonical_provider(provider)
+    if normalized_provider == "curseforge":
+        raise HuroshikiError(
+            "CurseForge search is unavailable; enter a numeric project ID."
+        )
+    if normalized_provider != "modrinth":
+        raise HuroshikiError(f"Provider search is unavailable for {provider}")
+    if not 1 <= limit <= 50:
+        raise HuroshikiError("Provider search limit must be between 1 and 50")
+    record = _run_provider_lookup(
+        [
+            "modrinth",
+            "search",
+            query,
+            "--minecraft",
+            minecraft,
+            "--loader",
+            loader,
+            "--limit",
+            str(limit),
+        ],
+        cancel_event=cancel_event,
+        deadline=deadline,
+    )
+    if not isinstance(record, dict) or record.get("provider") != "modrinth":
+        raise HuroshikiError("Provider lookup returned an invalid provider")
+    raw_results = record.get("results")
+    if not isinstance(raw_results, list) or len(raw_results) > limit:
+        raise HuroshikiError("Provider lookup returned an invalid results list")
+    projects: list[ProviderProject] = []
+    identities: set[str] = set()
+    for item in raw_results:
+        project = ProviderProject(
+            "modrinth",
+            _provider_protocol_text(item, "project_id"),
+            _provider_protocol_text(item, "slug"),
+            _provider_protocol_text(item, "title"),
+            _provider_protocol_text(item, "description", required=False),
+            _provider_protocol_text(item, "author", required=False),
+        )
+        if project.project_id in identities:
+            raise HuroshikiError(
+                f"Provider lookup returned duplicate project ID {project.project_id}"
+            )
+        identities.add(project.project_id)
+        projects.append(project)
+    return tuple(projects)
 
 
 def canonical_project_id_from_label(provider: str, label: str) -> str | None:
@@ -3003,7 +3141,9 @@ def _apply_profile_entry(transaction: PackTransaction, entry: Mapping[str, objec
         )
 
     if provider == "modrinth":
-        project_id: str | int = packctl.resolve_modrinth(str(project))
+        project_id: str | int = (
+            resolve_project_selector("modrinth", str(project)).canonical_project_id or ""
+        )
     else:
         try:
             project_id = int(project)
@@ -3686,7 +3826,12 @@ def resolve_mod_closure(
     if cancel_event is not None and cancel_event.is_set():
         raise HuroshikiError("MOD resolution was cancelled")
     if canonical_project_id is None:
-        resolved_selector = resolve_project_selector(provider, selector)
+        resolved_selector = resolve_project_selector(
+            provider,
+            selector,
+            cancel_event=cancel_event,
+            deadline=deadline,
+        )
     else:
         normalized_provider, normalized_selector = normalize_add_selector(
             provider, selector

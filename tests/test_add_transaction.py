@@ -62,6 +62,11 @@ class AddTransactionTest(unittest.TestCase):
             ),
             patch.object(
                 core,
+                "_run_provider_lookup",
+                side_effect=self.provider_lookup,
+            ),
+            patch.object(
+                core,
                 "run_resolver_process",
                 side_effect=self.run_fake_resolver,
             ),
@@ -101,6 +106,17 @@ class AddTransactionTest(unittest.TestCase):
             False,
             False,
         )
+
+    @staticmethod
+    def provider_lookup(arguments, **_):
+        selector = arguments[2]
+        reference = packctl.modrinth_project_reference(selector)
+        return {
+            "provider": "modrinth",
+            "project_id": reference,
+            "slug": reference,
+            "title": reference,
+        }
 
     def install_files(self, cwd: Path, root_id: str = "example") -> None:
         (cwd / "mods/root.pw.toml").write_text(
@@ -430,8 +446,14 @@ class AddTransactionTest(unittest.TestCase):
             return self.completed(command)
 
         for selector in selectors:
+            lookup_result = {
+                "provider": "modrinth",
+                "project_id": canonical_id,
+                "slug": "sodium-extra",
+                "title": "Sodium Extra",
+            }
             with self.subTest(selector=selector), patch.object(
-                packctl, "resolve_modrinth_identity", return_value=canonical_id
+                core, "_run_provider_lookup", return_value=lookup_result
             ) as resolve, patch.object(core.subprocess, "run", side_effect=run):
                 closure = core.resolve_mod_closure(
                     provider="modrinth",
@@ -445,11 +467,11 @@ class AddTransactionTest(unittest.TestCase):
 
     def test_modrinth_resolution_and_root_mismatch_fail_closed(self) -> None:
         for error in (
-            packctl.ConfigError("API unavailable"),
-            packctl.ConfigError("API timed out"),
+            core.HuroshikiError("API unavailable"),
+            core.HuroshikiError("API timed out"),
         ):
             with self.subTest(error=str(error)), patch.object(
-                packctl, "resolve_modrinth_identity", side_effect=error
+                core, "_run_provider_lookup", side_effect=error
             ), patch.object(core.subprocess, "run") as run:
                 with self.assertRaisesRegex(core.HuroshikiError, str(error)):
                     core.resolve_mod_closure(
@@ -467,8 +489,14 @@ class AddTransactionTest(unittest.TestCase):
             )
             return self.completed(command)
 
+        lookup_result = {
+            "provider": "modrinth",
+            "project_id": "expected",
+            "slug": "expected",
+            "title": "Expected",
+        }
         with patch.object(
-            packctl, "resolve_modrinth_identity", return_value="expected"
+            core, "_run_provider_lookup", return_value=lookup_result
         ), patch.object(core.subprocess, "run", side_effect=wrong_root):
             with self.assertRaisesRegex(core.HuroshikiError, "resolved 0 times"):
                 core.resolve_mod_closure(
