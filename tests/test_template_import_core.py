@@ -850,8 +850,28 @@ class TemplateImportCoreTest(unittest.TestCase):
             core, "run_resolver_process", side_effect=self.refresh_ok
         ):
             operation.run()
-            operation.discard()
+        operation.discard()
         self.assertEqual(core.tree_digest_snapshot(self.source), before)
+
+    def test_cli_json_reports_selected_options_and_root_member(self) -> None:
+        args = packctl.parser().parse_args(
+            ["apply-template", "demo", "base", "--json"]
+        )
+        output = StringIO()
+        with (
+            patch.object(core, "resolve_mod_closure", return_value=self.closure()),
+            patch.object(core, "run_resolver_process", side_effect=self.refresh_ok),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(packctl.cmd_apply_template(args), 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["selected_options"], ["template:modrinth:root"])
+        self.assertEqual(
+            payload["resolved_roots"][0]["selection_key"],
+            "template:modrinth:root",
+        )
+        self.assertFalse((self.source / "mods/root.pw.toml").exists())
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
     def test_cli_failed_non_conflicting_candidate_returns_one_and_unlocks(self) -> None:
