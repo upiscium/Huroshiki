@@ -2902,6 +2902,56 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
         plan = session.plan
         if args.resolution is None:
             if plan.requires_resolution:
+                conflict_payload = {
+                    "name": [
+                        {
+                            "key": conflict.key,
+                            "candidates": [
+                                candidate.candidate_key
+                                for candidate in conflict.candidates
+                            ],
+                        }
+                        for conflict in plan.name_conflicts
+                    ],
+                    "url_selector": [
+                        {
+                            "key": conflict.key,
+                            "candidates": [
+                                candidate.candidate_key
+                                for candidate in conflict.candidates
+                            ],
+                        }
+                        for conflict in plan.url_selector_conflicts
+                    ],
+                    "actual_identity": [
+                        {
+                            "key": conflict.key,
+                            "candidates": [
+                                candidate.candidate_key
+                                for candidate in conflict.candidates
+                            ],
+                        }
+                        for conflict in plan.actual_identity_conflicts
+                    ],
+                }
+                if args.json:
+                    print(
+                        json.dumps(
+                            {
+                                "plan_digest": plan.plan_digest,
+                                "requested_roots": [
+                                    item.candidate_key for item in plan.new_roots
+                                ],
+                                "resolved_roots": [],
+                                "added_dependencies": [],
+                                "removed": [],
+                                "side_changes": [],
+                                "conflicts": conflict_payload,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    return 2
                 print("Template import conflicts require a resolution file:", file=sys.stderr)
                 print("version: 1", file=sys.stderr)
                 print(f'plan_digest: "{plan.plan_digest}"', file=sys.stderr)
@@ -2922,7 +2972,12 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                             "    acknowledge_duplicate_risk: false",
                             file=sys.stderr,
                         )
-                print("side_conflicts: {}", file=sys.stderr)
+                print("side_conflicts:", file=sys.stderr)
+                if not plan.side_conflicts:
+                    print("  {}", file=sys.stderr)
+                for conflict in plan.side_conflicts:
+                    key = f"{conflict.identity[0]}:{conflict.identity[1]}"
+                    print(f'  "{key}": keep_pack', file=sys.stderr)
                 return 2
             resolved = resolve_template_import_plan(plan)
         else:

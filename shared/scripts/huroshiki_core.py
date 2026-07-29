@@ -5577,12 +5577,25 @@ def _verify_import_candidates(
                 url_allow_private_networks=candidate.url_allow_private_networks,
             )
             actual_identity = closure.root_identity
+            root_metadata = [
+                item for item in closure.metadata if item.identity == actual_identity
+            ]
+            if len(root_metadata) != 1:
+                raise HuroshikiError(
+                    f"Verified URL closure must contain exactly one root for "
+                    f"{candidate.candidate_key}"
+                )
             cached_closure = closure
         else:
             actual_identity = candidate.logical_identity
+            root_metadata = []
             cached_closure = None
         verified_candidate = replace(
             candidate,
+            metadata_path=(
+                root_metadata[0].relative_path if root_metadata else candidate.metadata_path
+            ),
+            filename=root_metadata[0].filename if root_metadata else candidate.filename,
             actual_provider=actual_identity[0],
             actual_project_id=actual_identity[1],
         )
@@ -5607,14 +5620,18 @@ def build_verified_template_import_plan(
     verified_candidates: Sequence[VerifiedImportCandidate],
 ) -> TemplateImportPlan:
     actual_by_selector = {
-        item.candidate.selector_identity: item.actual_identity
+        item.candidate.selector_identity: item
         for item in verified_candidates
     }
     final_candidates = tuple(
         replace(
             candidate,
-            actual_provider=actual_by_selector[candidate.selector_identity][0],
-            actual_project_id=actual_by_selector[candidate.selector_identity][1],
+            metadata_path=actual_by_selector[
+                candidate.selector_identity
+            ].candidate.metadata_path,
+            filename=actual_by_selector[candidate.selector_identity].candidate.filename,
+            actual_provider=actual_by_selector[candidate.selector_identity].actual_identity[0],
+            actual_project_id=actual_by_selector[candidate.selector_identity].actual_identity[1],
         )
         for candidate in template_candidates
     )

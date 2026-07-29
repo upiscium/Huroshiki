@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -230,6 +231,17 @@ class TemplateImportCoreTest(unittest.TestCase):
         self.assertIn("resolution file", stderr.getvalue())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
+        args.json = True
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(packctl.cmd_apply_template(args), 2)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["plan_digest"], core.prepare_template_import_plan(
+            "pack:demo", ["base"]
+        ).plan_digest)
+        self.assertEqual(payload["conflicts"]["name"][0]["key"], "root")
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
     def test_resolution_digest_and_cli_parser_fail_closed(self) -> None:
         plan = core.prepare_template_import_plan("pack:demo", ["base"])
         resolution = self.root / "resolution.yaml"
@@ -285,6 +297,21 @@ class TemplateImportCoreTest(unittest.TestCase):
         with self.assertRaisesRegex(core.HuroshikiError, "real Packwiz source changed"):
             operation.apply()
         self.assertTrue((self.source / "mods/late.pw.toml").is_file())
+
+    def test_external_config_change_after_preview_blocks_apply(self) -> None:
+        operation = self.operation()
+        with (
+            patch.object(core, "resolve_mod_closure", return_value=self.closure()),
+            patch.object(core, "run_resolver_process", side_effect=self.refresh_ok),
+        ):
+            operation.run()
+        (self.pack / "pack.local.yaml").write_text(
+            "url_max_jar_size_bytes: 1024\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(core.HuroshikiError, "configuration changed"):
+            operation.apply()
+        self.assertFalse((self.source / "mods").exists())
 
     def test_failed_session_creation_releases_project_lock(self) -> None:
         with patch.object(

@@ -399,6 +399,38 @@ class TemplateImportPlannerTest(unittest.TestCase):
         )
         self.assertNotEqual(first.plan_digest, second.plan_digest)
 
+    def test_two_urls_resolving_to_same_actual_identity_fail_closed(self) -> None:
+        candidates = [
+            template_candidate(
+                template,
+                name=name,
+                provider="url",
+                project_id=logical_id,
+                side="both",
+                url=url,
+                actual_provider="url",
+                actual_project_id="shared_actual",
+            )
+            for template, name, logical_id, url in (
+                ("a", "First", "first", "https://a.example/first.jar"),
+                ("b", "Second", "second", "https://b.example/second.jar"),
+            )
+        ]
+        plan = build(["a", "b"], [], candidates)
+        self.assertEqual(plan.actual_identity_conflicts[0].key, "url:shared_actual")
+        with self.assertRaisesRegex(TemplateMergeError, "actual identity"):
+            resolve_template_import_plan(plan)
+        with self.assertRaisesRegex(TemplateMergeError, "exactly one"):
+            resolve_template_import_plan(
+                plan,
+                actual_identity_resolutions={
+                    "url:shared_actual": ConflictResolution(
+                        tuple(candidate.candidate_key for candidate in candidates),
+                        True,
+                    )
+                },
+            )
+
     def test_plan_digest_changes_with_template_order_or_candidate_data(self) -> None:
         a = template_candidate(
             "a", name="A", provider="modrinth", project_id="a", side="both"
