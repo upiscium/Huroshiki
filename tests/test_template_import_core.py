@@ -268,7 +268,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         with redirect_stderr(stderr):
             self.assertEqual(packctl.cmd_apply_template(args), 2)
         self.assertIn("resolution file", stderr.getvalue())
-        self.assertIn("version: 2", stderr.getvalue())
+        self.assertIn("version: 3", stderr.getvalue())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
         args.json = True
@@ -286,7 +286,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         plan = core.prepare_template_import_plan("pack:demo", ["base"])
         resolution = self.root / "resolution.yaml"
         resolution.write_text(
-            "version: 2\nplan_digest: stale\nname_conflicts: {}\nside_conflicts: {}\n",
+            "version: 3\nplan_digest: stale\nname_conflicts: {}\nside_conflicts: {}\n",
             encoding="utf-8",
         )
         with self.assertRaisesRegex(packctl.ConfigError, "stale plan digest"):
@@ -296,6 +296,12 @@ class TemplateImportCoreTest(unittest.TestCase):
             encoding="utf-8",
         )
         with self.assertRaisesRegex(packctl.ConfigError, "no longer supported"):
+            packctl._template_import_resolution(resolution, plan)
+        resolution.write_text(
+            "version: 2\nplan_digest: stale\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(packctl.ConfigError, "version 2.*no longer"):
             packctl._template_import_resolution(resolution, plan)
         args = packctl.parser().parse_args(
             ["apply-template", "demo", "base", "--apply", "--json"]
@@ -451,6 +457,15 @@ class TemplateImportCoreTest(unittest.TestCase):
             payload["url_selector"][0]["candidates"][1]["error"],
             "HTTP 404",
         )
+        self.assertTrue(
+            payload["url_selector"][0]["candidates"][0]["selection_key"].startswith(
+                "template:"
+            )
+        )
+        self.assertEqual(
+            payload["url_selector"][0]["candidates"][0]["origin_kind"],
+            "template",
+        )
         good, bad = session.plan.template_candidates
         resolved = resolve_template_import_plan(
             session.plan,
@@ -560,6 +575,66 @@ class TemplateImportCoreTest(unittest.TestCase):
             )
         session.discard()
         self.assertEqual(core.tree_digest_snapshot(self.source), before)
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_same_selector_resolution_v3_round_trip_and_validation(self) -> None:
+        self.install_logical_url()
+        self.use_url_template()
+        with patch.object(
+            core, "resolve_mod_closure", return_value=self.url_closure("new-id")
+        ):
+            session = core.TemplateImportSession.create("pack:demo", ["base"])
+        conflict = session.plan.logical_identity_conflicts[0]
+        installed = conflict.pack_candidate
+        incoming = conflict.template_candidates[0]
+        self.assertEqual(installed.candidate_key, incoming.candidate_key)
+        self.assertNotEqual(installed.selection_key, incoming.selection_key)
+        resolution = self.root / "resolution-v3.yaml"
+
+        def write_selection(lines: list[str]) -> None:
+            resolution.write_text(
+                "version: 3\n"
+                f'plan_digest: "{session.plan.plan_digest}"\n'
+                "name_conflicts: {}\n"
+                "url_selector_conflicts: {}\n"
+                "logical_identity_conflicts:\n"
+                "  \"url:logical\":\n"
+                "    selections:\n"
+                + "".join(f'      - "{item}"\n' for item in lines)
+                + "    acknowledge_duplicate_risk: false\n"
+                "actual_identity_conflicts: {}\n"
+                "side_conflicts: {}\n",
+                encoding="utf-8",
+            )
+
+        write_selection([installed.selection_key])
+        keep = packctl._template_import_resolution(resolution, session.plan)
+        self.assertEqual(keep.removed_pack_candidates, ())
+        write_selection([incoming.selection_key])
+        replace_plan = packctl._template_import_resolution(resolution, session.plan)
+        self.assertEqual(replace_plan.removed_pack_candidates, (installed,))
+        self.assertEqual(replace_plan.selected_new_roots, (incoming,))
+        write_selection(["template:url:unknown@https://mods.example/unknown.jar"])
+        with self.assertRaisesRegex(packctl.ConfigError, "Invalid resolution"):
+            packctl._template_import_resolution(resolution, session.plan)
+        write_selection([installed.selection_key, installed.selection_key])
+        with self.assertRaisesRegex(packctl.ConfigError, "Invalid resolution"):
+            packctl._template_import_resolution(resolution, session.plan)
+        resolution.write_text(
+            "version: 3\n"
+            f'plan_digest: "{session.plan.plan_digest}"\n'
+            "name_conflicts: {}\n"
+            "url_selector_conflicts: {}\n"
+            "logical_identity_conflicts:\n"
+            "  \"url:logical\":\n"
+            "    candidates: []\n"
+            "actual_identity_conflicts: {}\n"
+            "side_conflicts: {}\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(packctl.ConfigError, "selections must be strings"):
+            packctl._template_import_resolution(resolution, session.plan)
+        session.discard()
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
     def test_url_verification_cancellation_and_deadline_remain_global(self) -> None:
