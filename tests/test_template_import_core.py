@@ -407,7 +407,10 @@ class TemplateImportCoreTest(unittest.TestCase):
         with patch.object(
             core,
             "resolve_mod_closure",
-            side_effect=(self.url_closure("good_actual"), core.HuroshikiError("HTTP 404")),
+            side_effect=(
+                self.url_closure("good_actual"),
+                core.UrlCandidateVerificationError("HTTP 404"),
+            ),
         ) as resolver:
             session = core.TemplateImportSession.create("pack:demo", ["base"])
         self.assertEqual(resolver.call_count, 2)
@@ -449,7 +452,10 @@ class TemplateImportCoreTest(unittest.TestCase):
         with patch.object(
             core,
             "resolve_mod_closure",
-            side_effect=(self.url_closure("good_actual"), core.HuroshikiError("HTTP 404")),
+            side_effect=(
+                self.url_closure("good_actual"),
+                core.UrlCandidateVerificationError("HTTP 404"),
+            ),
         ):
             session = core.TemplateImportSession.create("pack:demo", ["base"])
         _good, bad = session.plan.template_candidates
@@ -468,7 +474,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         with patch.object(
             core,
             "resolve_mod_closure",
-            side_effect=core.HuroshikiError("invalid JAR"),
+            side_effect=core.UrlCandidateVerificationError("invalid JAR"),
         ):
             session = core.TemplateImportSession.create("pack:demo", ["base"])
         self.assertFalse(session.plan.requires_resolution)
@@ -495,6 +501,16 @@ class TemplateImportCoreTest(unittest.TestCase):
             "resolve_mod_closure",
             side_effect=core.LoaderMigrationDeadlineExceeded("deadline"),
         ), self.assertRaises(core.LoaderMigrationDeadlineExceeded):
+            core.TemplateImportSession.create("pack:demo", ["base"])
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_url_verification_state_failure_remains_global(self) -> None:
+        self.use_url_template()
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=core.HuroshikiError("state directory is corrupt"),
+        ), self.assertRaisesRegex(core.HuroshikiError, "state directory"):
             core.TemplateImportSession.create("pack:demo", ["base"])
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
@@ -536,7 +552,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         with patch.object(
             core,
             "resolve_mod_closure",
-            side_effect=core.HuroshikiError("HTTP 404"),
+            side_effect=core.UrlCandidateVerificationError("HTTP 404"),
         ):
             failed = core.TemplateImportSession.create("pack:demo", ["base"])
         self.assertNotEqual(success_digest, failed.plan.plan_digest)
@@ -549,8 +565,8 @@ class TemplateImportCoreTest(unittest.TestCase):
             core,
             "resolve_mod_closure",
             side_effect=(
-                core.HuroshikiError("HTTP 404"),
-                core.HuroshikiError("invalid JAR"),
+                core.UrlCandidateVerificationError("HTTP 404"),
+                core.UrlCandidateVerificationError("invalid JAR"),
             ),
         ):
             session = core.TemplateImportSession.create("pack:demo", ["base"])
@@ -577,7 +593,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         with patch.object(
             core,
             "resolve_mod_closure",
-            side_effect=core.HuroshikiError("HTTP 404"),
+            side_effect=core.UrlCandidateVerificationError("HTTP 404"),
         ), redirect_stderr(stderr):
             self.assertEqual(packctl.cmd_apply_template(args), 1)
         self.assertIn("HTTP 404", stderr.getvalue())

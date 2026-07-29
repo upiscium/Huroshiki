@@ -4999,6 +4999,10 @@ def resolved_root_identity(
     return expected
 
 
+class UrlCandidateVerificationError(HuroshikiError):
+    pass
+
+
 def resolve_mod_closure(
     *,
     provider: str,
@@ -5015,12 +5019,17 @@ def resolve_mod_closure(
     if cancel_event is not None and cancel_event.is_set():
         raise HuroshikiError("MOD resolution was cancelled")
     if canonical_project_id is None:
-        resolved_selector = resolve_project_selector(
-            provider,
-            selector,
-            cancel_event=cancel_event,
-            deadline=deadline,
-        )
+        try:
+            resolved_selector = resolve_project_selector(
+                provider,
+                selector,
+                cancel_event=cancel_event,
+                deadline=deadline,
+            )
+        except HuroshikiError as error:
+            if canonical_provider(provider) == "url":
+                raise UrlCandidateVerificationError(str(error)) from error
+            raise
     else:
         normalized_provider, normalized_selector = normalize_add_selector(
             provider, selector
@@ -5058,23 +5067,26 @@ def resolve_mod_closure(
             )
             if remaining is not None and remaining <= 0:
                 raise HuroshikiError("URL resolver deadline exceeded")
-            artifact = download_url_artifact(
-                normalized_selector,
-                cancel_event or threading.Event(),
-                Path(directory) / "logs",
-                loader,
-                (
-                    url_max_jar_size_bytes
-                    if url_max_jar_size_bytes is not None
-                    else DEFAULT_URL_MAX_JAR_SIZE_BYTES
-                ),
-                allow_private_networks=url_allow_private_networks,
-                total_timeout_seconds=(
-                    min(DEFAULT_URL_TOTAL_TIMEOUT_SECONDS, remaining)
-                    if remaining is not None
-                    else DEFAULT_URL_TOTAL_TIMEOUT_SECONDS
-                ),
-            )
+            try:
+                artifact = download_url_artifact(
+                    normalized_selector,
+                    cancel_event or threading.Event(),
+                    Path(directory) / "logs",
+                    loader,
+                    (
+                        url_max_jar_size_bytes
+                        if url_max_jar_size_bytes is not None
+                        else DEFAULT_URL_MAX_JAR_SIZE_BYTES
+                    ),
+                    allow_private_networks=url_allow_private_networks,
+                    total_timeout_seconds=(
+                        min(DEFAULT_URL_TOTAL_TIMEOUT_SECONDS, remaining)
+                        if remaining is not None
+                        else DEFAULT_URL_TOTAL_TIMEOUT_SECONDS
+                    ),
+                )
+            except HuroshikiError as error:
+                raise UrlCandidateVerificationError(str(error)) from error
             identity = ("url", artifact.mod_id)
             write_url_metadata(
                 source,
@@ -5608,7 +5620,7 @@ def verify_import_candidates(
                 )
             except (LoaderMigrationCancelled, LoaderMigrationDeadlineExceeded):
                 raise
-            except HuroshikiError as error:
+            except UrlCandidateVerificationError as error:
                 if cancel_event.is_set():
                     raise LoaderMigrationCancelled(
                         "Template import was cancelled"
@@ -5628,6 +5640,16 @@ def verify_import_candidates(
                     )
                 )
                 continue
+            except HuroshikiError as error:
+                if cancel_event.is_set():
+                    raise LoaderMigrationCancelled(
+                        "Template import was cancelled"
+                    ) from error
+                if time.monotonic() >= candidate_deadline:
+                    raise LoaderMigrationDeadlineExceeded(
+                        "Template import URL verification deadline exceeded"
+                    ) from error
+                raise
             actual_identity = closure.root_identity
             root_metadata = [
                 item for item in closure.metadata if item.identity == actual_identity
