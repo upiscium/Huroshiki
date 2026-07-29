@@ -267,15 +267,17 @@ worker, displays progress and changed files, and completes cancellation cleanup 
 
 `packctl apply-template <pack> <template> [<template> ...]` prepares a one-shot import into an
 existing pack. The default is a dry run; `--apply` publishes the staged closure. Name, URL selector,
-logical-identity replacement, and resolved-identity conflicts require a version 3 `--resolution`
+logical-identity replacement, and resolved-identity conflicts require a version 4 `--resolution`
 YAML file containing the displayed plan digest, while identity side conflicts default to keeping the
 installed pack side. All overlapping conflict choices form one global constraint set; contradictory
 choices and removal without a selected Template replacement fail closed. Planning starts by locking
 and copying the Pack transaction, and reads installed metadata only from that transaction source.
-Resolution files use origin-qualified `selection_key` values, so an installed candidate and a
-Template candidate remain distinguishable even when their human-readable provider/selector key is
-identical. A failed URL replacement still creates a keep-or-replace conflict: selecting the installed
-candidate ignores that failure, while selecting the failed Template candidate is rejected.
+Resolution files select source options. Equivalent installed and Template origins with the same
+selector and verified actual identity form one option, so name-conflict decisions include or exclude
+every origin for that source. Distinct actual identities and failed verification remain separate
+options. When an installed URL source exists, all replacement URLs share one exactly-one logical
+identity conflict; selecting the installed option rejects every replacement. Selecting an unverified
+Template option is rejected.
 Template order, each complete URL, effective URL size/private-network policy, verification result,
 resolved closure fingerprint, and the MOD identity verified from each URL JAR are bound into the
 digest. A normal URL failure remains attached to that candidate so another candidate can be selected,
