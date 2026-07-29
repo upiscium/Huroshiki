@@ -286,6 +286,14 @@ addition and replacement are classified by actual identity, and all closures plu
 preflighted before the transaction is changed. Packwiz dependencies are shown separately, and no
 persistent template association or content overlay is created.
 
+The resolved import is also a postcondition on the staged source. A selected root closure may not
+require an actual identity removed by the resolution, and removed identities are checked again after
+closure merge and after Packwiz refresh in both preflight and the transaction. Such a dependency
+reintroduction fails before a preview and leaves the real Pack unchanged. Preview classes describe
+the final staged result: `removed` roots are absent, `unchanged` roots are equivalent retained Pack
+sources without side changes, and `added_roots`, `added_dependencies`, and `side_changes` are
+disjoint changes from that retained state. Resolution files remain schema version 4.
+
 The settings commands pin the managed collection and project directory, snapshot both committed and
 local configuration, validate the prospective merged project entirely in memory, and publish through
 Linux `renameat2` compare-and-swap. The directory identities are rechecked before and after
