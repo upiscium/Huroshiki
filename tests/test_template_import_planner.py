@@ -528,6 +528,80 @@ class TemplateImportPlannerTest(unittest.TestCase):
             [incoming.candidate_key],
         )
 
+    def test_name_conflict_selects_and_rejects_whole_source_options(self) -> None:
+        installed = pack_candidate("Same", "shared")
+        equivalent = template_candidate(
+            "base",
+            name="Same",
+            provider="modrinth",
+            project_id="shared",
+            side="both",
+            actual_provider="modrinth",
+            actual_project_id="shared",
+        )
+        alternate = template_candidate(
+            "base",
+            name="Same",
+            provider="curseforge",
+            project_id="2",
+            side="both",
+            actual_provider="curseforge",
+            actual_project_id="2",
+        )
+        plan = build(["base"], [installed], [equivalent, alternate])
+        conflict = plan.name_conflicts[0]
+        grouped = next(option for option in conflict.options if len(option.candidates) == 2)
+        alternate_option = next(
+            option for option in conflict.options if option.candidates == (alternate,)
+        )
+        keep = resolve_template_import_plan(
+            plan,
+            name_resolutions={
+                conflict.key: ImportConflictResolution((grouped.option_key,))
+            },
+        )
+        self.assertEqual(keep.retained_pack_candidates, (installed,))
+        self.assertEqual(keep.selected_template_candidates, (equivalent,))
+        self.assertEqual(keep.selected_new_roots, ())
+        self.assertNotIn(alternate, keep.selected_template_candidates)
+        replace_plan = resolve_template_import_plan(
+            plan,
+            name_resolutions={
+                conflict.key: ImportConflictResolution((alternate_option.option_key,))
+            },
+        )
+        self.assertEqual(replace_plan.removed_pack_candidates, (installed,))
+        self.assertEqual(replace_plan.selected_template_candidates, (alternate,))
+        self.assertEqual(replace_plan.selected_new_roots, (alternate,))
+
+    def test_name_conflict_uses_aliases_from_every_source_option_member(self) -> None:
+        installed = pack_candidate("Old Name", "shared")
+        equivalent = template_candidate(
+            "base",
+            name="New Name",
+            provider="modrinth",
+            project_id="shared",
+            side="both",
+            actual_provider="modrinth",
+            actual_project_id="shared",
+        )
+        alternate = template_candidate(
+            "base",
+            name="New Name",
+            provider="curseforge",
+            project_id="2",
+            side="both",
+            actual_provider="curseforge",
+            actual_project_id="2",
+        )
+        plan = build(["base"], [installed], [equivalent, alternate])
+        self.assertEqual(len(plan.name_conflicts), 1)
+        self.assertEqual(len(plan.name_conflicts[0].options), 2)
+        self.assertEqual(
+            set(plan.name_conflicts[0].candidates),
+            {installed, equivalent, alternate},
+        )
+
     def test_logical_divergence_requires_explicit_replacement(self) -> None:
         installed, incoming, plan = self.logical_divergence()
         self.assertEqual(plan.logical_identity_conflicts[0].key, "url:logical")
@@ -680,11 +754,16 @@ class TemplateImportPlannerTest(unittest.TestCase):
             side="both",
         )
         plan = build(["base"], [removed, retained], [incoming])
+        retained_option = next(
+            option
+            for option in plan.name_conflicts[0].options
+            if retained in option.candidates
+        )
         with self.assertRaisesRegex(TemplateMergeError, "no selected replacement"):
             resolve_template_import_plan(
                 plan,
                 name_resolutions={
-                    "same": ImportConflictResolution((retained.selection_key,))
+                    "same": ImportConflictResolution((retained_option.option_key,))
                 },
             )
 

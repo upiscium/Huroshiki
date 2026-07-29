@@ -118,24 +118,17 @@ class IdentitySideConflict:
 class CandidateNameConflict:
     key: str
     name: str
-    candidates: tuple[ModCandidate, ...]
+    options: tuple[ImportSelectionOption, ...]
+
+    @property
+    def candidates(self) -> tuple[ModCandidate, ...]:
+        return tuple(candidate for option in self.options for candidate in option.candidates)
 
 
 @dataclass(frozen=True)
 class UrlSelectorConflict:
     logical_identity: tuple[str, str]
-    candidates: tuple[ModCandidate, ...]
-
-    @property
-    def key(self) -> str:
-        return f"{self.logical_identity[0]}:{self.logical_identity[1]}"
-
-
-@dataclass(frozen=True)
-class LogicalIdentityConflict:
-    logical_identity: tuple[str, str]
-    pack_candidate: ModCandidate
-    template_candidates: tuple[ModCandidate, ...]
+    options: tuple[ImportSelectionOption, ...]
 
     @property
     def key(self) -> str:
@@ -143,14 +136,37 @@ class LogicalIdentityConflict:
 
     @property
     def candidates(self) -> tuple[ModCandidate, ...]:
-        return (self.pack_candidate, *self.template_candidates)
+        return tuple(candidate for option in self.options for candidate in option.candidates)
+
+
+@dataclass(frozen=True)
+class LogicalIdentityConflict:
+    logical_identity: tuple[str, str]
+    options: tuple[ImportSelectionOption, ...]
+
+    @property
+    def key(self) -> str:
+        return f"{self.logical_identity[0]}:{self.logical_identity[1]}"
+
+    @property
+    def candidates(self) -> tuple[ModCandidate, ...]:
+        return tuple(candidate for option in self.options for candidate in option.candidates)
+
+    @property
+    def pack_candidate(self) -> ModCandidate:
+        return next(candidate for candidate in self.candidates if candidate.origin_kind == "pack")
+
+    @property
+    def template_candidates(self) -> tuple[ModCandidate, ...]:
+        return tuple(
+            candidate for candidate in self.candidates if candidate.origin_kind == "template"
+        )
 
 
 @dataclass(frozen=True)
 class ActualIdentityConflict:
     actual_identity: tuple[str, str]
-    pack_candidate: ModCandidate | None
-    template_candidates: tuple[ModCandidate, ...]
+    options: tuple[ImportSelectionOption, ...]
 
     @property
     def key(self) -> str:
@@ -158,9 +174,20 @@ class ActualIdentityConflict:
 
     @property
     def candidates(self) -> tuple[ModCandidate, ...]:
-        if self.pack_candidate is None:
-            return self.template_candidates
-        return (self.pack_candidate, *self.template_candidates)
+        return tuple(candidate for option in self.options for candidate in option.candidates)
+
+    @property
+    def pack_candidate(self) -> ModCandidate | None:
+        return next(
+            (candidate for candidate in self.candidates if candidate.origin_kind == "pack"),
+            None,
+        )
+
+    @property
+    def template_candidates(self) -> tuple[ModCandidate, ...]:
+        return tuple(
+            candidate for candidate in self.candidates if candidate.origin_kind == "template"
+        )
 
 
 @dataclass(frozen=True)
@@ -218,6 +245,7 @@ class TemplateImportPlan:
 @dataclass(frozen=True)
 class ResolvedTemplateImportPlan:
     plan_digest: str
+    selected_option_keys: tuple[str, ...]
     selected_template_candidates: tuple[ModCandidate, ...]
     retained_pack_candidates: tuple[ModCandidate, ...]
     selected_new_roots: tuple[ModCandidate, ...]
@@ -341,19 +369,17 @@ def import_selection_options(
     return options
 
 
-def _name_conflicts(candidates: Sequence[ModCandidate]) -> tuple[CandidateNameConflict, ...]:
-    identity_order: list[tuple[str, str, str | None]] = []
-    identity_candidates: dict[tuple[str, str, str | None], ModCandidate] = {}
-    aliases: dict[tuple[str, str, str | None], set[str]] = {}
-    for candidate in candidates:
-        identity = candidate.selector_identity
-        if identity not in identity_candidates:
-            identity_order.append(identity)
-            identity_candidates[identity] = candidate
-            aliases[identity] = set()
-        aliases[identity].add(normalize_name(candidate.name))
+def _name_conflicts(
+    options: Sequence[ImportSelectionOption],
+) -> tuple[CandidateNameConflict, ...]:
+    aliases = {
+        option.option_key: {
+            normalize_name(candidate.name) for candidate in option.candidates
+        }
+        for option in options
+    }
 
-    parents = list(range(len(identity_order)))
+    parents = list(range(len(options)))
 
     def root(index: int) -> int:
         while parents[index] != index:
@@ -362,21 +388,21 @@ def _name_conflicts(candidates: Sequence[ModCandidate]) -> tuple[CandidateNameCo
         return index
 
     first_by_name: dict[str, int] = {}
-    for index, identity in enumerate(identity_order):
-        for alias in sorted(aliases[identity]):
+    for index, option in enumerate(options):
+        for alias in sorted(aliases[option.option_key]):
             previous = first_by_name.get(alias)
             if previous is None:
                 first_by_name[alias] = index
             else:
                 parents[root(index)] = root(previous)
 
-    groups: dict[int, list[ModCandidate]] = {}
-    for index, identity in enumerate(identity_order):
-        groups.setdefault(root(index), []).append(identity_candidates[identity])
+    groups: dict[int, list[ImportSelectionOption]] = {}
+    for index, option in enumerate(options):
+        groups.setdefault(root(index), []).append(option)
     return tuple(
         CandidateNameConflict(
-            normalize_name(group[0].name),
-            group[0].name.strip(),
+            normalize_name(group[0].candidates[0].name),
+            group[0].candidates[0].name.strip(),
             tuple(group),
         )
         for group in groups.values()
@@ -385,71 +411,68 @@ def _name_conflicts(candidates: Sequence[ModCandidate]) -> tuple[CandidateNameCo
 
 
 def _url_selector_conflicts(
-    candidates: Sequence[ModCandidate],
+    options: Sequence[ImportSelectionOption],
 ) -> tuple[UrlSelectorConflict, ...]:
-    grouped: dict[tuple[str, str], list[ModCandidate]] = {}
-    for candidate in candidates:
-        if candidate.provider == "url":
-            grouped.setdefault(candidate.logical_identity, []).append(candidate)
+    grouped: dict[tuple[str, str], list[ImportSelectionOption]] = {}
+    for option in options:
+        if option.selector_identity[0] == "url" and not any(
+            candidate.origin_kind == "pack" for candidate in option.candidates
+        ):
+            identity = option.selector_identity[:2]
+            grouped.setdefault(identity, []).append(option)
     return tuple(
         UrlSelectorConflict(identity, tuple(group))
         for identity, group in grouped.items()
-        if len({candidate.selector_identity for candidate in group}) > 1
+        if len({option.selector_identity for option in group}) > 1
     )
 
 
 def _logical_identity_conflicts(
-    pack_candidates: Sequence[ModCandidate],
-    template_candidates: Sequence[ModCandidate],
+    options: Sequence[ImportSelectionOption],
 ) -> tuple[LogicalIdentityConflict, ...]:
-    pack_by_logical = {
-        candidate.logical_identity: candidate for candidate in pack_candidates
-    }
-    grouped: dict[tuple[str, str], list[ModCandidate]] = {}
-    for candidate in template_candidates:
-        pack_candidate = pack_by_logical.get(candidate.logical_identity)
-        if (
-            pack_candidate is not None
+    grouped: dict[tuple[str, str], list[ImportSelectionOption]] = {}
+    for option in options:
+        grouped.setdefault(option.selector_identity[:2], []).append(option)
+    conflicts: list[LogicalIdentityConflict] = []
+    for identity, group in grouped.items():
+        pack_option = next(
+            (
+                option
+                for option in group
+                if any(candidate.origin_kind == "pack" for candidate in option.candidates)
+            ),
+            None,
+        )
+        if pack_option is None:
+            continue
+        divergent = tuple(
+            option
+            for option in group
+            if option is not pack_option
             and (
-                candidate.actual_identity is None
-                or candidate.actual_identity != pack_candidate.actual_identity
+                option.actual_identity is None
+                or option.actual_identity != pack_option.actual_identity
             )
-        ):
-            grouped.setdefault(candidate.logical_identity, []).append(candidate)
-    return tuple(
-        LogicalIdentityConflict(identity, pack_by_logical[identity], tuple(candidates))
-        for identity, candidates in grouped.items()
-    )
+        )
+        if divergent:
+            conflicts.append(
+                LogicalIdentityConflict(identity, (pack_option, *divergent))
+            )
+    return tuple(conflicts)
 
 
 def _actual_identity_conflicts(
-    pack_candidates: Sequence[ModCandidate],
-    template_candidates: Sequence[ModCandidate],
+    options: Sequence[ImportSelectionOption],
 ) -> tuple[ActualIdentityConflict, ...]:
-    pack_by_identity = {
-        candidate.actual_identity: candidate
-        for candidate in pack_candidates
-        if candidate.actual_identity is not None
-    }
-    grouped: dict[tuple[str, str], list[ModCandidate]] = {}
-    for candidate in template_candidates:
-        if candidate.actual_identity is not None:
-            grouped.setdefault(candidate.actual_identity, []).append(candidate)
-    conflicts: list[ActualIdentityConflict] = []
-    for identity, candidates in grouped.items():
-        pack_candidate = pack_by_identity.get(identity)
-        selector_collision = len(
-            {candidate.selector_identity for candidate in candidates}
-        ) > 1
-        differs_from_pack_selector = pack_candidate is not None and any(
-            candidate.selector_identity != pack_candidate.selector_identity
-            for candidate in candidates
-        )
-        if differs_from_pack_selector or selector_collision:
-            conflicts.append(
-                ActualIdentityConflict(identity, pack_candidate, tuple(candidates))
-            )
-    return tuple(conflicts)
+    grouped: dict[tuple[str, str], list[ImportSelectionOption]] = {}
+    for option in options:
+        if option.actual_identity is not None:
+            grouped.setdefault(option.actual_identity, []).append(option)
+    return tuple(
+        ActualIdentityConflict(identity, tuple(group))
+        for identity, group in grouped.items()
+        if len(group) > 1
+    )
 
 
 def _plan_digest_payload(
@@ -625,14 +648,10 @@ def build_template_import_plan(
         == pack_by_actual[candidate.actual_identity].selector_identity
         and pack_by_actual[candidate.actual_identity].side != candidate.side
     )
-    name_conflicts = _name_conflicts((*pack_candidates, *merged_templates))
-    url_selector_conflicts = _url_selector_conflicts(merged_templates)
-    logical_identity_conflicts = _logical_identity_conflicts(
-        pack_candidates, merged_templates
-    )
-    actual_identity_conflicts = _actual_identity_conflicts(
-        pack_candidates, merged_templates
-    )
+    name_conflicts = _name_conflicts(selection_options)
+    url_selector_conflicts = _url_selector_conflicts(selection_options)
+    logical_identity_conflicts = _logical_identity_conflicts(selection_options)
+    actual_identity_conflicts = _actual_identity_conflicts(selection_options)
     return TemplateImportPlan(
         pack_key,
         ordered_ids,
@@ -689,15 +708,15 @@ def resolve_template_import_plan(
         *,
         kind: str,
         key: str,
-        candidates: Sequence[ModCandidate],
+        options: Sequence[ImportSelectionOption],
         resolution: ImportConflictResolution,
         cardinality: Literal["one-or-more", "exactly-one"],
     ) -> None:
-        keys = tuple(resolution.selection_keys)
-        available_keys = tuple(candidate.selection_key for candidate in candidates)
+        keys = tuple(resolution.option_keys)
+        available_keys = tuple(option.option_key for option in options)
         available = set(available_keys)
         if len(available) != len(available_keys):
-            raise TemplateMergeError(f"Conflict {kind} {key!r} has duplicate candidate keys")
+            raise TemplateMergeError(f"Conflict {kind} {key!r} has duplicate option keys")
         if len(set(keys)) != len(keys) or not set(keys) <= available:
             raise TemplateMergeError(f"Invalid resolution for {kind} conflict {key!r}")
         if cardinality == "exactly-one" and len(keys) != 1:
@@ -710,23 +729,19 @@ def resolve_template_import_plan(
             )
         selected = set(keys)
         source = f'{kind} conflict "{key}"'
-        candidate_by_selection = {
-            candidate.selection_key: candidate for candidate in candidates
-        }
-        for selection_key in available_keys:
-            required = selection_key in selected
-            previous = requirements.get(selection_key)
+        for option_key in available_keys:
+            required = option_key in selected
+            previous = requirements.get(option_key)
             if previous is not None and previous != required:
-                previous_source = sources[selection_key][-1]
+                previous_source = sources[option_key][-1]
                 action = "selected" if previous else "rejected"
                 opposite = "selected" if required else "rejected"
-                candidate = candidate_by_selection[selection_key]
                 raise TemplateMergeError(
-                    f"Selection {selection_key} ({candidate.candidate_key}) is "
-                    f"{action} by {previous_source} but {opposite} by {source}"
+                    f"Option {option_key} is {action} by {previous_source} "
+                    f"but {opposite} by {source}"
                 )
-            requirements[selection_key] = required
-            sources.setdefault(selection_key, []).append(source)
+            requirements[option_key] = required
+            sources.setdefault(option_key, []).append(source)
 
     conflict_groups = (
         (
@@ -769,22 +784,22 @@ def resolve_template_import_plan(
             apply_constraints(
                 kind=kind,
                 key=conflict.key,
-                candidates=conflict.candidates,
+                options=conflict.options,
                 resolution=resolutions[conflict.key],
                 cardinality=cardinality,
             )
 
-    selected_keys = {
-        candidate.selection_key
-        for candidate in (*plan.pack_candidates, *plan.template_candidates)
-        if requirements.get(candidate.selection_key, True)
+    selected_option_keys = {
+        option.option_key
+        for option in plan.selection_options
+        if requirements.get(option.option_key, True)
     }
     for kind, conflicts, resolutions, cardinality in conflict_groups:
         for conflict in conflicts:
             final_keys = tuple(
-                candidate.selection_key
-                for candidate in conflict.candidates
-                if candidate.selection_key in selected_keys
+                option.option_key
+                for option in conflict.options
+                if option.option_key in selected_option_keys
             )
             if cardinality == "exactly-one" and len(final_keys) != 1:
                 raise TemplateMergeError(
@@ -805,15 +820,22 @@ def resolve_template_import_plan(
                     f"{conflict.key}: multiple sources retained; duplicate MOD risk acknowledged"
                 )
 
+    selected_candidate_keys = {
+        candidate.selection_key
+        for option in plan.selection_options
+        if option.option_key in selected_option_keys
+        for candidate in option.candidates
+    }
+
     selected_templates = tuple(
         candidate
         for candidate in plan.template_candidates
-        if candidate.selection_key in selected_keys
+        if candidate.selection_key in selected_candidate_keys
     )
     retained_pack = tuple(
         candidate
         for candidate in plan.pack_candidates
-        if candidate.selection_key in selected_keys
+        if candidate.selection_key in selected_candidate_keys
     )
     verification_by_selector = {
         item.selector_identity: item for item in plan.verifications
@@ -832,12 +854,13 @@ def resolve_template_import_plan(
     selected_new = tuple(
         candidate
         for candidate in selected_templates
-        if candidate.actual_identity not in retained_actual
+        if candidate.actual_identity is not None
+        and candidate.actual_identity not in retained_actual
     )
     removed_pack = tuple(
         candidate
         for candidate in plan.pack_candidates
-        if candidate.selection_key not in selected_keys
+        if candidate.selection_key not in selected_candidate_keys
     )
     all_conflicts = tuple(
         conflict
@@ -847,7 +870,11 @@ def resolve_template_import_plan(
     for removed in removed_pack:
         replacing = any(
             removed in conflict.candidates
-            and any(candidate in selected_new for candidate in conflict.candidates)
+            and any(
+                option.option_key in selected_option_keys
+                and any(candidate in selected_new for candidate in option.candidates)
+                for option in conflict.options
+            )
             for conflict in all_conflicts
         )
         if not replacing:
@@ -883,6 +910,11 @@ def resolve_template_import_plan(
             side_changes.append((conflict.identity, conflict.pack_side, result))
     return ResolvedTemplateImportPlan(
         plan.plan_digest,
+        tuple(
+            option.option_key
+            for option in plan.selection_options
+            if option.option_key in selected_option_keys
+        ),
         selected_templates,
         retained_pack,
         selected_new,
