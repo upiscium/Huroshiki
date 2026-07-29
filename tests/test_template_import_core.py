@@ -5,6 +5,7 @@ from io import StringIO
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -136,6 +137,20 @@ class TemplateImportCoreTest(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def use_url_conflict_template(self) -> None:
+        (self.template / "template.yaml").write_text(
+            "id: base\ndisplay_name: Base\nenabled: true\n"
+            "minecraft: 1.21.1\nloader: neoforge\n"
+            "reference_loader_version: 21.1.0\nmods:\n"
+            "  - name: Good\n    provider: url\n"
+            "    project_id: logical\n    side: client\n"
+            "    url: https://mods.example/good.jar\n"
+            "  - name: Bad\n    provider: url\n"
+            "    project_id: logical\n    side: client\n"
+            "    url: https://mods.example/bad.jar\n",
+            encoding="utf-8",
+        )
+
     def operation(self) -> core.TemplateImportOperation:
         session = core.TemplateImportSession.create("pack:demo", ["base"])
         resolved = resolve_template_import_plan(session.plan)
@@ -229,6 +244,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         with redirect_stderr(stderr):
             self.assertEqual(packctl.cmd_apply_template(args), 2)
         self.assertIn("resolution file", stderr.getvalue())
+        self.assertIn("version: 2", stderr.getvalue())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
         args.json = True
@@ -246,10 +262,16 @@ class TemplateImportCoreTest(unittest.TestCase):
         plan = core.prepare_template_import_plan("pack:demo", ["base"])
         resolution = self.root / "resolution.yaml"
         resolution.write_text(
-            "version: 1\nplan_digest: stale\nname_conflicts: {}\nside_conflicts: {}\n",
+            "version: 2\nplan_digest: stale\nname_conflicts: {}\nside_conflicts: {}\n",
             encoding="utf-8",
         )
         with self.assertRaisesRegex(packctl.ConfigError, "stale plan digest"):
+            packctl._template_import_resolution(resolution, plan)
+        resolution.write_text(
+            "version: 1\nplan_digest: stale\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(packctl.ConfigError, "no longer supported"):
             packctl._template_import_resolution(resolution, plan)
         args = packctl.parser().parse_args(
             ["apply-template", "demo", "base", "--apply", "--json"]
@@ -379,6 +401,252 @@ class TemplateImportCoreTest(unittest.TestCase):
         with self.assertRaisesRegex(core.HuroshikiError, "changed before removal"):
             core._remove_import_candidates(transaction.source, (candidate,))
         transaction.discard()
+
+    def test_failed_unselected_url_candidate_does_not_block_session(self) -> None:
+        self.use_url_conflict_template()
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=(
+                self.url_closure("good_actual"),
+                core.UrlCandidateVerificationError("HTTP 404"),
+            ),
+        ) as resolver:
+            session = core.TemplateImportSession.create("pack:demo", ["base"])
+        self.assertEqual(resolver.call_count, 2)
+        self.assertEqual(
+            [item.succeeded for item in session.plan.verifications],
+            [True, False],
+        )
+        payload = packctl._template_import_conflict_payload(session.plan)
+        self.assertEqual(
+            [item["status"] for item in payload["url_selector"][0]["candidates"]],
+            ["verified", "failed"],
+        )
+        self.assertEqual(
+            payload["url_selector"][0]["candidates"][1]["error"],
+            "HTTP 404",
+        )
+        good, bad = session.plan.template_candidates
+        resolved = resolve_template_import_plan(
+            session.plan,
+            url_selector_resolutions={
+                "url:logical": core.ConflictResolution((good.candidate_key,))
+            },
+        )
+        operation = core.TemplateImportOperation(session, resolved)
+        with patch.object(core, "run_resolver_process", side_effect=self.refresh_ok):
+            operation.run()
+        self.assertIsNone(operation.error)
+        self.assertEqual(
+            operation.preview.added_roots[0].actual_identity,
+            ("url", "good_actual"),
+        )
+        self.assertNotIn(bad.candidate_key, [
+            item.candidate_key for item in resolved.selected_template_candidates
+        ])
+        operation.discard()
+
+    def test_selecting_failed_url_candidate_is_rejected(self) -> None:
+        self.use_url_conflict_template()
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=(
+                self.url_closure("good_actual"),
+                core.UrlCandidateVerificationError("HTTP 404"),
+            ),
+        ):
+            session = core.TemplateImportSession.create("pack:demo", ["base"])
+        _good, bad = session.plan.template_candidates
+        with self.assertRaisesRegex(core.TemplateMergeError, "HTTP 404"):
+            resolve_template_import_plan(
+                session.plan,
+                url_selector_resolutions={
+                    "url:logical": core.ConflictResolution((bad.candidate_key,))
+                },
+            )
+        session.discard()
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_failed_non_conflicting_candidate_blocks_operation(self) -> None:
+        self.use_url_template()
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=core.UrlCandidateVerificationError("invalid JAR"),
+        ):
+            session = core.TemplateImportSession.create("pack:demo", ["base"])
+        self.assertFalse(session.plan.requires_resolution)
+        with self.assertRaisesRegex(core.TemplateMergeError, "invalid JAR"):
+            resolve_template_import_plan(session.plan)
+        session.discard()
+
+    def test_url_verification_cancellation_and_deadline_remain_global(self) -> None:
+        self.use_url_template()
+        cancelled = threading.Event()
+
+        def cancel_then_fail(**_: object):
+            cancelled.set()
+            raise core.HuroshikiError("download cancelled")
+
+        with patch.object(
+            core, "resolve_mod_closure", side_effect=cancel_then_fail
+        ), self.assertRaises(core.LoaderMigrationCancelled):
+            core.TemplateImportSession.create(
+                "pack:demo", ["base"], cancel_event=cancelled
+            )
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=core.LoaderMigrationDeadlineExceeded("deadline"),
+        ), self.assertRaises(core.LoaderMigrationDeadlineExceeded):
+            core.TemplateImportSession.create("pack:demo", ["base"])
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_url_verification_state_failure_remains_global(self) -> None:
+        self.use_url_template()
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=core.HuroshikiError("state directory is corrupt"),
+        ), self.assertRaisesRegex(core.HuroshikiError, "state directory"):
+            core.TemplateImportSession.create("pack:demo", ["base"])
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_closure_metadata_change_changes_fingerprint_and_digest(self) -> None:
+        self.use_url_template()
+        first_closure = self.url_closure("actual")
+        changed_record = first_closure.metadata[0].__class__(
+            **{
+                **first_closure.metadata[0].__dict__,
+                "contents": first_closure.metadata[0].contents + b"\n# changed\n",
+            }
+        )
+        second_closure = core.ResolvedModClosure(
+            first_closure.root_identity,
+            (changed_record,),
+        )
+        with patch.object(core, "resolve_mod_closure", return_value=first_closure):
+            first = core.TemplateImportSession.create("pack:demo", ["base"])
+        first_fingerprint = first.plan.verifications[0].closure_fingerprint
+        first_digest = first.plan.plan_digest
+        first.discard()
+        with patch.object(core, "resolve_mod_closure", return_value=second_closure):
+            second = core.TemplateImportSession.create("pack:demo", ["base"])
+        self.assertNotEqual(
+            first_fingerprint,
+            second.plan.verifications[0].closure_fingerprint,
+        )
+        self.assertNotEqual(first_digest, second.plan.plan_digest)
+        second.discard()
+
+    def test_verification_success_changes_digest_from_failure(self) -> None:
+        self.use_url_template()
+        with patch.object(
+            core, "resolve_mod_closure", return_value=self.url_closure("actual")
+        ):
+            succeeded = core.TemplateImportSession.create("pack:demo", ["base"])
+        success_digest = succeeded.plan.plan_digest
+        succeeded.discard()
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=core.UrlCandidateVerificationError("HTTP 404"),
+        ):
+            failed = core.TemplateImportSession.create("pack:demo", ["base"])
+        self.assertNotEqual(success_digest, failed.plan.plan_digest)
+        self.assertEqual(failed.plan.verifications[0].error, "HTTP 404")
+        failed.discard()
+
+    def test_all_failed_url_candidates_are_reported(self) -> None:
+        self.use_url_conflict_template()
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=(
+                core.UrlCandidateVerificationError("HTTP 404"),
+                core.UrlCandidateVerificationError("invalid JAR"),
+            ),
+        ):
+            session = core.TemplateImportSession.create("pack:demo", ["base"])
+        self.assertEqual(
+            [item.error for item in session.plan.verifications],
+            ["HTTP 404", "invalid JAR"],
+        )
+        session.discard()
+
+    def test_cli_failed_non_conflicting_candidate_returns_one_and_unlocks(self) -> None:
+        self.use_url_template()
+        args = type(
+            "Args",
+            (),
+            {
+                "pack": "demo",
+                "templates": ["base"],
+                "resolution": None,
+                "apply": False,
+                "json": False,
+            },
+        )()
+        stderr = StringIO()
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=core.UrlCandidateVerificationError("HTTP 404"),
+        ), redirect_stderr(stderr):
+            self.assertEqual(packctl.cmd_apply_template(args), 1)
+        self.assertIn("HTTP 404", stderr.getvalue())
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_cli_explicit_cancellation_returns_130(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "pack": "demo",
+                "templates": ["base"],
+                "resolution": None,
+                "apply": False,
+                "json": False,
+            },
+        )()
+        with patch.object(
+            core.TemplateImportSession,
+            "create",
+            side_effect=core.LoaderMigrationCancelled("cancelled"),
+        ), redirect_stderr(StringIO()):
+            self.assertEqual(packctl.cmd_apply_template(args), 130)
+
+    def test_logical_divergence_template_selection_replaces_atomically(self) -> None:
+        self.use_url_template()
+        mods = self.source / "mods"
+        mods.mkdir()
+        (mods / "logical.pw.toml").write_bytes(
+            url_metadata(
+                "Installed",
+                "old.jar",
+                "https://mods.example/old.jar",
+            )
+        )
+        with patch.object(
+            core, "resolve_mod_closure", return_value=self.url_closure("actual-new")
+        ):
+            session = core.TemplateImportSession.create("pack:demo", ["base"])
+        incoming = session.plan.template_candidates[0]
+        conflict = session.plan.logical_identity_conflicts[0]
+        resolved = resolve_template_import_plan(
+            session.plan,
+            logical_identity_resolutions={
+                conflict.key: core.ConflictResolution((incoming.candidate_key,))
+            },
+        )
+        operation = core.TemplateImportOperation(session, resolved)
+        with patch.object(core, "run_resolver_process", side_effect=self.refresh_ok):
+            operation.run()
+            operation.apply()
+        self.assertFalse((self.source / "mods/logical.pw.toml").exists())
+        self.assertTrue((self.source / "mods/actual-new.pw.toml").is_file())
 
 
 if __name__ == "__main__":

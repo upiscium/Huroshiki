@@ -266,15 +266,19 @@ The same flow is available under `Settings` then `Versions`; preparation runs in
 worker, displays progress and changed files, and completes cancellation cleanup before navigation.
 
 `packctl apply-template <pack> <template> [<template> ...]` prepares a one-shot import into an
-existing pack. The default is a dry run; `--apply` publishes the staged closure. Name conflicts
-and URL selector or resolved-identity conflicts require a versioned `--resolution` YAML file
-containing the displayed plan digest, while identity side conflicts default to keeping the installed
-pack side. Planning starts by locking and copying the Pack transaction, and reads installed metadata
-only from that transaction source. Template order, each complete URL, effective URL size/private-
-network policy, and the MOD identity verified from each URL JAR are bound into the digest. Verified
-URL closures are reused for execution, roots are reported by both requested and actual identity, and
-new conflicts discovered during verification fail closed. Packwiz dependencies are shown separately,
-and no persistent template association or content overlay is created.
+existing pack. The default is a dry run; `--apply` publishes the staged closure. Name, URL selector,
+logical-identity replacement, and resolved-identity conflicts require a version 2 `--resolution`
+YAML file containing the displayed plan digest, while identity side conflicts default to keeping the
+installed pack side. All overlapping conflict choices form one global constraint set; contradictory
+choices and removal without a selected Template replacement fail closed. Planning starts by locking
+and copying the Pack transaction, and reads installed metadata only from that transaction source.
+Template order, each complete URL, effective URL size/private-network policy, verification result,
+resolved closure fingerprint, and the MOD identity verified from each URL JAR are bound into the
+digest. A normal URL failure remains attached to that candidate so another candidate can be selected,
+but selecting an unverified candidate fails before execution. Verified URL closures are reused,
+addition and replacement are classified by actual identity, and all closures plus Packwiz refresh are
+preflighted before the transaction is changed. Packwiz dependencies are shown separately, and no
+persistent template association or content overlay is created.
 
 The settings commands pin the managed collection and project directory, snapshot both committed and
 local configuration, validate the prospective merged project entirely in memory, and publish through

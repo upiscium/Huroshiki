@@ -4,10 +4,12 @@ from pathlib import Path
 import unittest
 
 from template_import import (
+    ImportCandidateVerification,
     ModCandidate,
     TemplateCompatibility,
     build_template_import_plan,
     candidate_from_template_entry,
+    merge_template_import_candidates,
     resolve_template_import_plan,
     template_candidate,
 )
@@ -29,6 +31,8 @@ def pack_candidate(
         side,
         Path(f"mods/{project_id}.pw.toml"),
         f"{project_id}.jar",
+        actual_provider=provider,
+        actual_project_id=project_id,
     )
 
 
@@ -37,6 +41,37 @@ def build(
     pack: list[ModCandidate],
     candidates: list[ModCandidate],
 ):
+    merged = merge_template_import_candidates(
+        [
+            candidate
+            for template in templates
+            for candidate in candidates
+            if candidate.origin_id == template
+        ]
+    )
+    verifications = tuple(
+        ImportCandidateVerification(
+            candidate.selector_identity,
+            candidate.actual_identity or candidate.logical_identity,
+            candidate.metadata_path,
+            candidate.filename,
+            "fingerprint" if candidate.provider == "url" else None,
+            None,
+        )
+        for candidate in merged
+    )
+    verified_candidates = [
+        candidate
+        if candidate.actual_identity is not None
+        else candidate.__class__(
+            **{
+                **candidate.__dict__,
+                "actual_provider": candidate.provider,
+                "actual_project_id": candidate.project_id,
+            }
+        )
+        for candidate in candidates
+    ]
     return build_template_import_plan(
         pack_key="pack:demo",
         pack_minecraft="1.21.1",
@@ -47,11 +82,32 @@ def build(
             for item in templates
         },
         pack_candidates=pack,
-        template_candidates=candidates,
+        template_candidates=verified_candidates,
+        verifications=verifications,
     )
 
 
 class TemplateImportPlannerTest(unittest.TestCase):
+    def logical_divergence(self, *, same_name: bool = False):
+        installed = pack_candidate("Installed", "logical", provider="url")
+        installed = installed.__class__(
+            **{
+                **installed.__dict__,
+                "url": "https://mods.example/old.jar",
+            }
+        )
+        incoming = template_candidate(
+            "base",
+            name="Installed" if same_name else "Replacement",
+            provider="url",
+            project_id="logical",
+            side="both",
+            url="https://mods.example/new.jar",
+            actual_provider="url",
+            actual_project_id="actual-new",
+        )
+        return installed, incoming, build(["base"], [installed], [incoming])
+
     def test_template_entry_adapter_preserves_candidate_identity(self) -> None:
         candidate = candidate_from_template_entry(
             TemplateModEntry(
@@ -105,6 +161,7 @@ class TemplateImportPlannerTest(unittest.TestCase):
                     compatibilities={"base": compatibility},
                     pack_candidates=[],
                     template_candidates=[],
+                    verifications=[],
                 )
 
     def test_same_identity_same_side_is_unchanged(self) -> None:
@@ -172,7 +229,10 @@ class TemplateImportPlannerTest(unittest.TestCase):
                 conflict.key: ConflictResolution((incoming.candidate_key,))
             },
         )
-        self.assertEqual(resolved.selected_new_roots, (incoming,))
+        self.assertEqual(
+            [item.candidate_key for item in resolved.selected_new_roots],
+            [incoming.candidate_key],
+        )
         self.assertEqual(resolved.removed_pack_candidates, (installed,))
 
     def test_three_candidates_require_duplicate_acknowledgement(self) -> None:
@@ -287,6 +347,8 @@ class TemplateImportPlannerTest(unittest.TestCase):
                 project_id="private",
                 side="both",
                 url=url,
+                actual_provider="url",
+                actual_project_id=f"actual-{template}",
             )
             for template, name, url in (
                 ("a", "First", "https://a.example/private.jar"),
@@ -313,7 +375,10 @@ class TemplateImportPlannerTest(unittest.TestCase):
                 "url:private": ConflictResolution((candidates[0].candidate_key,))
             },
         )
-        self.assertEqual(resolved.selected_new_roots, (candidates[0],))
+        self.assertEqual(
+            [item.candidate_key for item in resolved.selected_new_roots],
+            [candidates[0].candidate_key],
+        )
 
     def test_url_selector_order_and_policy_change_plan_digest(self) -> None:
         first = template_candidate(
@@ -364,6 +429,7 @@ class TemplateImportPlannerTest(unittest.TestCase):
             actual_project_id="actual",
         )
         plan = build(["base"], [installed], [incoming])
+        self.assertEqual(plan.new_roots, ())
         self.assertEqual(plan.actual_identity_conflicts[0].key, "url:actual")
         with self.assertRaisesRegex(TemplateMergeError, "actual identity"):
             resolve_template_import_plan(plan)
@@ -374,6 +440,197 @@ class TemplateImportPlannerTest(unittest.TestCase):
             },
         )
         self.assertEqual(resolved.selected_new_roots, (incoming,))
+        self.assertEqual(resolved.removed_pack_candidates, (installed,))
+        self.assertEqual(
+            [item.candidate_key for item in resolved.selected_new_roots],
+            [incoming.candidate_key],
+        )
+
+    def test_logical_divergence_requires_explicit_replacement(self) -> None:
+        installed, incoming, plan = self.logical_divergence()
+        self.assertEqual(plan.logical_identity_conflicts[0].key, "url:logical")
+        self.assertEqual(
+            [item.candidate_key for item in plan.new_roots],
+            [incoming.candidate_key],
+        )
+        keep = resolve_template_import_plan(
+            plan,
+            logical_identity_resolutions={
+                "url:logical": ConflictResolution((installed.candidate_key,))
+            },
+        )
+        self.assertEqual(keep.selected_new_roots, ())
+        self.assertEqual(keep.removed_pack_candidates, ())
+        replace_plan = resolve_template_import_plan(
+            plan,
+            logical_identity_resolutions={
+                "url:logical": ConflictResolution((incoming.candidate_key,))
+            },
+        )
+        self.assertEqual(
+            [item.candidate_key for item in replace_plan.selected_new_roots],
+            [incoming.candidate_key],
+        )
+        self.assertEqual(replace_plan.removed_pack_candidates, (installed,))
+
+    def test_different_names_still_create_logical_conflict(self) -> None:
+        _installed, _incoming, plan = self.logical_divergence(same_name=False)
+        self.assertEqual(len(plan.logical_identity_conflicts), 1)
+        self.assertEqual(plan.name_conflicts, ())
+
+    def test_name_and_actual_resolution_disagreement_is_rejected(self) -> None:
+        installed = pack_candidate("Same", "shared", provider="url")
+        installed = installed.__class__(
+            **{**installed.__dict__, "url": "https://mods.example/old.jar"}
+        )
+        incoming = template_candidate(
+            "base",
+            name="same",
+            provider="url",
+            project_id="incoming",
+            side="both",
+            url="https://mods.example/new.jar",
+            actual_provider="url",
+            actual_project_id="shared",
+        )
+        plan = build(["base"], [installed], [incoming])
+        with self.assertRaisesRegex(TemplateMergeError, "selected by name conflict"):
+            resolve_template_import_plan(
+                plan,
+                name_resolutions={
+                    "same": ConflictResolution((installed.candidate_key,))
+                },
+                actual_identity_resolutions={
+                    "url:shared": ConflictResolution((incoming.candidate_key,))
+                },
+            )
+        resolved = resolve_template_import_plan(
+            plan,
+            name_resolutions={
+                "same": ConflictResolution((incoming.candidate_key,))
+            },
+            actual_identity_resolutions={
+                "url:shared": ConflictResolution((incoming.candidate_key,))
+            },
+        )
+        self.assertEqual(resolved.removed_pack_candidates, (installed,))
+
+    def test_name_and_url_resolution_disagreement_is_rejected(self) -> None:
+        candidates = [
+            template_candidate(
+                template,
+                name="Same",
+                provider="url",
+                project_id="logical",
+                side="both",
+                url=url,
+                actual_provider="url",
+                actual_project_id=f"actual-{template}",
+            )
+            for template, url in (
+                ("a", "https://mods.example/a.jar"),
+                ("b", "https://mods.example/b.jar"),
+            )
+        ]
+        plan = build(["a", "b"], [], candidates)
+        with self.assertRaisesRegex(TemplateMergeError, "selected by name conflict"):
+            resolve_template_import_plan(
+                plan,
+                name_resolutions={
+                    "same": ConflictResolution((candidates[0].candidate_key,))
+                },
+                url_selector_resolutions={
+                    "url:logical": ConflictResolution((candidates[1].candidate_key,))
+                },
+            )
+
+    def test_logical_and_actual_resolution_disagreement_is_rejected(self) -> None:
+        logical_pack = pack_candidate("Logical", "logical", provider="url")
+        logical_pack = logical_pack.__class__(
+            **{**logical_pack.__dict__, "url": "https://mods.example/logical.jar"}
+        )
+        actual_pack = pack_candidate("Actual", "shared", provider="url")
+        actual_pack = actual_pack.__class__(
+            **{**actual_pack.__dict__, "url": "https://mods.example/shared.jar"}
+        )
+        incoming = template_candidate(
+            "base",
+            name="Incoming",
+            provider="url",
+            project_id="logical",
+            side="both",
+            url="https://mods.example/incoming.jar",
+            actual_provider="url",
+            actual_project_id="shared",
+        )
+        plan = build(["base"], [logical_pack, actual_pack], [incoming])
+        with self.assertRaisesRegex(TemplateMergeError, "logical identity conflict"):
+            resolve_template_import_plan(
+                plan,
+                logical_identity_resolutions={
+                    "url:logical": ConflictResolution((incoming.candidate_key,))
+                },
+                actual_identity_resolutions={
+                    "url:shared": ConflictResolution((actual_pack.candidate_key,))
+                },
+            )
+
+    def test_pack_candidate_cannot_be_removed_without_template_replacement(self) -> None:
+        first = pack_candidate("Same", "first")
+        second = pack_candidate("same", "second")
+        plan = build(["base"], [first, second], [])
+        with self.assertRaisesRegex(TemplateMergeError, "no selected replacement"):
+            resolve_template_import_plan(
+                plan,
+                name_resolutions={
+                    "same": ConflictResolution((first.candidate_key,))
+                },
+            )
+
+    def test_selected_existing_template_identity_cannot_justify_removal(self) -> None:
+        removed = pack_candidate("Same", "removed")
+        retained = pack_candidate("same", "retained")
+        incoming = template_candidate(
+            "base",
+            name="Same",
+            provider="modrinth",
+            project_id="retained",
+            side="both",
+        )
+        plan = build(["base"], [removed, retained], [incoming])
+        with self.assertRaisesRegex(TemplateMergeError, "no selected replacement"):
+            resolve_template_import_plan(
+                plan,
+                name_resolutions={
+                    "same": ConflictResolution((incoming.candidate_key,))
+                },
+            )
+
+    def test_removed_identity_does_not_receive_side_change(self) -> None:
+        installed = pack_candidate("Same", "shared", side="client")
+        same_identity = template_candidate(
+            "base",
+            name="same",
+            provider="modrinth",
+            project_id="shared",
+            side="server",
+        )
+        replacement = template_candidate(
+            "base",
+            name="Same",
+            provider="curseforge",
+            project_id="2",
+            side="both",
+        )
+        plan = build(["base"], [installed], [same_identity, replacement])
+        resolved = resolve_template_import_plan(
+            plan,
+            name_resolutions={
+                "same": ConflictResolution((replacement.candidate_key,))
+            },
+            side_decisions={("modrinth", "shared"): "use_template"},
+        )
+        self.assertEqual(resolved.side_changes, ())
         self.assertEqual(resolved.removed_pack_candidates, (installed,))
 
     def test_actual_identity_changes_plan_digest(self) -> None:
