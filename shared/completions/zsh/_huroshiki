@@ -28,6 +28,7 @@ _huroshiki() {
   packs=("${(@f)$(_huroshiki_candidates packs)}")
   templates=("${(@f)$(_huroshiki_candidates templates)}")
   _arguments -C \
+    '--version[show program version]' \
     '--root=[managed repository root]:root directory:_directories' \
     '--pack=[open a pack]:pack:->packs' \
     '--template=[open a template]:template:->templates'

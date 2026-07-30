@@ -7,8 +7,9 @@ The public interfaces are:
 - `packctl` for noninteractive commands and automation
 - `just` only for repository development tasks
 
-Every noninteractive project operation takes an explicit pack or template ID. There is no selected
-`MODPACK` shell context.
+Every noninteractive project-specific operation takes an explicit pack or template ID. Collection
+commands such as `list` and `validate` do not select a project, and there is no `MODPACK` shell
+context.
 
 ## Installation
 
@@ -19,6 +20,8 @@ nix run github:upiscium/Huroshiki -- --help
 nix profile install github:upiscium/Huroshiki#huroshiki
 huroshiki --help
 packctl --help
+huroshiki --version
+packctl --version
 ```
 
 The managed repository is selected by `--root PATH`, then `HUROSHIKI_ROOT`, then the current
@@ -78,7 +81,9 @@ huroshiki --template delight-base
 ```
 
 The TUI creates packs and templates, composes multiple templates, installs and removes MODs, edits
-sides and content overlays, builds, previews deployments, publishes, and manages retained state.
+sides and individual UTF-8 content-overlay files, builds, previews deployments, publishes, and
+manages retained state. This basic file editor does not provide directory moves, binary import/export,
+multi-file transactions, or dedicated KubeJS management.
 Template composition matches Minecraft and loader type, resolves current compatible files for the
 new pack's loader version, preserves template order, and unions sides for identical provider IDs.
 Every Packwiz root added through the TUI, CLI, a profile, or template composition is resolved in an

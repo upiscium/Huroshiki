@@ -157,7 +157,8 @@ _packctl() {
       _describe loader candidates
       ;;
     (*)
-      _arguments '--root=[managed repository root]:root directory:_directories' \
+      _arguments '--version[show program version]' \
+        '--root=[managed repository root]:root directory:_directories' \
         '--port=[HTTP server port]:port' \
         '--build[build after a successful update]' \
         '--allow-partial[apply resolvable updates despite resolver failures]' \

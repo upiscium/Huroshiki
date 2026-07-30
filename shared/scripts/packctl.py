@@ -45,6 +45,7 @@ from deploy_support import (
 )
 from packctl_errors import ConfigError
 from huroshiki_paths import import_root_argument, resolve_root
+from huroshiki_version import VERSION
 from overlay_policy import copy_content_overlays, scan_content_overlays
 from portable_paths import PortablePathError, portable_basename_key
 from process_runner import (
@@ -4667,6 +4668,11 @@ def parser() -> argparse.ArgumentParser:
         "--root",
         metavar="PATH",
         help="managed repository root (default: HUROSHIKI_ROOT, then current directory)",
+    )
+    root.add_argument(
+        "--version",
+        action="version",
+        version=f"packctl {VERSION}",
     )
     sub = root.add_subparsers(dest="command", required=True)
 
