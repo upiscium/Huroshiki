@@ -686,6 +686,92 @@ url = "https://example.invalid/manual.jar"
         self.assertIn('version = "v2"', first.read_text(encoding="utf-8"))
         self.assertIn('version = "v2"', second.read_text(encoding="utf-8"))
 
+    def test_update_all_final_refresh_keeps_preparation_deadline(self) -> None:
+        target = self.write_mod("first")
+        original = target.read_bytes()
+        controls: dict[str, object] = {}
+
+        def prepare(transaction, *, cancel_event, deadline, **kwargs):
+            controls["cancel_event"] = cancel_event
+            controls["deadline"] = deadline
+            relative = Path("mods/first.pw.toml")
+            candidate = core.UpdateCandidate(
+                "modrinth:first",
+                relative,
+                "first",
+                "First",
+                "modrinth",
+                "v1",
+                "v2",
+                "update",
+                (
+                    core.UpdateChange(
+                        relative,
+                        (transaction.source / relative).read_bytes(),
+                        metadata("First", "first", "v2").encode("utf-8"),
+                    ),
+                ),
+            )
+            transaction.update_candidates = [candidate]
+            return [candidate]
+
+        timeout = core.ResolverProcessResult(-15, "", "", False, True)
+
+        def refresh(command, *, cancel_event, deadline, **kwargs):
+            self.assertEqual(command, ["packwiz", "refresh"])
+            self.assertIs(cancel_event, controls["cancel_event"])
+            self.assertEqual(deadline, controls["deadline"])
+            return timeout
+
+        with (
+            patch.object(core, "UPDATE_OPERATION_TIMEOUT_SECONDS", 30),
+            patch.object(core.PackTransaction, "prepare_updates", new=prepare),
+            patch.object(core, "run_resolver_process", side_effect=refresh),
+        ):
+            with self.assertRaisesRegex(core.HuroshikiError, "timed out"):
+                core.update_all(self.key)
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_update_all_cancel_after_preparation_prevents_publication(self) -> None:
+        target = self.write_mod("first")
+        original = target.read_bytes()
+
+        def prepare(transaction, *, cancel_event, **kwargs):
+            relative = Path("mods/first.pw.toml")
+            candidate = core.UpdateCandidate(
+                "modrinth:first",
+                relative,
+                "first",
+                "First",
+                "modrinth",
+                "v1",
+                "v2",
+                "update",
+                (
+                    core.UpdateChange(
+                        relative,
+                        (transaction.source / relative).read_bytes(),
+                        metadata("First", "first", "v2").encode("utf-8"),
+                    ),
+                ),
+            )
+            transaction.update_candidates = [candidate]
+            cancel_event.set()
+            return [candidate]
+
+        def refresh(command, *, cancel_event, **kwargs):
+            self.assertEqual(command, ["packwiz", "refresh"])
+            self.assertTrue(cancel_event.is_set())
+            return core.ResolverProcessResult(-15, "", "", True, False)
+
+        with (
+            patch.object(core.PackTransaction, "prepare_updates", new=prepare),
+            patch.object(core, "run_resolver_process", side_effect=refresh),
+        ):
+            with self.assertRaisesRegex(core.HuroshikiError, "cancelled"):
+                core.update_all(self.key)
+        self.assertEqual(target.read_bytes(), original)
+
     def test_update_all_reports_no_available_updates_without_applying(self) -> None:
         target = self.write_mod("current")
         original = target.read_bytes()

@@ -4724,7 +4724,10 @@ def update_all(
         transaction.select_updates(
             candidate.relative_path for candidate in available
         )
-        transaction.apply()
+        transaction.apply(
+            cancel_event=cancel_event,
+            deadline=deadline,
+        )
         return UpdateRunReport(
             candidates,
             available,

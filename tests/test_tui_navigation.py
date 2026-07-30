@@ -104,6 +104,36 @@ class _BlockingUpdateTransaction(_UpdateTransaction):
         raise core.UpdatePreparationCancelled("cancelled")
 
 
+class _PreparedUpdateTransaction(_UpdateTransaction):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prepare_controls: tuple[threading.Event, float] | None = None
+        self.apply_controls: tuple[threading.Event | None, float | None] | None = None
+        self.selected: set[Path] = set()
+
+    def prepare_updates(self, *, cancel_event, deadline, **_) -> list[core.UpdateCandidate]:
+        self.prepare_controls = (cancel_event, deadline)
+        return [
+            core.UpdateCandidate(
+                "modrinth:first",
+                Path("mods/first.pw.toml"),
+                "first",
+                "First",
+                "modrinth",
+                "v1",
+                "v2",
+                "update",
+                (core.UpdateChange(Path("mods/first.pw.toml"), b"old", b"new"),),
+            )
+        ]
+
+    def select_updates(self, selected: set[Path]) -> None:
+        self.selected = set(selected)
+
+    def apply(self, *, cancel_event=None, deadline=None) -> None:
+        self.apply_controls = (cancel_event, deadline)
+
+
 class _NavigationApp(App[None]):
     CSS_PATH = str(Path(huroshiki.__file__).with_name("huroshiki.tcss"))
 
@@ -191,6 +221,28 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause()
                     self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
                     self.assertEqual(app.screen.project_key, "pack:demo")
+
+    async def test_update_apply_reuses_preparation_controls(self) -> None:
+        transaction = _PreparedUpdateTransaction()
+        with self.patches(), patch.object(
+            huroshiki.core.PackTransaction,
+            "create",
+            return_value=transaction,
+        ):
+            screen = huroshiki.UpdateScreen("pack:demo")
+            app = _NavigationApp(screen)
+            with patch.object(app, "suspend", return_value=nullcontext()):
+                async with app.run_test() as pilot:
+                    await pilot.pause(0.15)
+                    self.assertIsNotNone(transaction.prepare_controls)
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, huroshiki.ConfirmModal)
+                    await pilot.press("enter")
+                    await pilot.pause()
+
+        self.assertEqual(transaction.apply_controls, transaction.prepare_controls)
+        self.assertEqual(transaction.selected, {Path("mods/first.pw.toml")})
 
     async def test_update_worker_cancel_blocks_other_navigation_and_cleans_up(self) -> None:
         transaction = _BlockingUpdateTransaction()
