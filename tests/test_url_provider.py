@@ -774,7 +774,7 @@ mods:
                 encoding="utf-8",
             )
 
-            def fake_create(*args):
+            def fake_create(*args, **kwargs):
                 generated = self.packs / "generated"
                 source = generated / "source"
                 (source / "mods").mkdir(parents=True)
@@ -795,17 +795,12 @@ mods:
                 )
                 return 0
 
-            real_run = core.subprocess.run
-
-            def fake_run(command, **kwargs):
-                if command[-1] == "refresh":
-                    return core.subprocess.CompletedProcess(command, 0, "", "")
-                return real_run(command, **kwargs)
-
             with patch.object(
                 core, "create_project", side_effect=fake_create
             ), patch.object(
-                core.subprocess, "run", side_effect=fake_run
+                core,
+                "run_resolver_process",
+                return_value=core.ResolverProcessResult(0, "", "", False, False),
             ), patch.object(
                 core,
                 "download_url_artifact",

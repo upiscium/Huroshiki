@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
 import huroshiki_core as core
 import packctl
+from process_runner import BoundedProcessResult
 
 
 METADATA = b'''name = "Example"\nfilename = "example.jar"\nside = "both"\n'''
@@ -45,7 +47,7 @@ class SideTransactionTest(unittest.TestCase):
         self.metadata.write_bytes(b"partial metadata")
         (self.source / "index.toml").write_bytes(b"partial index")
         (self.source / "pack.toml").write_bytes(b"partial pack")
-        return subprocess.CompletedProcess(command, 1, "", "refresh failed")
+        return BoundedProcessResult(1, "", "refresh failed", False, False)
 
     def assert_rolled_back(self) -> None:
         self.assertEqual(self.metadata.read_bytes(), METADATA)
@@ -56,13 +58,39 @@ class SideTransactionTest(unittest.TestCase):
         args = argparse.Namespace(
             pack="demo", metadata_file="mods/example.pw.toml", side="server"
         )
-        with patch.object(packctl.subprocess, "run", side_effect=self.failed_refresh):
+        with patch.object(packctl, "run_bounded_process", side_effect=self.failed_refresh):
             with self.assertRaisesRegex(packctl.ConfigError, "refresh failed"):
                 packctl.cmd_side(args)
         self.assert_rolled_back()
 
+    def test_success_updates_side_and_index_with_shared_controls(self) -> None:
+        cancel_event = threading.Event()
+        deadline = time.monotonic() + 30
+
+        def refresh(command, *, cwd, cancel_event: object, deadline: float):
+            self.assertIs(cancel_event, expected_cancel)
+            self.assertEqual(deadline, expected_deadline)
+            (cwd / "index.toml").write_bytes(b"refreshed index\n")
+            return BoundedProcessResult(0, "", "", False, False)
+
+        expected_cancel = cancel_event
+        expected_deadline = deadline
+        with patch.object(packctl, "run_bounded_process", side_effect=refresh):
+            packctl.set_side_and_refresh(
+                self.source,
+                self.metadata,
+                "server",
+                cancel_event=cancel_event,
+                deadline=deadline,
+            )
+        self.assertEqual(packctl.read_toml(self.metadata)["side"], "server")
+        self.assertEqual(
+            (self.source / "index.toml").read_bytes(),
+            b"refreshed index\n",
+        )
+
     def test_tui_side_refresh_failure_uses_same_rollback(self) -> None:
-        with patch.object(packctl.subprocess, "run", side_effect=self.failed_refresh):
+        with patch.object(packctl, "run_bounded_process", side_effect=self.failed_refresh):
             with self.assertRaisesRegex(core.HuroshikiError, "refresh failed"):
                 core.set_installed_mod_side(
                     core.project_key("pack", "demo"),
@@ -79,7 +107,7 @@ class SideTransactionTest(unittest.TestCase):
             (self.source / "pack.toml").write_bytes(b"partial pack")
             raise KeyboardInterrupt
 
-        with patch.object(packctl.subprocess, "run", side_effect=interrupted_refresh):
+        with patch.object(packctl, "run_bounded_process", side_effect=interrupted_refresh):
             with self.assertRaises(KeyboardInterrupt):
                 packctl.set_side_and_refresh(self.source, self.metadata, "server")
         self.assert_rolled_back()
@@ -96,16 +124,51 @@ class SideTransactionTest(unittest.TestCase):
             return real_replace(path, target)
 
         with (
-            patch.object(packctl.subprocess, "run", side_effect=self.failed_refresh),
+            patch.object(packctl, "run_bounded_process", side_effect=self.failed_refresh),
             patch.object(Path, "replace", fail_two_restores),
         ):
             with self.assertRaises(packctl.ConfigError) as raised:
                 packctl.set_side_and_refresh(self.source, self.metadata, "server")
 
         message = str(raised.exception)
+        self.assertIn("refresh failed", message)
         self.assertIn("cannot restore example.pw.toml", message)
         self.assertIn("cannot restore index.toml", message)
         self.assertEqual((self.source / "pack.toml").read_bytes(), PACK_TOML)
+
+    def test_all_bounded_failure_flags_roll_back_files(self) -> None:
+        cases = (
+            (BoundedProcessResult(-15, "", "", True, False), "cancelled"),
+            (BoundedProcessResult(-15, "", "", False, True), "timed out"),
+            (
+                BoundedProcessResult(0, "", "", False, False, True, False),
+                "background processes",
+            ),
+            (
+                BoundedProcessResult(0, "", "", True, True, True, True),
+                "termination was incomplete",
+            ),
+        )
+        for result, message in cases:
+            with self.subTest(message=message):
+                self.metadata.write_bytes(METADATA)
+                (self.source / "index.toml").write_bytes(b"original index\n")
+                (self.source / "pack.toml").write_bytes(PACK_TOML)
+
+                def failed(command, **kwargs):
+                    self.metadata.write_bytes(b"partial metadata")
+                    (self.source / "index.toml").write_bytes(b"partial index")
+                    (self.source / "pack.toml").write_bytes(b"partial pack")
+                    return result
+
+                with patch.object(packctl, "run_bounded_process", side_effect=failed):
+                    with self.assertRaisesRegex(packctl.ConfigError, message):
+                        packctl.set_side_and_refresh(
+                            self.source,
+                            self.metadata,
+                            "server",
+                        )
+                self.assert_rolled_back()
 
 
 if __name__ == "__main__":

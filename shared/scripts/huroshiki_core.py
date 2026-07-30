@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 import queue
 import re
-import signal
 import shlex
 import shutil
 import stat
@@ -29,6 +28,21 @@ from uuid import uuid4
 import tomlkit
 
 import packctl
+from process_runner import (
+    BoundedProcessResult,
+    PACKWIZ_OPERATION_TIMEOUT_SECONDS,
+    PACKWIZ_PROCESS_TIMEOUT_SECONDS,
+    PROCESS_KILL_GRACE_SECONDS,
+    PROCESS_POLL_SECONDS,
+    PROCESS_REAP_GRACE_SECONDS,
+    PROCESS_TERMINATE_GRACE_SECONDS,
+    ProcessGroupMember,
+    ProcessTerminationResult,
+    live_process_group_members,
+    process_failure_message,
+    run_bounded_process,
+    stop_process_group,
+)
 from overlay_policy import (
     OVERLAY_TARGETS,
     OverlayPolicyError,
@@ -712,28 +726,10 @@ class InstallSearchResult:
     subtitle: str
 
 
-@dataclass(frozen=True)
-class ResolverProcessResult:
-    returncode: int | None
-    stdout: str
-    stderr: str
-    cancelled: bool
-    timed_out: bool
-    orphaned_descendants: bool = False
-    termination_incomplete: bool = False
-
-
-@dataclass(frozen=True)
-class ResolverTerminationResult:
-    group_drained: bool
-    parent_reaped: bool
-    forced: bool
-
-
-@dataclass(frozen=True)
-class ProcessGroupMember:
-    pid: int
-    state: str
+ResolverProcessResult = BoundedProcessResult
+ResolverTerminationResult = ProcessTerminationResult
+run_resolver_process = run_bounded_process
+stop_resolver_process_group = stop_process_group
 
 
 class ProviderSearchOperation:
@@ -1604,7 +1600,13 @@ class PackTransaction:
             _apply_update_change(self.source, change, use_after=True)
         self.selected_update_changes = merged
 
-    def remove_mods(self, slugs: Iterable[str]) -> int:
+    def remove_mods(
+        self,
+        slugs: Iterable[str],
+        *,
+        cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> int:
         self.ensure_active()
         selected = set(slugs)
         kind, project_id = split_project_key(self.project_key)
@@ -1640,20 +1642,31 @@ class PackTransaction:
             ]
             return 0
 
+        operation_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+        )
         for slug in sorted(selected):
+            self.ensure_active()
             ensure_safe_pack_source(self.source)
-            result = subprocess.run(
+            _run_noninteractive_packwiz(
                 ["packwiz", "remove", slug],
                 cwd=self.source,
-                text=True,
-                check=False,
+                cancel_event=cancel_event,
+                deadline=operation_deadline,
+                label=f"Packwiz remove {slug}",
             )
-            if result.returncode != 0:
-                return result.returncode
             ensure_safe_pack_source(self.source)
         return 0
 
-    def apply(self, *, refresh: bool = True) -> None:
+    def apply(
+        self,
+        *,
+        refresh: bool = True,
+        cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> None:
         self.ensure_active()
         with self._lock:
             if self._operation is not None and not self._operation.done.is_set():
@@ -1705,14 +1718,18 @@ class PackTransaction:
 
         ensure_safe_pack_source(self.source)
         if refresh:
-            refresh_result = subprocess.run(
+            operation_deadline = (
+                deadline
+                if deadline is not None
+                else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+            )
+            _run_noninteractive_packwiz(
                 ["packwiz", "refresh"],
                 cwd=self.source,
-                text=True,
-                check=False,
+                cancel_event=cancel_event,
+                deadline=operation_deadline,
+                label="Packwiz refresh",
             )
-            if refresh_result.returncode != 0:
-                raise HuroshikiError("packwiz refresh failed; transaction was not applied")
             ensure_safe_pack_source(self.source)
 
         real_root = project_root(self.project_key)
@@ -4201,6 +4218,9 @@ def set_installed_mod_side(
     relative_path: Path,
     client: bool,
     server: bool,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> None:
     try:
         with packctl.ProjectLock(project_key_value, "side"):
@@ -4215,7 +4235,13 @@ def set_installed_mod_side(
 
             source = project_source(project_key_value)
             path = safe_child(source, relative_path)
-            packctl.set_side_and_refresh(source, path, side)
+            packctl.set_side_and_refresh(
+                source,
+                path,
+                side,
+                cancel_event=cancel_event,
+                deadline=deadline,
+            )
     except packctl.ConfigError as error:
         raise HuroshikiError(str(error)) from error
 
@@ -4331,16 +4357,34 @@ def add_mod_transactionally(
         transaction.discard()
 
 
-def remove_installed_mods(project_key_value: str, slugs: Iterable[str]) -> int:
+def remove_installed_mods(
+    project_key_value: str,
+    slugs: Iterable[str],
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> int:
     selected = set(slugs)
     if not selected:
         return 0
+    operation_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+    )
     transaction = PackTransaction.create(project_key_value)
     try:
-        result = transaction.remove_mods(selected)
+        result = transaction.remove_mods(
+            selected,
+            cancel_event=cancel_event,
+            deadline=operation_deadline,
+        )
         if result != 0:
             return result
-        transaction.apply()
+        transaction.apply(
+            cancel_event=cancel_event,
+            deadline=operation_deadline,
+        )
         return 0
     finally:
         transaction.discard()
@@ -4354,6 +4398,9 @@ def create_project(
     loader: str,
     loader_version: str,
     lock_held: bool = False,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> int:
     try:
         packctl.validate_project_creation_fields(
@@ -4379,11 +4426,17 @@ def create_project(
         }
     )
     create = packctl._new_pack if command_name == "new" else packctl._new_template
-    if lock_held:
-        return create(args)
+    create_arguments: dict[str, object] = {}
+    if kind == "pack" and (cancel_event is not None or deadline is not None):
+        create_arguments = {
+            "cancel_event": cancel_event,
+            "deadline": deadline,
+        }
     try:
+        if lock_held:
+            return create(args, **create_arguments)
         with packctl.ProjectLock(project_key(kind, project_id), "create project"):
-            return create(args)
+            return create(args, **create_arguments)
     except packctl.ConfigError as error:
         raise HuroshikiError(str(error)) from error
 
@@ -4671,7 +4724,10 @@ def update_all(
         transaction.select_updates(
             candidate.relative_path for candidate in available
         )
-        transaction.apply()
+        transaction.apply(
+            cancel_event=cancel_event,
+            deadline=deadline,
+        )
         return UpdateRunReport(
             candidates,
             available,
@@ -4700,201 +4756,35 @@ def concise_process_error(
     return lines[-1][:240] if lines else f"exit code {result.returncode}"
 
 
-TEMPLATE_RESOLVER_TIMEOUT_SECONDS = 120
-RESOLVER_POLL_SECONDS = 0.05
-RESOLVER_TERMINATE_GRACE_SECONDS = 2.0
-RESOLVER_KILL_GRACE_SECONDS = 2.0
-RESOLVER_REAP_GRACE_SECONDS = 1.0
-
-
-def live_process_group_members(
-    process_group: int,
-) -> tuple[ProcessGroupMember, ...]:
-    members: list[ProcessGroupMember] = []
-    proc = Path("/proc")
-    try:
-        entries = tuple(proc.iterdir())
-    except OSError:
-        return ()
-    for entry in entries:
-        if not entry.name.isdecimal():
-            continue
-        try:
-            text = (entry / "stat").read_text(encoding="utf-8")
-            closing = text.rfind(") ")
-            if closing < 0:
-                continue
-            suffix = text[closing + 2 :].split()
-            state = suffix[0]
-            member_group = int(suffix[2])
-        except (OSError, ValueError, IndexError):
-            continue
-        if member_group == process_group and state not in {"Z", "X", "x"}:
-            members.append(ProcessGroupMember(int(entry.name), state))
-    return tuple(sorted(members, key=lambda member: member.pid))
-
-
-def stop_resolver_process_group(
-    process_group: int,
-    *,
-    parent: subprocess.Popen[bytes] | None = None,
-    cleanup_deadline: float,
-) -> ResolverTerminationResult:
-    forced = False
-    try:
-        os.killpg(process_group, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    grace_deadline = min(
-        cleanup_deadline,
-        time.monotonic() + RESOLVER_TERMINATE_GRACE_SECONDS,
-    )
-    while (
-        live_process_group_members(process_group)
-        and time.monotonic() < grace_deadline
-    ):
-        if parent is not None:
-            parent.poll()
-        time.sleep(
-            min(
-                RESOLVER_POLL_SECONDS,
-                max(0.0, grace_deadline - time.monotonic()),
-            )
-        )
-    if live_process_group_members(process_group):
-        forced = True
-        try:
-            os.killpg(process_group, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        kill_deadline = min(
-            cleanup_deadline,
-            time.monotonic() + RESOLVER_KILL_GRACE_SECONDS,
-        )
-        while (
-            live_process_group_members(process_group)
-            and time.monotonic() < kill_deadline
-        ):
-            if parent is not None:
-                parent.poll()
-            time.sleep(
-                min(
-                    RESOLVER_POLL_SECONDS,
-                    max(0.0, kill_deadline - time.monotonic()),
-                )
-            )
-    group_drained = not live_process_group_members(process_group)
-    parent_reaped = parent is None
-    if parent is not None:
-        if parent.poll() is not None:
-            parent_reaped = True
-        else:
-            remaining = min(
-                RESOLVER_REAP_GRACE_SECONDS,
-                max(0.0, cleanup_deadline - time.monotonic()),
-            )
-            try:
-                parent.wait(timeout=remaining)
-                parent_reaped = True
-            except subprocess.TimeoutExpired:
-                parent_reaped = False
-    return ResolverTerminationResult(group_drained, parent_reaped, forced)
-
-
-def run_resolver_process(
+def _run_noninteractive_packwiz(
     command: list[str],
     *,
     cwd: Path,
     cancel_event: threading.Event | None,
-    deadline: float | None,
+    deadline: float,
+    label: str,
 ) -> ResolverProcessResult:
-    if cancel_event is not None and cancel_event.is_set():
-        return ResolverProcessResult(-signal.SIGTERM, "", "", True, False)
-    if deadline is not None and time.monotonic() >= deadline:
-        return ResolverProcessResult(-signal.SIGTERM, "", "", False, True)
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            start_new_session=True,
-        )
-        cancelled = False
-        timed_out = False
-        orphaned_descendants = False
-        termination_incomplete = False
-        try:
-            while process.poll() is None:
-                if cancel_event is not None and cancel_event.is_set():
-                    cancelled = True
-                    cleanup = stop_resolver_process_group(
-                        process.pid,
-                        parent=process,
-                        cleanup_deadline=(
-                            time.monotonic()
-                            + RESOLVER_TERMINATE_GRACE_SECONDS
-                            + RESOLVER_KILL_GRACE_SECONDS
-                            + RESOLVER_REAP_GRACE_SECONDS
-                        ),
-                    )
-                    termination_incomplete = not (
-                        cleanup.group_drained and cleanup.parent_reaped
-                    )
-                    break
-                if deadline is not None and time.monotonic() >= deadline:
-                    timed_out = True
-                    cleanup = stop_resolver_process_group(
-                        process.pid,
-                        parent=process,
-                        cleanup_deadline=(
-                            time.monotonic()
-                            + RESOLVER_TERMINATE_GRACE_SECONDS
-                            + RESOLVER_KILL_GRACE_SECONDS
-                            + RESOLVER_REAP_GRACE_SECONDS
-                        ),
-                    )
-                    termination_incomplete = not (
-                        cleanup.group_drained and cleanup.parent_reaped
-                    )
-                    break
-                time.sleep(RESOLVER_POLL_SECONDS)
-        except KeyboardInterrupt:
-            stop_resolver_process_group(
-                process.pid,
-                parent=process,
-                cleanup_deadline=(
-                    time.monotonic()
-                    + RESOLVER_TERMINATE_GRACE_SECONDS
-                    + RESOLVER_KILL_GRACE_SECONDS
-                    + RESOLVER_REAP_GRACE_SECONDS
-                ),
-            )
-            raise
-        if not cancelled and not timed_out and live_process_group_members(process.pid):
-            orphaned_descendants = True
-            cleanup = stop_resolver_process_group(
-                process.pid,
-                cleanup_deadline=(
-                    time.monotonic()
-                    + RESOLVER_TERMINATE_GRACE_SECONDS
-                    + RESOLVER_KILL_GRACE_SECONDS
-                ),
-            )
-            termination_incomplete = not cleanup.group_drained
-        stdout_file.seek(0)
-        stderr_file.seek(0)
-        stdout = stdout_file.read().decode("utf-8", errors="replace")
-        stderr = stderr_file.read().decode("utf-8", errors="replace")
-    return ResolverProcessResult(
-        process.returncode,
-        stdout,
-        stderr,
-        cancelled,
-        timed_out,
-        orphaned_descendants,
-        termination_incomplete,
+    process_deadline = min(
+        deadline,
+        time.monotonic() + PACKWIZ_PROCESS_TIMEOUT_SECONDS,
     )
+    result = run_resolver_process(
+        command,
+        cwd=cwd,
+        cancel_event=cancel_event,
+        deadline=process_deadline,
+    )
+    failure = process_failure_message(result, label=label)
+    if failure is not None:
+        raise HuroshikiError(failure)
+    return result
+
+
+TEMPLATE_RESOLVER_TIMEOUT_SECONDS = PACKWIZ_PROCESS_TIMEOUT_SECONDS
+RESOLVER_POLL_SECONDS = PROCESS_POLL_SECONDS
+RESOLVER_TERMINATE_GRACE_SECONDS = PROCESS_TERMINATE_GRACE_SECONDS
+RESOLVER_KILL_GRACE_SECONDS = PROCESS_KILL_GRACE_SECONDS
+RESOLVER_REAP_GRACE_SECONDS = PROCESS_REAP_GRACE_SECONDS
 
 
 @dataclass(frozen=True)
@@ -5108,21 +4998,18 @@ def resolve_mod_closure(
             command = [
                 "packwiz", "--yes", "curseforge", "add", "--addon-id", project_id
             ]
-        resolver_deadline = (
-            deadline
-            if deadline is not None
-            else time.monotonic() + TEMPLATE_RESOLVER_TIMEOUT_SECONDS
-        )
+        resolver_deadline = time.monotonic() + TEMPLATE_RESOLVER_TIMEOUT_SECONDS
+        if deadline is not None:
+            resolver_deadline = min(
+                deadline,
+                resolver_deadline,
+            )
         process = run_resolver_process(
             command,
             cwd=source,
             cancel_event=cancel_event,
             deadline=resolver_deadline,
         )
-        if process.cancelled:
-            raise HuroshikiError("MOD resolution was cancelled")
-        if process.timed_out:
-            raise HuroshikiError("Packwiz resolver deadline exceeded")
         if process.termination_incomplete:
             raise HuroshikiError(
                 "Packwiz resolver process termination was incomplete"
@@ -5131,6 +5018,10 @@ def resolve_mod_closure(
             raise HuroshikiError(
                 "Packwiz resolver left background processes after completion"
             )
+        if process.cancelled:
+            raise HuroshikiError("MOD resolution was cancelled")
+        if process.timed_out:
+            raise HuroshikiError("Packwiz resolver deadline exceeded")
         if process.returncode != 0:
             raise HuroshikiError(concise_process_error(process))
         metadata = _read_resolver_metadata(source)
@@ -5253,6 +5144,8 @@ def _resolve_template_root(
     minecraft: str,
     loader: str,
     loader_version: str,
+    cancel_event: threading.Event,
+    deadline: float,
 ) -> _ResolvedTemplateRoot:
     expected_identity = (
         canonical_provider(entry.provider),
@@ -5266,6 +5159,8 @@ def _resolve_template_root(
             loader=loader,
             loader_version=loader_version,
             canonical_project_id=entry.project_id,
+            cancel_event=cancel_event,
+            deadline=deadline,
         )
         metadata = _resolved_metadata_with_side(closure.metadata, entry.side)
         if closure.root_identity != expected_identity:
@@ -5309,10 +5204,14 @@ def _resolve_template_root(
         )
         artifact = download_url_artifact(
             entry.url or "",
-            threading.Event(),
+            cancel_event,
             log_dir,
             loader,
             entry.max_url_jar_size_bytes or DEFAULT_URL_MAX_JAR_SIZE_BYTES,
+            total_timeout_seconds=min(
+                DEFAULT_URL_TOTAL_TIMEOUT_SECONDS,
+                max(0.001, deadline - time.monotonic()),
+            ),
             allow_private_networks=entry.url_allow_private_networks,
         )
         if artifact.mod_id != entry.project_id:
@@ -5793,7 +5692,11 @@ class TemplateImportSession:
         if kind != "pack":
             raise HuroshikiError("Templates can be imported only into packs")
         operation_cancel = cancel_event or threading.Event()
-        operation_deadline = deadline or time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS
+        operation_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS
+        )
 
         def checkpoint() -> None:
             if operation_cancel.is_set():
@@ -6044,7 +5947,10 @@ class TemplateImportOperation:
         self.session = session
         self.plan = session.plan
         self.resolved = resolved
-        self.deadline = min(session.deadline, deadline or session.deadline)
+        self.deadline = min(
+            session.deadline,
+            deadline if deadline is not None else session.deadline,
+        )
         self.cancel_event = session.cancel_event
         self.done = threading.Event()
         self.progress_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
@@ -6398,10 +6304,16 @@ def _create_pack_from_templates(
     minecraft: str,
     loader: str,
     loader_version: str,
+    cancel_event: threading.Event,
+    deadline: float,
 ) -> TemplateCreationReport:
     resolved_roots: list[_ResolvedTemplateRoot] = []
     resolution_failures: list[TemplateInstallFailure] = []
     for entry in resolved.mods:
+        if cancel_event.is_set():
+            raise HuroshikiError("Template creation was cancelled")
+        if time.monotonic() >= deadline:
+            raise HuroshikiError("Template creation deadline exceeded")
         print(
             f"== Resolving {entry.name} ({entry.provider}:{entry.project_id}) ==",
             flush=True,
@@ -6413,9 +6325,15 @@ def _create_pack_from_templates(
                     minecraft=minecraft,
                     loader=loader,
                     loader_version=loader_version,
+                    cancel_event=cancel_event,
+                    deadline=deadline,
                 )
             )
         except (HuroshikiError, UnicodeError, tomllib.TOMLDecodeError) as error:
+            if cancel_event.is_set():
+                raise HuroshikiError("Template creation was cancelled") from error
+            if time.monotonic() >= deadline:
+                raise HuroshikiError("Template creation deadline exceeded") from error
             reason = str(error)
             print(f"warning: {entry.name}: {reason}", file=sys.stderr, flush=True)
             resolution_failures.append(
@@ -6474,6 +6392,8 @@ def _create_pack_from_templates(
         loader,
         loader_version,
         True,
+        cancel_event=cancel_event,
+        deadline=deadline,
     )
     if result != 0:
         raise HuroshikiError("Failed to create the destination MODPACK")
@@ -6490,15 +6410,13 @@ def _create_pack_from_templates(
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(item.contents)
 
-        refresh = subprocess.run(
+        _run_noninteractive_packwiz(
             ["packwiz", "refresh"],
             cwd=source,
-            text=True,
-            capture_output=True,
-            check=False,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            label="Template creation Packwiz refresh",
         )
-        if refresh.returncode != 0:
-            raise HuroshikiError(concise_process_error(refresh))
 
         return TemplateCreationReport(
             pack_key=pack_key,
@@ -6531,6 +6449,8 @@ def create_pack_from_templates(
     loader_version: str,
     conflict_resolutions: Mapping[str, ConflictResolution] | None = None,
     expected_composition: TemplateComposition | None = None,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> TemplateCreationReport:
     try:
         packctl.validate_project_creation_fields(
@@ -6540,6 +6460,12 @@ def create_pack_from_templates(
         )
     except packctl.ConfigError as error:
         raise HuroshikiError(str(error)) from error
+    operation_cancel = cancel_event or threading.Event()
+    operation_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+    )
     pack_key = project_key("pack", project_id)
     with packctl.ProjectLock(pack_key, "create project"):
         composition = prepare_template_composition(
@@ -6563,6 +6489,8 @@ def create_pack_from_templates(
             minecraft=minecraft,
             loader=loader,
             loader_version=loader_version,
+            cancel_event=operation_cancel,
+            deadline=operation_deadline,
         )
 
 
@@ -6574,6 +6502,8 @@ def create_pack_from_template(
     minecraft: str,
     loader: str,
     loader_version: str,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> TemplateCreationReport:
     return create_pack_from_templates(
         template_ids=[template_id],
@@ -6582,4 +6512,6 @@ def create_pack_from_template(
         minecraft=minecraft,
         loader=loader,
         loader_version=loader_version,
+        cancel_event=cancel_event,
+        deadline=deadline,
     )

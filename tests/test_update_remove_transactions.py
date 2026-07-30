@@ -686,6 +686,92 @@ url = "https://example.invalid/manual.jar"
         self.assertIn('version = "v2"', first.read_text(encoding="utf-8"))
         self.assertIn('version = "v2"', second.read_text(encoding="utf-8"))
 
+    def test_update_all_final_refresh_keeps_preparation_deadline(self) -> None:
+        target = self.write_mod("first")
+        original = target.read_bytes()
+        controls: dict[str, object] = {}
+
+        def prepare(transaction, *, cancel_event, deadline, **kwargs):
+            controls["cancel_event"] = cancel_event
+            controls["deadline"] = deadline
+            relative = Path("mods/first.pw.toml")
+            candidate = core.UpdateCandidate(
+                "modrinth:first",
+                relative,
+                "first",
+                "First",
+                "modrinth",
+                "v1",
+                "v2",
+                "update",
+                (
+                    core.UpdateChange(
+                        relative,
+                        (transaction.source / relative).read_bytes(),
+                        metadata("First", "first", "v2").encode("utf-8"),
+                    ),
+                ),
+            )
+            transaction.update_candidates = [candidate]
+            return [candidate]
+
+        timeout = core.ResolverProcessResult(-15, "", "", False, True)
+
+        def refresh(command, *, cancel_event, deadline, **kwargs):
+            self.assertEqual(command, ["packwiz", "refresh"])
+            self.assertIs(cancel_event, controls["cancel_event"])
+            self.assertEqual(deadline, controls["deadline"])
+            return timeout
+
+        with (
+            patch.object(core, "UPDATE_OPERATION_TIMEOUT_SECONDS", 30),
+            patch.object(core.PackTransaction, "prepare_updates", new=prepare),
+            patch.object(core, "run_resolver_process", side_effect=refresh),
+        ):
+            with self.assertRaisesRegex(core.HuroshikiError, "timed out"):
+                core.update_all(self.key)
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_update_all_cancel_after_preparation_prevents_publication(self) -> None:
+        target = self.write_mod("first")
+        original = target.read_bytes()
+
+        def prepare(transaction, *, cancel_event, **kwargs):
+            relative = Path("mods/first.pw.toml")
+            candidate = core.UpdateCandidate(
+                "modrinth:first",
+                relative,
+                "first",
+                "First",
+                "modrinth",
+                "v1",
+                "v2",
+                "update",
+                (
+                    core.UpdateChange(
+                        relative,
+                        (transaction.source / relative).read_bytes(),
+                        metadata("First", "first", "v2").encode("utf-8"),
+                    ),
+                ),
+            )
+            transaction.update_candidates = [candidate]
+            cancel_event.set()
+            return [candidate]
+
+        def refresh(command, *, cancel_event, **kwargs):
+            self.assertEqual(command, ["packwiz", "refresh"])
+            self.assertTrue(cancel_event.is_set())
+            return core.ResolverProcessResult(-15, "", "", True, False)
+
+        with (
+            patch.object(core.PackTransaction, "prepare_updates", new=prepare),
+            patch.object(core, "run_resolver_process", side_effect=refresh),
+        ):
+            with self.assertRaisesRegex(core.HuroshikiError, "cancelled"):
+                core.update_all(self.key)
+        self.assertEqual(target.read_bytes(), original)
+
     def test_update_all_reports_no_available_updates_without_applying(self) -> None:
         target = self.write_mod("current")
         original = target.read_bytes()
@@ -1340,10 +1426,94 @@ class RemoveTransactionTest(TransactionTestCase):
             return self.completed(command)
 
         with patch.object(core.subprocess, "run", side_effect=run):
-            result = core.remove_installed_mods(self.key, ["first", "second"])
-        self.assertEqual(result, 9)
+            with self.assertRaisesRegex(core.HuroshikiError, "remove second failed"):
+                core.remove_installed_mods(self.key, ["first", "second"])
         self.assertTrue(first.exists())
         self.assertTrue(second.exists())
+
+    def test_remove_bounded_failures_preserve_source_and_release_lock(self) -> None:
+        cases = (
+            (core.ResolverProcessResult(-15, "", "", True, False), "cancelled"),
+            (core.ResolverProcessResult(-15, "", "", False, True), "timed out"),
+            (
+                core.ResolverProcessResult(0, "", "", False, False, True, False),
+                "background processes",
+            ),
+            (
+                core.ResolverProcessResult(0, "", "", True, True, True, True),
+                "termination was incomplete",
+            ),
+        )
+        for failure, message in cases:
+            with self.subTest(message=message):
+                first = self.write_mod("first")
+                second = self.write_mod("second")
+
+                def run(command, *, cwd, **kwargs):
+                    if command[2] == "first":
+                        (cwd / "mods" / "first.pw.toml").unlink()
+                        return core.ResolverProcessResult(0, "", "", False, False)
+                    return failure
+
+                with patch.object(core, "run_resolver_process", side_effect=run):
+                    with self.assertRaisesRegex(core.HuroshikiError, message):
+                        core.remove_installed_mods(self.key, ["first", "second"])
+                self.assertTrue(first.exists())
+                self.assertTrue(second.exists())
+                if core.TRANSACTION_ROOT.exists():
+                    self.assertEqual(list(core.TRANSACTION_ROOT.iterdir()), [])
+                with packctl.ProjectLock(self.key, "test lock release"):
+                    pass
+
+    def test_final_refresh_bounded_failures_never_publish(self) -> None:
+        cases = (
+            core.ResolverProcessResult(-15, "", "", False, True),
+            core.ResolverProcessResult(0, "", "", False, False, True, False),
+            core.ResolverProcessResult(0, "", "", False, False, False, True),
+        )
+        original = (self.source / "pack.toml").read_bytes()
+        for failure in cases:
+            with self.subTest(result=failure):
+                transaction = core.PackTransaction.create(self.key)
+                (transaction.source / "pack.toml").write_text(
+                    'name = "Staged"\n', encoding="utf-8"
+                )
+                with patch.object(core, "run_resolver_process", return_value=failure):
+                    with self.assertRaises(core.HuroshikiError):
+                        transaction.apply()
+                self.assertEqual((self.source / "pack.toml").read_bytes(), original)
+                self.assertTrue(transaction.active)
+                transaction.discard()
+
+    def test_remove_and_final_refresh_share_stricter_deadline(self) -> None:
+        first = self.write_mod("first")
+        second = self.write_mod("second")
+        cancel_event = threading.Event()
+        deadline = time.monotonic() + 30
+        calls: list[tuple[threading.Event | None, float | None]] = []
+
+        def run(command, *, cwd, cancel_event, deadline):
+            calls.append((cancel_event, deadline))
+            if command[:2] == ["packwiz", "remove"]:
+                (cwd / "mods" / f"{command[2]}.pw.toml").unlink()
+            return core.ResolverProcessResult(0, "", "", False, False)
+
+        with patch.object(core, "run_resolver_process", side_effect=run):
+            self.assertEqual(
+                core.remove_installed_mods(
+                    self.key,
+                    ["first", "second"],
+                    cancel_event=cancel_event,
+                    deadline=deadline,
+                ),
+                0,
+            )
+        self.assertEqual(
+            calls,
+            [(cancel_event, deadline), (cancel_event, deadline), (cancel_event, deadline)],
+        )
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
 
     def test_external_source_change_aborts_batch_remove(self) -> None:
         first = self.write_mod("first")

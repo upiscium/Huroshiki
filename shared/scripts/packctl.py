@@ -21,6 +21,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import tomllib
 from typing import Any, Callable, Literal
 import unicodedata
@@ -45,6 +47,13 @@ from packctl_errors import ConfigError
 from huroshiki_paths import import_root_argument, resolve_root
 from overlay_policy import copy_content_overlays, scan_content_overlays
 from portable_paths import PortablePathError, portable_basename_key
+from process_runner import (
+    BoundedProcessResult,
+    PACKWIZ_OPERATION_TIMEOUT_SECONDS,
+    PACKWIZ_PROCESS_TIMEOUT_SECONDS,
+    process_failure_message,
+    run_bounded_process,
+)
 import project_locks
 from project_locks import ProjectLockMetadata, process_start_identity
 from url_artifacts import DEFAULT_URL_MAX_JAR_SIZE_BYTES
@@ -1917,6 +1926,29 @@ def run(command: list[str], *, cwd: Path | None = None) -> None:
     subprocess.run(command, cwd=cwd, check=True)
 
 
+def run_packwiz(
+    command: list[str],
+    *,
+    cwd: Path,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> BoundedProcessResult:
+    print("+", " ".join(shlex.quote(part) for part in command))
+    process_deadline = time.monotonic() + PACKWIZ_PROCESS_TIMEOUT_SECONDS
+    if deadline is not None:
+        process_deadline = min(deadline, process_deadline)
+    result = run_bounded_process(
+        command,
+        cwd=cwd,
+        cancel_event=cancel_event,
+        deadline=process_deadline,
+    )
+    failure = process_failure_message(result, label="Packwiz")
+    if failure is not None:
+        raise ConfigError(failure)
+    return result
+
+
 def copy_tree(source: Path, destination: Path) -> None:
     if source.exists():
         shutil.copytree(
@@ -1950,22 +1982,26 @@ def set_side_file(path: Path, side: str) -> None:
     path.write_text(tomlkit.dumps(doc), encoding="utf-8")
 
 
-def set_side_and_refresh(source: Path, path: Path, side: str) -> None:
+def set_side_and_refresh(
+    source: Path,
+    path: Path,
+    side: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> None:
     snapshots = {
         item: item.read_bytes() if item.exists() else None
         for item in (path, source / "index.toml", source / "pack.toml")
     }
     try:
         set_side_file(path, side)
-        result = subprocess.run(
+        run_packwiz(
             ["packwiz", "refresh"],
             cwd=source,
-            text=True,
-            capture_output=True,
-            check=False,
+            cancel_event=cancel_event,
+            deadline=deadline,
         )
-        if result.returncode != 0:
-            raise ConfigError(result.stderr.strip() or "packwiz refresh failed")
     except BaseException as error:
         rollback_errors: list[str] = []
         for item, content in snapshots.items():
@@ -2146,6 +2182,8 @@ def init_packwiz_project(
     minecraft: str,
     loader: str,
     loader_version: str,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> None:
     if loader not in LOADER_FLAGS:
         raise ConfigError(f"Unsupported loader: {loader}")
@@ -2168,7 +2206,12 @@ def init_packwiz_project(
         LOADER_FLAGS[loader],
         loader_version,
     ]
-    run(command, cwd=source)
+    run_packwiz(
+        command,
+        cwd=source,
+        cancel_event=cancel_event,
+        deadline=deadline,
+    )
     create_layout(root)
     (source / ".packwizignore").write_text(
         "*.log\n*.gitkeep\n/crash-reports/\n/logs/\n/saves/\n/screenshots/\n/world/\n",
@@ -2176,7 +2219,12 @@ def init_packwiz_project(
     )
 
 
-def _new_pack(args: argparse.Namespace) -> int:
+def _new_pack(
+    args: argparse.Namespace,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> int:
     validate_project_creation_fields(
         display_name=args.display_name,
         minecraft=args.minecraft,
@@ -2192,6 +2240,8 @@ def _new_pack(args: argparse.Namespace) -> int:
             minecraft=args.minecraft,
             loader=args.loader,
             loader_version=args.loader_version,
+            cancel_event=cancel_event,
+            deadline=deadline,
         )
         pack_yaml = {
             "id": args.pack,
@@ -2215,7 +2265,7 @@ def _new_pack(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
         (root / "profiles.yaml").write_text("profiles: {}\n", encoding="utf-8")
-    except Exception:
+    except BaseException:
         shutil.rmtree(root, ignore_errors=True)
         raise
     print(f"Created packs/{args.pack}")
@@ -3823,7 +3873,14 @@ def build_target(
     destination: Path | None = None,
     *,
     refresh: bool = True,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> list[str]:
+    operation_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+    )
     source = root / "source"
     workspace: Path | None = None
     if destination is None:
@@ -3864,7 +3921,12 @@ def build_target(
         if errors:
             return errors
         if refresh:
-            run(["packwiz", "refresh"], cwd=destination)
+            run_packwiz(
+                ["packwiz", "refresh"],
+                cwd=destination,
+                cancel_event=cancel_event,
+                deadline=operation_deadline,
+            )
 
         if workspace is not None:
             live_target = root / "dist" / target
@@ -3880,7 +3942,17 @@ def build_target(
             shutil.rmtree(workspace, ignore_errors=True)
 
 
-def _build_pack(pack_id: str) -> int:
+def _build_pack(
+    pack_id: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> int:
+    operation_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+    )
     root = get_pack_root(pack_id)
     for required in (root / "source" / "pack.toml", root / "source" / "index.toml"):
         if not required.is_file():
@@ -3890,10 +3962,20 @@ def _build_pack(pack_id: str) -> int:
     preserve_workspace = False
     try:
         errors = build_target(
-            root, "client", staged_dist / "client", refresh=False
+            root,
+            "client",
+            staged_dist / "client",
+            refresh=False,
+            cancel_event=cancel_event,
+            deadline=operation_deadline,
         )
         errors += build_target(
-            root, "server", staged_dist / "server", refresh=False
+            root,
+            "server",
+            staged_dist / "server",
+            refresh=False,
+            cancel_event=cancel_event,
+            deadline=operation_deadline,
         )
         errors = list(dict.fromkeys(errors))
         if errors:
@@ -3910,8 +3992,18 @@ def _build_pack(pack_id: str) -> int:
             )
             return 1
 
-        run(["packwiz", "refresh"], cwd=staged_dist / "client")
-        run(["packwiz", "refresh"], cwd=staged_dist / "server")
+        run_packwiz(
+            ["packwiz", "refresh"],
+            cwd=staged_dist / "client",
+            cancel_event=cancel_event,
+            deadline=operation_deadline,
+        )
+        run_packwiz(
+            ["packwiz", "refresh"],
+            cwd=staged_dist / "server",
+            cancel_event=cancel_event,
+            deadline=operation_deadline,
+        )
 
         try:
             swap_directory(staged_dist, root / "dist", workspace / "previous-dist")
@@ -3925,9 +4017,18 @@ def _build_pack(pack_id: str) -> int:
     return 0
 
 
-def build_pack(pack_id: str) -> int:
+def build_pack(
+    pack_id: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> int:
     with ProjectLock(f"pack:{pack_id}", "build"):
-        return _build_pack(pack_id)
+        return _build_pack(
+            pack_id,
+            cancel_event=cancel_event,
+            deadline=deadline,
+        )
 
 
 def cmd_build(args: argparse.Namespace) -> int:

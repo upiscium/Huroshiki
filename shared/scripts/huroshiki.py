@@ -1517,6 +1517,8 @@ class VersionsScreen(BaseScreen):
         self.operation: core.LoaderMigrationOperation | None = None
         self.operation_thread: threading.Thread | None = None
         self.operation_timer: Timer | None = None
+        self.transaction_cancel_event: threading.Event | None = None
+        self.transaction_deadline: float | None = None
         self.leave_after_cancel = False
 
     def compose(self) -> ComposeResult:
@@ -4100,7 +4102,7 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
         if not operation.done.is_set():
             return
         if self.operation_timer is not None:
-            self.operation_timer.pause()
+            self.operation_timer.stop()
             self.operation_timer = None
         self.operation_thread = None
         self.operation = None
@@ -4113,6 +4115,8 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
                 self.return_to_project()
             return
         self.transaction = operation.claim_transaction()
+        self.transaction_cancel_event = operation.cancel_event
+        self.transaction_deadline = operation.deadline
         self.candidates = list(operation.candidates)
         self.selected_paths = {
             candidate.relative_path
@@ -4205,9 +4209,14 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
         try:
             self.transaction.select_updates(self.selected_paths)
             with self.app.suspend():
-                self.transaction.apply()
+                self.transaction.apply(
+                    cancel_event=self.transaction_cancel_event,
+                    deadline=self.transaction_deadline,
+                )
             self.app.notify(f"Applied {len(self.selected_paths)} MOD update(s)")
             self.transaction = None
+            self.transaction_cancel_event = None
+            self.transaction_deadline = None
             self.app.open_list(self.project_key)
         except Exception as error:
             self.app.notify(str(error), severity="error")
@@ -4223,17 +4232,21 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
         if self.transaction is not None:
             self.transaction.discard()
             self.transaction = None
+            self.transaction_cancel_event = None
+            self.transaction_deadline = None
         self.return_to_project()
 
     def discard_and_navigate(self, destination: Callable[[], None]) -> None:
         if self.transaction is not None:
             self.transaction.discard()
             self.transaction = None
+            self.transaction_cancel_event = None
+            self.transaction_deadline = None
         destination()
 
     def on_unmount(self) -> None:
         if self.operation_timer is not None:
-            self.operation_timer.pause()
+            self.operation_timer.stop()
             self.operation_timer = None
         if self.operation is not None:
             self.operation.cancel()
