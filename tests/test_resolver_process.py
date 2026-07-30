@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import huroshiki_core as core
+import process_runner as runner
 
 
 @unittest.skipUnless(os.name == "posix", "resolver process groups require POSIX")
@@ -81,7 +82,7 @@ class ResolverProcessTest(unittest.TestCase):
             f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid)); "
             "time.sleep(0.2)"
         )
-        with patch.object(core, "RESOLVER_TERMINATE_GRACE_SECONDS", 0.15):
+        with patch.object(runner, "PROCESS_TERMINATE_GRACE_SECONDS", 0.15):
             result = self.run_python(source)
         child_pid = int(child_pid_file.read_text())
         self.assertTrue(result.orphaned_descendants)
@@ -142,7 +143,7 @@ class ResolverProcessTest(unittest.TestCase):
     def test_prestart_cancel_does_not_spawn(self) -> None:
         cancel = threading.Event()
         cancel.set()
-        with patch.object(core.subprocess, "Popen") as popen:
+        with patch.object(runner.subprocess, "Popen") as popen:
             result = self.run_python("raise SystemExit(0)", cancel_event=cancel)
         popen.assert_not_called()
         self.assertTrue(result.cancelled)
@@ -165,7 +166,7 @@ class ResolverProcessTest(unittest.TestCase):
         timer = threading.Timer(0.15, cancel.set)
         timer.start()
         try:
-            with patch.object(core, "RESOLVER_TERMINATE_GRACE_SECONDS", 0.15):
+            with patch.object(runner, "PROCESS_TERMINATE_GRACE_SECONDS", 0.15):
                 result = self.run_python(
                     "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                     "time.sleep(60)",
@@ -199,8 +200,8 @@ class ResolverProcessTest(unittest.TestCase):
             parent_reaped=False,
             forced=True,
         )
-        with patch.object(core.subprocess, "Popen", return_value=process), patch.object(
-            core, "stop_resolver_process_group", return_value=cleanup
+        with patch.object(runner.subprocess, "Popen", return_value=process), patch.object(
+            runner, "stop_process_group", return_value=cleanup
         ) as stop:
             result = self.run_python("raise SystemExit(0)", cancel_event=cancel)
 
@@ -215,10 +216,10 @@ class ResolverProcessTest(unittest.TestCase):
         parent.poll.return_value = None
         parent.wait.side_effect = subprocess.TimeoutExpired("resolver", 0)
         with patch.object(
-            core, "live_process_group_members", return_value=(12345,)
-        ), patch.object(core.os, "killpg") as killpg, patch.object(
-            core, "RESOLVER_TERMINATE_GRACE_SECONDS", 0.0
-        ), patch.object(core, "RESOLVER_KILL_GRACE_SECONDS", 0.0):
+            runner, "live_process_group_members", return_value=(12345,)
+        ), patch.object(runner.os, "killpg") as killpg, patch.object(
+            runner, "PROCESS_TERMINATE_GRACE_SECONDS", 0.0
+        ), patch.object(runner, "PROCESS_KILL_GRACE_SECONDS", 0.0):
             result = core.stop_resolver_process_group(
                 12345,
                 parent=parent,
@@ -249,8 +250,8 @@ class ResolverProcessTest(unittest.TestCase):
                 raise KeyboardInterrupt
             real_sleep(seconds)
 
-        with patch.object(core.subprocess, "Popen", side_effect=launch), patch.object(
-            core.time, "sleep", side_effect=interrupt_once
+        with patch.object(runner.subprocess, "Popen", side_effect=launch), patch.object(
+            runner.time, "sleep", side_effect=interrupt_once
         ):
             with self.assertRaises(KeyboardInterrupt):
                 self.run_python("import time; time.sleep(60)")
@@ -292,6 +293,40 @@ class ResolverProcessTest(unittest.TestCase):
             time.sleep(0.02)
         if state_path.exists():
             self.assertEqual(state_path.read_text().split()[2], "Z")
+
+    def test_legacy_core_api_reexports_shared_runner(self) -> None:
+        self.assertIs(core.ResolverProcessResult, runner.BoundedProcessResult)
+        self.assertIs(core.ResolverTerminationResult, runner.ProcessTerminationResult)
+        self.assertIs(core.run_resolver_process, runner.run_bounded_process)
+        self.assertIs(core.stop_resolver_process_group, runner.stop_process_group)
+
+    def test_failure_message_prioritizes_cleanup_integrity_and_stderr(self) -> None:
+        result = runner.BoundedProcessResult(
+            7,
+            "stdout detail\n",
+            "stderr first\nstderr last\n",
+            True,
+            True,
+            True,
+            True,
+        )
+        self.assertEqual(
+            runner.process_failure_message(result, label="Packwiz"),
+            "Packwiz process termination was incomplete",
+        )
+        self.assertEqual(
+            runner.process_failure_message(
+                runner.BoundedProcessResult(
+                    7,
+                    "stdout detail\n",
+                    "stderr first\nstderr last\n",
+                    False,
+                    False,
+                ),
+                label="Packwiz",
+            ),
+            "Packwiz failed: stderr last",
+        )
 
 
 if __name__ == "__main__":

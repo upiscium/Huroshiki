@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -117,7 +116,7 @@ class ProfileTransactionTest(unittest.TestCase):
     def refresh_success(command, *, cwd, **_):
         if command == ["packwiz", "refresh"]:
             (cwd / "index.toml").write_bytes(b"refreshed index\n")
-        return subprocess.CompletedProcess(command, 0)
+        return core.ResolverProcessResult(0, "", "", False, False)
 
     def test_success_installs_only_in_copy_and_atomically_applies(self) -> None:
         original = self.snapshot()
@@ -134,7 +133,7 @@ class ProfileTransactionTest(unittest.TestCase):
             self.install()(command, cwd=cwd)
 
         with patch.object(core, "resolve_mod_closure", side_effect=self.resolver()), patch.object(
-            core.subprocess, "run", side_effect=self.refresh_success
+            core, "run_resolver_process", side_effect=self.refresh_success
         ) as run:
             core.apply_profiles(self.key, profile, ["base"])
 
@@ -167,7 +166,7 @@ class ProfileTransactionTest(unittest.TestCase):
             {"source": "curseforge", "project": 101, "side": "client"}
         )
         for failure in (
-            subprocess.CompletedProcess(["packwiz", "refresh"], 9),
+            core.ResolverProcessResult(9, "", "refresh failed", False, False),
             KeyboardInterrupt(),
         ):
             with self.subTest(failure=type(failure).__name__):
@@ -180,7 +179,7 @@ class ProfileTransactionTest(unittest.TestCase):
                     return failure
 
                 with patch.object(core, "resolve_mod_closure", side_effect=self.resolver()), patch.object(
-                    core.subprocess, "run", side_effect=refresh
+                    core, "run_resolver_process", side_effect=refresh
                 ):
                     expected = KeyboardInterrupt if isinstance(failure, KeyboardInterrupt) else core.HuroshikiError
                     with self.assertRaises(expected):
@@ -194,10 +193,10 @@ class ProfileTransactionTest(unittest.TestCase):
 
         def refresh(command, *, cwd, **_):
             (self.source / "index.toml").write_bytes(b"external index\n")
-            return subprocess.CompletedProcess(command, 0)
+            return core.ResolverProcessResult(0, "", "", False, False)
 
         with patch.object(core, "resolve_mod_closure", side_effect=self.resolver()), patch.object(
-            core.subprocess, "run", side_effect=refresh
+            core, "run_resolver_process", side_effect=refresh
         ):
             with self.assertRaisesRegex(core.HuroshikiError, "real Packwiz source changed"):
                 core.apply_profiles(self.key, profile, ["base"])
@@ -244,7 +243,7 @@ class ProfileTransactionTest(unittest.TestCase):
             {"source": "curseforge", "project": 101, "side": "server"}
         )
         with patch.object(core, "resolve_mod_closure", side_effect=self.resolver()) as install, patch.object(
-            core.subprocess, "run", side_effect=self.refresh_success
+            core, "run_resolver_process", side_effect=self.refresh_success
         ):
             core.apply_profiles(self.key, profile, ["base"])
         install.assert_called_once()

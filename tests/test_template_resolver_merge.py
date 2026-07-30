@@ -90,7 +90,7 @@ class TemplateResolverMergeTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def fake_create(self, *args) -> int:
+    def fake_create(self, *args, **kwargs) -> int:
         pack_root = self.packs / "generated"
         (pack_root / "source" / "mods").mkdir(parents=True)
         (pack_root / "source" / "pack.toml").write_text(PACK_TOML, encoding="utf-8")
@@ -156,7 +156,7 @@ class TemplateResolverMergeTest(unittest.TestCase):
         self.assertEqual(packctl.read_toml(mods / "shared.pw.toml")["side"], "both")
         client = self.packs / "generated" / "client-test"
         server = self.packs / "generated" / "server-test"
-        with patch.object(packctl, "run"):
+        with patch.object(packctl, "run_packwiz"):
             packctl.build_target(self.packs / "generated", "client", client)
             packctl.build_target(self.packs / "generated", "server", server)
         self.assertFalse((server / "mods" / "client-one.pw.toml").exists())

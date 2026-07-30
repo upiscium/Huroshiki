@@ -31,9 +31,16 @@ class TemplateCreationTest(unittest.TestCase):
             "run_resolver_process",
             side_effect=self.run_fake_resolver,
         )
+        self.packctl_runner_patch = patch.object(
+            packctl,
+            "run_bounded_process",
+            side_effect=self.run_fake_resolver,
+        )
         self.runner_patch.start()
+        self.packctl_runner_patch.start()
 
     def tearDown(self) -> None:
+        self.packctl_runner_patch.stop()
         self.runner_patch.stop()
 
     @staticmethod
@@ -265,7 +272,6 @@ mods:
                 patch.object(packctl, "ROOT", root),
                 patch.object(packctl, "PACKS", packs),
                 patch.object(packctl, "TEMPLATES", templates),
-                patch.object(packctl, "run", side_effect=fake_packwiz),
                 patch.object(core.subprocess, "run", side_effect=fake_packwiz),
             ):
                 report = core.create_pack_from_template(
@@ -404,7 +410,7 @@ mods:
             for item in patches:
                 item.start()
 
-            def fake_create(*args):
+            def fake_create(*args, **kwargs):
                 source = packs / "generated" / "source"
                 (source / "mods").mkdir(parents=True)
                 (source / "pack.toml").write_text(PACK_TOML, encoding="utf-8")
@@ -485,6 +491,100 @@ mods:
             create.assert_not_called()
             self.assertFalse((packs / "generated").exists())
 
+    def test_final_refresh_bounded_failures_remove_owned_destination(self) -> None:
+        failures = (
+            (core.ResolverProcessResult(1, "", "refresh failed", False, False), "refresh failed"),
+            (core.ResolverProcessResult(-15, "", "", False, True), "timed out"),
+            (core.ResolverProcessResult(-15, "", "", True, False), "cancelled"),
+            (
+                core.ResolverProcessResult(0, "", "", False, False, True, False),
+                "background processes",
+            ),
+            (
+                core.ResolverProcessResult(0, "", "", False, False, False, True),
+                "termination was incomplete",
+            ),
+        )
+        for failure, message in failures:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                packs = root / "packs"
+                templates = root / "templates"
+                template = templates / "base"
+                template.mkdir(parents=True)
+                (template / "template.yaml").write_text(
+                    "id: base\ndisplay_name: Base\n"
+                    "minecraft: 1.21.1\nloader: neoforge\n"
+                    "reference_loader_version: 21.1.234\nmods: []\n",
+                    encoding="utf-8",
+                )
+
+                def fake_create(*args, **kwargs):
+                    source = packs / "generated" / "source"
+                    source.mkdir(parents=True)
+                    (source / "pack.toml").write_text(PACK_TOML, encoding="utf-8")
+                    (source / "index.toml").write_text("index\n", encoding="utf-8")
+                    return 0
+
+                with (
+                    patch.object(core, "ROOT", root),
+                    patch.object(core, "PACKS", packs),
+                    patch.object(core, "TEMPLATES", templates),
+                    patch.object(packctl, "ROOT", root),
+                    patch.object(packctl, "PACKS", packs),
+                    patch.object(packctl, "TEMPLATES", templates),
+                    patch.object(core, "create_project", side_effect=fake_create),
+                    patch.object(core, "run_resolver_process", return_value=failure),
+                ):
+                    with self.assertRaisesRegex(core.HuroshikiError, message):
+                        core.create_pack_from_template(
+                            template_id="base",
+                            project_id="generated",
+                            display_name="Generated",
+                            minecraft="1.21.1",
+                            loader="neoforge",
+                            loader_version="21.1.999",
+                        )
+                    self.assertFalse((packs / "generated").exists())
+                    with packctl.ProjectLock("pack:generated", "test lock release"):
+                        pass
+
+    def test_packwiz_init_timeout_removes_partial_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packs = root / "packs"
+            templates = root / "templates"
+            template = templates / "base"
+            template.mkdir(parents=True)
+            (template / "template.yaml").write_text(
+                "id: base\ndisplay_name: Base\n"
+                "minecraft: 1.21.1\nloader: neoforge\n"
+                "reference_loader_version: 21.1.234\nmods: []\n",
+                encoding="utf-8",
+            )
+            timeout = core.ResolverProcessResult(-15, "", "", False, True)
+            with (
+                patch.object(core, "ROOT", root),
+                patch.object(core, "PACKS", packs),
+                patch.object(core, "TEMPLATES", templates),
+                patch.object(packctl, "ROOT", root),
+                patch.object(packctl, "PACKS", packs),
+                patch.object(packctl, "TEMPLATES", templates),
+                patch.object(packctl, "run_bounded_process", return_value=timeout),
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, "timed out"):
+                    core.create_pack_from_template(
+                        template_id="base",
+                        project_id="generated",
+                        display_name="Generated",
+                        minecraft="1.21.1",
+                        loader="neoforge",
+                        loader_version="21.1.999",
+                    )
+                self.assertFalse((packs / "generated").exists())
+                with packctl.ProjectLock("pack:generated", "test lock release"):
+                    pass
+
     def test_source_initialization_failure_removes_owned_destination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -498,7 +598,7 @@ mods:
                 encoding="utf-8",
             )
 
-            def fake_create(*args):
+            def fake_create(*args, **kwargs):
                 (packs / "generated").mkdir(parents=True)
                 return 0
 
@@ -544,7 +644,7 @@ mods:
                 encoding="utf-8",
             )
 
-            def fake_create(*args):
+            def fake_create(*args, **kwargs):
                 source = packs / "generated" / "source"
                 (source / "mods").mkdir(parents=True)
                 (source / "pack.toml").write_text(PACK_TOML, encoding="utf-8")
@@ -606,7 +706,7 @@ mods: []
                 encoding="utf-8",
             )
 
-            def failed_create(*args):
+            def failed_create(*args, **kwargs):
                 destination = packs / "generated"
                 destination.mkdir(parents=True)
                 (destination / "diagnostic.txt").write_text("retained", encoding="utf-8")
@@ -687,7 +787,7 @@ mods:
             for item in patches:
                 item.start()
 
-            def fake_create(*args):
+            def fake_create(*args, **kwargs):
                 pack_root = packs / "generated"
                 (pack_root / "source" / "mods").mkdir(parents=True)
                 (pack_root / "source" / "pack.toml").write_text(
@@ -792,7 +892,7 @@ mods:
                 encoding="utf-8",
             )
 
-            def fake_create(*args):
+            def fake_create(*args, **kwargs):
                 source = packs / "generated" / "source"
                 (source / "mods").mkdir(parents=True)
                 (source / "pack.toml").write_text(PACK_TOML, encoding="utf-8")
@@ -862,7 +962,7 @@ mods:
                 encoding="utf-8",
             )
 
-            def fake_create(*args):
+            def fake_create(*args, **kwargs):
                 source = packs / "generated" / "source"
                 (source / "mods").mkdir(parents=True)
                 (source / "pack.toml").write_text(PACK_TOML, encoding="utf-8")
@@ -906,7 +1006,7 @@ mods:
             dependency = pack_root / "source" / "mods" / "client-dependency.pw.toml"
             self.assertEqual(packctl.read_toml(dependency)["side"], "client")
             server = pack_root / "server-test"
-            with patch.object(packctl, "run"):
+            with patch.object(packctl, "run_packwiz"):
                 self.assertEqual(packctl.build_target(pack_root, "server", server), [])
             self.assertFalse((server / "mods" / dependency.name).exists())
 

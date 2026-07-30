@@ -182,9 +182,9 @@ mods:
             "unknown": (True, True, "both"),
         }
         with patch.object(
-            packctl.subprocess,
-            "run",
-            return_value=type("Result", (), {"returncode": 0, "stderr": ""})(),
+            packctl,
+            "run_bounded_process",
+            return_value=core.ResolverProcessResult(0, "", "", False, False),
         ):
             for name, (client, server, expected) in repairs.items():
                 core.set_installed_mod_side(
