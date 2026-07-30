@@ -871,7 +871,7 @@ class ResolvedAddOperation:
             self.done.set()
         return self.result
 
-    def cancel(self) -> None:
+    def cancel(self, *, deadline: float | None = None) -> None:
         self.cancelled = True
         self.cancel_event.set()
 
@@ -899,6 +899,9 @@ class PackwizAddOperation:
         self.cancel_event = threading.Event()
         self.done = threading.Event()
         self.result: AddOperationResult | None = None
+        self.termination_result: ProcessTerminationResult | None = None
+        self.termination_incomplete = False
+        self.cleanup_error: BaseException | None = None
         self.menu_items: dict[int, str] = {}
         self.selection: str | None = None
         self.checkpoint = transaction.root / f"checkpoint-{uuid4().hex}"
@@ -948,10 +951,16 @@ class PackwizAddOperation:
                 if self.session is None:
                     raise HuroshikiError("Packwiz PTY session was not initialized")
                 pty_result = self.session.run()
+                self.termination_result = pty_result.termination_result
+                self.termination_incomplete = pty_result.termination_incomplete
                 self.result = self.transaction._finish_add(self, pty_result)
             return self.result
         except Exception as error:
-            self.transaction._rollback_add(self)
+            try:
+                self.transaction._rollback_add(self)
+            except BaseException as cleanup_error:
+                self.cleanup_error = cleanup_error
+                raise
             raw_log, text_log, event_log = url_log_paths(self.log_dir)
             if self.provider == "url":
                 ensure_url_error_log(self.log_dir, str(error))
@@ -966,6 +975,12 @@ class PackwizAddOperation:
             )
             return self.result
         finally:
+            if self.session is not None and self.session.termination_result is not None:
+                self.termination_result = self.session.termination_result
+                self.termination_incomplete = not (
+                    self.termination_result.group_drained
+                    and self.termination_result.parent_reaped
+                )
             self.done.set()
 
     def send_selection(self, index: int) -> None:
@@ -988,11 +1003,21 @@ class PackwizAddOperation:
         except (OSError, RuntimeError):
             self.session.cancel()
 
-    def cancel(self) -> None:
+    def cancel(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> ProcessTerminationResult | None:
         self.cancelled = True
         self.cancel_event.set()
         if self.session is not None:
-            self.session.cancel()
+            self.termination_result = self.session.cancel(deadline=deadline)
+            if self.termination_result is not None:
+                self.termination_incomplete = not (
+                    self.termination_result.group_drained
+                    and self.termination_result.parent_reaped
+                )
+        return self.termination_result
 
     def resize(self, width: int, height: int) -> None:
         if self.session is not None:
@@ -1000,6 +1025,82 @@ class PackwizAddOperation:
 
     def wait(self, timeout: float | None = None) -> bool:
         return self.done.wait(timeout)
+
+
+TRANSACTION_DISCARD_TIMEOUT_SECONDS = 10.0
+
+
+class TransactionDiscardError(HuroshikiError):
+    pass
+
+
+class TransactionDiscardTimeout(TransactionDiscardError):
+    pass
+
+
+class TransactionDiscardIntegrityError(TransactionDiscardError):
+    pass
+
+
+class TransactionDiscardOperation:
+    def __init__(
+        self,
+        transaction: "PackTransaction",
+        deadline: float,
+    ) -> None:
+        self.transaction = transaction
+        self.deadline = deadline
+        self.done = threading.Event()
+        self.error: BaseException | None = None
+        self._lock = threading.Lock()
+        self._started = False
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+            self._thread = threading.Thread(
+                target=self._execute,
+                name=f"huroshiki-discard-{self.transaction.project_key}",
+                daemon=False,
+            )
+            try:
+                self._thread.start()
+            except BaseException as error:
+                self.error = error
+                self.transaction._record_discard_failure(self, error)
+                self.done.set()
+                raise
+
+    def run(self) -> None:
+        with self._lock:
+            owner = not self._started
+            if owner:
+                self._started = True
+        if owner:
+            self._execute()
+            return
+        self.wait(max(0.0, self.deadline - time.monotonic()))
+
+    def _execute(self) -> None:
+        try:
+            self.transaction._run_discard_operation(self)
+        except BaseException as error:
+            self.error = error
+            self.transaction._record_discard_failure(self, error)
+        finally:
+            self.done.set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self.done.wait(timeout)
+
+    def raise_for_error(self) -> None:
+        if not self.done.is_set():
+            raise TransactionDiscardTimeout("Transaction discard is still running")
+        if self.error is not None:
+            raise self.error
 
 
 @dataclass
@@ -1023,6 +1124,17 @@ class PackTransaction:
     )
     _lock: threading.RLock = field(
         default_factory=threading.RLock, init=False, repr=False
+    )
+    _lifecycle_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    _discard_operation: TransactionDiscardOperation | None = field(
+        default=None, init=False, repr=False
+    )
+    _discard_finalized: bool = field(default=False, init=False, repr=False)
+    _discard_error: BaseException | None = field(default=None, init=False, repr=False)
+    _discard_state: Literal["active", "discarding", "discarded", "failed"] = field(
+        default="active", init=False, repr=False
     )
 
     @classmethod
@@ -1138,19 +1250,44 @@ class PackTransaction:
             raise
 
     def _finish_state(self) -> None:
-        try:
-            (self.root / ".completed").touch(exist_ok=True)
-        except OSError:
-            pass
-        if self._project_lock is not None:
-            self._project_lock.release()
-            self._project_lock = None
+        with self._lock:
+            try:
+                (self.root / ".completed").touch(exist_ok=True)
+            except OSError:
+                pass
+            if self._project_lock is not None:
+                self._project_lock.release()
+                self._project_lock = None
+
+    def _mark_lifecycle_completed(self) -> None:
+        with self._lock:
+            self.active = False
+            self._discard_finalized = True
+            self._discard_error = None
+            self._discard_state = "discarded"
 
     def __del__(self) -> None:
         project_lock = getattr(self, "_project_lock", None)
         if project_lock is not None:
-            project_lock.release()
-            self._project_lock = None
+            try:
+                root = getattr(self, "root", None)
+                if isinstance(root, Path) and root.is_dir():
+                    try:
+                        (root / ".discard-integrity-error").write_text(
+                            "Transaction owner was destroyed before bounded discard completed.\n",
+                            encoding="utf-8",
+                        )
+                    except OSError:
+                        pass
+                print(
+                    f"Transaction cleanup was not completed for {self.project_key}; "
+                    f"retaining {self.root}",
+                    file=sys.stderr,
+                )
+                project_lock.release()
+                self._project_lock = None
+            except BaseException:
+                pass
 
     def ensure_active(self) -> None:
         if not self.active or not self.source.is_dir():
@@ -1165,11 +1302,15 @@ class PackTransaction:
         server: bool,
         on_event: Callable[[ParserEvent], None] | None = None,
     ) -> PackwizAddOperation:
-        self.ensure_active()
         side_from_flags(client, server)
         with self._lock:
-            if self._operation is not None and not self._operation.done.is_set():
-                raise HuroshikiError("Another Packwiz search is already running")
+            self.ensure_active()
+            if self._operation is not None:
+                if not self._operation.done.is_set() or (
+                    isinstance(self._operation, PackwizAddOperation)
+                    and self._operation.termination_incomplete
+                ):
+                    raise HuroshikiError("Another Packwiz search is already running")
             operation = PackwizAddOperation(
                 self,
                 provider,
@@ -1189,10 +1330,14 @@ class PackTransaction:
         canonical_project_id: str | None,
         side: str,
     ) -> ResolvedAddOperation:
-        self.ensure_active()
         with self._lock:
-            if self._operation is not None and not self._operation.done.is_set():
-                raise HuroshikiError("Another add operation is already running")
+            self.ensure_active()
+            if self._operation is not None:
+                if not self._operation.done.is_set() or (
+                    isinstance(self._operation, PackwizAddOperation)
+                    and self._operation.termination_incomplete
+                ):
+                    raise HuroshikiError("Another add operation is already running")
             operation = ResolvedAddOperation(
                 self,
                 provider=provider,
@@ -1305,6 +1450,8 @@ class PackTransaction:
         with self._lock:
             if not self.active or self._operation is not operation:
                 self._rollback_add(operation)
+                if pty_result.termination_incomplete:
+                    self._operation = operation
                 return AddOperationResult(
                     returncode=pty_result.returncode or 1,
                     changed_files=(),
@@ -1316,6 +1463,29 @@ class PackTransaction:
                 )
 
             ensure_safe_pack_source(self.source)
+            if pty_result.termination_incomplete:
+                self._rollback_add(operation)
+                self._operation = operation
+                return AddOperationResult(
+                    returncode=pty_result.returncode or 1,
+                    changed_files=(),
+                    raw_log=pty_result.raw_log,
+                    text_log=pty_result.text_log,
+                    event_log=pty_result.event_log,
+                    message="Packwiz PTY process termination was incomplete",
+                    cancelled=pty_result.cancelled,
+                )
+            if pty_result.orphaned_descendants:
+                self._rollback_add(operation)
+                return AddOperationResult(
+                    returncode=pty_result.returncode or 1,
+                    changed_files=(),
+                    raw_log=pty_result.raw_log,
+                    text_log=pty_result.text_log,
+                    event_log=pty_result.event_log,
+                    message="Packwiz PTY left background processes after completion",
+                    cancelled=pty_result.cancelled,
+                )
             if pty_result.returncode != 0:
                 self._rollback_add(operation)
                 return AddOperationResult(
@@ -1667,6 +1837,20 @@ class PackTransaction:
         cancel_event: threading.Event | None = None,
         deadline: float | None = None,
     ) -> None:
+        with self._lifecycle_lock:
+            self._apply(
+                refresh=refresh,
+                cancel_event=cancel_event,
+                deadline=deadline,
+            )
+
+    def _apply(
+        self,
+        *,
+        refresh: bool,
+        cancel_event: threading.Event | None,
+        deadline: float | None,
+    ) -> None:
         self.ensure_active()
         with self._lock:
             if self._operation is not None and not self._operation.done.is_set():
@@ -1684,7 +1868,7 @@ class PackTransaction:
                 packctl.save_template_mods_raw(project_id, self.template_manifest)
                 self._finish_state()
                 shutil.rmtree(self.root, ignore_errors=True)
-                self.active = False
+                self._mark_lifecycle_completed()
                 return
             existing = packctl.template_mods(project_id)
             merged: dict[tuple[str, str], dict[str, str]] = {
@@ -1713,7 +1897,7 @@ class PackTransaction:
             packctl.save_template_mods(project_id, list(merged.values()))
             self._finish_state()
             shutil.rmtree(self.root, ignore_errors=True)
-            self.active = False
+            self._mark_lifecycle_completed()
             return
 
         ensure_safe_pack_source(self.source)
@@ -1828,35 +2012,167 @@ class PackTransaction:
                 os.close(original_fd)
             os.close(staged_fd)
 
-        self.active = False
         self._finish_state()
+        self._mark_lifecycle_completed()
 
-    def discard(self) -> None:
+    def begin_discard(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> TransactionDiscardOperation:
+        operation_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS
+        )
         with self._lock:
-            if not self.active:
-                return
+            if self._discard_state == "discarded":
+                if self._discard_operation is None:
+                    completed = TransactionDiscardOperation(self, operation_deadline)
+                    completed._started = True
+                    completed.done.set()
+                    self._discard_operation = completed
+                return self._discard_operation
+            if self._discard_state == "discarding":
+                if self._discard_operation is None:
+                    raise TransactionDiscardIntegrityError(
+                        "Transaction discard state has no owner operation"
+                    )
+                self._discard_operation.deadline = min(
+                    self._discard_operation.deadline,
+                    operation_deadline,
+                )
+                return self._discard_operation
+            if (
+                self._discard_state == "failed"
+                and self._discard_operation is not None
+                and not self._discard_operation.done.is_set()
+            ):
+                return self._discard_operation
             self.active = False
+            self._discard_state = "discarding"
+            self._discard_error = None
+            operation = TransactionDiscardOperation(self, operation_deadline)
+            self._discard_operation = operation
+            return operation
+
+    def retry_discard(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> TransactionDiscardOperation:
+        operation = self.begin_discard(deadline=deadline)
+        operation.start()
+        return operation
+
+    def discard(self, *, deadline: float | None = None) -> None:
+        operation = self.begin_discard(deadline=deadline)
+        operation.run()
+        if not operation.done.is_set():
+            raise TransactionDiscardTimeout(
+                f"Transaction discard timed out for {self.project_key}"
+            )
+        operation.raise_for_error()
+
+    def wait_for_discard(self, timeout: float | None = None) -> bool:
+        with self._lock:
+            operation = self._discard_operation
+            state = self._discard_state
+        if operation is None:
+            return state == "discarded"
+        return operation.wait(timeout)
+
+    @property
+    def discard_error(self) -> BaseException | None:
+        with self._lock:
+            return self._discard_error
+
+    def _run_discard_operation(self, discard: TransactionDiscardOperation) -> None:
+        with self._lifecycle_lock:
+            self._run_discard_operation_locked(discard)
+
+    def _run_discard_operation_locked(
+        self,
+        discard: TransactionDiscardOperation,
+    ) -> None:
+        with self._lock:
+            if self._discard_finalized:
+                self._discard_error = None
+                self._discard_state = "discarded"
+                return
+            if self._discard_operation is not discard:
+                raise TransactionDiscardIntegrityError(
+                    "Transaction discard ownership changed unexpectedly"
+                )
             operation = self._operation
         if operation is not None and not operation.done.is_set():
-            operation.cancel()
-            if not operation.wait(3.0):
-                threading.Thread(
-                    target=self._finish_discard_after_operation,
-                    args=(operation,),
-                    daemon=True,
-                    name=f"huroshiki-discard-{self.project_key}",
-                ).start()
+            try:
+                operation.cancel(deadline=discard.deadline)
+            except BaseException as error:
+                raise TransactionDiscardIntegrityError(
+                    f"Could not cancel the active transaction operation: {error}"
+                ) from error
+            remaining = max(0.0, discard.deadline - time.monotonic())
+            if not operation.wait(remaining):
+                raise TransactionDiscardTimeout(
+                    f"Active operation did not stop before discard deadline for "
+                    f"{self.project_key}"
+                )
+        if (
+            isinstance(operation, PackwizAddOperation)
+            and operation.termination_incomplete
+        ):
+            operation.cancel(deadline=discard.deadline)
+        if isinstance(operation, PackwizAddOperation):
+            if operation.cleanup_error is not None:
+                raise TransactionDiscardIntegrityError(
+                    f"Active operation cleanup failed: {operation.cleanup_error}"
+                ) from operation.cleanup_error
+            if operation.termination_incomplete:
+                raise TransactionDiscardIntegrityError(
+                    "Active Packwiz process-group cleanup was incomplete"
+                )
+        if time.monotonic() >= discard.deadline:
+            raise TransactionDiscardTimeout(
+                f"Transaction discard deadline exceeded for {self.project_key}"
+            )
+        self._finish_discard_once()
+        with self._lock:
+            if self._discard_operation is discard:
+                self._discard_error = None
+                self._discard_state = "discarded"
+
+    def _record_discard_failure(
+        self,
+        operation: TransactionDiscardOperation,
+        error: BaseException,
+    ) -> None:
+        with self._lock:
+            if self._discard_operation is operation:
+                self._discard_error = error
+                self._discard_state = "failed"
+
+    def _finish_discard_once(self) -> None:
+        with self._lock:
+            if self._discard_finalized:
                 return
-        self._finish_discard()
-
-    def _finish_discard_after_operation(self, operation: PackwizAddOperation) -> None:
-        operation.wait()
-        self._finish_discard()
-
-    def _finish_discard(self) -> None:
-        self._finish_state()
-        if not (self.root / "replaced-source").exists():
-            shutil.rmtree(self.root, ignore_errors=True)
+            try:
+                if (self.root / "replaced-source").exists():
+                    (self.root / ".completed").touch(exist_ok=True)
+                    if self._project_lock is not None:
+                        self._project_lock.release()
+                        self._project_lock = None
+                else:
+                    if self.root.exists():
+                        shutil.rmtree(self.root)
+                    if self._project_lock is not None:
+                        self._project_lock.release()
+                        self._project_lock = None
+            except BaseException as error:
+                raise TransactionDiscardIntegrityError(
+                    f"Could not finalize transaction discard: {error}"
+                ) from error
+            self._discard_finalized = True
 
 
 def create_resolver_source(

@@ -19,9 +19,19 @@ import time
 from typing import Callable
 
 from packwiz_parser import PackwizOutputParser, ParserEvent
+from process_runner import (
+    PROCESS_KILL_GRACE_SECONDS,
+    PROCESS_POLL_SECONDS,
+    PROCESS_REAP_GRACE_SECONDS,
+    PROCESS_TERMINATE_GRACE_SECONDS,
+    ProcessTerminationResult,
+    live_process_group_members,
+    stop_process_group,
+)
 
 
 EventCallback = Callable[[ParserEvent], None]
+PTY_INTERRUPT_GRACE_SECONDS = 1.5
 
 
 @dataclass(frozen=True)
@@ -31,6 +41,10 @@ class PtyResult:
     event_log: Path
     text_log: Path
     normalized_text: str
+    termination_result: ProcessTerminationResult | None = None
+    cancelled: bool = False
+    orphaned_descendants: bool = False
+    termination_incomplete: bool = False
 
 
 class PackwizPtySession:
@@ -59,12 +73,28 @@ class PackwizPtySession:
         self.master_fd: int | None = None
         self._write_lock = threading.Lock()
         self._cancelled = threading.Event()
+        self._termination_lock = threading.Lock()
+        self._termination_result: ProcessTerminationResult | None = None
+        self._cancel_deadline: float | None = None
 
     def run(self) -> PtyResult:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         raw_log = self.log_dir / "session.raw"
         event_log = self.log_dir / "session.jsonl"
         text_log = self.log_dir / "session.txt"
+
+        if self._cancelled.is_set():
+            raw_log.touch()
+            event_log.touch()
+            text_log.write_text("", encoding="utf-8")
+            return PtyResult(
+                -signal.SIGINT,
+                raw_log,
+                event_log,
+                text_log,
+                "",
+                cancelled=True,
+            )
 
         master_fd, slave_fd = os.openpty()
         self.master_fd = master_fd
@@ -88,73 +118,116 @@ class PackwizPtySession:
             self.master_fd = None
             raise
 
-        if self._cancelled.is_set():
-            try:
-                os.killpg(self.process.pid, signal.SIGINT)
-            except ProcessLookupError:
-                pass
-
         os.set_blocking(master_fd, False)
         selector = selectors.DefaultSelector()
         selector.register(master_fd, selectors.EVENT_READ)
+        orphaned_descendants = False
+        termination_incomplete = False
+        try:
+            with (
+                raw_log.open("wb") as raw_handle,
+                event_log.open("w", encoding="utf-8") as event_handle,
+            ):
+                while True:
+                    if self._cancelled.is_set():
+                        deadline = self._cancel_deadline
+                        if deadline is None:
+                            deadline = self._default_cleanup_deadline()
+                        termination = self.cancel(deadline=deadline)
+                        if termination is not None:
+                            termination_incomplete = not (
+                                termination.group_drained and termination.parent_reaped
+                            )
+                            if termination_incomplete:
+                                break
 
-        with (
-            raw_log.open("wb") as raw_handle,
-            event_log.open("w", encoding="utf-8") as event_handle,
-        ):
-            while True:
-                read_any = False
-                for key, _ in selector.select(timeout=0.1):
-                    try:
-                        chunk = os.read(key.fd, 65536)
-                    except OSError as error:
-                        if error.errno == errno.EIO:
-                            chunk = b""
-                        else:
-                            raise
-
-                    if not chunk:
+                    read_any = False
+                    for key, _ in selector.select(timeout=0.1):
                         try:
-                            selector.unregister(key.fd)
-                        except Exception:
-                            pass
-                        break
+                            chunk = os.read(key.fd, 65536)
+                        except OSError as error:
+                            if error.errno == errno.EIO:
+                                chunk = b""
+                            else:
+                                raise
 
-                    read_any = True
-                    raw_handle.write(chunk)
-                    raw_handle.flush()
-                    self._record_event(event_handle, "output", chunk)
-                    self._emit_many(self.parser.feed(chunk))
+                        if not chunk:
+                            try:
+                                selector.unregister(key.fd)
+                            except Exception:
+                                pass
+                            break
 
-                process_done = self.process.poll() is not None
-                if process_done and not selector.get_map():
-                    break
-                if process_done and not read_any:
-                    # PTYs report EOF as EIO, but allow one final drain cycle.
-                    try:
-                        chunk = os.read(master_fd, 65536)
-                    except OSError as error:
-                        if error.errno == errno.EIO:
-                            chunk = b""
-                        else:
-                            raise
-                    if chunk:
+                        read_any = True
                         raw_handle.write(chunk)
+                        raw_handle.flush()
                         self._record_event(event_handle, "output", chunk)
                         self._emit_many(self.parser.feed(chunk))
-                    else:
+
+                    process_done = self.process.poll() is not None
+                    if process_done:
+                        if live_process_group_members(self.process.pid):
+                            orphaned_descendants = True
+                            self._termination_result = stop_process_group(
+                                self.process.pid,
+                                cleanup_deadline=self._default_cleanup_deadline(),
+                            )
+                            termination_incomplete = not self._termination_result.group_drained
+                        if not selector.get_map():
+                            break
+                        if not read_any:
+                            try:
+                                chunk = os.read(master_fd, 65536)
+                            except OSError as error:
+                                if error.errno == errno.EIO:
+                                    chunk = b""
+                                else:
+                                    raise
+                            if chunk:
+                                raw_handle.write(chunk)
+                                self._record_event(event_handle, "output", chunk)
+                                self._emit_many(self.parser.feed(chunk))
+                            else:
+                                break
+                    elif not selector.get_map():
+                        self._termination_result = stop_process_group(
+                            self.process.pid,
+                            parent=self.process,
+                            cleanup_deadline=self._default_cleanup_deadline(),
+                        )
+                        termination_incomplete = not (
+                            self._termination_result.group_drained
+                            and self._termination_result.parent_reaped
+                        )
                         break
+        except BaseException:
+            cleanup_deadline = self._default_cleanup_deadline()
+            if self._cancel_deadline is not None:
+                cleanup_deadline = min(cleanup_deadline, self._cancel_deadline)
+            self._termination_result = stop_process_group(
+                self.process.pid,
+                parent=self.process,
+                cleanup_deadline=cleanup_deadline,
+            )
+            raise
+        finally:
+            selector.close()
+            with self._write_lock:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+                self.master_fd = None
 
         self._emit_many(self.parser.feed(b"", final=True))
-        returncode = self.process.wait()
-        normalized_text = "\n".join(self.parser.normalized_lines).rstrip() + "\n"
+        returncode = self.process.poll()
+        if returncode is None:
+            returncode = -signal.SIGKILL
+        normalized_text = "\n".join(self.parser.normalized_lines).rstrip()
+        if normalized_text:
+            normalized_text += "\n"
         text_log.write_text(normalized_text, encoding="utf-8")
         self._emit(ParserEvent("completed", str(returncode)))
-
-        try:
-            os.close(master_fd)
-        finally:
-            self.master_fd = None
 
         return PtyResult(
             returncode=returncode,
@@ -162,6 +235,10 @@ class PackwizPtySession:
             event_log=event_log,
             text_log=text_log,
             normalized_text=normalized_text,
+            termination_result=self._termination_result,
+            cancelled=self._cancelled.is_set(),
+            orphaned_descendants=orphaned_descendants,
+            termination_incomplete=termination_incomplete,
         )
 
     def send_line(self, value: str) -> None:
@@ -171,26 +248,82 @@ class PackwizPtySession:
                 raise RuntimeError("Packwiz PTY is not running")
             os.write(self.master_fd, payload)
 
-    def cancel(self) -> None:
-        if self._cancelled.is_set():
-            return
+    @property
+    def termination_result(self) -> ProcessTerminationResult | None:
+        return self._termination_result
+
+    def cancel(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> ProcessTerminationResult | None:
         self._cancelled.set()
+        if deadline is not None:
+            if self._cancel_deadline is None:
+                self._cancel_deadline = deadline
+            else:
+                self._cancel_deadline = min(self._cancel_deadline, deadline)
         process = self.process
-        if process is None or process.poll() is not None:
-            return
+        if process is None:
+            return self._termination_result
+        parent_done = process.poll() is not None
+        if parent_done:
+            if deadline is not None and live_process_group_members(process.pid):
+                self._termination_result = stop_process_group(
+                    process.pid,
+                    cleanup_deadline=deadline,
+                )
+            return self._termination_result
         try:
             os.killpg(process.pid, signal.SIGINT)
-        except ProcessLookupError:
-            return
-        try:
-            process.wait(timeout=1.5)
-            return
-        except subprocess.TimeoutExpired:
+        except OSError:
             pass
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
+        if deadline is None:
+            return self._termination_result
+        with self._termination_lock:
+            if self._termination_result is not None and (
+                self._termination_result.group_drained
+                and self._termination_result.parent_reaped
+            ):
+                return self._termination_result
+            interrupt_deadline = min(
+                deadline,
+                time.monotonic() + PTY_INTERRUPT_GRACE_SECONDS,
+            )
+            while (
+                live_process_group_members(process.pid)
+                and time.monotonic() < interrupt_deadline
+            ):
+                process.poll()
+                time.sleep(
+                    min(
+                        PROCESS_POLL_SECONDS,
+                        max(0.0, interrupt_deadline - time.monotonic()),
+                    )
+                )
+            if not live_process_group_members(process.pid):
+                self._termination_result = ProcessTerminationResult(
+                    True,
+                    process.poll() is not None,
+                    False,
+                )
+            else:
+                self._termination_result = stop_process_group(
+                    process.pid,
+                    parent=process,
+                    cleanup_deadline=deadline,
+                )
+            return self._termination_result
+
+    @staticmethod
+    def _default_cleanup_deadline() -> float:
+        return (
+            time.monotonic()
+            + PTY_INTERRUPT_GRACE_SECONDS
+            + PROCESS_TERMINATE_GRACE_SECONDS
+            + PROCESS_KILL_GRACE_SECONDS
+            + PROCESS_REAP_GRACE_SECONDS
+        )
 
     def resize(self, columns: int, rows: int) -> None:
         master_fd = self.master_fd

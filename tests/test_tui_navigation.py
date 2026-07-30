@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from contextlib import contextmanager, ExitStack, nullcontext
+from contextlib import contextmanager, ExitStack, nullcontext, redirect_stderr
+import io
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -83,12 +85,52 @@ class _InstallTransaction(_Transaction):
 class _UpdateTransaction:
     def __init__(self) -> None:
         self.discarded = False
+        self.discard_operation = _DiscardOperation(self)
 
     def prepare_updates(self, **_) -> list[core.UpdateCandidate]:
         return []
 
     def discard(self) -> None:
         self.discarded = True
+
+    def begin_discard(self):
+        return self.discard_operation
+
+
+class _DiscardOperation:
+    def __init__(self, transaction, *, complete_on_start: bool = True) -> None:
+        self.transaction = transaction
+        self.done = threading.Event()
+        self.error: BaseException | None = None
+        self.complete_on_start = complete_on_start
+        self.starts = 0
+
+    def start(self) -> None:
+        self.starts += 1
+        if self.complete_on_start:
+            self.done.set()
+
+    def raise_for_error(self) -> None:
+        if self.error is not None:
+            raise self.error
+
+
+class _RegistryTransaction:
+    active = True
+
+    def __init__(self, *, error: BaseException | None = None) -> None:
+        self.discard_operation = _DiscardOperation(self, complete_on_start=False)
+        self.discard_operation.error = error
+        self.discard_deadlines: list[float | None] = []
+        self.discard_error = error
+
+    def begin_discard(self):
+        return self.discard_operation
+
+    def discard(self, *, deadline=None) -> None:
+        self.discard_deadlines.append(deadline)
+        if self.discard_error is not None:
+            raise self.discard_error
 
 
 class _BlockingUpdateTransaction(_UpdateTransaction):
@@ -243,6 +285,143 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(transaction.apply_controls, transaction.prepare_controls)
         self.assertEqual(transaction.selected, {Path("mods/first.pw.toml")})
+
+    async def test_update_navigation_waits_for_discard_and_rejects_duplicates(self) -> None:
+        transaction = _PreparedUpdateTransaction()
+        transaction.discard_operation = _DiscardOperation(
+            transaction,
+            complete_on_start=False,
+        )
+        with self.patches(), patch.object(
+            huroshiki.core.PackTransaction,
+            "create",
+            return_value=transaction,
+        ):
+            screen = huroshiki.UpdateScreen("pack:demo")
+            app = _NavigationApp(screen)
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                await pilot.press("l")
+                await pilot.pause()
+                self.assertIs(app.screen, screen)
+                self.assertEqual(transaction.discard_operation.starts, 1)
+                await pilot.press("i")
+                self.assertEqual(transaction.discard_operation.starts, 1)
+
+                transaction.discard_operation.done.set()
+                await pilot.pause(0.1)
+                self.assertIsInstance(app.screen, huroshiki.InstalledModsScreen)
+
+    async def test_update_discard_failure_stays_on_screen(self) -> None:
+        transaction = _PreparedUpdateTransaction()
+        transaction.discard_operation = _DiscardOperation(
+            transaction,
+            complete_on_start=False,
+        )
+        transaction.discard_operation.error = core.TransactionDiscardIntegrityError(
+            "cleanup failed"
+        )
+        with self.patches(), patch.object(
+            huroshiki.core.PackTransaction,
+            "create",
+            return_value=transaction,
+        ):
+            screen = huroshiki.UpdateScreen("pack:demo")
+            app = _NavigationApp(screen)
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                await pilot.press("l")
+                transaction.discard_operation.done.set()
+                await pilot.pause(0.1)
+                self.assertIs(app.screen, screen)
+                self.assertIs(screen.transaction, transaction)
+                self.assertIs(app.transactions["pack:demo"], transaction)
+
+    async def test_registry_retains_transaction_until_async_discard_succeeds(self) -> None:
+        transaction = _RegistryTransaction()
+        called: list[str] = []
+        with self.patches():
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test() as pilot:
+                app.transactions["pack:demo"] = transaction
+                app.discard_transaction("pack:demo", lambda: called.append("done"))
+                await pilot.pause()
+                self.assertIs(app.transactions["pack:demo"], transaction)
+                self.assertEqual(called, [])
+
+                transaction.discard_operation.done.set()
+                await pilot.pause(0.1)
+                self.assertNotIn("pack:demo", app.transactions)
+                self.assertEqual(called, ["done"])
+
+    async def test_registry_discard_failure_keeps_owner_and_skips_destination(self) -> None:
+        error = core.TransactionDiscardIntegrityError("cleanup failed")
+        transaction = _RegistryTransaction(error=error)
+        called: list[str] = []
+        with self.patches():
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test() as pilot:
+                app.transactions["pack:demo"] = transaction
+                app.discard_transaction("pack:demo", lambda: called.append("done"))
+                transaction.discard_operation.done.set()
+                await pilot.pause(0.1)
+                self.assertIs(app.transactions["pack:demo"], transaction)
+                self.assertEqual(called, [])
+                transaction.discard_error = None
+
+    async def test_shutdown_uses_one_deadline_and_retains_failures(self) -> None:
+        successful = _RegistryTransaction()
+        failed = _RegistryTransaction(
+            error=core.TransactionDiscardIntegrityError("cleanup failed")
+        )
+        app = huroshiki.HuroshikiApp()
+        app.transactions = {
+            "pack:success": successful,
+            "pack:failed": failed,
+        }
+        stderr = io.StringIO()
+
+        with redirect_stderr(stderr):
+            app.on_unmount()
+
+        self.assertNotIn("pack:success", app.transactions)
+        self.assertIs(app.transactions["pack:failed"], failed)
+        self.assertEqual(successful.discard_deadlines, failed.discard_deadlines)
+        self.assertIn("pack:failed", stderr.getvalue())
+        self.assertIn("cleanup failed", stderr.getvalue())
+
+    async def test_remove_transaction_does_not_pop_before_discard_success(self) -> None:
+        error = core.TransactionDiscardIntegrityError("cleanup failed")
+        transaction = _RegistryTransaction(error=error)
+        app = huroshiki.HuroshikiApp()
+        app.transactions["pack:demo"] = transaction
+
+        with self.assertRaisesRegex(core.TransactionDiscardIntegrityError, "cleanup failed"):
+            app.remove_transaction("pack:demo", discard=True)
+
+        self.assertIs(app.transactions["pack:demo"], transaction)
+
+    async def test_project_delete_waits_for_transaction_discard(self) -> None:
+        transaction = _RegistryTransaction()
+        with self.patches(), patch.object(
+            huroshiki.core,
+            "delete_project",
+            return_value=SimpleNamespace(name="trashed-demo"),
+        ) as delete:
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test() as pilot:
+                screen = app.screen
+                self.assertIsInstance(screen, huroshiki.MainMenuScreen)
+                app.transactions["pack:demo"] = transaction
+                screen.delete_confirmed("pack:demo", True)
+                await pilot.pause()
+                delete.assert_not_called()
+                self.assertIs(app.transactions["pack:demo"], transaction)
+
+                transaction.discard_operation.done.set()
+                await pilot.pause(0.1)
+                delete.assert_called_once_with("pack:demo")
+                self.assertNotIn("pack:demo", app.transactions)
 
     async def test_update_worker_cancel_blocks_other_navigation_and_cleans_up(self) -> None:
         transaction = _BlockingUpdateTransaction()
