@@ -111,6 +111,39 @@ DataTable {
     text-style: bold;
 }
 
+#template-import-status,
+#template-import-conflict-message,
+#template-import-conflict-error,
+#template-import-side-message,
+#template-import-side-error,
+#template-import-execution-status,
+#template-import-order {
+    height: auto;
+    min-height: 2;
+    margin: 0 2;
+    padding: 0 1;
+}
+
+#template-import-order,
+#template-import-conflict-error,
+#template-import-side-error {
+    color: $warning;
+}
+
+#template-import-candidates,
+#template-import-conflicts,
+#template-import-side-conflicts {
+    min-height: 8;
+}
+
+#template-import-preview {
+    height: 1fr;
+    margin: 1 2;
+    padding: 1 2;
+    border: round $primary;
+    overflow-y: auto;
+}
+
 ConfirmModal,
 MessageModal,
 PublicPackUrlEditModal,

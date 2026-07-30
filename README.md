@@ -286,6 +286,13 @@ addition and replacement are classified by actual identity, and all closures plu
 preflighted before the transaction is changed. Packwiz dependencies are shown separately, and no
 persistent template association or content overlay is created.
 
+The same one-shot workflow is available in the TUI: open an existing Pack, choose **Apply
+Template**, select compatible Templates in the required order, resolve source-option and side
+conflicts, then review explicit roots, dependencies, side changes, removals, unchanged sources,
+warnings, and metadata changes before applying atomically. Planning and execution remain cancellable
+background operations; leaving waits for resolver and transaction cleanup. Applying a Template this
+way does not create a persistent Template association.
+
 The resolved import is also a postcondition on the staged source. A selected root closure may not
 require an actual identity removed by the resolution, and removed identities are checked again after
 closure merge and after Packwiz refresh in both preflight and the transaction. Such a dependency

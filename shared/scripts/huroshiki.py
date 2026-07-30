@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass, field
 from pathlib import Path
 import sys
 import threading
+import time
 from typing import Callable, Iterable
 
 from huroshiki_paths import resolve_root, set_import_root
@@ -54,6 +56,16 @@ except ModuleNotFoundError as error:
     raise
 
 import huroshiki_core as core
+from template_import import (
+    ActualIdentityConflict,
+    CandidateNameConflict,
+    IdentitySideConflict,
+    ImportConflictResolution,
+    ImportSelectionOption,
+    LogicalIdentityConflict,
+    TemplateImportPlan,
+    UrlSelectorConflict,
+)
 
 
 def enabled_marker(enabled: bool) -> str:
@@ -149,6 +161,16 @@ class HuroshikiApp(App[None]):
             return
         self.selected_project = project_key
         self.switch_screen(UpdateScreen(project_key))
+
+    def open_template_import(self, project_key: str) -> None:
+        if not self.project_is_usable(project_key):
+            return
+        project = core.project_info(project_key)
+        if project.kind != "pack":
+            self.notify("Templates can be imported only into packs", severity="warning")
+            return
+        self.selected_project = project_key
+        self.switch_screen(TemplateImportSelectionScreen(project_key))
 
     def open_settings(self, project_key: str) -> None:
         if not self.project_is_usable(project_key):
@@ -253,7 +275,7 @@ class MessageModal(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         with Container(id="modal-dialog", classes="wide-dialog"):
             yield Static(self.dialog_title, classes="modal-title")
-            yield Static("\n".join(self.lines), id="modal-message")
+            yield Static("\n".join(self.lines), id="modal-message", markup=False)
             yield Static("Enter / Esc: close", classes="modal-help")
 
     def action_close(self) -> None:
@@ -1000,7 +1022,7 @@ class ProjectScreen(BaseScreen):
         )
         self.actions = core.project_actions(project_key)
         if self.project.kind == "pack":
-            self.actions = (*self.actions, "settings")
+            self.actions = (*self.actions, "Apply Template", "settings")
             self.help_text = (
                 "i: install  l: list  u: update  t: files  s: settings  "
                 "j/k: move  Enter: run  Esc: main"
@@ -1032,6 +1054,9 @@ class ProjectScreen(BaseScreen):
         if index is None:
             return
         action = self.actions[index]
+        if action == "Apply Template":
+            self.app.open_template_import(self.project_key)
+            return
         if action == "settings":
             self.app.open_settings(self.project_key)
             return
@@ -1911,6 +1936,956 @@ class TemplateScreen(ProjectChildScreen, FilterListScreen):
             self.return_to_project()
         elif key == "escape":
             self.return_to_project()
+        else:
+            return
+        event.stop()
+
+
+ImportOptionConflict = (
+    CandidateNameConflict
+    | UrlSelectorConflict
+    | LogicalIdentityConflict
+    | ActualIdentityConflict
+)
+
+
+@dataclass
+class TemplateImportResolutionState:
+    selected: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    duplicate_acknowledged: set[tuple[str, str]] = field(default_factory=set)
+    side_decisions: dict[tuple[str, str], str] = field(default_factory=dict)
+
+
+def _import_conflict_groups(
+    plan: TemplateImportPlan,
+) -> tuple[
+    tuple[str, str, str, tuple[ImportOptionConflict, ...]],
+    ...,
+]:
+    return (
+        ("name", "Name", "one-or-more", plan.name_conflicts),
+        ("url", "URL selector", "one-or-more", plan.url_selector_conflicts),
+        (
+            "logical",
+            "Logical identity",
+            "exactly-one",
+            plan.logical_identity_conflicts,
+        ),
+        (
+            "actual",
+            "Actual identity",
+            "exactly-one",
+            plan.actual_identity_conflicts,
+        ),
+    )
+
+
+def _import_candidate_status(
+    plan: TemplateImportPlan,
+    candidate: core.ModCandidate,
+) -> tuple[str, str]:
+    if candidate.origin_kind == "pack":
+        return "installed", ""
+    verification = next(
+        (
+            item
+            for item in plan.verifications
+            if item.selector_identity == candidate.selector_identity
+        ),
+        None,
+    )
+    if verification is None:
+        return "missing verification", "Verification result is unavailable"
+    if verification.succeeded:
+        return "verified", ""
+    return "failed", verification.error or "Unknown verification failure"
+
+
+def _import_option_lines(
+    plan: TemplateImportPlan,
+    option: ImportSelectionOption,
+) -> list[str]:
+    lines = [f"Option: {option.option_key}"]
+    for candidate in option.candidates:
+        status, error = _import_candidate_status(plan, candidate)
+        requested = f"{candidate.provider}:{candidate.project_id}"
+        if candidate.url is not None:
+            requested += f" @ {candidate.url}"
+        actual = (
+            "unverified"
+            if candidate.actual_identity is None
+            else f"{candidate.actual_identity[0]}:{candidate.actual_identity[1]}"
+        )
+        metadata = (
+            str(candidate.metadata_path)
+            if candidate.metadata_path is not None
+            else candidate.filename or "-"
+        )
+        lines.extend(
+            [
+                "",
+                f"Origin: {candidate.origin_kind}:{candidate.origin_id}",
+                f"Selection member: {candidate.selection_key}",
+                f"MOD: {candidate.name}",
+                f"Requested: {requested}",
+                f"Verified actual identity: {actual}",
+                f"Side: {candidate.side}",
+                f"Metadata: {metadata}",
+                f"Verification: {status}",
+            ]
+        )
+        if error:
+            lines.append(f"Verification error: {error}")
+    return lines
+
+
+def _import_resolution_arguments(
+    plan: TemplateImportPlan,
+    state: TemplateImportResolutionState,
+) -> dict[str, object]:
+    arguments: dict[str, object] = {}
+    argument_names = {
+        "name": "name_resolutions",
+        "url": "url_selector_resolutions",
+        "logical": "logical_identity_resolutions",
+        "actual": "actual_identity_resolutions",
+    }
+    for kind, _label, _cardinality, conflicts in _import_conflict_groups(plan):
+        arguments[argument_names[kind]] = {
+            conflict.key: ImportConflictResolution(
+                tuple(state.selected[(kind, conflict.key)]),
+                (kind, conflict.key) in state.duplicate_acknowledged,
+            )
+            for conflict in conflicts
+        }
+    return arguments
+
+
+class TemplateImportSelectionScreen(ProjectChildScreen, BaseScreen):
+    help_text = "j/k: move  Space: select in order  q: clear  Enter: plan  Esc: project"
+
+    def __init__(self, project_key: str) -> None:
+        super().__init__()
+        self.project_key = project_key
+        project = core.project_info(project_key)
+        self.screen_title = f"{project.display_name} / Apply Template"
+        self.project = project
+        self.templates: list[core.ProjectInfo] = []
+        self.selected_template_ids: list[str] = []
+        self.cancel_event: threading.Event | None = None
+        self.deadline: float | None = None
+        self.worker_thread: threading.Thread | None = None
+        self.worker_timer: Timer | None = None
+        self.worker_done = threading.Event()
+        self.worker_error: BaseException | None = None
+        self.session: core.TemplateImportSession | None = None
+        self.leave_after_cancel = False
+        self.session_transferred = False
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        yield Static(
+            "Candidates match Minecraft and loader type; reference loader versions are informational.",
+            id="template-import-status",
+        )
+        yield Static("Selected order: none", id="template-import-order")
+        yield DataTable(id="template-import-candidates")
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#template-import-candidates", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns(
+            "Order", "Template", "ID", "Minecraft", "Loader", "Reference", "MODs"
+        )
+        try:
+            self.templates = core.compatible_templates(
+                self.project.minecraft,
+                self.project.loader,
+            )
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+        self.reload_rows()
+        if not self.templates:
+            self.app.notify("No compatible Templates are available", severity="warning")
+        table.focus()
+
+    @property
+    def planning(self) -> bool:
+        return self.worker_thread is not None
+
+    def reload_rows(self) -> None:
+        table = self.query_one("#template-import-candidates", DataTable)
+        cursor = table.cursor_row
+        table.clear()
+        for template in self.templates:
+            order = (
+                str(self.selected_template_ids.index(template.project_id) + 1)
+                if template.project_id in self.selected_template_ids
+                else "-"
+            )
+            table.add_row(
+                order,
+                template.display_name,
+                template.project_id,
+                template.minecraft,
+                template.loader,
+                template.loader_version,
+                str(template.mod_count or 0),
+            )
+        order_text = " -> ".join(self.selected_template_ids) or "none"
+        self.query_one("#template-import-order", Static).update(
+            f"Selected order: {order_text}"
+        )
+        if table.row_count:
+            table.move_cursor(row=min(cursor, table.row_count - 1))
+
+    def toggle_selected(self) -> None:
+        if self.planning:
+            self.app.notify("Template import planning is running", severity="warning")
+            return
+        table = self.query_one("#template-import-candidates", DataTable)
+        index = self.current_index(table, len(self.templates))
+        if index is None:
+            return
+        template_id = self.templates[index].project_id
+        if template_id in self.selected_template_ids:
+            self.selected_template_ids.remove(template_id)
+        else:
+            self.selected_template_ids.append(template_id)
+        self.reload_rows()
+
+    def start_planning(self) -> None:
+        if self.planning:
+            self.app.notify("Template import planning is already running", severity="warning")
+            return
+        if not self.selected_template_ids:
+            self.app.notify("Select at least one Template", severity="warning")
+            return
+        self.cancel_event = threading.Event()
+        self.deadline = time.monotonic() + core.UPDATE_OPERATION_TIMEOUT_SECONDS
+        self.worker_done.clear()
+        self.worker_error = None
+        self.session = None
+        template_ids = tuple(self.selected_template_ids)
+
+        def create_session() -> None:
+            session: core.TemplateImportSession | None = None
+            try:
+                session = core.TemplateImportSession.create(
+                    self.project_key,
+                    template_ids,
+                    cancel_event=self.cancel_event,
+                    deadline=self.deadline,
+                )
+                if self.cancel_event is not None and self.cancel_event.is_set():
+                    session.discard()
+                    session = None
+            except BaseException as error:
+                self.worker_error = error
+            finally:
+                self.session = session
+                self.worker_done.set()
+
+        self.query_one("#template-import-status", Static).update(
+            "Planning Template import..."
+        )
+        self.worker_thread = threading.Thread(
+            target=create_session,
+            name=f"huroshiki-template-import-plan-{self.project_key}",
+            daemon=False,
+        )
+        try:
+            self.worker_thread.start()
+            self.worker_timer = self.set_interval(0.05, self._poll_planning)
+        except Exception as error:
+            if self.cancel_event is not None:
+                self.cancel_event.set()
+            self.worker_thread = None
+            self.worker_error = error
+            self.query_one("#template-import-status", Static).update(str(error))
+            self.app.notify(str(error), severity="error")
+
+    def _poll_planning(self) -> None:
+        if not self.worker_done.is_set():
+            return
+        if self.worker_timer is not None:
+            self.worker_timer.stop()
+            self.worker_timer = None
+        self.worker_thread = None
+        if self.leave_after_cancel:
+            if self.session is not None:
+                self.session.discard()
+                self.session = None
+            self.session_transferred = True
+            self.return_to_project()
+            return
+        if self.worker_error is not None:
+            message = str(self.worker_error)
+            self.query_one("#template-import-status", Static).update(message)
+            self.app.notify(message, severity="error")
+            return
+        if self.session is None:
+            self.query_one("#template-import-status", Static).update(
+                "Template import planning was cancelled"
+            )
+            return
+        session = self.session
+        self.session = None
+        self.session_transferred = True
+        self.app.switch_screen(TemplateImportConflictScreen(self.project_key, session))
+
+    def leave(self) -> None:
+        if self.planning:
+            self.leave_after_cancel = True
+            if self.cancel_event is not None:
+                self.cancel_event.set()
+            self.query_one("#template-import-status", Static).update(
+                "Cancelling planning and cleaning up..."
+            )
+            return
+        if self.session is not None:
+            self.session.discard()
+            self.session = None
+        self.session_transferred = True
+        self.return_to_project()
+
+    def on_unmount(self) -> None:
+        if self.worker_timer is not None:
+            self.worker_timer.stop()
+            self.worker_timer = None
+        if self.session_transferred:
+            return
+        if self.worker_thread is not None and self.cancel_event is not None:
+            self.cancel_event.set()
+        elif self.session is not None:
+            self.session.discard()
+            self.session = None
+
+    def on_key(self, event: events.Key) -> None:
+        table = self.query_one("#template-import-candidates", DataTable)
+        if self.planning:
+            if event.key == "escape":
+                self.leave()
+            else:
+                self.app.notify(
+                    "Wait for planning or press Esc to cancel",
+                    severity="warning",
+                )
+            event.stop()
+            return
+        if event.key == "j":
+            self.move_table(table, len(self.templates), 1)
+        elif event.key == "k":
+            self.move_table(table, len(self.templates), -1)
+        elif event.key == "space":
+            self.toggle_selected()
+        elif event.key == "q":
+            self.selected_template_ids.clear()
+            self.reload_rows()
+        elif event.key == "enter":
+            self.start_planning()
+        elif event.key == "escape":
+            self.leave()
+        else:
+            return
+        event.stop()
+
+
+class TemplateImportConflictScreen(BaseScreen):
+    help_text = "j/k: move  Space: select option  d: details  Enter: continue  Esc: discard"
+
+    def __init__(
+        self,
+        project_key: str,
+        session: core.TemplateImportSession,
+        state: TemplateImportResolutionState | None = None,
+    ) -> None:
+        super().__init__()
+        self.project_key = project_key
+        self.session = session
+        self.plan = session.plan
+        self.state = state or TemplateImportResolutionState()
+        project = core.project_info(project_key)
+        self.screen_title = f"{project.display_name} / Resolve Template conflicts"
+        self.groups = _import_conflict_groups(self.plan)
+        self.rows: list[
+            tuple[str, str, str, ImportOptionConflict, ImportSelectionOption]
+        ] = []
+        for kind, label, cardinality, conflicts in self.groups:
+            for conflict in conflicts:
+                state_key = (kind, conflict.key)
+                self.state.selected.setdefault(state_key, [])
+                for option in conflict.options:
+                    self.rows.append((kind, label, cardinality, conflict, option))
+        self.session_transferred = False
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        yield Static(
+            "Selections use source option keys. Details show every Pack/Template origin.",
+            id="template-import-conflict-message",
+        )
+        yield Static("", markup=False, id="template-import-conflict-error")
+        yield DataTable(id="template-import-conflicts")
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#template-import-conflicts", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns(
+            "Selected",
+            "Kind",
+            "Conflict",
+            "Option key",
+            "Origins",
+            "MODs",
+            "Requested selector",
+            "Actual identity",
+            "Side",
+            "Verification",
+            "Metadata",
+        )
+        self.reload_rows()
+        table.focus()
+
+    def reload_rows(self) -> None:
+        table = self.query_one("#template-import-conflicts", DataTable)
+        cursor = table.cursor_row
+        table.clear()
+        for kind, label, _cardinality, conflict, option in self.rows:
+            selected = option.option_key in self.state.selected[(kind, conflict.key)]
+            origins: list[str] = []
+            names: list[str] = []
+            selectors: list[str] = []
+            actuals: list[str] = []
+            sides: list[str] = []
+            statuses: list[str] = []
+            metadata: list[str] = []
+            for candidate in option.candidates:
+                origins.append(f"{candidate.origin_kind}:{candidate.origin_id}")
+                names.append(candidate.name)
+                selector = f"{candidate.provider}:{candidate.project_id}"
+                if candidate.url is not None:
+                    selector += f" @ {candidate.url}"
+                selectors.append(selector)
+                actuals.append(
+                    "unverified"
+                    if candidate.actual_identity is None
+                    else f"{candidate.actual_identity[0]}:{candidate.actual_identity[1]}"
+                )
+                sides.append(candidate.side)
+                status, error = _import_candidate_status(self.plan, candidate)
+                statuses.append(status if not error else f"{status}: {error}")
+                metadata.append(
+                    str(candidate.metadata_path)
+                    if candidate.metadata_path is not None
+                    else candidate.filename or "-"
+                )
+            table.add_row(
+                "[x]" if selected else "[ ]",
+                label,
+                conflict.key,
+                option.option_key,
+                " | ".join(origins),
+                " | ".join(names),
+                " | ".join(selectors),
+                " | ".join(actuals),
+                " | ".join(sides),
+                " | ".join(statuses),
+                " | ".join(metadata),
+            )
+        if table.row_count:
+            table.move_cursor(row=min(cursor, table.row_count - 1))
+
+    def current_row(
+        self,
+    ) -> tuple[str, str, str, ImportOptionConflict, ImportSelectionOption] | None:
+        table = self.query_one("#template-import-conflicts", DataTable)
+        index = self.current_index(table, len(self.rows))
+        return None if index is None else self.rows[index]
+
+    def toggle_option(self) -> None:
+        row = self.current_row()
+        if row is None:
+            return
+        kind, _label, cardinality, conflict, option = row
+        state_key = (kind, conflict.key)
+        selected = self.state.selected[state_key]
+        if cardinality == "exactly-one":
+            selected[:] = [option.option_key]
+        elif option.option_key in selected:
+            selected.remove(option.option_key)
+        else:
+            selected.append(option.option_key)
+        self.state.duplicate_acknowledged.discard(state_key)
+        self.query_one("#template-import-conflict-error", Static).update("")
+        self.reload_rows()
+
+    def show_option_details(self) -> None:
+        row = self.current_row()
+        if row is not None:
+            self.app.push_screen(
+                MessageModal("Template import source option", _import_option_lines(self.plan, row[4]))
+            )
+
+    def resolution_arguments(self) -> dict[str, object]:
+        return _import_resolution_arguments(self.plan, self.state)
+
+    def continue_resolution(self, acknowledged: bool = False) -> None:
+        unresolved: list[str] = []
+        multiple: list[tuple[str, str]] = []
+        for kind, label, cardinality, conflicts in self.groups:
+            for conflict in conflicts:
+                state_key = (kind, conflict.key)
+                selected = self.state.selected[state_key]
+                if not selected:
+                    unresolved.append(f"{label}: {conflict.key}")
+                if cardinality == "one-or-more" and len(selected) > 1:
+                    multiple.append(state_key)
+        if unresolved:
+            message = "Select required options for: " + ", ".join(unresolved)
+            self.query_one("#template-import-conflict-error", Static).update(message)
+            self.app.notify(message, severity="warning")
+            return
+        pending_ack = [key for key in multiple if key not in self.state.duplicate_acknowledged]
+        if pending_ack and not acknowledged:
+            self.app.push_screen(
+                ConfirmModal(
+                    "Retain multiple Template import sources?",
+                    [
+                        "Duplicate MOD IDs or overlapping functionality may prevent startup.",
+                        "Enter explicitly acknowledges this risk for the current selections.",
+                    ],
+                ),
+                lambda confirmed: self.continue_resolution(True) if confirmed else None,
+            )
+            return
+        if acknowledged:
+            self.state.duplicate_acknowledged.update(multiple)
+        arguments = self.resolution_arguments()
+        try:
+            resolved = core.resolve_template_import_plan(
+                self.plan,
+                **arguments,
+                side_decisions=self.state.side_decisions,
+            )
+        except Exception as error:
+            message = str(error)
+            self.query_one("#template-import-conflict-error", Static).update(message)
+            self.app.notify(message, severity="error")
+            return
+        self.session_transferred = True
+        if self.plan.side_conflicts:
+            self.app.switch_screen(
+                TemplateImportSideConflictScreen(
+                    self.project_key,
+                    self.session,
+                    self.state,
+                )
+            )
+        else:
+            self.app.switch_screen(
+                TemplateImportExecutionScreen(self.project_key, self.session, resolved)
+            )
+
+    def discard_and_leave(self) -> None:
+        self.session.discard()
+        self.session_transferred = True
+        if not self.app.open_project(self.project_key):
+            self.app.go_main()
+
+    def on_unmount(self) -> None:
+        if not self.session_transferred:
+            self.session.discard()
+
+    def on_key(self, event: events.Key) -> None:
+        table = self.query_one("#template-import-conflicts", DataTable)
+        if event.key == "j":
+            self.move_table(table, len(self.rows), 1)
+        elif event.key == "k":
+            self.move_table(table, len(self.rows), -1)
+        elif event.key == "space":
+            self.toggle_option()
+        elif event.key == "d":
+            self.show_option_details()
+        elif event.key == "enter":
+            self.continue_resolution()
+        elif event.key == "escape":
+            self.discard_and_leave()
+        else:
+            return
+        event.stop()
+
+
+class TemplateImportSideConflictScreen(BaseScreen):
+    help_text = "j/k: move  Space: cycle decision  Enter: execute  Esc: options"
+
+    def __init__(
+        self,
+        project_key: str,
+        session: core.TemplateImportSession,
+        state: TemplateImportResolutionState,
+    ) -> None:
+        super().__init__()
+        self.project_key = project_key
+        self.session = session
+        self.plan = session.plan
+        self.state = state
+        project = core.project_info(project_key)
+        self.screen_title = f"{project.display_name} / Resolve side conflicts"
+        for conflict in self.plan.side_conflicts:
+            self.state.side_decisions.setdefault(conflict.identity, "keep_pack")
+        self.session_transferred = False
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        yield Static(
+            "Choose whether each retained source keeps the Pack side, uses the Template side, or unions both.",
+            id="template-import-side-message",
+        )
+        yield Static("", markup=False, id="template-import-side-error")
+        yield DataTable(id="template-import-side-conflicts")
+        yield from self.compose_footer()
+
+    @staticmethod
+    def result_side(conflict: IdentitySideConflict, decision: str) -> str:
+        if decision == "keep_pack":
+            return conflict.pack_side
+        if decision == "use_template":
+            return conflict.template_side
+        return core.union_side(conflict.pack_side, conflict.template_side)
+
+    def on_mount(self) -> None:
+        table = self.query_one("#template-import-side-conflicts", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns(
+            "Identity", "Pack side", "Template side", "Decision", "Result side"
+        )
+        self.reload_rows()
+        table.focus()
+
+    def reload_rows(self) -> None:
+        table = self.query_one("#template-import-side-conflicts", DataTable)
+        cursor = table.cursor_row
+        table.clear()
+        for conflict in self.plan.side_conflicts:
+            decision = self.state.side_decisions[conflict.identity]
+            table.add_row(
+                f"{conflict.identity[0]}:{conflict.identity[1]}",
+                conflict.pack_side,
+                conflict.template_side,
+                decision,
+                self.result_side(conflict, decision),
+            )
+        if table.row_count:
+            table.move_cursor(row=min(cursor, table.row_count - 1))
+
+    def cycle_decision(self) -> None:
+        table = self.query_one("#template-import-side-conflicts", DataTable)
+        index = self.current_index(table, len(self.plan.side_conflicts))
+        if index is None:
+            return
+        conflict = self.plan.side_conflicts[index]
+        decisions = ("keep_pack", "use_template", "union")
+        current = self.state.side_decisions[conflict.identity]
+        self.state.side_decisions[conflict.identity] = decisions[
+            (decisions.index(current) + 1) % len(decisions)
+        ]
+        self.reload_rows()
+
+    def execute(self) -> None:
+        try:
+            resolved = core.resolve_template_import_plan(
+                self.plan,
+                **_import_resolution_arguments(self.plan, self.state),
+                side_decisions=self.state.side_decisions,
+            )
+        except Exception as error:
+            message = str(error)
+            self.query_one("#template-import-side-error", Static).update(message)
+            self.app.notify(message, severity="error")
+            return
+        self.session_transferred = True
+        self.app.switch_screen(
+            TemplateImportExecutionScreen(self.project_key, self.session, resolved)
+        )
+
+    def back_to_options(self) -> None:
+        self.session_transferred = True
+        self.app.switch_screen(
+            TemplateImportConflictScreen(self.project_key, self.session, self.state)
+        )
+
+    def on_unmount(self) -> None:
+        if not self.session_transferred:
+            self.session.discard()
+
+    def on_key(self, event: events.Key) -> None:
+        table = self.query_one("#template-import-side-conflicts", DataTable)
+        if event.key == "j":
+            self.move_table(table, len(self.plan.side_conflicts), 1)
+        elif event.key == "k":
+            self.move_table(table, len(self.plan.side_conflicts), -1)
+        elif event.key == "space":
+            self.cycle_decision()
+        elif event.key == "enter":
+            self.execute()
+        elif event.key == "escape":
+            self.back_to_options()
+        else:
+            return
+        event.stop()
+
+
+class TemplateImportExecutionScreen(BaseScreen):
+    help_text = "Enter: review/apply  Esc: cancel/discard and return to project"
+
+    def __init__(
+        self,
+        project_key: str,
+        session: core.TemplateImportSession,
+        resolved: core.ResolvedTemplateImportPlan,
+    ) -> None:
+        super().__init__()
+        self.project_key = project_key
+        self.session = session
+        self.resolved = resolved
+        project = core.project_info(project_key)
+        self.screen_title = f"{project.display_name} / Template import preview"
+        self.operation: core.TemplateImportOperation | None = core.TemplateImportOperation(
+            session, resolved
+        )
+        self.worker_thread: threading.Thread | None = None
+        self.worker_timer: Timer | None = None
+        self.leave_after_cancel = False
+        self.ownership_finished = False
+        self.preview_lines: list[str] = []
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        yield Static("Preparing staged Template import...", id="template-import-execution-status")
+        yield Static("", markup=False, id="template-import-preview")
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        if self.operation is None:
+            return
+        self.worker_thread = threading.Thread(
+            target=self.operation.run,
+            name=f"huroshiki-template-import-run-{self.project_key}",
+            daemon=False,
+        )
+        try:
+            self.worker_thread.start()
+            self.worker_timer = self.set_interval(0.05, self._poll_operation)
+        except Exception as error:
+            self.operation.cancel()
+            self.ownership_finished = True
+            self.worker_thread = None
+            self.query_one("#template-import-execution-status", Static).update(str(error))
+            self.app.notify(str(error), severity="error")
+
+    def _poll_operation(self) -> None:
+        operation = self.operation
+        if operation is None:
+            return
+        progress = operation.drain_progress()
+        if progress:
+            self.query_one("#template-import-execution-status", Static).update(progress[-1])
+        if not operation.done.is_set():
+            return
+        if self.worker_timer is not None:
+            self.worker_timer.stop()
+            self.worker_timer = None
+        self.worker_thread = None
+        if operation.error is not None:
+            self.ownership_finished = True
+            message = str(operation.error)
+            self.query_one("#template-import-execution-status", Static).update(message)
+            self.app.notify(message, severity="error")
+            if self.leave_after_cancel:
+                self.ownership_finished = True
+                self.operation = None
+                self.app.open_project(self.project_key)
+            return
+        if operation.cancelled:
+            self.ownership_finished = True
+            self.query_one("#template-import-execution-status", Static).update(
+                "Template import cancelled"
+            )
+            if self.leave_after_cancel:
+                self.ownership_finished = True
+                self.operation = None
+                self.app.open_project(self.project_key)
+            return
+        if operation.preview is None:
+            operation.discard()
+            self.ownership_finished = True
+            self.query_one("#template-import-execution-status", Static).update(
+                "Template import produced no preview"
+            )
+            return
+        self.preview_lines = self._build_preview_lines(operation.preview)
+        self.query_one("#template-import-preview", Static).update(
+            "\n".join(self.preview_lines)
+        )
+        self.query_one("#template-import-execution-status", Static).update(
+            "Preview ready. Press Enter to review and apply."
+        )
+
+    def _build_preview_lines(self, preview: core.TemplateImportPreview) -> list[str]:
+        lines = ["Selected Templates (in order):"]
+        lines.extend(
+            f"  {index}. {template_id}"
+            for index, template_id in enumerate(self.session.template_ids, 1)
+        )
+        lines.extend(["", "Explicit roots:"])
+        lines.extend(
+            f"  {item.requested_name} [{item.candidate_key}] -> "
+            f"{item.actual_identity[0]}:{item.actual_identity[1]} ({item.relative_path})"
+            for item in preview.added_roots
+        )
+        if not preview.added_roots:
+            lines.append("  none")
+        lines.extend(["", "Dependencies:"])
+        lines.extend(
+            f"  {item.name} [{item.provider}:{item.project_id}] ({item.relative_path})"
+            for item in preview.added_dependencies
+        )
+        if not preview.added_dependencies:
+            lines.append("  none")
+        lines.extend(["", "Side changes:"])
+        lines.extend(
+            f"  {identity[0]}:{identity[1]}: {old} -> {new}"
+            for identity, old, new in preview.side_changes
+        )
+        if not preview.side_changes:
+            lines.append("  none")
+        lines.extend(["", "REMOVED Pack roots (review carefully):"])
+        lines.extend(
+            f"  {item.name} [{item.candidate_key}] ({item.metadata_path})"
+            for item in preview.removed
+        )
+        if not preview.removed:
+            lines.append("  none")
+        lines.extend(["", "Unchanged equivalent Pack roots:"])
+        lines.extend(
+            f"  {item.name} [{item.candidate_key}] ({item.metadata_path})"
+            for item in preview.unchanged
+        )
+        if not preview.unchanged:
+            lines.append("  none")
+        lines.extend(["", "Metadata file changes:"])
+        for change in preview.changes:
+            if change.before is None:
+                action = "added"
+            elif change.after is None:
+                action = "removed"
+            else:
+                action = "modified"
+            lines.append(f"  {action}: {change.relative_path}")
+        if not preview.changes:
+            lines.append("  none")
+        lines.extend(["", "Warnings:"])
+        lines.extend(f"  {warning}" for warning in preview.warnings)
+        if not preview.warnings:
+            lines.append("  none")
+        lines.extend(
+            [
+                "",
+                "This is a one-shot import. No persistent Template association will be created.",
+            ]
+        )
+        return lines
+
+    def request_apply(self) -> None:
+        operation = self.operation
+        if operation is None:
+            self.app.notify("There is no applicable Template import preview", severity="warning")
+            return
+        if self.worker_thread is not None or not operation.done.is_set():
+            self.app.notify("Template import execution is still running", severity="warning")
+            return
+        if operation.preview is None or operation.error is not None:
+            self.app.notify("There is no applicable Template import preview", severity="warning")
+            return
+        self.app.push_screen(
+            ConfirmModal("Apply this one-shot Template import?", self.preview_lines),
+            self.apply_confirmed,
+        )
+
+    def apply_confirmed(self, confirmed: bool | None) -> None:
+        if not confirmed:
+            self.discard_and_leave()
+            return
+        try:
+            if self.operation is None:
+                raise core.HuroshikiError("Template import operation is unavailable")
+            with self.app.suspend():
+                self.operation.apply()
+            self.ownership_finished = True
+            self.operation = None
+            self.app.notify("Template import applied atomically")
+            self.app.open_project(self.project_key)
+        except Exception as error:
+            self.ownership_finished = True
+            self.app.notify(str(error), severity="error")
+            self.query_one("#template-import-execution-status", Static).update(str(error))
+
+    def discard_and_leave(self) -> None:
+        operation = self.operation
+        if operation is None or self.ownership_finished:
+            self.operation = None
+            if not self.app.open_project(self.project_key):
+                self.app.go_main()
+            return
+        if self.worker_thread is not None and not operation.done.is_set():
+            self.leave_after_cancel = True
+            operation.cancel()
+            self.query_one("#template-import-execution-status", Static).update(
+                "Cancelling execution and cleaning up..."
+            )
+            return
+        operation.discard()
+        self.ownership_finished = True
+        self.operation = None
+        if not self.app.open_project(self.project_key):
+            self.app.go_main()
+
+    def on_unmount(self) -> None:
+        if self.worker_timer is not None:
+            self.worker_timer.stop()
+            self.worker_timer = None
+        if self.ownership_finished or self.operation is None:
+            return
+        if self.worker_thread is not None and not self.operation.done.is_set():
+            self.operation.cancel()
+        else:
+            self.operation.discard()
+
+    def on_key(self, event: events.Key) -> None:
+        if (
+            self.worker_thread is not None
+            and self.operation is not None
+            and not self.operation.done.is_set()
+        ):
+            if event.key == "escape":
+                self.discard_and_leave()
+            else:
+                self.app.notify(
+                    "Wait for execution or press Esc to cancel",
+                    severity="warning",
+                )
+            event.stop()
+            return
+        if event.key == "enter":
+            self.request_apply()
+        elif event.key == "escape":
+            self.discard_and_leave()
         else:
             return
         event.stop()
