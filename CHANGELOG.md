@@ -10,6 +10,10 @@
   Listing and snapshots stream file digests and full-file UTF-8/NUL classification with bounded
   text probes, while staged writes remain cancellable and post-publication rollback receives a
   separate bounded cleanup budget.
+- Added a Pack Content browser and bounded UTF-8 editor for common, client, and server
+  overlays, including filtered metadata views, KubeJS script presets, safe create/delete/move
+  operations, conflict previews, stale-edit protection, and atomic application through the
+  Content transaction core. Local Content import and binary editing remain unsupported.
 
 ### Reliability and Transaction Safety
 

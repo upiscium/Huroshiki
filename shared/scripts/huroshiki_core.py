@@ -30,6 +30,8 @@ import tomlkit
 
 import packctl
 from content_operations import (
+    CONTENT_EDITOR_MAX_BYTES,
+    ContentBrowseResult,
     ContentChange,
     ContentChangePlan,
     ContentCleanupError,
@@ -50,11 +52,16 @@ from content_operations import (
     ContentReplaceFile,
     ContentSnapshot,
     ContentSnapshotEntry,
+    ContentTextDocument,
     PathIdentity,
     apply_content_changes as _apply_content_changes,
+    analyze_content_conflicts,
     content_snapshot_at,
     discard_content_plan as _discard_content_plan,
     list_content_entries_at,
+    load_content_browser_at,
+    load_content_text_document_at,
+    encode_content_editor_text,
     plan_content_changes_at,
     read_content_file_at,
 )
@@ -2828,9 +2835,18 @@ def _pack_content_root(project_key_value: str) -> Path:
 def list_content_entries(
     project_key_value: str,
     side: str | None = None,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> tuple[ContentEntry, ...]:
     root = _pack_content_root(project_key_value)
-    return list_content_entries_at(project_key_value, root, side)
+    checkpoint = lambda: content_checkpoint(cancel_event, deadline)
+    return list_content_entries_at(
+        project_key_value,
+        root,
+        side,
+        checkpoint=checkpoint,
+    )
 
 
 def read_content_file(
@@ -2850,9 +2866,63 @@ def read_content_file(
     )
 
 
-def content_snapshot(project_key_value: str) -> ContentSnapshot:
+def content_snapshot(
+    project_key_value: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> ContentSnapshot:
     root = _pack_content_root(project_key_value)
-    return content_snapshot_at(project_key_value, root)
+    checkpoint = lambda: content_checkpoint(cancel_event, deadline)
+    return content_snapshot_at(project_key_value, root, checkpoint=checkpoint)
+
+
+def content_checkpoint(
+    cancel_event: threading.Event | None,
+    deadline: float | None,
+) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise ContentOperationCancelled("Content operation was cancelled")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise ContentOperationDeadlineExceeded("Content operation deadline exceeded")
+
+
+def load_content_browser(
+    project_key_value: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> ContentBrowseResult:
+    root = _pack_content_root(project_key_value)
+    return load_content_browser_at(
+        project_key_value,
+        root,
+        cancel_event=cancel_event,
+        deadline=deadline,
+    )
+
+
+def load_content_text_document(
+    project_key_value: str,
+    side: str,
+    relative_path: str | Path,
+    *,
+    expected_snapshot: ContentSnapshot,
+    max_bytes: int = CONTENT_EDITOR_MAX_BYTES,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> ContentTextDocument:
+    root = _pack_content_root(project_key_value)
+    return load_content_text_document_at(
+        project_key_value,
+        root,
+        side,
+        relative_path,
+        expected_snapshot=expected_snapshot,
+        max_bytes=max_bytes,
+        cancel_event=cancel_event,
+        deadline=deadline,
+    )
 
 
 def plan_content_changes(

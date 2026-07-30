@@ -194,6 +194,149 @@ class ContentOperationsTest(unittest.TestCase):
         self.assertEqual(len(inspection.text_probe), 64 * 1024)
         self.assertTrue(inspection.text_probe.endswith(b"\xc3"))
 
+    def test_coherent_browser_result_is_lock_free_and_detects_external_change(self) -> None:
+        common = self.content / "common/config/demo.txt"
+        client = self.content / "client/config/demo.txt"
+        common.parent.mkdir(parents=True)
+        client.parent.mkdir(parents=True)
+        common.write_text("common", encoding="utf-8")
+        client.write_text("client", encoding="utf-8")
+
+        result = core.load_content_browser("pack:demo")
+        self.assertEqual(
+            {(entry.side, entry.relative_path) for entry in result.entries},
+            {
+                (entry.side, entry.relative_path)
+                for entry in result.snapshot.entries
+            },
+        )
+        self.assertTrue(
+            any(
+                conflict.kind == "common_client_overlap"
+                for conflict in result.conflicts
+            )
+        )
+        self.assertEqual(
+            result.conflicts,
+            core.analyze_content_conflicts(result.snapshot),
+        )
+        self.assertFalse((self.state / "transactions").exists())
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+        original_list = content_operations.list_content_entries_at
+        calls = 0
+
+        def change_during_load(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            entries = original_list(*args, **kwargs)
+            if calls == 2:
+                common.write_text("changed", encoding="utf-8")
+            return entries
+
+        with patch.object(
+            content_operations,
+            "list_content_entries_at",
+            side_effect=change_during_load,
+        ):
+            with self.assertRaisesRegex(
+                core.ContentOperationError,
+                "changed while loading the browser",
+            ):
+                core.load_content_browser("pack:demo")
+
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaises(core.ContentOperationCancelled):
+            core.load_content_browser("pack:demo", cancel_event=cancelled)
+        with self.assertRaises(core.ContentOperationDeadlineExceeded):
+            core.load_content_browser("pack:demo", deadline=time.monotonic() - 1)
+
+    def test_text_document_preserves_mode_newlines_and_snapshot_digest_cas(self) -> None:
+        config = self.content / "common/config"
+        config.mkdir(parents=True)
+        cases = {
+            "lf.txt": ("one\ntwo\n", "lf", b"one\ntwo\n"),
+            "crlf.txt": ("one\r\ntwo\r\n", "crlf", b"one\r\ntwo\r\n"),
+            "cr.txt": ("one\rtwo\r", "cr", b"one\rtwo\r"),
+            "mixed.txt": ("one\r\ntwo\nthree\r", "mixed", b"one\ntwo\nthree\n"),
+            "none.txt": ("one", "none", b"one"),
+        }
+        for name, (text, _, _) in cases.items():
+            path = config / name
+            path.write_bytes(text.encode("utf-8"))
+            path.chmod(0o754)
+        browser = core.load_content_browser("pack:demo")
+        for name, (_source, policy, encoded) in cases.items():
+            document = core.load_content_text_document(
+                "pack:demo",
+                "common",
+                Path("config") / name,
+                expected_snapshot=browser.snapshot,
+            )
+            self.assertEqual(document.newline_policy, policy)
+            self.assertEqual(document.mode, 0o754)
+            self.assertEqual(document.digest, hashlib.sha256((config / name).read_bytes()).hexdigest())
+            self.assertEqual(
+                core.encode_content_editor_text(document.text, document.newline_policy),
+                encoded,
+            )
+            self.assertEqual(document.text.endswith("\n"), encoded.endswith((b"\n", b"\r")))
+
+        (config / "lf.txt").write_text("external", encoding="utf-8")
+        with self.assertRaisesRegex(core.ContentPlanStale, "reload the browser"):
+            core.load_content_text_document(
+                "pack:demo",
+                "common",
+                "config/lf.txt",
+                expected_snapshot=browser.snapshot,
+            )
+
+    def test_text_document_rejects_binary_directory_large_and_read_replacement(self) -> None:
+        config = self.content / "common/config"
+        config.mkdir(parents=True)
+        binary = config / "binary.bin"
+        binary.write_bytes(b"text\0binary")
+        large = config / "large.txt"
+        large.write_bytes(b"x" * 32)
+        text = config / "text.txt"
+        text.write_text("before", encoding="utf-8")
+        browser = core.load_content_browser("pack:demo")
+
+        for relative, limit, message in (
+            ("config/binary.bin", 1024, "Binary or invalid UTF-8"),
+            ("config", 1024, "regular Content files"),
+            ("config/large.txt", 8, "read limit"),
+        ):
+            with self.assertRaisesRegex(core.ContentOperationError, message):
+                core.load_content_text_document(
+                    "pack:demo",
+                    "common",
+                    relative,
+                    expected_snapshot=browser.snapshot,
+                    max_bytes=limit,
+                )
+
+        original_read = content_operations.read_overlay_bytes
+
+        def replace_after_read(*args, **kwargs):
+            result = original_read(*args, **kwargs)
+            text.write_text("after", encoding="utf-8")
+            return result
+
+        with patch.object(
+            content_operations,
+            "read_overlay_bytes",
+            side_effect=replace_after_read,
+        ):
+            with self.assertRaisesRegex(core.ContentPlanStale, "reload the browser"):
+                core.load_content_text_document(
+                    "pack:demo",
+                    "common",
+                    "config/text.txt",
+                    expected_snapshot=browser.snapshot,
+                )
+
     def test_snapshot_is_stable_and_tracks_content_mode_and_empty_directories(self) -> None:
         target = self.content / "common/config/demo.toml"
         target.parent.mkdir(parents=True)

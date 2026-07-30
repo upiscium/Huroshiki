@@ -32,6 +32,7 @@ CONTENT_TEXT_PROBE_BYTES = 64 * 1024
 CONTENT_OPERATION_TIMEOUT_SECONDS = 600.0
 CONTENT_DISCARD_TIMEOUT_SECONDS = 10.0
 CONTENT_CLEANUP_TIMEOUT_SECONDS = 10.0
+CONTENT_EDITOR_MAX_BYTES = 2 * 1024 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _SIDE_ORDER = {side: index for index, side in enumerate(OVERLAY_TARGETS)}
 
@@ -106,6 +107,26 @@ class ContentSnapshot:
     content_identity: PathIdentity
     entries: tuple[ContentSnapshotEntry, ...]
     digest: str
+
+
+@dataclass(frozen=True)
+class ContentBrowseResult:
+    entries: tuple[ContentEntry, ...]
+    snapshot: ContentSnapshot
+    conflicts: tuple[ContentConflict, ...]
+
+
+@dataclass(frozen=True)
+class ContentTextDocument:
+    project_key: str
+    side: str
+    relative_path: Path
+    snapshot: ContentSnapshot
+    digest: str
+    mode: int
+    text: str
+    newline_policy: Literal["lf", "crlf", "cr", "mixed", "none"]
+    size: int
 
 
 @dataclass(frozen=True)
@@ -365,6 +386,7 @@ def read_content_file_at(
     relative_path: str | Path,
     *,
     max_bytes: int | None = None,
+    checkpoint: Callable[[], None] | None = None,
 ) -> ContentFile:
     normalized_side = _normalize_side(side)
     relative = _normalize_path(relative_path)
@@ -374,6 +396,7 @@ def read_content_file_at(
             normalized_side,
             relative,
             max_bytes=max_bytes,
+            checkpoint=checkpoint,
         )
     except (OverlayPolicyError, OSError) as error:
         raise ContentOperationError(str(error)) from error
@@ -489,6 +512,204 @@ def content_snapshot_at(
         before_content,
         ordered,
         _snapshot_digest(ordered),
+    )
+
+
+def _snapshots_match(left: ContentSnapshot, right: ContentSnapshot) -> bool:
+    return (
+        left.project_key == right.project_key
+        and left.project_identity == right.project_identity
+        and left.content_parent_identity == right.content_parent_identity
+        and left.content_identity == right.content_identity
+        and left.entries == right.entries
+        and left.digest == right.digest
+    )
+
+
+def analyze_content_conflicts(
+    snapshot: ContentSnapshot,
+) -> tuple[ContentConflict, ...]:
+    return _conflicts(snapshot)
+
+
+def load_content_browser_at(
+    project_key: str,
+    project_root: Path,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> ContentBrowseResult:
+    effective_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + CONTENT_OPERATION_TIMEOUT_SECONDS
+    )
+    checkpoint = lambda: _checkpoint(cancel_event, effective_deadline)
+    before = content_snapshot_at(
+        project_key,
+        project_root,
+        checkpoint=checkpoint,
+    )
+    entries = list_content_entries_at(
+        project_key,
+        project_root,
+        checkpoint=checkpoint,
+    )
+    after = content_snapshot_at(
+        project_key,
+        project_root,
+        checkpoint=checkpoint,
+    )
+    if not _snapshots_match(before, after):
+        raise ContentOperationError(
+            "Content changed while loading the browser; reload Content"
+        )
+    snapshot_by_key = {
+        (entry.side, entry.relative_path): entry for entry in after.entries
+    }
+    entry_keys = {(entry.side, entry.relative_path) for entry in entries}
+    if entry_keys != set(snapshot_by_key):
+        raise ContentOperationError(
+            "Content changed while loading the browser; reload Content"
+        )
+    for entry in entries:
+        snapshot_entry = snapshot_by_key.get((entry.side, entry.relative_path))
+        if snapshot_entry is None or (
+            snapshot_entry.kind,
+            snapshot_entry.mode,
+            snapshot_entry.size,
+            snapshot_entry.digest,
+            snapshot_entry.errors,
+        ) != (
+            entry.kind,
+            entry.mode,
+            entry.size,
+            entry.digest,
+            entry.errors,
+        ):
+            raise ContentOperationError(
+                "Content changed while loading the browser; reload Content"
+            )
+    return ContentBrowseResult(entries, after, analyze_content_conflicts(after))
+
+
+def detect_content_newline_policy(
+    text: str,
+) -> Literal["lf", "crlf", "cr", "mixed", "none"]:
+    crlf = text.count("\r\n")
+    remaining = text.replace("\r\n", "")
+    kinds = sum((crlf > 0, "\n" in remaining, "\r" in remaining))
+    if kinds > 1:
+        return "mixed"
+    if crlf:
+        return "crlf"
+    if "\n" in remaining:
+        return "lf"
+    if "\r" in remaining:
+        return "cr"
+    return "none"
+
+
+def _editor_text(text: str, newline_policy: str) -> str:
+    if newline_policy in {"crlf", "cr", "mixed"}:
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+    return text
+
+
+def encode_content_editor_text(text: str, newline_policy: str) -> bytes:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if newline_policy == "crlf":
+        normalized = normalized.replace("\n", "\r\n")
+    elif newline_policy == "cr":
+        normalized = normalized.replace("\n", "\r")
+    elif newline_policy not in {"lf", "mixed", "none"}:
+        raise ContentOperationError(
+            f"Unsupported Content newline policy: {newline_policy}"
+        )
+    return normalized.encode("utf-8")
+
+
+def load_content_text_document_at(
+    project_key: str,
+    project_root: Path,
+    side: str,
+    relative_path: str | Path,
+    *,
+    expected_snapshot: ContentSnapshot,
+    max_bytes: int = CONTENT_EDITOR_MAX_BYTES,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> ContentTextDocument:
+    effective_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + CONTENT_OPERATION_TIMEOUT_SECONDS
+    )
+    checkpoint = lambda: _checkpoint(cancel_event, effective_deadline)
+    current = content_snapshot_at(
+        project_key,
+        project_root,
+        checkpoint=checkpoint,
+    )
+    if not _snapshots_match(current, expected_snapshot):
+        raise ContentPlanStale(
+            "Content changed while opening the editor; reload the browser"
+        )
+    normalized_side = _normalize_side(side)
+    normalized_path = _normalize_path(relative_path)
+    snapshot_entry = next(
+        (
+            entry
+            for entry in current.entries
+            if entry.side == normalized_side
+            and entry.relative_path == normalized_path
+        ),
+        None,
+    )
+    if snapshot_entry is None or snapshot_entry.kind != "file":
+        raise ContentOperationError("Only regular Content files can be edited")
+    if snapshot_entry.errors:
+        raise ContentOperationError("Invalid Content entries cannot be edited")
+    file = read_content_file_at(
+        project_key,
+        project_root,
+        normalized_side,
+        normalized_path,
+        max_bytes=max_bytes,
+        checkpoint=checkpoint,
+    )
+    if file.entry.text_kind != "utf8":
+        raise ContentOperationError("Binary or invalid UTF-8 Content cannot be edited")
+    try:
+        decoded = file.contents.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ContentOperationError(
+            "Binary or invalid UTF-8 Content cannot be edited"
+        ) from error
+    after = content_snapshot_at(
+        project_key,
+        project_root,
+        checkpoint=checkpoint,
+    )
+    if (
+        not _snapshots_match(current, after)
+        or file.entry.digest != snapshot_entry.digest
+        or file.entry.mode != snapshot_entry.mode
+    ):
+        raise ContentPlanStale(
+            "Content changed while opening the editor; reload the browser"
+        )
+    newline_policy = detect_content_newline_policy(decoded)
+    return ContentTextDocument(
+        project_key,
+        normalized_side,
+        normalized_path,
+        after,
+        file.entry.digest or "",
+        file.entry.mode,
+        _editor_text(decoded, newline_policy),
+        newline_policy,
+        len(file.contents),
     )
 
 
