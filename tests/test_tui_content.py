@@ -6,6 +6,7 @@ import io
 from pathlib import Path
 import threading
 import time
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +15,7 @@ from textual.widgets import DataTable, Input, Static, TextArea
 
 import huroshiki
 import huroshiki_core as core
+import overlay_policy
 
 
 PACK = core.ProjectInfo(
@@ -98,6 +100,17 @@ DOCUMENT = core.ContentTextDocument(
     "hello\n",
     "lf",
     6,
+)
+MIXED_DOCUMENT = core.ContentTextDocument(
+    "pack:demo",
+    "common",
+    Path("config/demo.txt"),
+    SNAPSHOT,
+    "a" * 64,
+    0o644,
+    "one\ntwo\n",
+    "mixed",
+    10,
 )
 
 
@@ -336,6 +349,100 @@ class ContentTuiTest(unittest.IsolatedAsyncioTestCase):
                 table.move_cursor(row=2)
                 browser.edit_current()
                 self.assertIs(app.screen, browser)
+
+    async def test_editor_preview_cancel_failure_retry_preserve_exact_draft(self) -> None:
+        plans = [
+            _Plan(conflicts=(CONFLICTS[1],)),
+            _Plan(),
+            _Plan(discard_error=RuntimeError("cleanup failed")),
+            _Plan(),
+        ]
+        apply_should_fail = True
+
+        def plan_changes(_key, operations, **_kwargs):
+            plan = plans.pop(0)
+            plan.operations = tuple(operations)
+            return plan
+
+        def apply(plan, **_kwargs):
+            if apply_should_fail:
+                raise core.ContentOperationError("apply failed")
+            plan.state = "applied"
+            plan._project_lock = None
+
+        with self.patches(), patch.object(
+            huroshiki.core,
+            "load_content_text_document",
+            return_value=MIXED_DOCUMENT,
+        ), patch.object(
+            huroshiki.core,
+            "plan_content_changes",
+            side_effect=plan_changes,
+        ), patch.object(
+            huroshiki.core,
+            "apply_content_changes",
+            side_effect=apply,
+        ):
+            editor_screen = huroshiki.ContentEditorScreen(
+                "pack:demo", ENTRIES[0], SNAPSHOT
+            )
+            app = _ContentApp(editor_screen)
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                editor = editor_screen.query_one("#content-editor", TextArea)
+                draft = "draft line\nsecond line\n"
+                editor.text = draft
+                editor.cursor_location = (1, 4)
+                cursor = editor.cursor_location
+
+                await pilot.press("ctrl+s")
+                await pilot.pause(0.15)
+                preview = app.screen
+                self.assertIsInstance(preview, huroshiki.ContentPlanPreviewScreen)
+                self.assertIn("Mixed newlines -> LF", preview.preview_text())
+                self.assertIn(
+                    "Mixed newlines -> LF",
+                    str(preview.query_one("#content-plan-preview", Static).content),
+                )
+                self.assertTrue(preview.fatal)
+                await pilot.press("escape")
+                await pilot.pause(0.15)
+                self.assertIs(app.screen, editor_screen)
+                self.assertIs(editor_screen.query_one("#content-editor", TextArea), editor)
+                self.assertEqual(editor.text, draft)
+                self.assertEqual(editor.cursor_location, cursor)
+
+                await pilot.press("ctrl+s")
+                await pilot.pause(0.15)
+                await pilot.press("enter")
+                await pilot.pause(0.15)
+                self.assertIsInstance(app.screen, huroshiki.ContentPlanPreviewScreen)
+                self.assertIn("apply failed", str(app.screen.query_one("#content-operation-status", Static).content))
+                await pilot.press("escape")
+                await pilot.pause(0.15)
+                self.assertIs(app.screen, editor_screen)
+                self.assertEqual(editor.text, draft)
+                self.assertEqual(editor.cursor_location, cursor)
+
+                await pilot.press("ctrl+s")
+                await pilot.pause(0.15)
+                cleanup_plan = app.screen.plan
+                await pilot.press("escape")
+                await pilot.pause(0.15)
+                self.assertIsInstance(app.screen, huroshiki.ContentPlanPreviewScreen)
+                cleanup_plan.discard_error = None
+                await pilot.press("r")
+                await pilot.pause(0.15)
+                self.assertIs(app.screen, editor_screen)
+                self.assertEqual(editor.text, draft)
+                self.assertEqual(editor.cursor_location, cursor)
+
+                apply_should_fail = False
+                await pilot.press("ctrl+s")
+                await pilot.pause(0.15)
+                await pilot.press("enter")
+                await pilot.pause(0.15)
+                self.assertIsInstance(app.screen, huroshiki.ContentScreen)
 
     async def test_create_delete_move_use_immutable_operations_and_preview(self) -> None:
         plans: list[_Plan] = []
@@ -597,6 +704,37 @@ class ContentCreateModelTest(unittest.TestCase):
 
 
 class ContentAppShutdownTest(unittest.TestCase):
+    def test_shutdown_cancels_recursive_scan_worker_without_live_thread(self) -> None:
+        entered = threading.Event()
+        with tempfile.TemporaryDirectory() as directory:
+            content_root = Path(directory) / "content"
+
+            def target(cancel_event: threading.Event, _deadline: float):
+                def checkpoint() -> None:
+                    entered.set()
+                    cancel_event.wait(2)
+                    if cancel_event.is_set():
+                        raise core.ContentOperationCancelled("scan cancelled")
+
+                return overlay_policy.scan_content_overlays(
+                    content_root,
+                    checkpoint=checkpoint,
+                )
+
+            worker = huroshiki.ContentWorker(
+                "huroshiki-content-browser-pack-demo",
+                target,
+            )
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            app = huroshiki.HuroshikiApp()
+            app.content_workers["pack:demo"] = worker
+            app.on_unmount()
+        self.assertTrue(worker.done.is_set())
+        self.assertIsNotNone(worker.thread)
+        self.assertFalse(worker.thread.is_alive())
+        self.assertFalse(app.content_workers)
+
     def test_worker_instance_identity_rejects_stale_completion(self) -> None:
         app = huroshiki.HuroshikiApp()
         stale = huroshiki.ContentWorker(

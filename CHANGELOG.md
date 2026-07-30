@@ -13,7 +13,9 @@
 - Added a Pack Content browser and bounded UTF-8 editor for common, client, and server
   overlays, including filtered metadata views, KubeJS script presets, safe create/delete/move
   operations, conflict previews, stale-edit protection, and atomic application through the
-  Content transaction core. Local Content import and binary editing remain unsupported.
+  Content transaction core. Save previews preserve the active editor draft when cancelled, and
+  recursive browser scans remain cancellable. Local Content import and binary editing remain
+  unsupported.
 
 ### Reliability and Transaction Safety
 

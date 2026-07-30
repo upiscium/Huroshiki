@@ -252,6 +252,48 @@ class ContentOperationsTest(unittest.TestCase):
         with self.assertRaises(core.ContentOperationDeadlineExceeded):
             core.load_content_browser("pack:demo", deadline=time.monotonic() - 1)
 
+    def test_overlay_scan_checkpoint_precedes_access_and_interrupts_traversal(self) -> None:
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with self.assertRaises(core.ContentOperationCancelled):
+            core.load_content_browser("pack:demo", cancel_event=cancel_event)
+        with self.assertRaises(core.ContentOperationDeadlineExceeded):
+            core.load_content_browser("pack:demo", deadline=time.monotonic() - 1)
+
+        cancelled = core.ContentOperationCancelled("cancelled")
+        with patch.object(
+            Path,
+            "lstat",
+            side_effect=AssertionError("filesystem access happened before checkpoint"),
+        ):
+            with self.assertRaises(core.ContentOperationCancelled):
+                overlay_policy.scan_content_overlays(
+                    self.content,
+                    checkpoint=lambda: (_ for _ in ()).throw(cancelled),
+                )
+
+        directory = self.content / "common/config"
+        directory.mkdir(parents=True)
+        for index in range(100):
+            (directory / f"item-{index:03}.txt").write_text("value", encoding="utf-8")
+        checkpoints = 0
+
+        def interrupt() -> None:
+            nonlocal checkpoints
+            checkpoints += 1
+            if checkpoints == 20:
+                raise core.ContentOperationCancelled("mid-scan cancellation")
+
+        with self.assertRaisesRegex(
+            core.ContentOperationCancelled,
+            "mid-scan cancellation",
+        ):
+            overlay_policy.scan_content_overlays(
+                self.content,
+                checkpoint=interrupt,
+            )
+        self.assertEqual(checkpoints, 20)
+
     def test_text_document_preserves_mode_newlines_and_snapshot_digest_cas(self) -> None:
         config = self.content / "common/config"
         config.mkdir(parents=True)

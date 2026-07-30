@@ -309,7 +309,7 @@ def list_content_entries_at(
 ) -> tuple[ContentEntry, ...]:
     selected_side = None if side is None else _normalize_side(side)
     content_root = _content_root or project_root / "content"
-    scan = scan_content_overlays(content_root)
+    scan = scan_content_overlays(content_root, checkpoint=checkpoint)
     issues: dict[Path, list[str]] = {}
     for issue in scan.issues:
         issues.setdefault(issue.relative_path, []).append(issue.message)
@@ -457,7 +457,10 @@ def content_snapshot_at(
         _content_root=actual_content_root,
     )
     snapshot_entries: list[ContentSnapshotEntry] = []
-    overlay_scan = scan_content_overlays(actual_content_root)
+    overlay_scan = scan_content_overlays(
+        actual_content_root,
+        checkpoint=checkpoint,
+    )
     metadata_by_path = {
         entry.relative_path: entry for entry in overlay_scan.entries
     }
@@ -1366,7 +1369,7 @@ def plan_content_changes_at(
             checkpoint()
             _apply_operation(staging, operation, checkpoint)
         checkpoint()
-        staging_scan = scan_content_overlays(staging)
+        staging_scan = scan_content_overlays(staging, checkpoint=checkpoint)
         if staging_scan.issues:
             details = "; ".join(
                 f"{issue.relative_path}: {issue.message}"

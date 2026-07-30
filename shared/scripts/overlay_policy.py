@@ -801,7 +801,10 @@ def _scan_path(
     issues: list[OverlayIssue],
     *,
     include_entry: bool = True,
+    checkpoint: Callable[[], None] | None = None,
 ) -> None:
+    if checkpoint is not None:
+        checkpoint()
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -835,19 +838,41 @@ def _scan_path(
 
     if not stat.S_ISDIR(metadata.st_mode):
         return
+    if checkpoint is not None:
+        checkpoint()
     try:
-        children = sorted(os.scandir(path), key=lambda item: item.name)
+        children: list[tuple[str, Path]] = []
+        with os.scandir(path) as iterator:
+            for child in iterator:
+                if checkpoint is not None:
+                    checkpoint()
+                children.append((child.name, Path(child.path)))
+        children.sort(key=lambda item: item[0])
     except OSError as error:
         issues.append(OverlayIssue(relative, f"cannot list directory: {error}"))
         return
-    for child in children:
-        child_relative = relative / child.name
-        _scan_path(Path(child.path), child_relative, entries, issues)
+    for child_name, child_path in children:
+        if checkpoint is not None:
+            checkpoint()
+        child_relative = relative / child_name
+        _scan_path(
+            child_path,
+            child_relative,
+            entries,
+            issues,
+            checkpoint=checkpoint,
+        )
 
 
-def scan_content_overlays(content_root: Path) -> OverlayScan:
+def scan_content_overlays(
+    content_root: Path,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> OverlayScan:
     entries: list[OverlayEntry] = []
     issues: list[OverlayIssue] = []
+    if checkpoint is not None:
+        checkpoint()
     try:
         metadata = content_root.lstat()
     except FileNotFoundError:
@@ -867,12 +892,15 @@ def scan_content_overlays(content_root: Path) -> OverlayScan:
         )
 
     for target in OVERLAY_TARGETS:
+        if checkpoint is not None:
+            checkpoint()
         _scan_path(
             content_root / target,
             Path(target),
             entries,
             issues,
             include_entry=False,
+            checkpoint=checkpoint,
         )
     return OverlayScan(tuple(entries), tuple(issues))
 

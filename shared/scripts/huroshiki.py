@@ -2300,11 +2300,12 @@ class ContentScreen(ProjectChildScreen, FilterListScreen):
                     )
                     self.app.begin_content_discard(self.project_key, destination)
                     return
-                self.app.switch_screen(
+                self.app.push_screen(
                     ContentPlanPreviewScreen(
                         self.project_key,
                         result,
                         select_key=self.selected_key,
+                        return_to_origin=True,
                     )
                 )
                 return
@@ -2705,11 +2706,20 @@ class ContentEditorScreen(ProjectChildScreen, BaseScreen):
                     lambda: self.app.switch_screen(ContentScreen(self.project_key)),
                 )
                 return
-            self.app.switch_screen(
+            self.query_one("#content-editor", TextArea).disabled = False
+            notes = (
+                ("Mixed newlines -> LF when this save is applied.",)
+                if self.document is not None
+                and self.document.newline_policy == "mixed"
+                else ()
+            )
+            self.app.push_screen(
                 ContentPlanPreviewScreen(
                     self.project_key,
                     result,
                     select_key=(self.entry.side, self.entry.relative_path),
+                    return_to_origin=True,
+                    notes=notes,
                 )
             )
             return
@@ -2791,11 +2801,15 @@ class ContentPlanPreviewScreen(ProjectChildScreen, BaseScreen):
         plan: core.ContentChangePlan,
         *,
         select_key: tuple[str, Path] | None = None,
+        return_to_origin: bool = False,
+        notes: tuple[str, ...] = (),
     ) -> None:
         super().__init__()
         self.project_key = project_key
         self.plan = plan
         self.select_key = select_key
+        self.return_to_origin = return_to_origin
+        self.notes = notes
         project = core.project_info(project_key)
         self.screen_title = f"{project.display_name} / Content change preview"
         self.worker: ContentWorker[object] | None = None
@@ -2836,6 +2850,9 @@ class ContentPlanPreviewScreen(ProjectChildScreen, BaseScreen):
         lines.extend(f"  {item.kind}: {item.message}" for item in warnings)
         lines.extend(("", f"Fatal conflicts: {len(fatal)}"))
         lines.extend(f"  {item.kind}: {item.message}" for item in fatal)
+        if self.notes:
+            lines.extend(("", "Notes:"))
+            lines.extend(f"  {note}" for note in self.notes)
         lines.extend(("", f"Transaction: {self.plan.transaction_root}"))
         if fatal:
             lines.append("Apply disabled until fatal conflicts are resolved.")
@@ -2884,9 +2901,17 @@ class ContentPlanPreviewScreen(ProjectChildScreen, BaseScreen):
         if self.app.content_plans.get(self.project_key) is self.plan:
             self.app.content_plans.pop(self.project_key, None)
         self.app.notify("Content changes applied atomically")
-        self.app.switch_screen(
-            ContentScreen(self.project_key, select_key=self.select_key)
-        )
+        if self.return_to_origin:
+            self.app.pop_screen()
+        self.app.switch_screen(ContentScreen(self.project_key, select_key=self.select_key))
+
+    def return_after_discard(self) -> None:
+        if self.return_to_origin:
+            self.app.pop_screen()
+        else:
+            self.app.switch_screen(
+                ContentScreen(self.project_key, select_key=self.select_key)
+            )
 
     def begin_discard(self) -> None:
         if self.project_key in self.app._content_discards:
@@ -2897,9 +2922,7 @@ class ContentPlanPreviewScreen(ProjectChildScreen, BaseScreen):
         )
         self.app.begin_content_discard(
             self.project_key,
-            lambda: self.app.switch_screen(
-                ContentScreen(self.project_key, select_key=self.select_key)
-            ),
+            self.return_after_discard,
         )
 
     def on_unmount(self) -> None:
