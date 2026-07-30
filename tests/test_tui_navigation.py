@@ -52,9 +52,11 @@ class _Operation:
     def __init__(self) -> None:
         self.done = threading.Event()
         self.cancelled = False
+        self.cancel_deadline: float | None = None
 
-    def cancel(self) -> None:
+    def cancel(self, *, deadline=None) -> None:
         self.cancelled = True
+        self.cancel_deadline = deadline
         self.done.set()
 
 
@@ -97,11 +99,84 @@ class _InstallTransaction(_Transaction):
 
     def __init__(self) -> None:
         super().__init__()
+        self.add_calls: list[dict[str, object]] = []
         self.resolved_calls: list[dict[str, object]] = []
+        self.queued_operations: list[object] = []
+        self._operation: object | None = None
+
+    def _next_operation(self):
+        operation = (
+            self.queued_operations.pop(0)
+            if self.queued_operations
+            else _ResolvedOperation()
+        )
+        self._operation = operation
+        return operation
+
+    def begin_add(self, provider, selector, **kwargs):
+        self.add_calls.append(
+            {"provider": provider, "selector": selector, **kwargs}
+        )
+        return self._next_operation()
 
     def begin_resolved_add(self, **kwargs):
         self.resolved_calls.append(kwargs)
-        return _ResolvedOperation()
+        return self._next_operation()
+
+
+class _BlockingInstallOperation(core.ResolvedAddOperation):
+    def __init__(self, transaction: _InstallTransaction) -> None:
+        self.transaction = transaction
+        self.done = threading.Event()
+        self.cancel_event = threading.Event()
+        self.cancelled = False
+        self.cancel_deadline: float | None = None
+        self.cleanup_error: BaseException | None = None
+        self.termination_result = None
+        self.termination_incomplete = False
+        self.result: core.AddOperationResult | None = None
+        self.started = threading.Event()
+        self.cleanup_started = threading.Event()
+        self.release_cleanup = threading.Event()
+
+    def run(self) -> core.AddOperationResult:
+        self.started.set()
+        self.cancel_event.wait(2)
+        self.cleanup_started.set()
+        self.release_cleanup.wait(2)
+        self.transaction._operation = None
+        self.result = core.AddOperationResult(
+            130,
+            (),
+            Path("raw.log"),
+            Path("output.log"),
+            Path("events.log"),
+            "Install operation was cancelled",
+            True,
+        )
+        self.done.set()
+        return self.result
+
+    def cancel(self, *, deadline=None) -> None:
+        self.cancelled = True
+        self.cancel_deadline = deadline
+        self.cancel_event.set()
+
+    def abort_before_start(self, error, *, cancelled=False) -> bool:
+        self.cancelled = cancelled
+        self.transaction._operation = None
+        self.result = core.AddOperationResult(
+            130 if cancelled else 1,
+            (),
+            Path("raw.log"),
+            Path("output.log"),
+            Path("events.log"),
+            str(error),
+            cancelled,
+        )
+        self.done.set()
+        return True
+
 
 class _UpdateTransaction:
     def __init__(self) -> None:
@@ -638,6 +713,96 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                     transaction.changes,
                     ["rollback", "post-navigation edit"],
                 )
+
+    async def test_url_checkpoint_worker_keeps_event_loop_responsive_and_defers_escape(self) -> None:
+        transaction = _InstallTransaction()
+        operation = _BlockingInstallOperation(transaction)
+        transaction.queued_operations.append(operation)
+        with self.patches():
+            screen = huroshiki.InstallScreen("pack:demo")
+            screen.provider = "url"
+            app = _NavigationApp(screen)
+            app.transactions["pack:demo"] = transaction
+            async with app.run_test() as pilot:
+                field = screen.query_one("#mod-search", Input)
+                field.value = "https://example.invalid/private.jar"
+                await pilot.press("enter")
+                await pilot.pause(0.05)
+
+                self.assertTrue(operation.started.is_set())
+                self.assertEqual(screen.state, "resolving")
+                self.assertIs(app.screen, screen)
+                assert screen.operation_thread is not None
+                self.assertFalse(screen.operation_thread.daemon)
+
+                await pilot.press("escape")
+                await pilot.pause(0.05)
+                self.assertTrue(operation.cancel_event.is_set())
+                self.assertTrue(operation.cleanup_started.is_set())
+                self.assertIs(app.screen, screen)
+                self.assertEqual(operation.cancel_deadline, screen._navigation_deadline)
+
+                operation.release_cleanup.set()
+                await pilot.pause(0.15)
+                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+
+    async def test_resolved_checkpoint_worker_defers_navigation_until_cleanup(self) -> None:
+        transaction = _InstallTransaction()
+        operation = _BlockingInstallOperation(transaction)
+        transaction.queued_operations.append(operation)
+        with self.patches():
+            screen = huroshiki.InstallScreen("pack:demo")
+            app = _NavigationApp(screen)
+            app.transactions["pack:demo"] = transaction
+            async with app.run_test() as pilot:
+                field = screen.query_one("#mod-search", Input)
+                field.value = "mr:canonical"
+                await pilot.press("enter")
+                await pilot.pause(0.05)
+                self.assertTrue(operation.started.is_set())
+                self.assertIs(app.screen, screen)
+
+                await pilot.press("escape")
+                await pilot.pause(0.05)
+                self.assertTrue(operation.cancel_event.is_set())
+                self.assertIs(app.screen, screen)
+
+                operation.release_cleanup.set()
+                await pilot.pause(0.15)
+                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+
+    async def test_install_worker_start_failure_restores_idle_and_allows_retry(self) -> None:
+        transaction = _InstallTransaction()
+        failed_operation = _BlockingInstallOperation(transaction)
+        transaction.queued_operations.append(failed_operation)
+        with self.patches():
+            screen = huroshiki.InstallScreen("pack:demo")
+            screen.provider = "url"
+            app = _NavigationApp(screen)
+            app.transactions["pack:demo"] = transaction
+            async with app.run_test() as pilot:
+                field = screen.query_one("#mod-search", Input)
+                field.value = "https://example.invalid/private.jar"
+                with patch.object(
+                    threading.Thread,
+                    "start",
+                    side_effect=RuntimeError("start failed"),
+                ):
+                    await pilot.press("enter")
+                    await pilot.pause()
+
+                self.assertTrue(failed_operation.done.is_set())
+                self.assertIsNone(transaction._operation)
+                self.assertIsNone(screen.operation)
+                self.assertIsNone(screen.operation_thread)
+                self.assertEqual(screen.state, "idle")
+                self.assertFalse(field.disabled)
+
+                field.value = "https://example.invalid/retry.jar"
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                self.assertEqual(len(transaction.add_calls), 2)
+                self.assertEqual(screen.state, "idle")
 
     async def test_install_stays_for_already_done_incomplete_pty_cleanup(self) -> None:
         with self.patches():

@@ -281,6 +281,41 @@ class ProjectLockTest(unittest.TestCase):
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
         self.assertFalse((transaction.root / "source" / "mods" / "private.pw.toml").exists())
 
+    def test_add_worker_start_failure_keeps_transaction_lock_until_discard(self) -> None:
+        transaction = core.PackTransaction.create("pack:demo")
+        operation = transaction.begin_add(
+            "url",
+            "https://example.invalid/private.jar",
+            client=True,
+            server=True,
+        )
+        operation.abort_before_start(
+            core.HuroshikiError("Add operation worker could not start: start failed")
+        )
+
+        self.assertTrue(operation.done.is_set())
+        self.assertIsNone(transaction._operation)
+        self.assertTrue(packctl.project_lock_is_active("pack:demo"))
+        results = self.context.Queue()
+        process = self.context.Process(
+            target=_try_lock,
+            args=(self.root, "pack:demo", results),
+        )
+        process.start()
+        self.assertEqual(results.get(timeout=5)[0], "blocked")
+        process.join(5)
+        self.assertEqual(process.exitcode, 0)
+
+        retry = transaction.begin_add(
+            "url",
+            "https://example.invalid/retry.jar",
+            client=True,
+            server=True,
+        )
+        retry.abort_before_start(core.HuroshikiError("test cleanup"))
+        transaction.discard()
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -237,6 +237,9 @@ class TransactionDiscardTest(unittest.TestCase):
         operation.done.set()
         operation.cancelled = False
         operation.cancel_event = threading.Event()
+        operation.deadline = time.monotonic() + 10
+        operation._state = "done"
+        operation._state_lock = threading.Lock()
         operation.session = _Session()
         operation.termination_result = incomplete
         operation.cleanup_error = None

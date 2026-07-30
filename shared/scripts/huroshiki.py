@@ -3621,7 +3621,18 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             name=f"huroshiki-provider-search-{self.project_key}",
             daemon=False,
         )
-        self.operation_thread.start()
+        try:
+            self.operation_thread.start()
+        except BaseException as error:
+            operation.cancel()
+            operation.error = f"Provider search worker could not start: {error}"
+            operation.done.set()
+            self.operation = None
+            self.operation_thread = None
+            self.state = "idle"
+            event.input.disabled = False
+            self.set_status(operation.error)
+            self.app.notify(operation.error, severity="error")
 
     def _start_resolved_operation(
         self,
@@ -3660,7 +3671,26 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             name=f"huroshiki-resolved-add-{self.project_key}",
             daemon=False,
         )
-        self.operation_thread.start()
+        try:
+            self.operation_thread.start()
+        except BaseException as error:
+            failure = core.HuroshikiError(
+                f"Add operation worker could not start: {error}"
+            )
+            operation.abort_before_start(failure)
+            self.operation = None
+            self.operation_thread = None
+            self.state = "idle"
+            search = self.query_one("#mod-search", Input)
+            search.disabled = False
+            message = (
+                operation.result.message
+                if operation.result is not None
+                else str(failure)
+            )
+            self.set_status(message)
+            self.app.notify(message, severity="error")
+            search.focus()
 
     def _run_search(self, operation: core.ProviderSearchOperation) -> None:
         operation.run()

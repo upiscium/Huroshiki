@@ -774,7 +774,137 @@ class ProviderSearchOperation:
         return self.done.wait(timeout)
 
 
-class ResolvedAddOperation:
+class AddOperationCancelled(HuroshikiError):
+    pass
+
+
+class AddOperationDeadlineExceeded(HuroshikiError):
+    pass
+
+
+class _AddOperationLifecycle:
+    def __init__(
+        self,
+        transaction: "PackTransaction",
+        *,
+        deadline: float | None,
+    ) -> None:
+        self.transaction = transaction
+        self.cancel_event = threading.Event()
+        self.done = threading.Event()
+        self.cancelled = False
+        self.deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+        )
+        self.result: AddOperationResult | None = None
+        self.cleanup_error: BaseException | None = None
+        self._checkpoint_complete = False
+        self._state: Literal["created", "running", "done"] = "created"
+        self._state_lock = threading.Lock()
+
+    @property
+    def state(self) -> Literal["created", "running", "done"]:
+        with self._state_lock:
+            return self._state
+
+    def _mark_started(self) -> bool:
+        with self._state_lock:
+            if self._state == "done":
+                return False
+            if self._state != "created":
+                raise HuroshikiError("Add operation is already running")
+            self._state = "running"
+            return True
+
+    def _claim_prestart_abort(self) -> bool:
+        with self._state_lock:
+            if self._state != "created":
+                return False
+            self._state = "running"
+            return True
+
+    def _complete(self, result: AddOperationResult) -> AddOperationResult:
+        with self._state_lock:
+            if self._state == "done":
+                assert self.result is not None
+                return self.result
+            self.result = result
+            self._state = "done"
+            self.done.set()
+            return result
+
+    def _checkpoint(self) -> None:
+        if self.cancel_event.is_set():
+            self.cancelled = True
+            raise AddOperationCancelled("Install operation was cancelled")
+        with self._state_lock:
+            deadline = self.deadline
+        if time.monotonic() >= deadline:
+            raise AddOperationDeadlineExceeded(
+                "Install operation deadline exceeded"
+            )
+
+    def _request_cancel(self, *, deadline: float | None) -> float:
+        with self._state_lock:
+            self.cancelled = True
+            self.cancel_event.set()
+            if deadline is not None:
+                self.deadline = min(self.deadline, deadline)
+            effective_deadline = self.deadline
+            abort_before_start = self._state == "created"
+        if abort_before_start:
+            self.abort_before_start(
+                AddOperationCancelled("Install operation was cancelled"),
+                cancelled=True,
+            )
+        return effective_deadline
+
+    def _normalized_error(self, error: BaseException) -> BaseException:
+        if self.cancelled or self.cancel_event.is_set():
+            self.cancelled = True
+            return AddOperationCancelled("Install operation was cancelled")
+        with self._state_lock:
+            deadline = self.deadline
+        if isinstance(error, AddOperationDeadlineExceeded) or time.monotonic() >= deadline:
+            return AddOperationDeadlineExceeded(
+                "Install operation deadline exceeded"
+            )
+        return error
+
+    def _error_result(self, error: BaseException) -> AddOperationResult:
+        raw_log, text_log, event_log = url_log_paths(self.log_dir)
+        message = str(error)
+        if self.cleanup_error is not None:
+            message = f"Add operation cleanup failed: {self.cleanup_error}"
+        return AddOperationResult(
+            returncode=130 if self.cancelled else 1,
+            changed_files=(),
+            raw_log=raw_log,
+            text_log=text_log,
+            event_log=event_log,
+            message=message,
+            cancelled=self.cancelled,
+        )
+
+    def abort_before_start(
+        self,
+        error: BaseException,
+        *,
+        cancelled: bool = False,
+    ) -> bool:
+        return self.transaction.fail_operation_start(
+            self,
+            error,
+            cancelled=cancelled,
+        )
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self.done.wait(timeout)
+
+
+class ResolvedAddOperation(_AddOperationLifecycle):
     def __init__(
         self,
         transaction: "PackTransaction",
@@ -783,17 +913,17 @@ class ResolvedAddOperation:
         selector: str,
         canonical_project_id: str | None,
         side: str,
+        deadline: float | None = None,
     ) -> None:
-        self.transaction = transaction
+        super().__init__(transaction, deadline=deadline)
         self.provider, self.selector = normalize_add_selector(provider, selector)
         self.canonical_project_id = canonical_project_id
         self.side = packctl.normalize_side(side)
-        self.cancel_event = threading.Event()
-        self.done = threading.Event()
-        self.cancelled = False
-        self.result: AddOperationResult | None = None
         self.checkpoint = transaction.root / f"checkpoint-{uuid4().hex}"
         self.resolver_root = transaction.root / f"resolved-{uuid4().hex}"
+        self.minecraft = ""
+        self.loader = ""
+        self.loader_version = ""
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         self.log_dir = (
             ROOT
@@ -804,41 +934,57 @@ class ResolvedAddOperation:
         )
 
     def run(self) -> AddOperationResult:
+        if not self._mark_started():
+            assert self.result is not None
+            return self.result
+        fatal_error: BaseException | None = None
+        result: AddOperationResult | None = None
         raw_log, text_log, event_log = url_log_paths(self.log_dir)
         try:
-            if self.cancel_event.is_set():
-                raise HuroshikiError("MOD resolution was cancelled")
+            self._checkpoint()
             with self.transaction._lock:
                 if not self.transaction.active or self.transaction._operation is not self:
                     raise HuroshikiError("Transaction was closed before MOD resolution started")
-                copy_transaction_source(
-                    self.transaction.source,
-                    self.checkpoint,
-                )
-            minecraft, loader, loader_version = packctl.project_versions(
-                self.transaction.source
+            self._checkpoint()
+            copy_transaction_source(
+                self.transaction.source,
+                self.checkpoint,
+                checkpoint=self._checkpoint,
             )
+            self._checkpoint_complete = True
+            self._checkpoint()
+            with self.transaction._lock:
+                if not self.transaction.active or self.transaction._operation is not self:
+                    raise HuroshikiError(
+                        "Transaction was closed during MOD checkpoint preparation"
+                    )
+                self.minecraft, self.loader, self.loader_version = (
+                    packctl.project_versions(self.transaction.source)
+                )
+                self._checkpoint()
             closure = resolve_mod_closure(
                 provider=self.provider,
                 selector=self.selector,
-                minecraft=minecraft,
-                loader=loader,
-                loader_version=loader_version,
+                minecraft=self.minecraft,
+                loader=self.loader,
+                loader_version=self.loader_version,
                 canonical_project_id=self.canonical_project_id,
                 cancel_event=self.cancel_event,
+                deadline=self.deadline,
             )
+            self._checkpoint()
             with self.transaction._lock:
-                if self.cancel_event.is_set():
-                    raise HuroshikiError("MOD resolution was cancelled")
                 if not self.transaction.active or self.transaction._operation is not self:
                     raise HuroshikiError(
                         "Transaction was closed before MOD resolution completed"
                     )
+                self._checkpoint()
                 changed = merge_metadata_closure(
                     self.transaction.source,
                     closure,
                     requested_side=self.side,
                 )
+                self._checkpoint()
                 self.transaction.batches.append(
                     TransactionBatch(
                         provider=self.provider,
@@ -846,9 +992,12 @@ class ResolvedAddOperation:
                         changed_files=changed,
                     )
                 )
-                shutil.rmtree(self.checkpoint, ignore_errors=True)
+                if self.resolver_root.exists():
+                    shutil.rmtree(self.resolver_root)
+                shutil.rmtree(self.checkpoint)
+                self._checkpoint_complete = False
                 self.transaction._operation = None
-            self.result = AddOperationResult(
+            result = AddOperationResult(
                 0,
                 changed,
                 raw_log,
@@ -856,30 +1005,27 @@ class ResolvedAddOperation:
                 event_log,
                 f"Staged {self.provider}:{closure.root_identity[1]} and dependencies",
             )
-        except Exception as error:
-            self.transaction._rollback_add(self)
-            self.result = AddOperationResult(
-                130 if self.cancelled else 1,
-                (),
-                raw_log,
-                text_log,
-                event_log,
-                str(error),
-                self.cancelled,
-            )
-        finally:
-            self.done.set()
-        return self.result
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                fatal_error = error
+            error = self._normalized_error(error)
+            try:
+                self.transaction._rollback_add(self)
+            except BaseException as cleanup_error:
+                self.cleanup_error = cleanup_error
+            result = self._error_result(error)
+        if result is None:
+            result = self._error_result(HuroshikiError("Add operation failed"))
+        completed = self._complete(result)
+        if fatal_error is not None:
+            raise fatal_error
+        return completed
 
     def cancel(self, *, deadline: float | None = None) -> None:
-        self.cancelled = True
-        self.cancel_event.set()
-
-    def wait(self, timeout: float | None = None) -> bool:
-        return self.done.wait(timeout)
+        self._request_cancel(deadline=deadline)
 
 
-class PackwizAddOperation:
+class PackwizAddOperation(_AddOperationLifecycle):
     def __init__(
         self,
         transaction: "PackTransaction",
@@ -889,33 +1035,23 @@ class PackwizAddOperation:
         client: bool,
         server: bool,
         on_event: Callable[[ParserEvent], None] | None = None,
+        deadline: float | None = None,
     ) -> None:
-        self.transaction = transaction
+        super().__init__(transaction, deadline=deadline)
         self.provider, self.query = normalize_add_selector(provider, query)
         self.client = client
         self.server = server
         self.on_event = on_event
-        self.cancelled = False
-        self.cancel_event = threading.Event()
-        self.done = threading.Event()
-        self.result: AddOperationResult | None = None
         self.termination_result: ProcessTerminationResult | None = None
         self.termination_incomplete = False
-        self.cleanup_error: BaseException | None = None
         self.menu_items: dict[int, str] = {}
         self.selection: str | None = None
         self.checkpoint = transaction.root / f"checkpoint-{uuid4().hex}"
-        copy_transaction_source(transaction.source, self.checkpoint)
         self.resolver_root = transaction.root / f"resolver-{uuid4().hex}"
         self.resolver_source = self.resolver_root / "source"
-        minecraft, loader, loader_version = packctl.project_versions(transaction.source)
-        create_resolver_source(
-            self.resolver_source,
-            display_name=f"Resolve {self.query}",
-            minecraft=minecraft,
-            loader=loader,
-            loader_version=loader_version,
-        )
+        self.minecraft = ""
+        self.loader = ""
+        self.loader_version = ""
 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         self.log_dir = (
@@ -923,57 +1059,88 @@ class PackwizAddOperation:
             / transaction.project_key.replace(":", "-")
             / f"{timestamp}-{uuid4().hex[:8]}"
         )
-        packctl.ensure_safe_state_path(
-            self.log_dir,
-            state_root=ROOT / ".huroshiki",
-            repository_root=ROOT,
-        )
         self.session: PackwizPtySession | None = None
-        if self.provider != "url":
-            def record_event(event: ParserEvent) -> None:
-                if event.kind == "search_results":
-                    self.menu_items = {item.index: item.label for item in event.items}
-                if self.on_event is not None:
-                    self.on_event(event)
 
-            self.session = PackwizPtySession(
-                build_add_command(self.provider, self.query),
-                cwd=self.resolver_source,
-                log_dir=self.log_dir,
-                on_event=record_event,
+    def _prepare(self) -> None:
+        self._checkpoint()
+        with self.transaction._lock:
+            if not self.transaction.active or self.transaction._operation is not self:
+                raise HuroshikiError("Transaction was closed before add preparation started")
+        self._checkpoint()
+        copy_transaction_source(
+            self.transaction.source,
+            self.checkpoint,
+            checkpoint=self._checkpoint,
+        )
+        self._checkpoint_complete = True
+        self._checkpoint()
+        with self.transaction._lock:
+            if not self.transaction.active or self.transaction._operation is not self:
+                raise HuroshikiError(
+                    "Transaction was closed during add checkpoint preparation"
+                )
+            self.minecraft, self.loader, self.loader_version = packctl.project_versions(
+                self.transaction.source
             )
+            self._checkpoint()
+            create_resolver_source(
+                self.resolver_source,
+                display_name=f"Resolve {self.query}",
+                minecraft=self.minecraft,
+                loader=self.loader,
+                loader_version=self.loader_version,
+            )
+            self._checkpoint()
+            packctl.ensure_safe_state_path(
+                self.log_dir,
+                state_root=ROOT / ".huroshiki",
+                repository_root=ROOT,
+            )
+            if self.provider != "url":
+                def record_event(event: ParserEvent) -> None:
+                    if event.kind == "search_results":
+                        self.menu_items = {item.index: item.label for item in event.items}
+                    if self.on_event is not None:
+                        self.on_event(event)
+
+                self.session = PackwizPtySession(
+                    build_add_command(self.provider, self.query),
+                    cwd=self.resolver_source,
+                    log_dir=self.log_dir,
+                    on_event=record_event,
+                )
+            self._checkpoint()
 
     def run(self) -> AddOperationResult:
+        if not self._mark_started():
+            assert self.result is not None
+            return self.result
+        fatal_error: BaseException | None = None
+        result: AddOperationResult | None = None
         try:
+            self._prepare()
+            self._checkpoint()
             if self.provider == "url":
-                self.result = self.transaction._finish_url_add(self)
+                result = self.transaction._finish_url_add(self)
             else:
                 if self.session is None:
                     raise HuroshikiError("Packwiz PTY session was not initialized")
                 pty_result = self.session.run()
                 self.termination_result = pty_result.termination_result
                 self.termination_incomplete = pty_result.termination_incomplete
-                self.result = self.transaction._finish_add(self, pty_result)
-            return self.result
-        except Exception as error:
+                self._checkpoint()
+                result = self.transaction._finish_add(self, pty_result)
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                fatal_error = error
+            error = self._normalized_error(error)
             try:
                 self.transaction._rollback_add(self)
             except BaseException as cleanup_error:
                 self.cleanup_error = cleanup_error
-                raise
-            raw_log, text_log, event_log = url_log_paths(self.log_dir)
             if self.provider == "url":
                 ensure_url_error_log(self.log_dir, str(error))
-            self.result = AddOperationResult(
-                returncode=1,
-                changed_files=(),
-                raw_log=raw_log,
-                text_log=text_log,
-                event_log=event_log,
-                message=str(error),
-                cancelled=self.cancelled,
-            )
-            return self.result
+            result = self._error_result(error)
         finally:
             if self.session is not None and self.session.termination_result is not None:
                 self.termination_result = self.session.termination_result
@@ -981,7 +1148,12 @@ class PackwizAddOperation:
                     self.termination_result.group_drained
                     and self.termination_result.parent_reaped
                 )
-            self.done.set()
+            if result is None:
+                result = self._error_result(HuroshikiError("Add operation failed"))
+        completed = self._complete(result)
+        if fatal_error is not None:
+            raise fatal_error
+        return completed
 
     def send_selection(self, index: int) -> None:
         if self.session is None:
@@ -994,24 +1166,23 @@ class PackwizAddOperation:
             self.session.send_line("y" if accepted else "n")
 
     def cancel_menu(self) -> None:
-        self.cancelled = True
-        self.cancel_event.set()
+        effective_deadline = self._request_cancel(deadline=None)
         if self.session is None:
             return
         try:
             self.session.send_line("0")
         except (OSError, RuntimeError):
-            self.session.cancel()
+            self.session.cancel(deadline=effective_deadline)
 
     def cancel(
         self,
         *,
         deadline: float | None = None,
     ) -> ProcessTerminationResult | None:
-        self.cancelled = True
-        self.cancel_event.set()
-        if self.session is not None:
-            self.termination_result = self.session.cancel(deadline=deadline)
+        effective_deadline = self._request_cancel(deadline=deadline)
+        session = self.session
+        if session is not None:
+            self.termination_result = session.cancel(deadline=effective_deadline)
             if self.termination_result is not None:
                 self.termination_incomplete = not (
                     self.termination_result.group_drained
@@ -1022,10 +1193,6 @@ class PackwizAddOperation:
     def resize(self, width: int, height: int) -> None:
         if self.session is not None:
             self.session.resize(width, height)
-
-    def wait(self, timeout: float | None = None) -> bool:
-        return self.done.wait(timeout)
-
 
 TRANSACTION_DISCARD_TIMEOUT_SECONDS = 10.0
 
@@ -1301,16 +1468,13 @@ class PackTransaction:
         client: bool,
         server: bool,
         on_event: Callable[[ParserEvent], None] | None = None,
+        deadline: float | None = None,
     ) -> PackwizAddOperation:
         side_from_flags(client, server)
         with self._lock:
             self.ensure_active()
             if self._operation is not None:
-                if not self._operation.done.is_set() or (
-                    isinstance(self._operation, PackwizAddOperation)
-                    and self._operation.termination_incomplete
-                ):
-                    raise HuroshikiError("Another Packwiz search is already running")
+                raise HuroshikiError("Another Packwiz search is already running")
             operation = PackwizAddOperation(
                 self,
                 provider,
@@ -1318,6 +1482,7 @@ class PackTransaction:
                 client=client,
                 server=server,
                 on_event=on_event,
+                deadline=deadline,
             )
             self._operation = operation
             return operation
@@ -1329,24 +1494,52 @@ class PackTransaction:
         selector: str,
         canonical_project_id: str | None,
         side: str,
+        deadline: float | None = None,
     ) -> ResolvedAddOperation:
         with self._lock:
             self.ensure_active()
             if self._operation is not None:
-                if not self._operation.done.is_set() or (
-                    isinstance(self._operation, PackwizAddOperation)
-                    and self._operation.termination_incomplete
-                ):
-                    raise HuroshikiError("Another add operation is already running")
+                raise HuroshikiError("Another add operation is already running")
             operation = ResolvedAddOperation(
                 self,
                 provider=provider,
                 selector=selector,
                 canonical_project_id=canonical_project_id,
                 side=side,
+                deadline=deadline,
             )
             self._operation = operation
             return operation
+
+    def fail_operation_start(
+        self,
+        operation: _AddOperationLifecycle,
+        error: BaseException,
+        *,
+        cancelled: bool = False,
+    ) -> bool:
+        if not operation._claim_prestart_abort():
+            return False
+        cleanup_errors: list[BaseException] = []
+        with self._lock:
+            if self._operation is operation:
+                for path in (operation.checkpoint, operation.resolver_root):
+                    if not path.exists():
+                        continue
+                    try:
+                        shutil.rmtree(path)
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
+                self._operation = None
+            else:
+                cleanup_errors.append(
+                    HuroshikiError("Add operation ownership changed before worker start")
+                )
+        operation.cancelled = operation.cancelled or cancelled
+        if cleanup_errors:
+            operation.cleanup_error = cleanup_errors[0]
+        operation._complete(operation._error_result(error))
+        return True
 
     def add(self, provider: str, query: str) -> subprocess.CompletedProcess[str]:
         """Compatibility path for synchronous add callers."""
@@ -1448,6 +1641,7 @@ class PackTransaction:
         pty_result: PtyResult,
     ) -> AddOperationResult:
         with self._lock:
+            operation._checkpoint()
             if not self.active or self._operation is not operation:
                 self._rollback_add(operation)
                 if pty_result.termination_incomplete:
@@ -1463,6 +1657,7 @@ class PackTransaction:
                 )
 
             ensure_safe_pack_source(self.source)
+            operation._checkpoint()
             if pty_result.termination_incomplete:
                 self._rollback_add(operation)
                 self._operation = operation
@@ -1498,13 +1693,17 @@ class PackTransaction:
                     cancelled=operation.cancelled,
                 )
 
+            operation._checkpoint()
             metadata = _read_resolver_metadata(operation.resolver_source)
+            operation._checkpoint()
             selected = operation.selection or operation.query
             project_id = resolve_project_selector(
                 operation.provider,
                 selected,
                 cancel_event=operation.cancel_event,
+                deadline=operation.deadline,
             ).canonical_project_id
+            operation._checkpoint()
             if project_id is None:
                 raise HuroshikiError(
                     "Selected Packwiz result has no canonical project ID; "
@@ -1518,6 +1717,7 @@ class PackTransaction:
                 ResolvedModClosure(root_identity, metadata),
                 requested_side=side_from_flags(operation.client, operation.server),
             )
+            operation._checkpoint()
 
             self.batches.append(
                 TransactionBatch(
@@ -1526,8 +1726,10 @@ class PackTransaction:
                     changed_files=changed,
                 )
             )
-            shutil.rmtree(operation.checkpoint, ignore_errors=True)
-            shutil.rmtree(operation.resolver_root, ignore_errors=True)
+            if operation.resolver_root.exists():
+                shutil.rmtree(operation.resolver_root)
+            shutil.rmtree(operation.checkpoint)
+            operation._checkpoint_complete = False
             self._operation = None
             return AddOperationResult(
                 returncode=0,
@@ -1542,86 +1744,102 @@ class PackTransaction:
         self,
         operation: PackwizAddOperation,
     ) -> AddOperationResult:
-        try:
-            artifact = download_url_artifact(
-                operation.query,
-                operation.cancel_event,
-                operation.log_dir,
-                project_info(self.project_key).loader,
-                project_url_max_jar_size_bytes(self.project_key),
-                allow_private_networks=project_url_allow_private_networks(
-                    self.project_key
-                ),
+        operation._checkpoint()
+        remaining = operation.deadline - time.monotonic()
+        if remaining <= 0:
+            raise AddOperationDeadlineExceeded(
+                "Install operation deadline exceeded"
             )
-            if operation.cancelled or operation.cancel_event.is_set():
-                raise HuroshikiError("URL addition was cancelled")
+        artifact = download_url_artifact(
+            operation.query,
+            operation.cancel_event,
+            operation.log_dir,
+            operation.loader,
+            project_url_max_jar_size_bytes(self.project_key),
+            allow_private_networks=project_url_allow_private_networks(
+                self.project_key
+            ),
+            total_timeout_seconds=min(
+                DEFAULT_URL_TOTAL_TIMEOUT_SECONDS,
+                remaining,
+            ),
+        )
+        operation._checkpoint()
 
-            with self._lock:
-                if not self.active or self._operation is not operation:
-                    raise HuroshikiError(
-                        "Transaction was closed before the URL download completed"
-                    )
-                relative_path = Path("mods") / f"{artifact.mod_id}.pw.toml"
-                write_url_metadata(
-                    operation.resolver_source,
-                    relative_path,
-                    artifact,
-                    "both",
+        with self._lock:
+            if not self.active or self._operation is not operation:
+                raise HuroshikiError(
+                    "Transaction was closed before the URL download completed"
                 )
-                metadata = _read_resolver_metadata(operation.resolver_source)
-                identity = ("url", artifact.mod_id)
-                changed = merge_metadata_closure(
-                    self.source,
-                    ResolvedModClosure(identity, metadata),
-                    requested_side=side_from_flags(operation.client, operation.server),
+            operation._checkpoint()
+            relative_path = Path("mods") / f"{artifact.mod_id}.pw.toml"
+            write_url_metadata(
+                operation.resolver_source,
+                relative_path,
+                artifact,
+                "both",
+            )
+            metadata = _read_resolver_metadata(operation.resolver_source)
+            identity = ("url", artifact.mod_id)
+            operation._checkpoint()
+            changed = merge_metadata_closure(
+                self.source,
+                ResolvedModClosure(identity, metadata),
+                requested_side=side_from_flags(operation.client, operation.server),
+            )
+            operation._checkpoint()
+            if not changed:
+                raise HuroshikiError("The URL metadata is already current")
+            self.batches.append(
+                TransactionBatch(
+                    provider="url",
+                    query=operation.query,
+                    changed_files=changed,
                 )
-                if not changed:
-                    raise HuroshikiError("The URL metadata is already current")
-                self.batches.append(
-                    TransactionBatch(
-                        provider="url",
-                        query=operation.query,
-                        changed_files=changed,
-                    )
-                )
-                shutil.rmtree(operation.checkpoint, ignore_errors=True)
-                shutil.rmtree(operation.resolver_root, ignore_errors=True)
-                self._operation = None
+            )
+            if operation.resolver_root.exists():
+                shutil.rmtree(operation.resolver_root)
+            shutil.rmtree(operation.checkpoint)
+            operation._checkpoint_complete = False
+            self._operation = None
 
-            raw_log, text_log, event_log = url_log_paths(operation.log_dir)
-            version = f" {artifact.version}" if artifact.version else ""
-            return AddOperationResult(
-                returncode=0,
-                changed_files=changed,
-                raw_log=raw_log,
-                text_log=text_log,
-                event_log=event_log,
-                message=f"Staged {artifact.name}{version} from self-hosted URL",
-            )
-        except Exception as error:
-            self._rollback_add(operation)
-            ensure_url_error_log(operation.log_dir, str(error))
-            raw_log, text_log, event_log = url_log_paths(operation.log_dir)
-            return AddOperationResult(
-                returncode=130 if operation.cancelled else 1,
-                changed_files=(),
-                raw_log=raw_log,
-                text_log=text_log,
-                event_log=event_log,
-                message=str(error),
-                cancelled=operation.cancelled,
-            )
+        raw_log, text_log, event_log = url_log_paths(operation.log_dir)
+        version = f" {artifact.version}" if artifact.version else ""
+        return AddOperationResult(
+            returncode=0,
+            changed_files=changed,
+            raw_log=raw_log,
+            text_log=text_log,
+            event_log=event_log,
+            message=f"Staged {artifact.name}{version} from self-hosted URL",
+        )
 
     def _rollback_add(
         self, operation: PackwizAddOperation | ResolvedAddOperation
     ) -> None:
+        cleanup_errors: list[BaseException] = []
         with self._lock:
             if operation.checkpoint.exists():
-                shutil.rmtree(self.source, ignore_errors=True)
-                operation.checkpoint.rename(self.source)
-            shutil.rmtree(operation.resolver_root, ignore_errors=True)
-            if self._operation is operation:
+                try:
+                    if operation._checkpoint_complete:
+                        shutil.rmtree(self.source)
+                        operation.checkpoint.rename(self.source)
+                        operation._checkpoint_complete = False
+                    else:
+                        shutil.rmtree(operation.checkpoint)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            if operation.resolver_root.exists():
+                try:
+                    shutil.rmtree(operation.resolver_root)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            if not cleanup_errors and self._operation is operation:
                 self._operation = None
+        if cleanup_errors:
+            raise HuroshikiError(
+                f"Could not restore add operation checkpoint: {cleanup_errors[0]}"
+            ) from cleanup_errors[0]
 
     def staged_mods(self) -> list[ModInfo]:
         self.ensure_active()
@@ -1634,12 +1852,15 @@ class PackTransaction:
         ]
 
     def set_side(self, relative_path: Path, client: bool, server: bool) -> None:
-        self.ensure_active()
-        side = side_from_flags(client, server)
-        path = safe_child(self.source, relative_path)
-        if not path.is_file() or not path.name.endswith(".pw.toml"):
-            raise HuroshikiError(f"Unknown metadata file: {relative_path}")
-        packctl.set_side_file(path, side)
+        with self._lock:
+            self.ensure_active()
+            if self._operation is not None:
+                raise HuroshikiError("Wait for the active add operation to finish")
+            side = side_from_flags(client, server)
+            path = safe_child(self.source, relative_path)
+            if not path.is_file() or not path.name.endswith(".pw.toml"):
+                raise HuroshikiError(f"Unknown metadata file: {relative_path}")
+            packctl.set_side_file(path, side)
 
     def unstage(self, relative_path: Path) -> None:
         """Remove one selected metadata change from the transaction.
@@ -1651,9 +1872,9 @@ class PackTransaction:
         """
         self.ensure_active()
         with self._lock:
-            if self._operation is not None and not self._operation.done.is_set():
+            if self._operation is not None:
                 raise HuroshikiError(
-                    "Wait for the active Packwiz search to finish"
+                    "Wait for the active add operation to finish"
                 )
 
             current = metadata_digest_snapshot(self.source)
@@ -1853,8 +2074,8 @@ class PackTransaction:
     ) -> None:
         self.ensure_active()
         with self._lock:
-            if self._operation is not None and not self._operation.done.is_set():
-                raise HuroshikiError("Wait for the active Packwiz search to finish")
+            if self._operation is not None:
+                raise HuroshikiError("Wait for the active add operation to finish")
 
         kind, project_id = split_project_key(self.project_key)
         if kind == "template":
@@ -2118,16 +2339,13 @@ class PackTransaction:
                     f"Active operation did not stop before discard deadline for "
                     f"{self.project_key}"
                 )
-        if (
-            isinstance(operation, PackwizAddOperation)
-            and operation.termination_incomplete
-        ):
+        if isinstance(operation, PackwizAddOperation) and operation.termination_incomplete:
             operation.cancel(deadline=discard.deadline)
+        if operation is not None and getattr(operation, "cleanup_error", None) is not None:
+            raise TransactionDiscardIntegrityError(
+                f"Active operation cleanup failed: {operation.cleanup_error}"
+            ) from operation.cleanup_error
         if isinstance(operation, PackwizAddOperation):
-            if operation.cleanup_error is not None:
-                raise TransactionDiscardIntegrityError(
-                    f"Active operation cleanup failed: {operation.cleanup_error}"
-                ) from operation.cleanup_error
             if operation.termination_incomplete:
                 raise TransactionDiscardIntegrityError(
                     "Active Packwiz process-group cleanup was incomplete"

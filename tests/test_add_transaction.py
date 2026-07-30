@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -81,9 +82,13 @@ class AddTransactionTest(unittest.TestCase):
         self.temp.cleanup()
 
     def snapshot(self) -> dict[Path, bytes | str]:
+        return self.snapshot_tree(self.source)
+
+    @staticmethod
+    def snapshot_tree(root: Path) -> dict[Path, bytes | str]:
         snapshot: dict[Path, bytes | str] = {}
-        for path in sorted(self.source.rglob("*")):
-            relative = path.relative_to(self.source)
+        for path in sorted(root.rglob("*")):
+            relative = path.relative_to(root)
             if path.is_symlink():
                 snapshot[relative] = f"symlink:{path.readlink()}"
             elif path.is_file():
@@ -595,6 +600,403 @@ class AddTransactionTest(unittest.TestCase):
             assert operation.result is not None
             self.assertTrue(operation.result.cancelled)
             self.assertEqual(staged.read_bytes(), before)
+        finally:
+            transaction.discard()
+
+    def test_add_operation_constructors_do_not_prepare_filesystems(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        try:
+            with patch.object(core, "copy_transaction_source") as copy, patch.object(
+                core, "create_resolver_source"
+            ) as create, patch.object(
+                core.packctl, "project_versions"
+            ) as versions, patch.object(
+                core.packctl, "ensure_safe_state_path"
+            ) as validate_log, patch.object(
+                core, "PackwizPtySession"
+            ) as session:
+                before = time.monotonic()
+                url_operation = transaction.begin_add(
+                    "url",
+                    "https://example.invalid/private.jar",
+                    client=True,
+                    server=True,
+                )
+                after = time.monotonic()
+                self.assertGreaterEqual(
+                    url_operation.deadline,
+                    before + core.PACKWIZ_OPERATION_TIMEOUT_SECONDS,
+                )
+                self.assertLessEqual(
+                    url_operation.deadline,
+                    after + core.PACKWIZ_OPERATION_TIMEOUT_SECONDS,
+                )
+                copy.assert_not_called()
+                create.assert_not_called()
+                versions.assert_not_called()
+                validate_log.assert_not_called()
+                session.assert_not_called()
+                self.assertFalse(url_operation.checkpoint.exists())
+                self.assertFalse(url_operation.resolver_root.exists())
+                self.assertIsNone(url_operation.session)
+                self.assertTrue(
+                    url_operation.abort_before_start(
+                        core.HuroshikiError("test cleanup")
+                    )
+                )
+
+                resolved_operation = transaction.begin_resolved_add(
+                    provider="modrinth",
+                    selector="root",
+                    canonical_project_id="root",
+                    side="both",
+                )
+                copy.assert_not_called()
+                create.assert_not_called()
+                versions.assert_not_called()
+                self.assertFalse(resolved_operation.checkpoint.exists())
+                self.assertFalse(resolved_operation.resolver_root.exists())
+                resolved_operation.abort_before_start(
+                    core.HuroshikiError("test cleanup")
+                )
+        finally:
+            transaction.discard()
+
+    def test_url_checkpoint_copy_runs_only_in_operation_worker(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        caller_thread = threading.get_ident()
+        copy_threads: list[int] = []
+        original_copy = core.copy_transaction_source
+        try:
+            operation = transaction.begin_add(
+                "url",
+                "https://example.invalid/private.jar",
+                client=True,
+                server=True,
+            )
+            self.assertEqual(copy_threads, [])
+
+            def copy(*args, **kwargs):
+                copy_threads.append(threading.get_ident())
+                return original_copy(*args, **kwargs)
+
+            with patch.object(core, "copy_transaction_source", side_effect=copy), patch.object(
+                core, "download_url_artifact", return_value=self.url_artifact()
+            ):
+                worker = threading.Thread(target=operation.run)
+                worker.start()
+                worker.join(2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(copy_threads), 1)
+            self.assertNotEqual(copy_threads[0], caller_thread)
+            assert operation.result is not None
+            self.assertTrue(operation.result.success, operation.result.message)
+            self.assertIs(operation.run(), operation.result)
+        finally:
+            transaction.discard()
+
+    def test_checkpoint_copy_cancellation_removes_partial_state_and_rolls_back(self) -> None:
+        for resolved in (False, True):
+            with self.subTest(resolved=resolved):
+                transaction = core.PackTransaction.create(self.key)
+                started = threading.Event()
+                staged = transaction.source / "mods/staged.pw.toml"
+                staged.write_text(metadata("Staged", "staged"), encoding="utf-8")
+                staged_before = self.snapshot_tree(transaction.source)
+                real_before = self.snapshot()
+                try:
+                    operation = (
+                        transaction.begin_resolved_add(
+                            provider="modrinth",
+                            selector="root",
+                            canonical_project_id="root",
+                            side="both",
+                        )
+                        if resolved
+                        else transaction.begin_add(
+                            "url",
+                            "https://example.invalid/private.jar",
+                            client=True,
+                            server=True,
+                        )
+                    )
+
+                    def copy(_, destination, *, checkpoint):
+                        destination.mkdir(parents=True)
+                        (destination / "partial").write_text("partial", encoding="utf-8")
+                        started.set()
+                        while True:
+                            checkpoint()
+                            time.sleep(0.005)
+
+                    with patch.object(core, "copy_transaction_source", side_effect=copy):
+                        worker = threading.Thread(target=operation.run)
+                        worker.start()
+                        self.assertTrue(started.wait(1))
+                        operation.cancel(deadline=time.monotonic() + 1)
+                        worker.join(2)
+
+                    self.assertFalse(worker.is_alive())
+                    assert operation.result is not None
+                    self.assertTrue(operation.result.cancelled)
+                    self.assertEqual(operation.result.returncode, 130)
+                    self.assertFalse(operation.checkpoint.exists())
+                    self.assertFalse(operation.resolver_root.exists())
+                    self.assertEqual(
+                        self.snapshot_tree(transaction.source), staged_before
+                    )
+                    self.assertEqual(self.snapshot(), real_before)
+                    self.assertIsNone(transaction._operation)
+                    self.assertTrue(operation.done.is_set())
+                finally:
+                    transaction.discard()
+
+    def test_checkpoint_copy_deadline_is_distinct_from_cancellation(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        staged_before = self.snapshot_tree(transaction.source)
+        real_before = self.snapshot()
+        try:
+            operation = transaction.begin_add(
+                "url",
+                "https://example.invalid/private.jar",
+                client=True,
+                server=True,
+                deadline=time.monotonic() + 0.03,
+            )
+
+            def copy(_, destination, *, checkpoint):
+                destination.mkdir(parents=True)
+                (destination / "partial").touch()
+                while True:
+                    checkpoint()
+                    time.sleep(0.005)
+
+            with patch.object(core, "copy_transaction_source", side_effect=copy):
+                result = operation.run()
+
+            self.assertFalse(result.cancelled)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.message, "Install operation deadline exceeded")
+            self.assertFalse(operation.checkpoint.exists())
+            self.assertFalse(operation.resolver_root.exists())
+            self.assertEqual(self.snapshot_tree(transaction.source), staged_before)
+            self.assertEqual(self.snapshot(), real_before)
+            self.assertIsNone(transaction._operation)
+        finally:
+            transaction.discard()
+
+    def test_checkpoint_copy_rejects_conflicting_transaction_mutations(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        started = threading.Event()
+        staged = transaction.source / "mods/staged.pw.toml"
+        staged.write_text(metadata("Staged", "staged"), encoding="utf-8")
+        try:
+            operation = transaction.begin_add(
+                "url",
+                "https://example.invalid/private.jar",
+                client=True,
+                server=True,
+            )
+
+            def copy(_, destination, *, checkpoint):
+                destination.mkdir(parents=True)
+                started.set()
+                while True:
+                    checkpoint()
+                    time.sleep(0.005)
+
+            with patch.object(core, "copy_transaction_source", side_effect=copy):
+                worker = threading.Thread(target=operation.run)
+                worker.start()
+                self.assertTrue(started.wait(1))
+                with self.assertRaisesRegex(core.HuroshikiError, "Another Packwiz"):
+                    transaction.begin_add(
+                        "url",
+                        "https://example.invalid/second.jar",
+                        client=True,
+                        server=True,
+                    )
+                with self.assertRaisesRegex(core.HuroshikiError, "active add operation"):
+                    transaction.set_side(Path("mods/staged.pw.toml"), True, False)
+                with self.assertRaisesRegex(core.HuroshikiError, "active add operation"):
+                    transaction.unstage(Path("mods/staged.pw.toml"))
+                with self.assertRaisesRegex(core.HuroshikiError, "active add operation"):
+                    transaction.apply()
+                operation.cancel(deadline=time.monotonic() + 1)
+                worker.join(2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertIsNone(transaction._operation)
+        finally:
+            transaction.discard()
+
+    def test_resolved_add_propagates_operation_deadline(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        deadline = time.monotonic() + 30
+        closure = self.closure("root")
+        try:
+            operation = transaction.begin_resolved_add(
+                provider="modrinth",
+                selector="root",
+                canonical_project_id="root",
+                side="both",
+                deadline=deadline,
+            )
+            with patch.object(
+                core, "resolve_mod_closure", return_value=closure
+            ) as resolve:
+                result = operation.run()
+            self.assertTrue(result.success, result.message)
+            self.assertEqual(resolve.call_args.kwargs["deadline"], deadline)
+            self.assertIs(resolve.call_args.kwargs["cancel_event"], operation.cancel_event)
+        finally:
+            transaction.discard()
+
+    def test_cancel_tightens_but_never_extends_operation_deadline(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        try:
+            first = time.monotonic() + 30
+            operation = transaction.begin_resolved_add(
+                provider="modrinth",
+                selector="root",
+                canonical_project_id="root",
+                side="both",
+                deadline=first,
+            )
+            operation.cancel(deadline=first + 30)
+            self.assertEqual(operation.deadline, first)
+            self.assertTrue(operation.done.is_set())
+
+            second = transaction.begin_resolved_add(
+                provider="modrinth",
+                selector="root",
+                canonical_project_id="root",
+                side="both",
+                deadline=first,
+            )
+            tightened = first - 10
+            second.cancel(deadline=tightened)
+            self.assertEqual(second.deadline, tightened)
+            self.assertTrue(second.done.is_set())
+        finally:
+            transaction.discard()
+
+    def test_url_timeout_is_clipped_and_expired_deadline_skips_download(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        try:
+            deadline = time.monotonic() + 5
+            operation = transaction.begin_add(
+                "url",
+                "https://example.invalid/private.jar",
+                client=True,
+                server=True,
+                deadline=deadline,
+            )
+            observed_timeouts: list[tuple[float, float]] = []
+
+            def download(*_, total_timeout_seconds, **__):
+                observed_timeouts.append(
+                    (total_timeout_seconds, deadline - time.monotonic())
+                )
+                return self.url_artifact()
+
+            with patch.object(
+                core, "download_url_artifact", side_effect=download
+            ):
+                result = operation.run()
+            self.assertTrue(result.success, result.message)
+            timeout, remaining = observed_timeouts[0]
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, core.DEFAULT_URL_TOTAL_TIMEOUT_SECONDS)
+            self.assertLessEqual(timeout, remaining + 0.01)
+
+            expired = transaction.begin_add(
+                "url",
+                "https://example.invalid/expired.jar",
+                client=True,
+                server=True,
+                deadline=time.monotonic() - 1,
+            )
+            with patch.object(core, "download_url_artifact") as skipped:
+                expired_result = expired.run()
+            skipped.assert_not_called()
+            self.assertEqual(
+                expired_result.message, "Install operation deadline exceeded"
+            )
+            self.assertFalse(expired_result.cancelled)
+        finally:
+            transaction.discard()
+
+    def test_cancel_after_checkpoint_restores_staged_and_real_sources(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        entered = threading.Event()
+        staged = transaction.source / "mods/staged.pw.toml"
+        staged.write_text(metadata("Staged", "staged"), encoding="utf-8")
+        staged_before = self.snapshot_tree(transaction.source)
+        real_before = self.snapshot()
+        try:
+            operation = transaction.begin_add(
+                "url",
+                "https://example.invalid/private.jar",
+                client=True,
+                server=True,
+            )
+
+            def download(*_, **__):
+                entered.set()
+                operation.cancel_event.wait(2)
+                raise core.HuroshikiError("download cancelled")
+
+            with patch.object(core, "download_url_artifact", side_effect=download):
+                worker = threading.Thread(target=operation.run)
+                worker.start()
+                self.assertTrue(entered.wait(1))
+                self.assertTrue(operation._checkpoint_complete)
+                operation.cancel(deadline=time.monotonic() + 1)
+                worker.join(2)
+
+            self.assertFalse(worker.is_alive())
+            assert operation.result is not None
+            self.assertTrue(operation.result.cancelled)
+            self.assertEqual(self.snapshot_tree(transaction.source), staged_before)
+            self.assertEqual(self.snapshot(), real_before)
+            self.assertFalse(operation.checkpoint.exists())
+            self.assertFalse(operation.resolver_root.exists())
+            self.assertIsNone(transaction._operation)
+        finally:
+            transaction.discard()
+
+    def test_worker_start_failure_releases_operation_ownership(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        try:
+            operation = transaction.begin_add(
+                "url",
+                "https://example.invalid/private.jar",
+                client=True,
+                server=True,
+            )
+            self.assertTrue(
+                operation.abort_before_start(
+                    core.HuroshikiError(
+                        "Add operation worker could not start: start failed"
+                    )
+                )
+            )
+            self.assertTrue(operation.done.is_set())
+            self.assertEqual(operation.state, "done")
+            assert operation.result is not None
+            self.assertIn("worker could not start", operation.result.message)
+            self.assertIsNone(transaction._operation)
+            self.assertTrue(transaction.active)
+
+            retry = transaction.begin_add(
+                "url",
+                "https://example.invalid/retry.jar",
+                client=True,
+                server=True,
+            )
+            retry.abort_before_start(core.HuroshikiError("test cleanup"))
         finally:
             transaction.discard()
 
