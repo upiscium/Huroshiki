@@ -237,6 +237,10 @@ class TransactionDiscardTest(unittest.TestCase):
         operation.done.set()
         operation.cancelled = False
         operation.cancel_event = threading.Event()
+        operation.deadline = time.monotonic() + 10
+        operation._state = "done"
+        operation._state_lock = threading.Lock()
+        operation.transaction = transaction
         operation.session = _Session()
         operation.termination_result = incomplete
         operation.cleanup_error = None
@@ -256,6 +260,7 @@ class TransactionDiscardTest(unittest.TestCase):
         retry = transaction.retry_discard(deadline=time.monotonic() + 1)
         self.assertTrue(retry.wait(1))
         retry.raise_for_error()
+        self.assertIsNone(transaction._operation)
 
     def test_replaced_source_is_retained_after_successful_discard(self) -> None:
         transaction = self.transaction()

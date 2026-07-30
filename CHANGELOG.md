@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Reliability and Transaction Safety
+
+- Install checkpoint preparation now runs inside the add-operation worker and shares cancellation
+  plus one operation-wide absolute deadline across copy, resolution, URL download, merge, rollback,
+  interactive PTY polling, cleanup, and navigation. Checkpoints, resolver trees, and failed staged
+  sources are atomically handed to retained transaction state instead of recursively deleted by the
+  operation; worker-start failure releases only operation ownership while preserving the transaction
+  and project lock. Incomplete PTY termination retains cleanup ownership and the project lock until
+  bounded navigation or discard cleanup proves group drain and parent reap.
+
 ## 0.2.0-rc.1 - 2026-07-30
 
 ### Highlights
@@ -142,12 +152,3 @@ packctl build demo
 If migration fails, correct the committed manifest or allowed local configuration and rerun
 validation. Do not repair a migration by editing the real Packwiz `packs/<id>/source` during an
 active operation.
-
-### Known Issues
-
-- [Issue #75](https://github.com/upiscium/Huroshiki/issues/75): starting a URL add from Install
-  creates its transaction checkpoint before the worker starts, so copying a large Pack can
-  temporarily make the TUI unresponsive. Modrinth and CurseForge adds perform checkpoint copying off
-  the event loop, but cancellation and the operation deadline do not yet cover that copy. Atomicity
-  of the real Pack source is preserved; operation responsiveness during checkpoint creation remains
-  an open issue planned for correction before v0.2.0.

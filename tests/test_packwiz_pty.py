@@ -172,6 +172,65 @@ class PackwizPtySessionTest(unittest.TestCase):
 
         self.assertEqual(result, incomplete)
 
+    def test_cleanup_retry_observes_drained_group_and_reaped_parent(self) -> None:
+        class _Process:
+            pid = 12345
+
+            @staticmethod
+            def poll():
+                return 0
+
+        session = PackwizPtySession(
+            ["packwiz"],
+            cwd=Path("/tmp"),
+            log_dir=Path("/tmp/logs"),
+        )
+        session.process = _Process()
+        session._termination_result = process_runner.ProcessTerminationResult(
+            False, False, True
+        )
+        with patch.object(packwiz_pty, "live_process_group_members", return_value=()):
+            result = session.cancel(deadline=time.monotonic() + 1)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(result.group_drained)
+        self.assertTrue(result.parent_reaped)
+
+    def test_deadline_terminates_unresponsive_process_group_without_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = self.make_script(
+                root,
+                """\
+                #!/usr/bin/env bash
+                trap '' INT TERM
+                sleep 30 &
+                wait
+                """,
+            )
+            session = PackwizPtySession(
+                [str(binary)],
+                cwd=root,
+                log_dir=root / "logs",
+            )
+            started = time.monotonic()
+            result = session.run(deadline=started + 0.2)
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 1.0)
+            self.assertTrue(result.timed_out)
+            self.assertFalse(result.cancelled)
+            self.assertIsNotNone(result.termination_result)
+            assert result.termination_result is not None
+            self.assertTrue(result.termination_result.group_drained)
+            self.assertTrue(result.termination_result.parent_reaped)
+            assert session.process is not None
+            self.assertEqual(
+                packwiz_pty.live_process_group_members(session.process.pid),
+                (),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
