@@ -75,6 +75,7 @@
             test -f ${huroshiki}/lib/huroshiki/packwiz_parser.py
             test -f ${huroshiki}/lib/huroshiki/process_runner.py
             test -f ${huroshiki}/lib/huroshiki/overlay_policy.py
+            test -f ${huroshiki}/lib/huroshiki/content_operations.py
             test -f ${huroshiki}/lib/huroshiki/portable_paths.py
             test -f ${huroshiki}/lib/huroshiki/provider_lookup.py
             test -f ${huroshiki}/lib/huroshiki/template_import.py

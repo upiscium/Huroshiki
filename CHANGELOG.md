@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Content Management
+
+- Added the snapshot-based Content overlay core used to safely plan and atomically publish
+  multi-file changes across common, client, and server overlays. Plans detect stale content,
+  unsafe entries, portable collisions, and effective cross-side conflicts before publication.
+
 ### Reliability and Transaction Safety
 
 - Install checkpoint preparation now runs inside the add-operation worker and shares cancellation

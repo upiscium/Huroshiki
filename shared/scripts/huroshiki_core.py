@@ -29,6 +29,35 @@ from uuid import uuid4
 import tomlkit
 
 import packctl
+from content_operations import (
+    ContentChange,
+    ContentChangePlan,
+    ContentCleanupError,
+    ContentConflict,
+    ContentCreateDirectory,
+    ContentCreateFile,
+    ContentDeleteDirectory,
+    ContentDeleteFile,
+    ContentDiscardOperation,
+    ContentEntry,
+    ContentFile,
+    ContentMove,
+    ContentOperation,
+    ContentOperationCancelled,
+    ContentOperationDeadlineExceeded,
+    ContentOperationError,
+    ContentPlanStale,
+    ContentReplaceFile,
+    ContentSnapshot,
+    ContentSnapshotEntry,
+    PathIdentity,
+    apply_content_changes as _apply_content_changes,
+    content_snapshot_at,
+    discard_content_plan as _discard_content_plan,
+    list_content_entries_at,
+    plan_content_changes_at,
+    read_content_file_at,
+)
 from process_runner import (
     BoundedProcessResult,
     PACKWIZ_OPERATION_TIMEOUT_SECONDS,
@@ -2784,6 +2813,89 @@ def safe_child(root: Path, relative: Path) -> Path:
 TEMPLATE_TARGETS = OVERLAY_TARGETS
 
 
+def _pack_content_root(project_key_value: str) -> Path:
+    kind, _ = split_project_key(project_key_value)
+    if kind != "pack":
+        raise HuroshikiError(
+            "Content management is currently available only for packs"
+        )
+    root = project_root(project_key_value)
+    if not root.is_dir():
+        raise HuroshikiError(f"Missing project directory: {root}")
+    return root
+
+
+def list_content_entries(
+    project_key_value: str,
+    side: str | None = None,
+) -> tuple[ContentEntry, ...]:
+    root = _pack_content_root(project_key_value)
+    return list_content_entries_at(project_key_value, root, side)
+
+
+def read_content_file(
+    project_key_value: str,
+    side: str,
+    relative_path: str | Path,
+    *,
+    max_bytes: int | None = None,
+) -> ContentFile:
+    root = _pack_content_root(project_key_value)
+    return read_content_file_at(
+        project_key_value,
+        root,
+        side,
+        relative_path,
+        max_bytes=max_bytes,
+    )
+
+
+def content_snapshot(project_key_value: str) -> ContentSnapshot:
+    root = _pack_content_root(project_key_value)
+    return content_snapshot_at(project_key_value, root)
+
+
+def plan_content_changes(
+    project_key_value: str,
+    operations: Iterable[ContentOperation],
+    *,
+    expected_snapshot: ContentSnapshot | None = None,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> ContentChangePlan:
+    root = _pack_content_root(project_key_value)
+    return plan_content_changes_at(
+        project_key_value,
+        root,
+        TRANSACTION_ROOT,
+        tuple(operations),
+        expected_snapshot=expected_snapshot,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+
+
+def apply_content_changes(
+    plan: ContentChangePlan,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    _apply_content_changes(
+        plan,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+
+
+def discard_content_plan(
+    plan: ContentChangePlan,
+    *,
+    deadline: float | None = None,
+) -> None:
+    _discard_content_plan(plan, deadline=deadline)
+
+
 def normalize_template_target(target: str) -> str:
     normalized = target.strip().lower()
     if normalized not in TEMPLATE_TARGETS:
@@ -2902,6 +3014,18 @@ def read_template_text(
     target: str,
     relative_path: str | Path,
 ) -> str:
+    kind, _ = split_project_key(project_key_value)
+    if kind == "pack":
+        try:
+            file = read_content_file(project_key_value, target, relative_path)
+        except ContentOperationError as error:
+            raise HuroshikiError(str(error)) from error
+        try:
+            return file.contents.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise HuroshikiError(
+                f"Template file is not UTF-8 text: {target}/{relative_path}"
+            ) from error
     try:
         return read_overlay_text(
             project_root(project_key_value) / "content",
