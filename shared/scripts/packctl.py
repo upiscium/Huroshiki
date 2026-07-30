@@ -3876,8 +3876,10 @@ def build_target(
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
 ) -> list[str]:
-    operation_deadline = deadline or (
-        time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+    operation_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
     )
     source = root / "source"
     workspace: Path | None = None
@@ -3946,8 +3948,10 @@ def _build_pack(
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
 ) -> int:
-    operation_deadline = deadline or (
-        time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+    operation_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
     )
     root = get_pack_root(pack_id)
     for required in (root / "source" / "pack.toml", root / "source" / "index.toml"):

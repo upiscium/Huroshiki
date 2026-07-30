@@ -148,6 +148,12 @@ class ResolverProcessTest(unittest.TestCase):
         popen.assert_not_called()
         self.assertTrue(result.cancelled)
 
+    def test_prestart_expired_deadline_does_not_spawn(self) -> None:
+        with patch.object(runner.subprocess, "Popen") as popen:
+            result = self.run_python("raise SystemExit(0)", deadline=0.0)
+        popen.assert_not_called()
+        self.assertTrue(result.timed_out)
+
     def test_running_cancel_terminates_process_group(self) -> None:
         cancel = threading.Event()
         timer = threading.Timer(0.15, cancel.set)

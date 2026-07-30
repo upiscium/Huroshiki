@@ -1374,6 +1374,8 @@ class RemoveTransactionTest(TransactionTestCase):
                         core.remove_installed_mods(self.key, ["first", "second"])
                 self.assertTrue(first.exists())
                 self.assertTrue(second.exists())
+                if core.TRANSACTION_ROOT.exists():
+                    self.assertEqual(list(core.TRANSACTION_ROOT.iterdir()), [])
                 with packctl.ProjectLock(self.key, "test lock release"):
                     pass
 

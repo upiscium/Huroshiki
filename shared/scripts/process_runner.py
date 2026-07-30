@@ -89,7 +89,7 @@ def stop_process_group(
     forced = False
     try:
         os.killpg(process_group, signal.SIGTERM)
-    except ProcessLookupError:
+    except OSError:
         pass
     grace_deadline = min(
         cleanup_deadline,
@@ -108,7 +108,7 @@ def stop_process_group(
         forced = True
         try:
             os.killpg(process_group, signal.SIGKILL)
-        except ProcessLookupError:
+        except OSError:
             pass
         kill_deadline = min(
             cleanup_deadline,

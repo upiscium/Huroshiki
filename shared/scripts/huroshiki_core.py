@@ -1642,8 +1642,10 @@ class PackTransaction:
             ]
             return 0
 
-        operation_deadline = deadline or (
-            time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+        operation_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
         )
         for slug in sorted(selected):
             self.ensure_active()
@@ -1716,8 +1718,10 @@ class PackTransaction:
 
         ensure_safe_pack_source(self.source)
         if refresh:
-            operation_deadline = deadline or (
-                time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+            operation_deadline = (
+                deadline
+                if deadline is not None
+                else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
             )
             _run_noninteractive_packwiz(
                 ["packwiz", "refresh"],
@@ -4363,8 +4367,10 @@ def remove_installed_mods(
     selected = set(slugs)
     if not selected:
         return 0
-    operation_deadline = deadline or (
-        time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+    operation_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
     )
     transaction = PackTransaction.create(project_key_value)
     try:
@@ -5683,7 +5689,11 @@ class TemplateImportSession:
         if kind != "pack":
             raise HuroshikiError("Templates can be imported only into packs")
         operation_cancel = cancel_event or threading.Event()
-        operation_deadline = deadline or time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS
+        operation_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS
+        )
 
         def checkpoint() -> None:
             if operation_cancel.is_set():
@@ -5934,7 +5944,10 @@ class TemplateImportOperation:
         self.session = session
         self.plan = session.plan
         self.resolved = resolved
-        self.deadline = min(session.deadline, deadline or session.deadline)
+        self.deadline = min(
+            session.deadline,
+            deadline if deadline is not None else session.deadline,
+        )
         self.cancel_event = session.cancel_event
         self.done = threading.Event()
         self.progress_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
@@ -6445,8 +6458,10 @@ def create_pack_from_templates(
     except packctl.ConfigError as error:
         raise HuroshikiError(str(error)) from error
     operation_cancel = cancel_event or threading.Event()
-    operation_deadline = deadline or (
-        time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+    operation_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
     )
     pack_key = project_key("pack", project_id)
     with packctl.ProjectLock(pack_key, "create project"):
