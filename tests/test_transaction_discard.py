@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from pathlib import Path
-import shutil
 import tempfile
 import threading
 import time
@@ -83,7 +82,7 @@ class TransactionDiscardTest(unittest.TestCase):
             transaction.discard()
             transaction.discard()
 
-        self.assertFalse(transaction.root.exists())
+        self.assertTrue(transaction.root.is_dir())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
         self.assertEqual(release.call_count, 1)
         self.assertEqual(finish.call_count, 1)
@@ -109,7 +108,7 @@ class TransactionDiscardTest(unittest.TestCase):
         active.done.set()
         self.assertTrue(first.wait(1))
         first.raise_for_error()
-        self.assertFalse(transaction.root.exists())
+        self.assertTrue(transaction.root.is_dir())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
     def test_concurrent_synchronous_discard_finalizes_once(self) -> None:
@@ -167,26 +166,58 @@ class TransactionDiscardTest(unittest.TestCase):
         self.assertIsNot(retry, operation)
         self.assertTrue(retry.wait(1))
         retry.raise_for_error()
-        self.assertFalse(transaction.root.exists())
+        self.assertTrue(transaction.root.is_dir())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
-    def test_rmtree_failure_is_observable_and_retryable(self) -> None:
+    def test_expired_finalization_deadline_completes_failed_and_retries(self) -> None:
         transaction = self.transaction()
-        original_rmtree = shutil.rmtree
-        with patch.object(core.shutil, "rmtree", side_effect=OSError("disk busy")):
-            operation = transaction.begin_discard()
-            operation.run()
+        operation = transaction.begin_discard(deadline=time.monotonic() - 1)
+        operation.run()
 
-        with self.assertRaisesRegex(core.TransactionDiscardIntegrityError, "disk busy"):
+        self.assertTrue(operation.done.is_set())
+        with self.assertRaises(core.TransactionDiscardTimeout):
             operation.raise_for_error()
         self.assertTrue(transaction.root.is_dir())
         self.assertTrue(packctl.project_lock_is_active("pack:demo"))
 
-        with patch.object(core.shutil, "rmtree", side_effect=original_rmtree):
+        retry = transaction.retry_discard(deadline=time.monotonic() + 1)
+        self.assertTrue(retry.wait(1))
+        retry.raise_for_error()
+        self.assertTrue(transaction.root.is_dir())
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_lock_release_failure_is_observable_and_retryable(self) -> None:
+        transaction = self.transaction()
+        lock = transaction._project_lock
+        self.assertIsNotNone(lock)
+        assert lock is not None
+        original_release = lock.release
+        with patch.object(lock, "release", side_effect=OSError("lock busy")):
+            operation = transaction.begin_discard()
+            operation.run()
+
+        with self.assertRaisesRegex(core.TransactionDiscardIntegrityError, "lock busy"):
+            operation.raise_for_error()
+        self.assertTrue(transaction.root.is_dir())
+        self.assertTrue(packctl.project_lock_is_active("pack:demo"))
+
+        with patch.object(lock, "release", side_effect=original_release):
             retry = transaction.retry_discard(deadline=time.monotonic() + 1)
             self.assertTrue(retry.wait(1))
             retry.raise_for_error()
-        self.assertFalse(transaction.root.exists())
+        self.assertTrue(transaction.root.is_dir())
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_discard_defers_tree_cleanup_without_entering_rmtree(self) -> None:
+        transaction = self.transaction()
+        with patch.object(core.shutil, "rmtree") as rmtree:
+            started = time.monotonic()
+            transaction.discard(deadline=time.monotonic() + 0.1)
+            elapsed = time.monotonic() - started
+
+        rmtree.assert_not_called()
+        self.assertLess(elapsed, 0.1)
+        self.assertTrue(transaction.root.is_dir())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
     def test_incomplete_pty_cleanup_fails_closed(self) -> None:
@@ -235,7 +266,6 @@ class TransactionDiscardTest(unittest.TestCase):
         transaction.discard()
 
         self.assertTrue(transaction.root.is_dir())
-        self.assertTrue((transaction.root / ".completed").is_file())
         self.assertTrue((replaced / "pack.toml").is_file())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 

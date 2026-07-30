@@ -252,8 +252,8 @@ class ProjectLockTest(unittest.TestCase):
 
         original_finish = transaction._finish_discard_once
 
-        def finish_discard() -> None:
-            original_finish()
+        def finish_discard(*, deadline: float) -> None:
+            original_finish(deadline=deadline)
             cleaned.set()
 
         transaction._finish_discard_once = finish_discard
@@ -277,7 +277,7 @@ class ProjectLockTest(unittest.TestCase):
             retry.raise_for_error()
             self.assertTrue(cleaned.wait(2))
 
-        self.assertFalse(transaction.root.exists())
+        self.assertTrue(transaction.root.is_dir())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
         self.assertFalse((transaction.root / "source" / "mods" / "private.pw.toml").exists())
 

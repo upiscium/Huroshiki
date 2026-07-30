@@ -2136,7 +2136,7 @@ class PackTransaction:
             raise TransactionDiscardTimeout(
                 f"Transaction discard deadline exceeded for {self.project_key}"
             )
-        self._finish_discard_once()
+        self._finish_discard_once(deadline=discard.deadline)
         with self._lock:
             if self._discard_operation is discard:
                 self._discard_error = None
@@ -2152,22 +2152,18 @@ class PackTransaction:
                 self._discard_error = error
                 self._discard_state = "failed"
 
-    def _finish_discard_once(self) -> None:
+    def _finish_discard_once(self, *, deadline: float) -> None:
         with self._lock:
             if self._discard_finalized:
                 return
+            if time.monotonic() >= deadline:
+                raise TransactionDiscardTimeout(
+                    f"Transaction discard deadline exceeded for {self.project_key}"
+                )
             try:
-                if (self.root / "replaced-source").exists():
-                    (self.root / ".completed").touch(exist_ok=True)
-                    if self._project_lock is not None:
-                        self._project_lock.release()
-                        self._project_lock = None
-                else:
-                    if self.root.exists():
-                        shutil.rmtree(self.root)
-                    if self._project_lock is not None:
-                        self._project_lock.release()
-                        self._project_lock = None
+                if self._project_lock is not None:
+                    self._project_lock.release()
+                    self._project_lock = None
             except BaseException as error:
                 raise TransactionDiscardIntegrityError(
                     f"Could not finalize transaction discard: {error}"

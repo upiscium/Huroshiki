@@ -3441,7 +3441,14 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         if self._pending_navigation is not None:
             return
         operation = self.operation
-        if operation is None or operation.done.is_set():
+        if operation is None:
+            destination()
+            return
+        if operation.done.is_set():
+            integrity_error = self._operation_cleanup_integrity_error(operation)
+            if integrity_error is not None:
+                self._report_navigation_cleanup_error(integrity_error)
+                return
             destination()
             return
 
@@ -3452,7 +3459,13 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         )
         self.set_status("Cancelling Packwiz operation before leaving...")
         try:
-            operation.cancel()
+            if isinstance(
+                operation,
+                (core.PackwizAddOperation, core.ResolvedAddOperation),
+            ):
+                operation.cancel(deadline=self._navigation_deadline)
+            else:
+                operation.cancel()
         except Exception as error:
             self._pending_navigation = None
             self._pending_operation = None
@@ -3484,6 +3497,16 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
                     severity="error",
                 )
             return
+        integrity_error = self._operation_cleanup_integrity_error(operation)
+        if integrity_error is not None:
+            if self._navigation_timer is not None:
+                self._navigation_timer.stop()
+                self._navigation_timer = None
+            self._pending_navigation = None
+            self._pending_operation = None
+            self._navigation_deadline = None
+            self._report_navigation_cleanup_error(integrity_error)
+            return
         if self._navigation_timer is not None:
             self._navigation_timer.stop()
             self._navigation_timer = None
@@ -3491,6 +3514,23 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         self._pending_operation = None
         self._navigation_deadline = None
         destination()
+
+    @staticmethod
+    def _operation_cleanup_integrity_error(operation: object) -> str | None:
+        cleanup_error = getattr(operation, "cleanup_error", None)
+        if cleanup_error is not None:
+            return f"Add operation cleanup failed: {cleanup_error}"
+        termination = getattr(operation, "termination_result", None)
+        if getattr(operation, "termination_incomplete", False) or (
+            termination is not None
+            and not (termination.group_drained and termination.parent_reaped)
+        ):
+            return "Add operation process-group cleanup was incomplete"
+        return None
+
+    def _report_navigation_cleanup_error(self, message: str) -> None:
+        self.set_status(f"{message}; remaining on Install")
+        self.app.notify(message, severity="error")
 
     def discard_search_results(self) -> None:
         if not self.search_results:

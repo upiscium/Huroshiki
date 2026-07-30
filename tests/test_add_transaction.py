@@ -768,7 +768,9 @@ class AddTransactionTest(unittest.TestCase):
         self.assertEqual(self.snapshot(), original)
         self.assert_unlocked()
         transactions = self.root / ".huroshiki/transactions"
-        self.assertEqual(list(transactions.iterdir()), [])
+        retained = list(transactions.iterdir())
+        self.assertEqual(len(retained), 1)
+        self.assertTrue(retained[0].is_dir())
 
     def test_prestart_cancel_skips_selector_and_process_resolution(self) -> None:
         cancel = threading.Event()

@@ -71,6 +71,27 @@ class _ResolvedOperation(_Operation):
         )
 
 
+class _PackwizCleanupOperation(core.PackwizAddOperation):
+    def __init__(self, *, done: bool, incomplete: bool) -> None:
+        self.done = threading.Event()
+        if done:
+            self.done.set()
+        self.cancelled = False
+        self.cancel_deadline: float | None = None
+        self.cleanup_error: BaseException | None = None
+        self.termination_result = (
+            core.ProcessTerminationResult(False, False, True)
+            if incomplete
+            else None
+        )
+        self.termination_incomplete = incomplete
+
+    def cancel(self, *, deadline=None):
+        self.cancelled = True
+        self.cancel_deadline = deadline
+        return self.termination_result
+
+
 class _InstallTransaction(_Transaction):
     source = Path("/fake/source")
 
@@ -605,7 +626,6 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                 install.query_one("#search-results-table").focus()
                 await pilot.press("l", "p", "l")
                 await pilot.pause()
-
                 self.assertTrue(operation.cancelled)
                 self.assertIs(app.screen, install)
                 transaction.changes.append("rollback")
@@ -618,6 +638,46 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                     transaction.changes,
                     ["rollback", "post-navigation edit"],
                 )
+
+    async def test_install_stays_for_already_done_incomplete_pty_cleanup(self) -> None:
+        with self.patches():
+            screen = huroshiki.InstallScreen("pack:demo")
+            app = _NavigationApp(screen)
+            async with app.run_test() as pilot:
+                operation = _PackwizCleanupOperation(done=True, incomplete=True)
+                screen.operation = operation
+                screen.query_one("#search-results-table").focus()
+                await pilot.press("l")
+                await pilot.pause()
+
+                self.assertIs(app.screen, screen)
+                self.assertIsNone(screen._pending_navigation)
+
+    async def test_install_stays_when_cancelled_pty_cleanup_is_incomplete(self) -> None:
+        with self.patches():
+            screen = huroshiki.InstallScreen("pack:demo")
+            app = _NavigationApp(screen)
+            async with app.run_test() as pilot:
+                operation = _PackwizCleanupOperation(done=False, incomplete=False)
+                screen.operation = operation
+                screen.query_one("#search-results-table").focus()
+                await pilot.press("l")
+                await pilot.pause()
+                self.assertIsNotNone(operation.cancel_deadline)
+                self.assertEqual(operation.cancel_deadline, screen._navigation_deadline)
+                self.assertIs(app.screen, screen)
+
+                operation.termination_result = core.ProcessTerminationResult(
+                    False,
+                    False,
+                    True,
+                )
+                operation.termination_incomplete = True
+                operation.done.set()
+                await pilot.pause(0.1)
+
+                self.assertIs(app.screen, screen)
+                self.assertIsNone(screen._pending_navigation)
 
     async def test_install_search_shows_canonical_ids_and_resolves_selection(self) -> None:
         projects = (
