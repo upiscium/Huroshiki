@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import contextmanager
+import codecs
 import ctypes
 import errno
 import hashlib
@@ -10,7 +11,7 @@ from pathlib import Path
 import shutil
 import stat
 import sys
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Literal
 from uuid import uuid4
 
 
@@ -49,6 +50,7 @@ class OverlayFileInspection:
     device: int
     inode: int
     digest: str
+    text_kind: Literal["utf8", "binary"]
     text_probe: bytes
 
 
@@ -304,6 +306,9 @@ def inspect_overlay_file(
                 )
             digest = hashlib.sha256()
             probe = bytearray()
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+            valid_utf8 = True
+            contains_nul = False
             while True:
                 if checkpoint is not None:
                     checkpoint()
@@ -311,8 +316,19 @@ def inspect_overlay_file(
                 if not chunk:
                     break
                 digest.update(chunk)
+                contains_nul = contains_nul or b"\0" in chunk
+                if valid_utf8 and not contains_nul:
+                    try:
+                        decoder.decode(chunk, final=False)
+                    except UnicodeDecodeError:
+                        valid_utf8 = False
                 if len(probe) < probe_bytes:
                     probe.extend(chunk[: probe_bytes - len(probe)])
+            if valid_utf8 and not contains_nul:
+                try:
+                    decoder.decode(b"", final=True)
+                except UnicodeDecodeError:
+                    valid_utf8 = False
             after = os.fstat(fd)
             current = os.stat(
                 relative.name,
@@ -336,6 +352,7 @@ def inspect_overlay_file(
                 opened.st_dev,
                 opened.st_ino,
                 digest.hexdigest(),
+                "utf8" if valid_utf8 and not contains_nul else "binary",
                 bytes(probe),
             )
         finally:

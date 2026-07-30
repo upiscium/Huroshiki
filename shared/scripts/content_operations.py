@@ -336,7 +336,7 @@ def list_content_entries_at(
                 mode = file.mode
                 size = file.size
                 digest = file.digest
-                text_kind = _text_kind(file.text_probe)
+                text_kind = file.text_kind
         elif overlay_entry.kind == "directory" and not entry_errors:
             kind = "directory"
         else:
@@ -385,7 +385,7 @@ def read_content_file_at(
         file.mode,
         bool(file.mode & 0o111),
         file.digest,
-        _text_kind(file.contents[:CONTENT_TEXT_PROBE_BYTES]),
+        _text_kind(file.contents),
         _category(relative),
         (),
     )

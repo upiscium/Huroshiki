@@ -149,8 +149,50 @@ class ContentOperationsTest(unittest.TestCase):
             probe_bytes=content_operations.CONTENT_TEXT_PROBE_BYTES,
         )
         self.assertEqual(len(inspection.text_probe), 64 * 1024)
+        self.assertEqual(inspection.text_kind, "binary")
         self.assertLessEqual(max(requested_reads), 1024 * 1024)
         self.assertLess(peak, 8 * 1024 * 1024)
+
+    def test_streaming_text_classification_covers_full_file_and_probe_boundary(self) -> None:
+        config = self.content / "common/config"
+        config.mkdir(parents=True)
+        prefix = b"a" * content_operations.CONTENT_TEXT_PROBE_BYTES
+        (config / "late-invalid.txt").write_bytes(prefix + b"\xff")
+        (config / "late-nul.txt").write_bytes(prefix + b"\0")
+        (config / "incomplete-eof.txt").write_bytes(prefix + b"\xc3")
+        (config / "split-valid.txt").write_bytes(
+            prefix[:-1] + "é".encode("utf-8") + b"tail"
+        )
+
+        by_path = {
+            entry.relative_path: entry
+            for entry in core.list_content_entries("pack:demo", "common")
+        }
+        self.assertEqual(
+            by_path[Path("config/late-invalid.txt")].text_kind,
+            "binary",
+        )
+        self.assertEqual(
+            by_path[Path("config/late-nul.txt")].text_kind,
+            "binary",
+        )
+        self.assertEqual(
+            by_path[Path("config/incomplete-eof.txt")].text_kind,
+            "binary",
+        )
+        self.assertEqual(
+            by_path[Path("config/split-valid.txt")].text_kind,
+            "utf8",
+        )
+        inspection = overlay_policy.inspect_overlay_file(
+            self.content,
+            "common",
+            "config/split-valid.txt",
+            probe_bytes=content_operations.CONTENT_TEXT_PROBE_BYTES,
+        )
+        self.assertEqual(inspection.text_kind, "utf8")
+        self.assertEqual(len(inspection.text_probe), 64 * 1024)
+        self.assertTrue(inspection.text_probe.endswith(b"\xc3"))
 
     def test_snapshot_is_stable_and_tracks_content_mode_and_empty_directories(self) -> None:
         target = self.content / "common/config/demo.toml"
