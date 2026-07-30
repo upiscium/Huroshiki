@@ -1209,15 +1209,30 @@ class PackwizAddOperation(_AddOperationLifecycle):
         *,
         deadline: float | None = None,
     ) -> ProcessTerminationResult | None:
+        termination = self.termination_result
+        retrying_cleanup = self.done.is_set() and (
+            self.termination_incomplete
+            or (
+                termination is not None
+                and not (termination.group_drained and termination.parent_reaped)
+            )
+        )
         effective_deadline = self._request_cancel(deadline=deadline)
         session = self.session
         if session is not None:
-            self.termination_result = session.cancel(deadline=effective_deadline)
+            cleanup_deadline = (
+                deadline
+                if retrying_cleanup and deadline is not None
+                else effective_deadline
+            )
+            self.termination_result = session.cancel(deadline=cleanup_deadline)
             if self.termination_result is not None:
                 self.termination_incomplete = not (
                     self.termination_result.group_drained
                     and self.termination_result.parent_reaped
                 )
+        if self.done.is_set():
+            self.transaction._release_add_cleanup_ownership(self)
         return self.termination_result
 
     def resize(self, width: int, height: int) -> None:
@@ -1577,6 +1592,31 @@ class PackTransaction:
         if operation.checkpoint.exists():
             operation.checkpoint.rename(operation.retained_checkpoint)
 
+    @staticmethod
+    def _add_termination_incomplete(
+        operation: PackwizAddOperation | ResolvedAddOperation,
+    ) -> bool:
+        if not isinstance(operation, PackwizAddOperation):
+            return False
+        termination = operation.termination_result
+        return operation.termination_incomplete or (
+            termination is not None
+            and not (termination.group_drained and termination.parent_reaped)
+        )
+
+    def _release_add_cleanup_ownership(
+        self,
+        operation: PackwizAddOperation,
+    ) -> None:
+        with self._lock:
+            if (
+                self._operation is operation
+                and operation.done.is_set()
+                and operation.cleanup_error is None
+                and not self._add_termination_incomplete(operation)
+            ):
+                self._operation = None
+
     def add(self, provider: str, query: str) -> subprocess.CompletedProcess[str]:
         """Compatibility path for synchronous add callers."""
         self.ensure_active()
@@ -1883,7 +1923,11 @@ class PackTransaction:
                     operation.resolver_root.rename(operation.retained_resolver_root)
             except BaseException as error:
                 cleanup_errors.append(error)
-            if not cleanup_errors and self._operation is operation:
+            if (
+                not cleanup_errors
+                and self._operation is operation
+                and not self._add_termination_incomplete(operation)
+            ):
                 self._operation = None
         if cleanup_errors:
             raise HuroshikiError(
@@ -2388,17 +2432,16 @@ class PackTransaction:
                     f"Active operation did not stop before discard deadline for "
                     f"{self.project_key}"
                 )
-        if isinstance(operation, PackwizAddOperation) and operation.termination_incomplete:
+        if operation is not None and self._add_termination_incomplete(operation):
             operation.cancel(deadline=discard.deadline)
         if operation is not None and getattr(operation, "cleanup_error", None) is not None:
             raise TransactionDiscardIntegrityError(
                 f"Active operation cleanup failed: {operation.cleanup_error}"
             ) from operation.cleanup_error
-        if isinstance(operation, PackwizAddOperation):
-            if operation.termination_incomplete:
-                raise TransactionDiscardIntegrityError(
-                    "Active Packwiz process-group cleanup was incomplete"
-                )
+        if operation is not None and self._add_termination_incomplete(operation):
+            raise TransactionDiscardIntegrityError(
+                "Active Packwiz process-group cleanup was incomplete"
+            )
         if time.monotonic() >= discard.deadline:
             raise TransactionDiscardTimeout(
                 f"Transaction discard deadline exceeded for {self.project_key}"

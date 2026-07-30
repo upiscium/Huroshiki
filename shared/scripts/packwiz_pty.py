@@ -303,10 +303,21 @@ class PackwizPtySession:
             return self._termination_result
         parent_done = process.poll() is not None
         if parent_done:
-            if deadline is not None and live_process_group_members(process.pid):
+            members = live_process_group_members(process.pid)
+            if deadline is not None and members:
                 self._termination_result = stop_process_group(
                     process.pid,
                     cleanup_deadline=deadline,
+                )
+            elif not members:
+                self._termination_result = ProcessTerminationResult(
+                    True,
+                    True,
+                    (
+                        self._termination_result.forced
+                        if self._termination_result is not None
+                        else False
+                    ),
                 )
             return self._termination_result
         try:

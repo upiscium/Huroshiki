@@ -74,7 +74,13 @@ class _ResolvedOperation(_Operation):
 
 
 class _PackwizCleanupOperation(core.PackwizAddOperation):
-    def __init__(self, *, done: bool, incomplete: bool) -> None:
+    def __init__(
+        self,
+        *,
+        done: bool,
+        incomplete: bool,
+        complete_on_cancel: bool = False,
+    ) -> None:
         self.done = threading.Event()
         if done:
             self.done.set()
@@ -87,10 +93,14 @@ class _PackwizCleanupOperation(core.PackwizAddOperation):
             else None
         )
         self.termination_incomplete = incomplete
+        self.complete_on_cancel = complete_on_cancel
 
     def cancel(self, *, deadline=None):
         self.cancelled = True
         self.cancel_deadline = deadline
+        if self.complete_on_cancel:
+            self.termination_result = core.ProcessTerminationResult(True, True, True)
+            self.termination_incomplete = False
         return self.termination_result
 
 
@@ -862,6 +872,45 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                     "cleanup failed",
                     str(screen.query_one("#packwiz-status").render()),
                 )
+
+    async def test_install_completion_retains_incomplete_pty_until_navigation_retry(self) -> None:
+        transaction = _InstallTransaction()
+        with self.patches():
+            screen = huroshiki.InstallScreen("pack:demo")
+            app = _NavigationApp(screen)
+            app.transactions["pack:demo"] = transaction
+            async with app.run_test() as pilot:
+                operation = _PackwizCleanupOperation(
+                    done=True,
+                    incomplete=True,
+                    complete_on_cancel=True,
+                )
+                result = core.AddOperationResult(
+                    1,
+                    (),
+                    Path("raw.log"),
+                    Path("output.log"),
+                    Path("events.log"),
+                    "Install operation deadline exceeded",
+                    timed_out=True,
+                )
+                screen.operation = operation
+                screen._operation_finished(operation, result)
+
+                self.assertIs(screen.operation, operation)
+                self.assertIs(app.screen, screen)
+                self.assertIn(
+                    "cleanup was incomplete",
+                    str(screen.query_one("#packwiz-status").render()),
+                )
+
+                screen.query_one("#search-results-table").focus()
+                await pilot.press("l")
+                await pilot.pause()
+
+                self.assertIsNotNone(operation.cancel_deadline)
+                self.assertIsNone(screen.operation)
+                self.assertIsInstance(app.screen, huroshiki.InstalledModsScreen)
 
     async def test_install_search_shows_canonical_ids_and_resolves_selection(self) -> None:
         projects = (

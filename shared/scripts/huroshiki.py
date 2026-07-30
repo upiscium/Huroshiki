@@ -3452,9 +3452,25 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             return
         if operation.done.is_set():
             integrity_error = self._operation_cleanup_integrity_error(operation)
+            if (
+                integrity_error is not None
+                and isinstance(operation, core.PackwizAddOperation)
+                and operation.cleanup_error is None
+            ):
+                retry_deadline = (
+                    time.monotonic() + core.TRANSACTION_DISCARD_TIMEOUT_SECONDS
+                )
+                try:
+                    operation.cancel(deadline=retry_deadline)
+                except Exception as error:
+                    self.app.notify(str(error), severity="error")
+                    return
+                integrity_error = self._operation_cleanup_integrity_error(operation)
             if integrity_error is not None:
                 self._report_navigation_cleanup_error(integrity_error)
                 return
+            if self.operation is operation:
+                self.operation = None
             destination()
             return
 
@@ -3758,8 +3774,10 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
     ) -> None:
         if self.operation is not operation:
             return
-        self.operation = None
         self.operation_thread = None
+        integrity_error = self._operation_cleanup_integrity_error(operation)
+        if integrity_error is None:
+            self.operation = None
         if self._closing:
             return
 
@@ -3779,6 +3797,8 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         else:
             self.set_status(f"{result.message}. Log: {result.text_log}")
             self.app.notify(result.message, severity="warning")
+        if integrity_error is not None:
+            self._report_navigation_cleanup_error(integrity_error)
         search.focus()
 
     def current_search_result(self) -> core.InstallSearchResult | None:

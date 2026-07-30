@@ -991,6 +991,71 @@ class AddTransactionTest(unittest.TestCase):
         finally:
             transaction.discard()
 
+    def test_incomplete_pty_timeout_retains_ownership_until_discard_retry(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        staged = transaction.source / "mods/staged.pw.toml"
+        staged.write_text(metadata("Staged", "staged"), encoding="utf-8")
+        staged_before = self.snapshot_tree(transaction.source)
+        real_before = self.snapshot()
+        incomplete = core.ProcessTerminationResult(False, False, True)
+        complete = core.ProcessTerminationResult(True, True, True)
+        cleanup_deadlines: list[float] = []
+
+        class Session:
+            termination_result = incomplete
+
+            def __init__(self, *_, **__) -> None:
+                pass
+
+            def run(self, *, deadline):
+                return core.PtyResult(
+                    -15,
+                    Path("raw.log"),
+                    Path("events.log"),
+                    Path("output.log"),
+                    "",
+                    termination_result=incomplete,
+                    timed_out=True,
+                    termination_incomplete=True,
+                )
+
+            def cancel(self, *, deadline=None):
+                assert deadline is not None
+                cleanup_deadlines.append(deadline)
+                self.termination_result = complete
+                return complete
+
+        operation_deadline = time.monotonic() + 1
+        with patch.object(core, "PackwizPtySession", Session):
+            operation = transaction.begin_add(
+                "modrinth",
+                "root",
+                client=True,
+                server=True,
+                deadline=operation_deadline,
+            )
+            result = operation.run()
+
+        self.assertTrue(operation.done.is_set())
+        self.assertTrue(result.timed_out)
+        self.assertFalse(result.cancelled)
+        self.assertTrue(operation.termination_incomplete)
+        self.assertIs(transaction._operation, operation)
+        self.assertTrue(packctl.project_lock_is_active(self.key))
+        self.assertEqual(self.snapshot_tree(transaction.source), staged_before)
+        self.assertEqual(self.snapshot(), real_before)
+
+        discard_deadline = time.monotonic() + 2
+        discard = transaction.begin_discard(deadline=discard_deadline)
+        discard.run()
+        discard.raise_for_error()
+
+        self.assertEqual(cleanup_deadlines, [discard_deadline])
+        self.assertGreater(cleanup_deadlines[0], operation_deadline)
+        self.assertFalse(operation.termination_incomplete)
+        self.assertIsNone(transaction._operation)
+        self.assertFalse(packctl.project_lock_is_active(self.key))
+
     def test_success_hands_checkpoint_to_retention_without_recursive_delete(self) -> None:
         transaction = core.PackTransaction.create(self.key)
         staged = transaction.source / "mods/staged.pw.toml"

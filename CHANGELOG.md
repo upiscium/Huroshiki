@@ -9,7 +9,8 @@
   interactive PTY polling, cleanup, and navigation. Checkpoints, resolver trees, and failed staged
   sources are atomically handed to retained transaction state instead of recursively deleted by the
   operation; worker-start failure releases only operation ownership while preserving the transaction
-  and project lock.
+  and project lock. Incomplete PTY termination retains cleanup ownership and the project lock until
+  bounded navigation or discard cleanup proves group drain and parent reap.
 
 ## 0.2.0-rc.1 - 2026-07-30
 
