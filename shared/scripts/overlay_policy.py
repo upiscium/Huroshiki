@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import contextmanager
+import codecs
+import ctypes
 import errno
+import hashlib
 import os
 from pathlib import Path
 import shutil
 import stat
-from typing import Iterator
+import sys
+from typing import Callable, Iterator, Literal
 from uuid import uuid4
 
 
@@ -25,6 +29,29 @@ class OverlayEntry:
     kind: str
     size: int = 0
     link_target: str | None = None
+    mode: int = 0
+    device: int | None = None
+    inode: int | None = None
+
+
+@dataclass(frozen=True)
+class OverlayFile:
+    contents: bytes
+    mode: int
+    device: int
+    inode: int
+    digest: str
+
+
+@dataclass(frozen=True)
+class OverlayFileInspection:
+    size: int
+    mode: int
+    device: int
+    inode: int
+    digest: str
+    text_kind: Literal["utf8", "binary"]
+    text_probe: bytes
 
 
 @dataclass(frozen=True)
@@ -40,6 +67,8 @@ class OverlayScan:
 
 
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
 
 
 @dataclass
@@ -50,6 +79,39 @@ class _OverlayParent:
 
 def _open_directory(name: str, parent_fd: int) -> int:
     return os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+
+
+def _renameat2(
+    old_dir_fd: int,
+    old_name: str,
+    new_dir_fd: int,
+    new_name: str,
+    flags: int,
+) -> None:
+    if sys.platform != "linux":
+        raise OSError(errno.ENOTSUP, "atomic overlay rename is unavailable")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as error:
+        raise OSError(errno.ENOTSUP, "atomic overlay rename is unavailable") from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        old_dir_fd,
+        os.fsencode(old_name),
+        new_dir_fd,
+        os.fsencode(new_name),
+        flags,
+    ) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), new_name)
 
 
 @contextmanager
@@ -136,27 +198,501 @@ def create_overlay_file(content_root: Path, target: str, relative_path: str | Pa
         os.close(fd)
 
 
-def read_overlay_text(content_root: Path, target: str, relative_path: str | Path) -> str:
+def read_overlay_bytes(
+    content_root: Path,
+    target: str,
+    relative_path: str | Path,
+    *,
+    max_bytes: int | None = None,
+    checkpoint: Callable[[], None] | None = None,
+) -> OverlayFile:
     relative = normalize_overlay_relative_path(relative_path)
+    if max_bytes is not None and max_bytes < 0:
+        raise OverlayPolicyError("Overlay read limit must be non-negative")
     with _open_overlay_parent(content_root, target, relative, create=False) as parent:
         try:
             fd = os.open(
                 relative.name,
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
                 dir_fd=parent.fd,
             )
         except FileNotFoundError as error:
-            raise OverlayPolicyError(f"Overlay file does not exist: {target}/{relative}") from error
+            raise OverlayPolicyError(
+                f"Overlay file does not exist: {target}/{relative}"
+            ) from error
         try:
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise OverlayPolicyError(f"Overlay file does not exist: {target}/{relative}")
-            with os.fdopen(fd, "r", encoding="utf-8") as handle:
-                fd = -1
-                return handle.read()
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise OverlayPolicyError(
+                    f"Overlay file does not exist: {target}/{relative}"
+                )
+            if max_bytes is not None and opened.st_size > max_bytes:
+                raise OverlayPolicyError(
+                    f"Overlay file exceeds the {max_bytes}-byte read limit: "
+                    f"{target}/{relative}"
+                )
+            chunks: list[bytes] = []
+            digest = hashlib.sha256()
+            total = 0
+            while True:
+                if checkpoint is not None:
+                    checkpoint()
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if max_bytes is not None and total > max_bytes:
+                    raise OverlayPolicyError(
+                        f"Overlay file exceeds the {max_bytes}-byte read limit: "
+                        f"{target}/{relative}"
+                    )
+                chunks.append(chunk)
+                digest.update(chunk)
+            after = os.fstat(fd)
+            current = os.stat(
+                relative.name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            identity = (opened.st_dev, opened.st_ino)
+            if (
+                identity != (after.st_dev, after.st_ino)
+                or identity != (current.st_dev, current.st_ino)
+                or opened.st_size != after.st_size
+                or opened.st_mtime_ns != after.st_mtime_ns
+                or opened.st_ctime_ns != after.st_ctime_ns
+            ):
+                raise OverlayPolicyError(
+                    f"Overlay file changed while reading: {target}/{relative}"
+                )
+            return OverlayFile(
+                b"".join(chunks),
+                stat.S_IMODE(opened.st_mode),
+                opened.st_dev,
+                opened.st_ino,
+                digest.hexdigest(),
+            )
         finally:
-            if fd >= 0:
-                os.close(fd)
+            os.close(fd)
+
+
+def inspect_overlay_file(
+    content_root: Path,
+    target: str,
+    relative_path: str | Path,
+    *,
+    probe_bytes: int = 0,
+    checkpoint: Callable[[], None] | None = None,
+) -> OverlayFileInspection:
+    relative = normalize_overlay_relative_path(relative_path)
+    if probe_bytes < 0:
+        raise OverlayPolicyError("Overlay text probe limit must be non-negative")
+    with _open_overlay_parent(content_root, target, relative, create=False) as parent:
+        try:
+            fd = os.open(
+                relative.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                dir_fd=parent.fd,
+            )
+        except FileNotFoundError as error:
+            raise OverlayPolicyError(
+                f"Overlay file does not exist: {target}/{relative}"
+            ) from error
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise OverlayPolicyError(
+                    f"Overlay file does not exist: {target}/{relative}"
+                )
+            digest = hashlib.sha256()
+            probe = bytearray()
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+            valid_utf8 = True
+            contains_nul = False
+            while True:
+                if checkpoint is not None:
+                    checkpoint()
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                contains_nul = contains_nul or b"\0" in chunk
+                if valid_utf8 and not contains_nul:
+                    try:
+                        decoder.decode(chunk, final=False)
+                    except UnicodeDecodeError:
+                        valid_utf8 = False
+                if len(probe) < probe_bytes:
+                    probe.extend(chunk[: probe_bytes - len(probe)])
+            if valid_utf8 and not contains_nul:
+                try:
+                    decoder.decode(b"", final=True)
+                except UnicodeDecodeError:
+                    valid_utf8 = False
+            after = os.fstat(fd)
+            current = os.stat(
+                relative.name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            identity = (opened.st_dev, opened.st_ino)
+            if (
+                identity != (after.st_dev, after.st_ino)
+                or identity != (current.st_dev, current.st_ino)
+                or opened.st_size != after.st_size
+                or opened.st_mtime_ns != after.st_mtime_ns
+                or opened.st_ctime_ns != after.st_ctime_ns
+            ):
+                raise OverlayPolicyError(
+                    f"Overlay file changed while inspecting: {target}/{relative}"
+                )
+            return OverlayFileInspection(
+                opened.st_size,
+                stat.S_IMODE(opened.st_mode),
+                opened.st_dev,
+                opened.st_ino,
+                digest.hexdigest(),
+                "utf8" if valid_utf8 and not contains_nul else "binary",
+                bytes(probe),
+            )
+        finally:
+            os.close(fd)
+
+
+def read_overlay_text(content_root: Path, target: str, relative_path: str | Path) -> str:
+    return read_overlay_bytes(content_root, target, relative_path).contents.decode("utf-8")
+
+
+def create_overlay_directory(
+    content_root: Path,
+    target: str,
+    relative_path: str | Path,
+    *,
+    mode: int = 0o755,
+) -> None:
+    relative = normalize_overlay_relative_path(relative_path)
+    with _open_overlay_parent(content_root, target, relative, create=False) as parent:
+        try:
+            os.mkdir(relative.name, mode, dir_fd=parent.fd)
+        except FileExistsError as error:
+            raise OverlayPolicyError(
+                f"Overlay entry already exists: {target}/{relative}"
+            ) from error
+
+
+def write_overlay_bytes(
+    content_root: Path,
+    target: str,
+    relative_path: str | Path,
+    contents: bytes,
+    *,
+    mode: int | None = 0o644,
+    create: bool,
+    expected_digest: str | None = None,
+    checkpoint: Callable[[], None] | None = None,
+) -> None:
+    relative = normalize_overlay_relative_path(relative_path)
+    temporary_name = f".{relative.name}.huroshiki-tmp-{uuid4().hex}"
+    with _open_overlay_parent(content_root, target, relative, create=False) as parent:
+        existing_identity: tuple[int, int] | None = None
+        if create:
+            try:
+                os.stat(relative.name, dir_fd=parent.fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise OverlayPolicyError(
+                    f"Overlay entry already exists: {target}/{relative}"
+                )
+        else:
+            current = inspect_overlay_file(
+                content_root,
+                target,
+                relative,
+                checkpoint=checkpoint,
+            )
+            existing_identity = (current.device, current.inode)
+            if expected_digest is not None and current.digest != expected_digest:
+                raise OverlayPolicyError(
+                    f"Overlay file digest changed: {target}/{relative}"
+                )
+            if mode is None:
+                mode = current.mode
+        if mode is None:
+            raise OverlayPolicyError("Overlay create mode is required")
+        temporary_fd = -1
+        preserve_temporary = False
+        try:
+            temporary_fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                mode,
+                dir_fd=parent.fd,
+            )
+            view = memoryview(contents)
+            offset = 0
+            while offset < len(view):
+                if checkpoint is not None:
+                    checkpoint()
+                chunk = view[offset : offset + 1024 * 1024]
+                while chunk:
+                    written = os.write(temporary_fd, chunk)
+                    if written == 0:
+                        raise OSError(errno.EIO, "short overlay write")
+                    offset += written
+                    chunk = chunk[written:]
+            os.fchmod(temporary_fd, mode)
+            os.close(temporary_fd)
+            temporary_fd = -1
+            if existing_identity is not None:
+                current = os.stat(
+                    relative.name,
+                    dir_fd=parent.fd,
+                    follow_symlinks=False,
+                )
+                if existing_identity != (current.st_dev, current.st_ino):
+                    raise OverlayPolicyError(
+                        f"Overlay file changed before replacement: {target}/{relative}"
+                    )
+            if create:
+                if checkpoint is not None:
+                    checkpoint()
+                published = False
+                try:
+                    _renameat2(
+                        parent.fd,
+                        temporary_name,
+                        parent.fd,
+                        relative.name,
+                        _RENAME_NOREPLACE,
+                    )
+                    published = True
+                    if checkpoint is not None:
+                        checkpoint()
+                except FileExistsError as error:
+                    raise OverlayPolicyError(
+                        f"Overlay entry already exists: {target}/{relative}"
+                    ) from error
+                except BaseException as error:
+                    if published:
+                        try:
+                            _renameat2(
+                                parent.fd,
+                                relative.name,
+                                parent.fd,
+                                temporary_name,
+                                _RENAME_NOREPLACE,
+                            )
+                        except BaseException as rollback_error:
+                            preserve_temporary = True
+                            raise OverlayPolicyError(
+                                f"Overlay create rollback failed: {target}/{relative}: "
+                                f"{rollback_error}"
+                            ) from error
+                    raise
+            else:
+                if checkpoint is not None:
+                    checkpoint()
+                _renameat2(
+                    parent.fd,
+                    temporary_name,
+                    parent.fd,
+                    relative.name,
+                    _RENAME_EXCHANGE,
+                )
+                try:
+                    exchanged = os.stat(
+                        temporary_name,
+                        dir_fd=parent.fd,
+                        follow_symlinks=False,
+                    )
+                    if existing_identity != (exchanged.st_dev, exchanged.st_ino):
+                        raise OverlayPolicyError(
+                            f"Overlay file changed during replacement: {target}/{relative}"
+                        )
+                    if checkpoint is not None:
+                        checkpoint()
+                except BaseException as error:
+                    try:
+                        _renameat2(
+                            parent.fd,
+                            temporary_name,
+                            parent.fd,
+                            relative.name,
+                            _RENAME_EXCHANGE,
+                        )
+                    except BaseException as rollback_error:
+                        preserve_temporary = True
+                        raise OverlayPolicyError(
+                            f"Overlay replace rollback failed: {target}/{relative}: "
+                            f"{rollback_error}"
+                        ) from error
+                    raise
+        finally:
+            if temporary_fd >= 0:
+                os.close(temporary_fd)
+            if not preserve_temporary:
+                try:
+                    os.unlink(temporary_name, dir_fd=parent.fd)
+                except FileNotFoundError:
+                    pass
+
+
+def delete_overlay_entry(
+    content_root: Path,
+    target: str,
+    relative_path: str | Path,
+    *,
+    directory: bool,
+) -> None:
+    relative = normalize_overlay_relative_path(relative_path)
+    retained_name = f".{relative.name}.huroshiki-delete-{uuid4().hex}"
+    with _open_overlay_parent(content_root, target, relative, create=False) as parent:
+        try:
+            metadata = os.stat(
+                relative.name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise OverlayPolicyError(
+                f"Overlay entry does not exist: {target}/{relative}"
+            ) from error
+        if directory:
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise OverlayPolicyError(
+                    f"Overlay directory does not exist: {target}/{relative}"
+                )
+        else:
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OverlayPolicyError(
+                    f"Overlay file does not exist: {target}/{relative}"
+                )
+        _renameat2(
+            parent.fd,
+            relative.name,
+            parent.fd,
+            retained_name,
+            _RENAME_NOREPLACE,
+        )
+        moved = os.stat(
+            retained_name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        if (moved.st_dev, moved.st_ino) != (metadata.st_dev, metadata.st_ino):
+            _renameat2(
+                parent.fd,
+                retained_name,
+                parent.fd,
+                relative.name,
+                _RENAME_NOREPLACE,
+            )
+            raise OverlayPolicyError(
+                f"Overlay entry changed during deletion: {target}/{relative}"
+            )
+        if directory:
+            try:
+                os.rmdir(retained_name, dir_fd=parent.fd)
+            except OSError as error:
+                try:
+                    _renameat2(
+                        parent.fd,
+                        retained_name,
+                        parent.fd,
+                        relative.name,
+                        _RENAME_NOREPLACE,
+                    )
+                except OSError as rollback_error:
+                    raise OverlayPolicyError(
+                        f"Overlay directory deletion rollback failed: "
+                        f"{target}/{relative}: {rollback_error}"
+                    ) from error
+                if error.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+                    raise OverlayPolicyError(
+                        f"Overlay directory is not empty: {target}/{relative}"
+                    ) from error
+                raise
+        else:
+            os.unlink(retained_name, dir_fd=parent.fd)
+
+
+def move_overlay_entry(
+    content_root: Path,
+    source_target: str,
+    source_path: str | Path,
+    destination_target: str,
+    destination_path: str | Path,
+) -> None:
+    source = normalize_overlay_relative_path(source_path)
+    destination = normalize_overlay_relative_path(destination_path)
+    if (
+        source_target == destination_target
+        and len(destination.parts) > len(source.parts)
+        and destination.parts[: len(source.parts)] == source.parts
+    ):
+        raise OverlayPolicyError("Cannot move an overlay directory into itself")
+    with _open_overlay_parent(
+        content_root, source_target, source, create=False
+    ) as source_parent, _open_overlay_parent(
+        content_root, destination_target, destination, create=False
+    ) as destination_parent:
+        try:
+            source_metadata = os.stat(
+                source.name,
+                dir_fd=source_parent.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise OverlayPolicyError(
+                f"Overlay source does not exist: {source_target}/{source}"
+            ) from error
+        if not (
+            stat.S_ISREG(source_metadata.st_mode)
+            or stat.S_ISDIR(source_metadata.st_mode)
+        ):
+            raise OverlayPolicyError(
+                f"Overlay source is not a file or directory: {source_target}/{source}"
+            )
+        try:
+            os.stat(
+                destination.name,
+                dir_fd=destination_parent.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise OverlayPolicyError(
+                f"Overlay destination already exists: "
+                f"{destination_target}/{destination}"
+            )
+        _renameat2(
+            source_parent.fd,
+            source.name,
+            destination_parent.fd,
+            destination.name,
+            _RENAME_NOREPLACE,
+        )
+        moved = os.stat(
+            destination.name,
+            dir_fd=destination_parent.fd,
+            follow_symlinks=False,
+        )
+        if (moved.st_dev, moved.st_ino) != (
+            source_metadata.st_dev,
+            source_metadata.st_ino,
+        ):
+            _renameat2(
+                destination_parent.fd,
+                destination.name,
+                source_parent.fd,
+                source.name,
+                _RENAME_NOREPLACE,
+            )
+            raise OverlayPolicyError(
+                f"Overlay source changed during move: {source_target}/{source}"
+            )
 
 
 def write_overlay_text(
@@ -241,9 +777,10 @@ def normalize_overlay_relative_path(value: str | Path) -> Path:
         raise OverlayPolicyError(
             "Overlay path cannot contain '.', '..', or empty components"
         )
-    if relative.name == ".gitkeep":
+    if any(part == ".gitkeep" for part in relative.parts):
         raise OverlayPolicyError(".gitkeep is managed internally")
-    if is_packwiz_owned_name(relative.name):
+    reserved = next((part for part in relative.parts if is_packwiz_owned_name(part)), None)
+    if reserved is not None:
         raise OverlayPolicyError(
             f"Packwiz-owned path is not allowed in content overlays: {relative}"
         )
@@ -275,7 +812,7 @@ def _scan_path(
 
     if stat.S_ISLNK(metadata.st_mode):
         target = _link_target(path)
-        entries.append(OverlayEntry(relative, "symlink", link_target=target))
+        entries.append(OverlayEntry(relative, "symlink", link_target=target, mode=stat.S_IMODE(metadata.st_mode), device=metadata.st_dev, inode=metadata.st_ino))
         issues.append(OverlayIssue(relative, f"symlink is not allowed -> {target}"))
         if is_packwiz_owned_name(path.name):
             issues.append(OverlayIssue(relative, "Packwiz-owned path is not allowed"))
@@ -286,9 +823,11 @@ def _scan_path(
         return
 
     if include_entry and stat.S_ISREG(metadata.st_mode):
-        entries.append(OverlayEntry(relative, "file", metadata.st_size))
+        entries.append(OverlayEntry(relative, "file", metadata.st_size, mode=stat.S_IMODE(metadata.st_mode), device=metadata.st_dev, inode=metadata.st_ino))
+    elif include_entry and stat.S_ISDIR(metadata.st_mode):
+        entries.append(OverlayEntry(relative, "directory", mode=stat.S_IMODE(metadata.st_mode), device=metadata.st_dev, inode=metadata.st_ino))
     elif include_entry and not stat.S_ISDIR(metadata.st_mode):
-        entries.append(OverlayEntry(relative, "special"))
+        entries.append(OverlayEntry(relative, "special", mode=stat.S_IMODE(metadata.st_mode), device=metadata.st_dev, inode=metadata.st_ino))
         issues.append(OverlayIssue(relative, "special filesystem entry is not allowed"))
 
     if include_entry and is_packwiz_owned_name(path.name):
@@ -724,3 +1263,285 @@ def safe_overlay_child(
                 f"-> {_link_target(candidate)}"
             )
     return candidate
+
+
+def _copy_content_directory_strict(
+    source_fd: int,
+    destination_fd: int,
+    relative: Path,
+    checkpoint: Callable[[], None] | None,
+) -> None:
+    if checkpoint is not None:
+        checkpoint()
+    with os.scandir(source_fd) as iterator:
+        children = sorted(iterator, key=lambda item: item.name)
+    for child in children:
+        if checkpoint is not None:
+            checkpoint()
+        child_relative = relative / child.name
+        metadata = child.stat(follow_symlinks=False)
+        if child.name == ".gitkeep":
+            continue
+        if is_packwiz_owned_name(child.name):
+            raise OverlayPolicyError(
+                f"Packwiz-owned path is not allowed in content overlays: {child_relative}"
+            )
+        if stat.S_ISLNK(metadata.st_mode):
+            raise OverlayPolicyError(
+                f"Symlink is not allowed in content overlay: {child_relative} "
+                f"-> {_readlink_at(child.name, source_fd)}"
+            )
+        if stat.S_ISDIR(metadata.st_mode):
+            child_fd = _open_directory(child.name, source_fd)
+            output_fd = -1
+            try:
+                opened_directory = os.fstat(child_fd)
+                if (opened_directory.st_dev, opened_directory.st_ino) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ):
+                    raise OverlayPolicyError(
+                        f"Content source changed while opening: {child_relative}"
+                    )
+                os.mkdir(
+                    child.name,
+                    stat.S_IMODE(metadata.st_mode),
+                    dir_fd=destination_fd,
+                )
+                output_fd = _open_directory(child.name, destination_fd)
+                _copy_content_directory_strict(
+                    child_fd,
+                    output_fd,
+                    child_relative,
+                    checkpoint,
+                )
+                os.fchmod(output_fd, stat.S_IMODE(metadata.st_mode))
+                current = os.stat(
+                    child.name,
+                    dir_fd=source_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(current.st_mode)
+                    or (current.st_dev, current.st_ino)
+                    != (opened_directory.st_dev, opened_directory.st_ino)
+                ):
+                    raise OverlayPolicyError(
+                        f"Content source changed while copying: {child_relative}"
+                    )
+                current_output = os.stat(
+                    child.name,
+                    dir_fd=destination_fd,
+                    follow_symlinks=False,
+                )
+                opened_output = os.fstat(output_fd)
+                if (current_output.st_dev, current_output.st_ino) != (
+                    opened_output.st_dev,
+                    opened_output.st_ino,
+                ):
+                    raise OverlayPolicyError(
+                        f"Content destination changed while copying: {child_relative}"
+                    )
+            finally:
+                if output_fd >= 0:
+                    os.close(output_fd)
+                os.close(child_fd)
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OverlayPolicyError(
+                f"Special filesystem entry is not allowed: {child_relative}"
+            )
+        source_file_fd = os.open(
+            child.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+            dir_fd=source_fd,
+        )
+        destination_file_fd = -1
+        try:
+            opened = os.fstat(source_file_fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise OverlayPolicyError(
+                    f"Special filesystem entry is not allowed: {child_relative}"
+                )
+            if (opened.st_dev, opened.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise OverlayPolicyError(
+                    f"Content source changed while opening: {child_relative}"
+                )
+            destination_file_fd = os.open(
+                child.name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+                stat.S_IMODE(opened.st_mode),
+                dir_fd=destination_fd,
+            )
+            while True:
+                if checkpoint is not None:
+                    checkpoint()
+                chunk = os.read(source_file_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_file_fd, view)
+                    if written == 0:
+                        raise OSError(errno.EIO, "short content tree write")
+                    view = view[written:]
+            os.fchmod(destination_file_fd, stat.S_IMODE(opened.st_mode))
+            after = os.fstat(source_file_fd)
+            current = os.stat(
+                child.name,
+                dir_fd=source_fd,
+                follow_symlinks=False,
+            )
+            if (
+                (opened.st_dev, opened.st_ino)
+                != (after.st_dev, after.st_ino)
+                or (opened.st_dev, opened.st_ino)
+                != (current.st_dev, current.st_ino)
+                or opened.st_size != after.st_size
+                or opened.st_mtime_ns != after.st_mtime_ns
+                or opened.st_ctime_ns != after.st_ctime_ns
+            ):
+                raise OverlayPolicyError(
+                    f"Content source changed while copying: {child_relative}"
+                )
+            output = os.stat(
+                child.name,
+                dir_fd=destination_fd,
+                follow_symlinks=False,
+            )
+            opened_output = os.fstat(destination_file_fd)
+            if (output.st_dev, output.st_ino) != (
+                opened_output.st_dev,
+                opened_output.st_ino,
+            ):
+                raise OverlayPolicyError(
+                    f"Content destination changed while copying: {child_relative}"
+                )
+        finally:
+            if destination_file_fd >= 0:
+                os.close(destination_file_fd)
+            os.close(source_file_fd)
+
+
+def copy_content_tree(
+    source_content_root: Path,
+    staging_content_root: Path,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> None:
+    if staging_content_root.exists():
+        raise OverlayPolicyError(
+            f"Content staging destination already exists: {staging_content_root}"
+        )
+    staging_content_root.mkdir(mode=0o700)
+    destination_parent_fd = os.open(
+        staging_content_root.parent,
+        _DIRECTORY_FLAGS,
+    )
+    destination_fd = _open_directory(
+        staging_content_root.name,
+        destination_parent_fd,
+    )
+    source_parent_fd = source_fd = -1
+    try:
+        destination_identity = os.fstat(destination_fd)
+        try:
+            source_parent_fd = os.open(source_content_root.parent, _DIRECTORY_FLAGS)
+            source_fd = _open_directory(source_content_root.name, source_parent_fd)
+        except FileNotFoundError:
+            for target in OVERLAY_TARGETS:
+                os.mkdir(target, 0o755, dir_fd=destination_fd)
+            return
+        except OSError as error:
+            raise OverlayPolicyError(
+                f"Cannot open content root: {source_content_root}: {error}"
+            ) from error
+        source_identity = os.fstat(source_fd)
+        for target in OVERLAY_TARGETS:
+            if checkpoint is not None:
+                checkpoint()
+            try:
+                target_fd = _open_directory(target, source_fd)
+            except FileNotFoundError:
+                os.mkdir(target, 0o755, dir_fd=destination_fd)
+                continue
+            except OSError as error:
+                raise OverlayPolicyError(
+                    f"Cannot open content overlay target {target}: {error}"
+                ) from error
+            output_fd = -1
+            try:
+                target_metadata = os.fstat(target_fd)
+                os.mkdir(
+                    target,
+                    stat.S_IMODE(target_metadata.st_mode),
+                    dir_fd=destination_fd,
+                )
+                output_fd = _open_directory(target, destination_fd)
+                _copy_content_directory_strict(
+                    target_fd,
+                    output_fd,
+                    Path(target),
+                    checkpoint,
+                )
+                os.fchmod(output_fd, stat.S_IMODE(target_metadata.st_mode))
+                current_target = os.stat(
+                    target,
+                    dir_fd=source_fd,
+                    follow_symlinks=False,
+                )
+                if (current_target.st_dev, current_target.st_ino) != (
+                    target_metadata.st_dev,
+                    target_metadata.st_ino,
+                ):
+                    raise OverlayPolicyError(
+                        f"Content overlay target changed while copying: {target}"
+                    )
+                current_output = os.stat(
+                    target,
+                    dir_fd=destination_fd,
+                    follow_symlinks=False,
+                )
+                output_metadata = os.fstat(output_fd)
+                if (current_output.st_dev, current_output.st_ino) != (
+                    output_metadata.st_dev,
+                    output_metadata.st_ino,
+                ):
+                    raise OverlayPolicyError(
+                        f"Content staging target changed while copying: {target}"
+                    )
+            finally:
+                if output_fd >= 0:
+                    os.close(output_fd)
+                os.close(target_fd)
+        current_source = os.stat(source_content_root, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(current_source.st_mode)
+            or (current_source.st_dev, current_source.st_ino)
+            != (source_identity.st_dev, source_identity.st_ino)
+        ):
+            raise OverlayPolicyError("Content root changed while copying")
+        current_destination = os.stat(
+            staging_content_root.name,
+            dir_fd=destination_parent_fd,
+            follow_symlinks=False,
+        )
+        if (current_destination.st_dev, current_destination.st_ino) != (
+            destination_identity.st_dev,
+            destination_identity.st_ino,
+        ):
+            raise OverlayPolicyError("Content staging root changed while copying")
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        if source_parent_fd >= 0:
+            os.close(source_parent_fd)
+        os.close(destination_fd)
+        os.close(destination_parent_fd)
