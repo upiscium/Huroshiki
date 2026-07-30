@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+import tracemalloc
 import unittest
 from unittest.mock import patch
 
@@ -100,6 +101,56 @@ class ContentOperationsTest(unittest.TestCase):
             "currently available only for packs",
         ):
             core.list_content_entries("template:base")
+
+    def test_listing_and_snapshot_stream_large_files_with_bounded_probe_memory(self) -> None:
+        target = self.content / "client/resourcepacks/large.bin"
+        target.parent.mkdir(parents=True)
+        size = 32 * 1024 * 1024
+        with target.open("wb") as handle:
+            handle.truncate(size)
+        requested_reads: list[int] = []
+        original_read = overlay_policy.os.read
+
+        def track_read(descriptor: int, count: int) -> bytes:
+            requested_reads.append(count)
+            return original_read(descriptor, count)
+
+        tracemalloc.start()
+        try:
+            with patch.object(
+                content_operations,
+                "read_overlay_bytes",
+                side_effect=AssertionError("listing must not materialize file bytes"),
+            ), patch.object(overlay_policy.os, "read", side_effect=track_read):
+                entries = core.list_content_entries("pack:demo")
+                snapshot = core.content_snapshot("pack:demo")
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        entry = next(
+            item
+            for item in entries
+            if item.relative_path == Path("resourcepacks/large.bin")
+        )
+        self.assertEqual(entry.size, size)
+        self.assertIsNotNone(entry.digest)
+        self.assertTrue(
+            any(
+                item.relative_path == Path("resourcepacks/large.bin")
+                and item.digest == entry.digest
+                for item in snapshot.entries
+            )
+        )
+        inspection = overlay_policy.inspect_overlay_file(
+            self.content,
+            "client",
+            "resourcepacks/large.bin",
+            probe_bytes=content_operations.CONTENT_TEXT_PROBE_BYTES,
+        )
+        self.assertEqual(len(inspection.text_probe), 64 * 1024)
+        self.assertLessEqual(max(requested_reads), 1024 * 1024)
+        self.assertLess(peak, 8 * 1024 * 1024)
 
     def test_snapshot_is_stable_and_tracks_content_mode_and_empty_directories(self) -> None:
         target = self.content / "common/config/demo.toml"
@@ -357,6 +408,190 @@ class ContentOperationsTest(unittest.TestCase):
         os.mkfifo(fifo)
         with self.assertRaisesRegex(core.ContentOperationError, "unsafe or invalid"):
             core.plan_content_changes("pack:demo", ())
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_large_create_cancel_and_replace_deadline_interrupt_chunk_writes(self) -> None:
+        config = self.content / "common/config"
+        config.mkdir(parents=True)
+        original_apply = content_operations._apply_operation
+        original_write = overlay_policy.os.write
+
+        def run_case(*, replace: bool) -> None:
+            active = False
+            interrupted = False
+            cancel_event = threading.Event()
+            deadline = time.monotonic() + 100
+            existing = config / "value.bin"
+            if replace:
+                existing.write_bytes(b"old")
+
+            def activate(staging, operation, checkpoint):
+                nonlocal active
+                active = True
+                return original_apply(staging, operation, checkpoint)
+
+            def interrupt_write(descriptor: int, contents) -> int:
+                nonlocal interrupted
+                written = original_write(descriptor, contents)
+                if active and not interrupted:
+                    interrupted = True
+                    if replace:
+                        deadline_expired.set()
+                    else:
+                        cancel_event.set()
+                return written
+
+            deadline_expired = threading.Event()
+            original_monotonic = content_operations.time.monotonic
+
+            def monotonic() -> float:
+                return deadline + 1 if deadline_expired.is_set() else original_monotonic()
+
+            operation: core.ContentOperation
+            if replace:
+                operation = core.ContentReplaceFile(
+                    "common",
+                    Path("config/value.bin"),
+                    b"r" * (3 * 1024 * 1024),
+                )
+                expected_error = core.ContentOperationDeadlineExceeded
+            else:
+                operation = core.ContentCreateFile(
+                    "common",
+                    Path("config/value.bin"),
+                    b"c" * (3 * 1024 * 1024),
+                )
+                expected_error = core.ContentOperationCancelled
+            before_roots = set((self.state / "transactions").glob("*"))
+            with patch.object(
+                content_operations,
+                "_apply_operation",
+                side_effect=activate,
+            ), patch.object(
+                overlay_policy.os,
+                "write",
+                side_effect=interrupt_write,
+            ), patch.object(
+                content_operations.time,
+                "monotonic",
+                side_effect=monotonic,
+            ):
+                with self.assertRaises(expected_error):
+                    core.plan_content_changes(
+                        "pack:demo",
+                        (operation,),
+                        cancel_event=cancel_event,
+                        deadline=deadline,
+                    )
+            transaction_root = next(
+                path
+                for path in (self.state / "transactions").glob("*")
+                if path not in before_roots
+            )
+            staged = transaction_root / "staging-content/common/config/value.bin"
+            if replace:
+                self.assertEqual(staged.read_bytes(), b"old")
+                self.assertEqual(existing.read_bytes(), b"old")
+            else:
+                self.assertFalse(staged.exists())
+                self.assertFalse(existing.exists())
+            self.assertFalse(
+                any(staged.parent.glob(".value.bin.huroshiki-tmp-*"))
+            )
+            self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+        run_case(replace=False)
+        run_case(replace=True)
+
+    def test_replace_cancel_after_file_exchange_restores_staging_entry(self) -> None:
+        target = self.content / "common/config/value.bin"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"old")
+        cancel_event = threading.Event()
+        original_renameat2 = overlay_policy._renameat2
+        exchanged = False
+
+        def cancel_after_exchange(*args):
+            nonlocal exchanged
+            result = original_renameat2(*args)
+            if args[4] == overlay_policy._RENAME_EXCHANGE and not exchanged:
+                exchanged = True
+                cancel_event.set()
+            return result
+
+        before_roots = set((self.state / "transactions").glob("*"))
+        with patch.object(
+            overlay_policy,
+            "_renameat2",
+            side_effect=cancel_after_exchange,
+        ):
+            with self.assertRaises(core.ContentOperationCancelled):
+                core.plan_content_changes(
+                    "pack:demo",
+                    (
+                        core.ContentReplaceFile(
+                            "common", Path("config/value.bin"), b"new"
+                        ),
+                    ),
+                    cancel_event=cancel_event,
+                )
+        transaction_root = next(
+            path
+            for path in (self.state / "transactions").glob("*")
+            if path not in before_roots
+        )
+        self.assertEqual(target.read_bytes(), b"old")
+        self.assertEqual(
+            (
+                transaction_root
+                / "staging-content/common/config/value.bin"
+            ).read_bytes(),
+            b"old",
+        )
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_create_cancel_after_file_publication_restores_missing_entry(self) -> None:
+        parent = self.content / "common/config"
+        parent.mkdir(parents=True)
+        cancel_event = threading.Event()
+        original_renameat2 = overlay_policy._renameat2
+        published = False
+
+        def cancel_after_publish(*args):
+            nonlocal published
+            result = original_renameat2(*args)
+            if args[4] == overlay_policy._RENAME_NOREPLACE and not published:
+                published = True
+                cancel_event.set()
+            return result
+
+        before_roots = set((self.state / "transactions").glob("*"))
+        with patch.object(
+            overlay_policy,
+            "_renameat2",
+            side_effect=cancel_after_publish,
+        ):
+            with self.assertRaises(core.ContentOperationCancelled):
+                core.plan_content_changes(
+                    "pack:demo",
+                    (
+                        core.ContentCreateFile(
+                            "common", Path("config/new.bin"), b"new"
+                        ),
+                    ),
+                    cancel_event=cancel_event,
+                )
+        transaction_root = next(
+            path
+            for path in (self.state / "transactions").glob("*")
+            if path not in before_roots
+        )
+        self.assertFalse((parent / "new.bin").exists())
+        self.assertFalse(
+            (
+                transaction_root / "staging-content/common/config/new.bin"
+            ).exists()
+        )
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
     def test_plan_holds_exclusive_project_lock_for_its_lifetime(self) -> None:

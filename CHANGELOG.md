@@ -7,6 +7,8 @@
 - Added the snapshot-based Content overlay core used to safely plan and atomically publish
   multi-file changes across common, client, and server overlays. Plans detect stale content,
   unsafe entries, portable collisions, and effective cross-side conflicts before publication.
+  Listing and snapshots stream file digests with bounded text probes, while staged writes remain
+  cancellable and post-publication rollback receives a separate bounded cleanup budget.
 
 ### Reliability and Transaction Safety
 

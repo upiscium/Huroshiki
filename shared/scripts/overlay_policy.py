@@ -43,6 +43,16 @@ class OverlayFile:
 
 
 @dataclass(frozen=True)
+class OverlayFileInspection:
+    size: int
+    mode: int
+    device: int
+    inode: int
+    digest: str
+    text_probe: bytes
+
+
+@dataclass(frozen=True)
 class OverlayIssue:
     relative_path: Path
     message: str
@@ -264,6 +274,74 @@ def read_overlay_bytes(
             os.close(fd)
 
 
+def inspect_overlay_file(
+    content_root: Path,
+    target: str,
+    relative_path: str | Path,
+    *,
+    probe_bytes: int = 0,
+    checkpoint: Callable[[], None] | None = None,
+) -> OverlayFileInspection:
+    relative = normalize_overlay_relative_path(relative_path)
+    if probe_bytes < 0:
+        raise OverlayPolicyError("Overlay text probe limit must be non-negative")
+    with _open_overlay_parent(content_root, target, relative, create=False) as parent:
+        try:
+            fd = os.open(
+                relative.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                dir_fd=parent.fd,
+            )
+        except FileNotFoundError as error:
+            raise OverlayPolicyError(
+                f"Overlay file does not exist: {target}/{relative}"
+            ) from error
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise OverlayPolicyError(
+                    f"Overlay file does not exist: {target}/{relative}"
+                )
+            digest = hashlib.sha256()
+            probe = bytearray()
+            while True:
+                if checkpoint is not None:
+                    checkpoint()
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                if len(probe) < probe_bytes:
+                    probe.extend(chunk[: probe_bytes - len(probe)])
+            after = os.fstat(fd)
+            current = os.stat(
+                relative.name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            identity = (opened.st_dev, opened.st_ino)
+            if (
+                identity != (after.st_dev, after.st_ino)
+                or identity != (current.st_dev, current.st_ino)
+                or opened.st_size != after.st_size
+                or opened.st_mtime_ns != after.st_mtime_ns
+                or opened.st_ctime_ns != after.st_ctime_ns
+            ):
+                raise OverlayPolicyError(
+                    f"Overlay file changed while inspecting: {target}/{relative}"
+                )
+            return OverlayFileInspection(
+                opened.st_size,
+                stat.S_IMODE(opened.st_mode),
+                opened.st_dev,
+                opened.st_ino,
+                digest.hexdigest(),
+                bytes(probe),
+            )
+        finally:
+            os.close(fd)
+
+
 def read_overlay_text(content_root: Path, target: str, relative_path: str | Path) -> str:
     return read_overlay_bytes(content_root, target, relative_path).contents.decode("utf-8")
 
@@ -291,9 +369,10 @@ def write_overlay_bytes(
     relative_path: str | Path,
     contents: bytes,
     *,
-    mode: int = 0o644,
+    mode: int | None = 0o644,
     create: bool,
     expected_digest: str | None = None,
+    checkpoint: Callable[[], None] | None = None,
 ) -> None:
     relative = normalize_overlay_relative_path(relative_path)
     temporary_name = f".{relative.name}.huroshiki-tmp-{uuid4().hex}"
@@ -309,13 +388,23 @@ def write_overlay_bytes(
                     f"Overlay entry already exists: {target}/{relative}"
                 )
         else:
-            current = read_overlay_bytes(content_root, target, relative)
+            current = inspect_overlay_file(
+                content_root,
+                target,
+                relative,
+                checkpoint=checkpoint,
+            )
             existing_identity = (current.device, current.inode)
             if expected_digest is not None and current.digest != expected_digest:
                 raise OverlayPolicyError(
                     f"Overlay file digest changed: {target}/{relative}"
                 )
+            if mode is None:
+                mode = current.mode
+        if mode is None:
+            raise OverlayPolicyError("Overlay create mode is required")
         temporary_fd = -1
+        preserve_temporary = False
         try:
             temporary_fd = os.open(
                 temporary_name,
@@ -324,11 +413,17 @@ def write_overlay_bytes(
                 dir_fd=parent.fd,
             )
             view = memoryview(contents)
-            while view:
-                written = os.write(temporary_fd, view)
-                if written == 0:
-                    raise OSError(errno.EIO, "short overlay write")
-                view = view[written:]
+            offset = 0
+            while offset < len(view):
+                if checkpoint is not None:
+                    checkpoint()
+                chunk = view[offset : offset + 1024 * 1024]
+                while chunk:
+                    written = os.write(temporary_fd, chunk)
+                    if written == 0:
+                        raise OSError(errno.EIO, "short overlay write")
+                    offset += written
+                    chunk = chunk[written:]
             os.fchmod(temporary_fd, mode)
             os.close(temporary_fd)
             temporary_fd = -1
@@ -343,6 +438,9 @@ def write_overlay_bytes(
                         f"Overlay file changed before replacement: {target}/{relative}"
                     )
             if create:
+                if checkpoint is not None:
+                    checkpoint()
+                published = False
                 try:
                     _renameat2(
                         parent.fd,
@@ -351,11 +449,33 @@ def write_overlay_bytes(
                         relative.name,
                         _RENAME_NOREPLACE,
                     )
+                    published = True
+                    if checkpoint is not None:
+                        checkpoint()
                 except FileExistsError as error:
                     raise OverlayPolicyError(
                         f"Overlay entry already exists: {target}/{relative}"
                     ) from error
+                except BaseException as error:
+                    if published:
+                        try:
+                            _renameat2(
+                                parent.fd,
+                                relative.name,
+                                parent.fd,
+                                temporary_name,
+                                _RENAME_NOREPLACE,
+                            )
+                        except BaseException as rollback_error:
+                            preserve_temporary = True
+                            raise OverlayPolicyError(
+                                f"Overlay create rollback failed: {target}/{relative}: "
+                                f"{rollback_error}"
+                            ) from error
+                    raise
             else:
+                if checkpoint is not None:
+                    checkpoint()
                 _renameat2(
                     parent.fd,
                     temporary_name,
@@ -363,29 +483,42 @@ def write_overlay_bytes(
                     relative.name,
                     _RENAME_EXCHANGE,
                 )
-                exchanged = os.stat(
-                    temporary_name,
-                    dir_fd=parent.fd,
-                    follow_symlinks=False,
-                )
-                if existing_identity != (exchanged.st_dev, exchanged.st_ino):
-                    _renameat2(
-                        parent.fd,
+                try:
+                    exchanged = os.stat(
                         temporary_name,
-                        parent.fd,
-                        relative.name,
-                        _RENAME_EXCHANGE,
+                        dir_fd=parent.fd,
+                        follow_symlinks=False,
                     )
-                    raise OverlayPolicyError(
-                        f"Overlay file changed during replacement: {target}/{relative}"
-                    )
+                    if existing_identity != (exchanged.st_dev, exchanged.st_ino):
+                        raise OverlayPolicyError(
+                            f"Overlay file changed during replacement: {target}/{relative}"
+                        )
+                    if checkpoint is not None:
+                        checkpoint()
+                except BaseException as error:
+                    try:
+                        _renameat2(
+                            parent.fd,
+                            temporary_name,
+                            parent.fd,
+                            relative.name,
+                            _RENAME_EXCHANGE,
+                        )
+                    except BaseException as rollback_error:
+                        preserve_temporary = True
+                        raise OverlayPolicyError(
+                            f"Overlay replace rollback failed: {target}/{relative}: "
+                            f"{rollback_error}"
+                        ) from error
+                    raise
         finally:
             if temporary_fd >= 0:
                 os.close(temporary_fd)
-            try:
-                os.unlink(temporary_name, dir_fd=parent.fd)
-            except FileNotFoundError:
-                pass
+            if not preserve_temporary:
+                try:
+                    os.unlink(temporary_name, dir_fd=parent.fd)
+                except FileNotFoundError:
+                    pass
 
 
 def delete_overlay_entry(

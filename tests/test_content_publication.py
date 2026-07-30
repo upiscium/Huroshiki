@@ -211,6 +211,94 @@ class ContentPublicationTest(unittest.TestCase):
                 self.assertTrue(packctl.project_lock_is_active("pack:demo"))
                 self.finish(plan)
 
+    def test_post_exchange_deadline_uses_fresh_cleanup_deadline(self) -> None:
+        plan = self.plan(
+            core.ContentReplaceFile(
+                "common", Path("config/original.txt"), b"published"
+            )
+        )
+        execution_deadline = time.monotonic() + 100
+        original_checkpoint = content_operations._checkpoint
+        expired = False
+
+        def expire_after_exchange(cancel_event, deadline):
+            nonlocal expired
+            if (
+                plan._publication_active
+                and deadline == execution_deadline
+                and not expired
+            ):
+                expired = True
+                raise core.ContentOperationDeadlineExceeded(
+                    "Content operation deadline exceeded"
+                )
+            return original_checkpoint(cancel_event, deadline)
+
+        with patch.object(
+            content_operations,
+            "_checkpoint",
+            side_effect=expire_after_exchange,
+        ):
+            with self.assertRaises(core.ContentOperationDeadlineExceeded):
+                core.apply_content_changes(plan, deadline=execution_deadline)
+
+        self.assertTrue(expired)
+        self.assertEqual(self.original.read_bytes(), b"original")
+        self.assertEqual(
+            (plan.retained_failed_content / "common/config/original.txt").read_bytes(),
+            b"published",
+        )
+        self.assertFalse(plan._publication_active)
+        self.assertIsNone(plan.cleanup_error)
+        self.assertTrue(packctl.project_lock_is_active("pack:demo"))
+        self.finish(plan)
+
+    def test_post_exchange_cleanup_deadline_exhaustion_retries_discard(self) -> None:
+        plan = self.plan(
+            core.ContentReplaceFile(
+                "common", Path("config/original.txt"), b"published"
+            )
+        )
+        execution_deadline = time.monotonic() + 100
+        original_checkpoint = content_operations._checkpoint
+        expired = False
+
+        def expire_after_exchange(cancel_event, deadline):
+            nonlocal expired
+            if (
+                plan._publication_active
+                and deadline == execution_deadline
+                and not expired
+            ):
+                expired = True
+                raise core.ContentOperationDeadlineExceeded(
+                    "Content operation deadline exceeded"
+                )
+            return original_checkpoint(cancel_event, deadline)
+
+        with patch.object(
+            content_operations,
+            "_checkpoint",
+            side_effect=expire_after_exchange,
+        ), patch.object(
+            content_operations,
+            "CONTENT_CLEANUP_TIMEOUT_SECONDS",
+            0.0,
+        ):
+            with self.assertRaises(core.ContentCleanupError):
+                core.apply_content_changes(plan, deadline=execution_deadline)
+
+        self.assertEqual(self.original.read_bytes(), b"published")
+        self.assertTrue(plan._publication_active)
+        self.assertIsNotNone(plan.cleanup_error)
+        self.assertTrue(packctl.project_lock_is_active("pack:demo"))
+        retry = plan.retry_discard(deadline=time.monotonic() + 1)
+        self.assertTrue(retry.done.wait(1))
+        retry.raise_for_error()
+        self.assertEqual(self.original.read_bytes(), b"original")
+        self.assertFalse(plan._publication_active)
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
     def test_committed_lock_release_failure_is_observable_and_retryable(self) -> None:
         plan = self.plan(
             core.ContentReplaceFile(

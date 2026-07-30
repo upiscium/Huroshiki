@@ -18,6 +18,7 @@ from overlay_policy import (
     copy_content_tree,
     create_overlay_directory,
     delete_overlay_entry,
+    inspect_overlay_file,
     move_overlay_entry,
     normalize_overlay_relative_path,
     read_overlay_bytes,
@@ -30,6 +31,7 @@ from portable_paths import PortablePathError, portable_relative_path_key
 CONTENT_TEXT_PROBE_BYTES = 64 * 1024
 CONTENT_OPERATION_TIMEOUT_SECONDS = 600.0
 CONTENT_DISCARD_TIMEOUT_SECONDS = 10.0
+CONTENT_CLEANUP_TIMEOUT_SECONDS = 10.0
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _SIDE_ORDER = {side: index for index, side in enumerate(OVERLAY_TARGETS)}
 
@@ -255,8 +257,7 @@ def _category(path: Path) -> str:
     }.get(prefix, "other")
 
 
-def _text_kind(contents: bytes) -> Literal["utf8", "binary", "unknown"]:
-    probe = contents[:CONTENT_TEXT_PROBE_BYTES]
+def _text_kind(probe: bytes) -> Literal["utf8", "binary", "unknown"]:
     if b"\0" in probe:
         return "binary"
     try:
@@ -320,10 +321,11 @@ def list_content_entries_at(
         size = overlay_entry.size
         if overlay_entry.kind == "file" and not entry_errors:
             try:
-                file = read_overlay_bytes(
+                file = inspect_overlay_file(
                     content_root,
                     entry_side,
                     relative,
+                    probe_bytes=CONTENT_TEXT_PROBE_BYTES,
                     checkpoint=checkpoint,
                 )
             except (OverlayPolicyError, OSError) as error:
@@ -332,9 +334,9 @@ def list_content_entries_at(
             else:
                 kind = "file"
                 mode = file.mode
-                size = len(file.contents)
+                size = file.size
                 digest = file.digest
-                text_kind = _text_kind(file.contents)
+                text_kind = _text_kind(file.text_probe)
         elif overlay_entry.kind == "directory" and not entry_errors:
             kind = "directory"
         else:
@@ -383,7 +385,7 @@ def read_content_file_at(
         file.mode,
         bool(file.mode & 0o111),
         file.digest,
-        _text_kind(file.contents),
+        _text_kind(file.contents[:CONTENT_TEXT_PROBE_BYTES]),
         _category(relative),
         (),
     )
@@ -566,7 +568,11 @@ def _normalize_operations(
     return tuple(normalized)
 
 
-def _apply_operation(staging: Path, operation: ContentOperation) -> None:
+def _apply_operation(
+    staging: Path,
+    operation: ContentOperation,
+    checkpoint: Callable[[], None],
+) -> None:
     try:
         if isinstance(operation, ContentCreateFile):
             write_overlay_bytes(
@@ -576,21 +582,18 @@ def _apply_operation(staging: Path, operation: ContentOperation) -> None:
                 operation.contents,
                 mode=operation.mode,
                 create=True,
+                checkpoint=checkpoint,
             )
         elif isinstance(operation, ContentReplaceFile):
-            existing = read_overlay_bytes(
-                staging,
-                operation.side,
-                operation.relative_path,
-            )
             write_overlay_bytes(
                 staging,
                 operation.side,
                 operation.relative_path,
                 operation.contents,
-                mode=existing.mode if operation.mode is None else operation.mode,
+                mode=operation.mode,
                 create=False,
                 expected_digest=operation.expected_digest,
+                checkpoint=checkpoint,
             )
         elif isinstance(operation, ContentDeleteFile):
             delete_overlay_entry(
@@ -1140,7 +1143,7 @@ def plan_content_changes_at(
         normalized = _normalize_operations(tuple(operations))
         for operation in normalized:
             checkpoint()
-            _apply_operation(staging, operation)
+            _apply_operation(staging, operation, checkpoint)
         checkpoint()
         staging_scan = scan_content_overlays(staging)
         if staging_scan.issues:
@@ -1329,7 +1332,11 @@ def apply_content_changes(
         except BaseException as error:
             if plan._publication_active and not plan._publication_committed:
                 try:
-                    plan._rollback_publication(deadline=effective_deadline)
+                    plan._rollback_publication(
+                        deadline=(
+                            time.monotonic() + CONTENT_CLEANUP_TIMEOUT_SECONDS
+                        )
+                    )
                 except BaseException as rollback_error:
                     plan.cleanup_error = rollback_error
             plan.state = "failed"
