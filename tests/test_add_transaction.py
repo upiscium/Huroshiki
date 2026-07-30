@@ -335,6 +335,7 @@ class AddTransactionTest(unittest.TestCase):
             staged_shared = transaction.source / "mods/shared.pw.toml"
             self.assertEqual(packctl.read_toml(staged_shared)["side"], "both")
             self.assertFalse(operation.resolver_root.exists())
+            self.assertTrue(operation.retained_checkpoint.exists())
             self.assertEqual(packctl.read_toml(shared)["side"], "client")
         finally:
             transaction.discard()
@@ -696,7 +697,7 @@ class AddTransactionTest(unittest.TestCase):
         finally:
             transaction.discard()
 
-    def test_checkpoint_copy_cancellation_removes_partial_state_and_rolls_back(self) -> None:
+    def test_checkpoint_copy_cancellation_retains_partial_state_and_rolls_back(self) -> None:
         for resolved in (False, True):
             with self.subTest(resolved=resolved):
                 transaction = core.PackTransaction.create(self.key)
@@ -722,7 +723,7 @@ class AddTransactionTest(unittest.TestCase):
                         )
                     )
 
-                    def copy(_, destination, *, checkpoint):
+                    def copy(_, destination, *, checkpoint, **__):
                         destination.mkdir(parents=True)
                         (destination / "partial").write_text("partial", encoding="utf-8")
                         started.set()
@@ -742,6 +743,7 @@ class AddTransactionTest(unittest.TestCase):
                     self.assertTrue(operation.result.cancelled)
                     self.assertEqual(operation.result.returncode, 130)
                     self.assertFalse(operation.checkpoint.exists())
+                    self.assertTrue(operation.retained_checkpoint.exists())
                     self.assertFalse(operation.resolver_root.exists())
                     self.assertEqual(
                         self.snapshot_tree(transaction.source), staged_before
@@ -765,7 +767,7 @@ class AddTransactionTest(unittest.TestCase):
                 deadline=time.monotonic() + 0.03,
             )
 
-            def copy(_, destination, *, checkpoint):
+            def copy(_, destination, *, checkpoint, **__):
                 destination.mkdir(parents=True)
                 (destination / "partial").touch()
                 while True:
@@ -776,9 +778,11 @@ class AddTransactionTest(unittest.TestCase):
                 result = operation.run()
 
             self.assertFalse(result.cancelled)
+            self.assertTrue(result.timed_out)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(result.message, "Install operation deadline exceeded")
             self.assertFalse(operation.checkpoint.exists())
+            self.assertTrue(operation.retained_checkpoint.exists())
             self.assertFalse(operation.resolver_root.exists())
             self.assertEqual(self.snapshot_tree(transaction.source), staged_before)
             self.assertEqual(self.snapshot(), real_before)
@@ -799,7 +803,7 @@ class AddTransactionTest(unittest.TestCase):
                 server=True,
             )
 
-            def copy(_, destination, *, checkpoint):
+            def copy(_, destination, *, checkpoint, **__):
                 destination.mkdir(parents=True)
                 started.set()
                 while True:
@@ -850,6 +854,9 @@ class AddTransactionTest(unittest.TestCase):
             self.assertTrue(result.success, result.message)
             self.assertEqual(resolve.call_args.kwargs["deadline"], deadline)
             self.assertIs(resolve.call_args.kwargs["cancel_event"], operation.cancel_event)
+            self.assertEqual(
+                resolve.call_args.kwargs["resolver_root"], operation.resolver_root
+            )
         finally:
             transaction.discard()
 
@@ -926,6 +933,149 @@ class AddTransactionTest(unittest.TestCase):
             )
             self.assertFalse(expired_result.cancelled)
         finally:
+            transaction.discard()
+
+    def test_interactive_pty_timeout_rolls_back_and_completes_operation(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        staged = transaction.source / "mods/staged.pw.toml"
+        staged.write_text(metadata("Staged", "staged"), encoding="utf-8")
+        staged_before = self.snapshot_tree(transaction.source)
+        real_before = self.snapshot()
+        observed_deadlines: list[float] = []
+
+        class Session:
+            termination_result = None
+
+            def __init__(self, *_, **__) -> None:
+                pass
+
+            def run(self, *, deadline):
+                observed_deadlines.append(deadline)
+                termination = core.ProcessTerminationResult(True, True, True)
+                self.termination_result = termination
+                return core.PtyResult(
+                    -15,
+                    Path("raw.log"),
+                    Path("events.log"),
+                    Path("output.log"),
+                    "",
+                    termination_result=termination,
+                    timed_out=True,
+                )
+
+            def cancel(self, *, deadline=None):
+                return self.termination_result
+
+        try:
+            deadline = time.monotonic() + 1
+            with patch.object(core, "PackwizPtySession", Session):
+                operation = transaction.begin_add(
+                    "modrinth",
+                    "root",
+                    client=True,
+                    server=True,
+                    deadline=deadline,
+                )
+                result = operation.run()
+
+            self.assertEqual(observed_deadlines, [deadline])
+            self.assertEqual(result.message, "Install operation deadline exceeded")
+            self.assertFalse(result.cancelled)
+            self.assertTrue(result.timed_out)
+            self.assertTrue(operation.done.is_set())
+            self.assertIsNone(transaction._operation)
+            self.assertEqual(self.snapshot_tree(transaction.source), staged_before)
+            self.assertEqual(self.snapshot(), real_before)
+            self.assertTrue(operation.retained_failed_source.exists())
+            self.assertTrue(operation.retained_resolver_root.exists())
+        finally:
+            transaction.discard()
+
+    def test_success_hands_checkpoint_to_retention_without_recursive_delete(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        staged = transaction.source / "mods/staged.pw.toml"
+        staged.write_text(metadata("Staged", "staged"), encoding="utf-8")
+        staged_before = self.snapshot_tree(transaction.source)
+        try:
+            operation = transaction.begin_add(
+                "url",
+                "https://example.invalid/private.jar",
+                client=True,
+                server=True,
+            )
+
+            def destructive_delete(path, *_, **__):
+                target = Path(path)
+                if target == operation.checkpoint:
+                    candidate = next(
+                        item for item in target.rglob("*") if item.is_file()
+                    )
+                    candidate.unlink()
+                raise OSError("recursive cleanup stalled")
+
+            with patch.object(
+                core, "download_url_artifact", return_value=self.url_artifact()
+            ), patch.object(
+                core.shutil, "rmtree", side_effect=destructive_delete
+            ) as recursive_delete:
+                result = operation.run()
+
+            self.assertTrue(result.success, result.message)
+            recursive_delete.assert_not_called()
+            self.assertFalse(operation.checkpoint.exists())
+            self.assertTrue(operation.retained_checkpoint.exists())
+            self.assertEqual(
+                self.snapshot_tree(operation.retained_checkpoint), staged_before
+            )
+            self.assertFalse(operation.resolver_root.exists())
+            self.assertTrue(operation.retained_resolver_root.exists())
+            self.assertIsNone(transaction._operation)
+        finally:
+            transaction.discard()
+
+    def test_checkpoint_handoff_failure_retains_recovery_and_blocks_cleanup_integrity(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        staged = transaction.source / "mods/staged.pw.toml"
+        staged.write_text(metadata("Staged", "staged"), encoding="utf-8")
+        staged_before = self.snapshot_tree(transaction.source)
+        real_before = self.snapshot()
+        original_rename = Path.rename
+        try:
+            operation = transaction.begin_add(
+                "url",
+                "https://example.invalid/private.jar",
+                client=True,
+                server=True,
+                deadline=time.monotonic() + 1,
+            )
+
+            def fail_checkpoint_rename(path: Path, target: Path):
+                if path == operation.checkpoint:
+                    raise OSError("checkpoint handoff stalled")
+                return original_rename(path, target)
+
+            started = time.monotonic()
+            with patch.object(
+                core, "download_url_artifact", return_value=self.url_artifact()
+            ), patch.object(Path, "rename", autospec=True, side_effect=fail_checkpoint_rename):
+                result = operation.run()
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 1.0)
+            self.assertFalse(result.success)
+            self.assertIsNotNone(operation.cleanup_error)
+            self.assertIn("checkpoint handoff stalled", result.message)
+            self.assertTrue(operation.done.is_set())
+            self.assertIs(transaction._operation, operation)
+            self.assertEqual(self.snapshot(), real_before)
+            self.assertTrue(operation.checkpoint.exists())
+            self.assertEqual(
+                self.snapshot_tree(operation.checkpoint), staged_before
+            )
+            self.assertTrue(operation.retained_resolver_root.exists())
+            self.assertEqual(transaction.batches, [])
+        finally:
+            transaction._operation = None
             transaction.discard()
 
     def test_cancel_after_checkpoint_restores_staged_and_real_sources(self) -> None:

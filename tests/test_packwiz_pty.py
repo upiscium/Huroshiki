@@ -172,6 +172,40 @@ class PackwizPtySessionTest(unittest.TestCase):
 
         self.assertEqual(result, incomplete)
 
+    def test_deadline_terminates_unresponsive_process_group_without_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = self.make_script(
+                root,
+                """\
+                #!/usr/bin/env bash
+                trap '' INT TERM
+                sleep 30 &
+                wait
+                """,
+            )
+            session = PackwizPtySession(
+                [str(binary)],
+                cwd=root,
+                log_dir=root / "logs",
+            )
+            started = time.monotonic()
+            result = session.run(deadline=started + 0.2)
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 1.0)
+            self.assertTrue(result.timed_out)
+            self.assertFalse(result.cancelled)
+            self.assertIsNotNone(result.termination_result)
+            assert result.termination_result is not None
+            self.assertTrue(result.termination_result.group_drained)
+            self.assertTrue(result.termination_result.parent_reaped)
+            assert session.process is not None
+            self.assertEqual(
+                packwiz_pty.live_process_group_members(session.process.pid),
+                (),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

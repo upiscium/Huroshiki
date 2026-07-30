@@ -6,8 +6,10 @@
 
 - Install checkpoint preparation now runs inside the add-operation worker and shares cancellation
   plus one operation-wide absolute deadline across copy, resolution, URL download, merge, rollback,
-  cleanup, and navigation. Partial checkpoints are removed, and worker-start failure releases only
-  operation ownership while preserving the active transaction and project lock.
+  interactive PTY polling, cleanup, and navigation. Checkpoints, resolver trees, and failed staged
+  sources are atomically handed to retained transaction state instead of recursively deleted by the
+  operation; worker-start failure releases only operation ownership while preserving the transaction
+  and project lock.
 
 ## 0.2.0-rc.1 - 2026-07-30
 

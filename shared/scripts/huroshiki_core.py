@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 import errno
 import hashlib
@@ -615,6 +616,7 @@ class AddOperationResult:
     event_log: Path
     message: str
     cancelled: bool = False
+    timed_out: bool = False
 
     @property
     def success(self) -> bool:
@@ -801,6 +803,7 @@ class _AddOperationLifecycle:
         self.result: AddOperationResult | None = None
         self.cleanup_error: BaseException | None = None
         self._checkpoint_complete = False
+        self._pending_batch: TransactionBatch | None = None
         self._state: Literal["created", "running", "done"] = "created"
         self._state_lock = threading.Lock()
 
@@ -886,6 +889,7 @@ class _AddOperationLifecycle:
             event_log=event_log,
             message=message,
             cancelled=self.cancelled,
+            timed_out=isinstance(error, AddOperationDeadlineExceeded),
         )
 
     def abort_before_start(
@@ -919,8 +923,18 @@ class ResolvedAddOperation(_AddOperationLifecycle):
         self.provider, self.selector = normalize_add_selector(provider, selector)
         self.canonical_project_id = canonical_project_id
         self.side = packctl.normalize_side(side)
-        self.checkpoint = transaction.root / f"checkpoint-{uuid4().hex}"
-        self.resolver_root = transaction.root / f"resolved-{uuid4().hex}"
+        operation_id = uuid4().hex
+        self.checkpoint = transaction.root / f"checkpoint-{operation_id}"
+        self.retained_checkpoint = (
+            transaction.root / f"retained-add-checkpoint-{operation_id}"
+        )
+        self.resolver_root = transaction.root / f"resolved-{operation_id}"
+        self.retained_resolver_root = (
+            transaction.root / f"retained-add-resolver-{operation_id}"
+        )
+        self.retained_failed_source = (
+            transaction.root / f"retained-failed-add-source-{operation_id}"
+        )
         self.minecraft = ""
         self.loader = ""
         self.loader_version = ""
@@ -950,6 +964,7 @@ class ResolvedAddOperation(_AddOperationLifecycle):
                 self.transaction.source,
                 self.checkpoint,
                 checkpoint=self._checkpoint,
+                retained_destination=self.retained_checkpoint,
             )
             self._checkpoint_complete = True
             self._checkpoint()
@@ -971,6 +986,7 @@ class ResolvedAddOperation(_AddOperationLifecycle):
                 canonical_project_id=self.canonical_project_id,
                 cancel_event=self.cancel_event,
                 deadline=self.deadline,
+                resolver_root=self.resolver_root,
             )
             self._checkpoint()
             with self.transaction._lock:
@@ -985,26 +1001,25 @@ class ResolvedAddOperation(_AddOperationLifecycle):
                     requested_side=self.side,
                 )
                 self._checkpoint()
-                self.transaction.batches.append(
-                    TransactionBatch(
-                        provider=self.provider,
-                        query=self.selector,
-                        changed_files=changed,
-                    )
+                batch = TransactionBatch(
+                    provider=self.provider,
+                    query=self.selector,
+                    changed_files=changed,
                 )
-                if self.resolver_root.exists():
-                    shutil.rmtree(self.resolver_root)
-                shutil.rmtree(self.checkpoint)
+                result = AddOperationResult(
+                    0,
+                    changed,
+                    raw_log,
+                    text_log,
+                    event_log,
+                    f"Staged {self.provider}:{closure.root_identity[1]} and dependencies",
+                )
+                self._pending_batch = batch
+                self.transaction.batches.append(batch)
+                self.transaction._retain_add_operation_paths(self)
                 self._checkpoint_complete = False
+                self._pending_batch = None
                 self.transaction._operation = None
-            result = AddOperationResult(
-                0,
-                changed,
-                raw_log,
-                text_log,
-                event_log,
-                f"Staged {self.provider}:{closure.root_identity[1]} and dependencies",
-            )
         except BaseException as error:
             if not isinstance(error, Exception):
                 fatal_error = error
@@ -1046,8 +1061,18 @@ class PackwizAddOperation(_AddOperationLifecycle):
         self.termination_incomplete = False
         self.menu_items: dict[int, str] = {}
         self.selection: str | None = None
-        self.checkpoint = transaction.root / f"checkpoint-{uuid4().hex}"
-        self.resolver_root = transaction.root / f"resolver-{uuid4().hex}"
+        operation_id = uuid4().hex
+        self.checkpoint = transaction.root / f"checkpoint-{operation_id}"
+        self.retained_checkpoint = (
+            transaction.root / f"retained-add-checkpoint-{operation_id}"
+        )
+        self.resolver_root = transaction.root / f"resolver-{operation_id}"
+        self.retained_resolver_root = (
+            transaction.root / f"retained-add-resolver-{operation_id}"
+        )
+        self.retained_failed_source = (
+            transaction.root / f"retained-failed-add-source-{operation_id}"
+        )
         self.resolver_source = self.resolver_root / "source"
         self.minecraft = ""
         self.loader = ""
@@ -1071,6 +1096,7 @@ class PackwizAddOperation(_AddOperationLifecycle):
             self.transaction.source,
             self.checkpoint,
             checkpoint=self._checkpoint,
+            retained_destination=self.retained_checkpoint,
         )
         self._checkpoint_complete = True
         self._checkpoint()
@@ -1125,9 +1151,13 @@ class PackwizAddOperation(_AddOperationLifecycle):
             else:
                 if self.session is None:
                     raise HuroshikiError("Packwiz PTY session was not initialized")
-                pty_result = self.session.run()
+                pty_result = self.session.run(deadline=self.deadline)
                 self.termination_result = pty_result.termination_result
                 self.termination_incomplete = pty_result.termination_incomplete
+                if pty_result.timed_out:
+                    raise AddOperationDeadlineExceeded(
+                        "Install operation deadline exceeded"
+                    )
                 self._checkpoint()
                 result = self.transaction._finish_add(self, pty_result)
         except BaseException as error:
@@ -1523,13 +1553,10 @@ class PackTransaction:
         cleanup_errors: list[BaseException] = []
         with self._lock:
             if self._operation is operation:
-                for path in (operation.checkpoint, operation.resolver_root):
-                    if not path.exists():
-                        continue
-                    try:
-                        shutil.rmtree(path)
-                    except BaseException as cleanup_error:
-                        cleanup_errors.append(cleanup_error)
+                try:
+                    self._retain_add_operation_paths(operation)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
                 self._operation = None
             else:
                 cleanup_errors.append(
@@ -1540,6 +1567,15 @@ class PackTransaction:
             operation.cleanup_error = cleanup_errors[0]
         operation._complete(operation._error_result(error))
         return True
+
+    @staticmethod
+    def _retain_add_operation_paths(
+        operation: PackwizAddOperation | ResolvedAddOperation,
+    ) -> None:
+        if operation.resolver_root.exists():
+            operation.resolver_root.rename(operation.retained_resolver_root)
+        if operation.checkpoint.exists():
+            operation.checkpoint.rename(operation.retained_checkpoint)
 
     def add(self, provider: str, query: str) -> subprocess.CompletedProcess[str]:
         """Compatibility path for synchronous add callers."""
@@ -1719,19 +1755,12 @@ class PackTransaction:
             )
             operation._checkpoint()
 
-            self.batches.append(
-                TransactionBatch(
-                    provider=operation.provider,
-                    query=operation.query,
-                    changed_files=changed,
-                )
+            batch = TransactionBatch(
+                provider=operation.provider,
+                query=operation.query,
+                changed_files=changed,
             )
-            if operation.resolver_root.exists():
-                shutil.rmtree(operation.resolver_root)
-            shutil.rmtree(operation.checkpoint)
-            operation._checkpoint_complete = False
-            self._operation = None
-            return AddOperationResult(
+            result = AddOperationResult(
                 returncode=0,
                 changed_files=changed,
                 raw_log=pty_result.raw_log,
@@ -1739,6 +1768,13 @@ class PackTransaction:
                 event_log=pty_result.event_log,
                 message=f"Staged {len(changed)} metadata file(s)",
             )
+            operation._pending_batch = batch
+            self.batches.append(batch)
+            self._retain_add_operation_paths(operation)
+            operation._checkpoint_complete = False
+            operation._pending_batch = None
+            self._operation = None
+            return result
 
     def _finish_url_add(
         self,
@@ -1790,50 +1826,63 @@ class PackTransaction:
             operation._checkpoint()
             if not changed:
                 raise HuroshikiError("The URL metadata is already current")
-            self.batches.append(
-                TransactionBatch(
-                    provider="url",
-                    query=operation.query,
-                    changed_files=changed,
-                )
+            batch = TransactionBatch(
+                provider="url",
+                query=operation.query,
+                changed_files=changed,
             )
-            if operation.resolver_root.exists():
-                shutil.rmtree(operation.resolver_root)
-            shutil.rmtree(operation.checkpoint)
+            raw_log, text_log, event_log = url_log_paths(operation.log_dir)
+            version = f" {artifact.version}" if artifact.version else ""
+            result = AddOperationResult(
+                returncode=0,
+                changed_files=changed,
+                raw_log=raw_log,
+                text_log=text_log,
+                event_log=event_log,
+                message=f"Staged {artifact.name}{version} from self-hosted URL",
+            )
+            operation._pending_batch = batch
+            self.batches.append(batch)
+            self._retain_add_operation_paths(operation)
             operation._checkpoint_complete = False
+            operation._pending_batch = None
             self._operation = None
-
-        raw_log, text_log, event_log = url_log_paths(operation.log_dir)
-        version = f" {artifact.version}" if artifact.version else ""
-        return AddOperationResult(
-            returncode=0,
-            changed_files=changed,
-            raw_log=raw_log,
-            text_log=text_log,
-            event_log=event_log,
-            message=f"Staged {artifact.name}{version} from self-hosted URL",
-        )
+        return result
 
     def _rollback_add(
         self, operation: PackwizAddOperation | ResolvedAddOperation
     ) -> None:
         cleanup_errors: list[BaseException] = []
         with self._lock:
+            if operation._pending_batch is not None:
+                self.batches = [
+                    batch
+                    for batch in self.batches
+                    if batch is not operation._pending_batch
+                ]
+                operation._pending_batch = None
             if operation.checkpoint.exists():
-                try:
-                    if operation._checkpoint_complete:
-                        shutil.rmtree(self.source)
-                        operation.checkpoint.rename(self.source)
+                if operation._checkpoint_complete:
+                    try:
+                        self.source.rename(operation.retained_failed_source)
+                        try:
+                            operation.checkpoint.rename(self.source)
+                        except BaseException:
+                            operation.retained_failed_source.rename(self.source)
+                            raise
                         operation._checkpoint_complete = False
-                    else:
-                        shutil.rmtree(operation.checkpoint)
-                except BaseException as error:
-                    cleanup_errors.append(error)
-            if operation.resolver_root.exists():
-                try:
-                    shutil.rmtree(operation.resolver_root)
-                except BaseException as error:
-                    cleanup_errors.append(error)
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                else:
+                    try:
+                        operation.checkpoint.rename(operation.retained_checkpoint)
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+            try:
+                if operation.resolver_root.exists():
+                    operation.resolver_root.rename(operation.retained_resolver_root)
+            except BaseException as error:
+                cleanup_errors.append(error)
             if not cleanup_errors and self._operation is operation:
                 self._operation = None
         if cleanup_errors:
@@ -3205,6 +3254,7 @@ def copy_transaction_source(
     destination: Path,
     *,
     checkpoint: Callable[[], None] | None = None,
+    retained_destination: Path | None = None,
 ) -> None:
     _run_checkpoint(checkpoint)
     source_fd, source_metadata = _open_pinned_source(source)
@@ -3262,7 +3312,11 @@ def copy_transaction_source(
         if parent_fd >= 0:
             os.close(parent_fd)
             parent_fd = -1
-        shutil.rmtree(destination, ignore_errors=True)
+        if destination.exists():
+            if retained_destination is None:
+                shutil.rmtree(destination, ignore_errors=True)
+            else:
+                destination.rename(retained_destination)
         raise
     finally:
         if destination_fd >= 0:
@@ -5433,6 +5487,7 @@ def resolve_mod_closure(
     canonical_project_id: str | None = None,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
+    resolver_root: Path | None = None,
     url_max_jar_size_bytes: int | None = None,
     url_allow_private_networks: bool = False,
 ) -> ResolvedModClosure:
@@ -5470,9 +5525,14 @@ def resolve_mod_closure(
         state_root=state_root,
         repository_root=ROOT,
     )
-    with tempfile.TemporaryDirectory(
-        prefix="mod-resolver-", dir=transaction_root
-    ) as directory:
+    if resolver_root is None:
+        resolver_context = tempfile.TemporaryDirectory(
+            prefix="mod-resolver-", dir=transaction_root
+        )
+    else:
+        resolver_root.mkdir(mode=0o700)
+        resolver_context = nullcontext(str(resolver_root))
+    with resolver_context as directory:
         source = Path(directory) / "source"
         create_resolver_source(
             source,

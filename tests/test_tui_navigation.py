@@ -844,6 +844,25 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(app.screen, screen)
                 self.assertIsNone(screen._pending_navigation)
 
+    async def test_install_stays_when_checkpoint_handoff_cleanup_failed(self) -> None:
+        with self.patches():
+            screen = huroshiki.InstallScreen("pack:demo")
+            app = _NavigationApp(screen)
+            async with app.run_test() as pilot:
+                operation = _PackwizCleanupOperation(done=True, incomplete=False)
+                operation.cleanup_error = OSError("checkpoint handoff stalled")
+                screen.operation = operation
+                screen.query_one("#search-results-table").focus()
+                await pilot.press("l")
+                await pilot.pause()
+
+                self.assertIs(app.screen, screen)
+                self.assertIsNone(screen._pending_navigation)
+                self.assertIn(
+                    "cleanup failed",
+                    str(screen.query_one("#packwiz-status").render()),
+                )
+
     async def test_install_search_shows_canonical_ids_and_resolves_selection(self) -> None:
         projects = (
             core.ProviderProject(

@@ -43,6 +43,7 @@ class PtyResult:
     normalized_text: str
     termination_result: ProcessTerminationResult | None = None
     cancelled: bool = False
+    timed_out: bool = False
     orphaned_descendants: bool = False
     termination_incomplete: bool = False
 
@@ -77,7 +78,7 @@ class PackwizPtySession:
         self._termination_result: ProcessTerminationResult | None = None
         self._cancel_deadline: float | None = None
 
-    def run(self) -> PtyResult:
+    def run(self, *, deadline: float | None = None) -> PtyResult:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         raw_log = self.log_dir / "session.raw"
         event_log = self.log_dir / "session.jsonl"
@@ -94,6 +95,18 @@ class PackwizPtySession:
                 text_log,
                 "",
                 cancelled=True,
+            )
+        if deadline is not None and time.monotonic() >= deadline:
+            raw_log.touch()
+            event_log.touch()
+            text_log.write_text("", encoding="utf-8")
+            return PtyResult(
+                -signal.SIGTERM,
+                raw_log,
+                event_log,
+                text_log,
+                "",
+                timed_out=True,
             )
 
         master_fd, slave_fd = os.openpty()
@@ -123,6 +136,7 @@ class PackwizPtySession:
         selector.register(master_fd, selectors.EVENT_READ)
         orphaned_descendants = False
         termination_incomplete = False
+        timed_out = False
         try:
             with (
                 raw_log.open("wb") as raw_handle,
@@ -140,6 +154,18 @@ class PackwizPtySession:
                             )
                             if termination_incomplete:
                                 break
+                    elif deadline is not None and time.monotonic() >= deadline:
+                        timed_out = True
+                        self._termination_result = stop_process_group(
+                            self.process.pid,
+                            parent=self.process,
+                            cleanup_deadline=deadline,
+                        )
+                        termination_incomplete = not (
+                            self._termination_result.group_drained
+                            and self._termination_result.parent_reaped
+                        )
+                        break
 
                     read_any = False
                     for key, _ in selector.select(timeout=0.1):
@@ -168,9 +194,12 @@ class PackwizPtySession:
                     if process_done:
                         if live_process_group_members(self.process.pid):
                             orphaned_descendants = True
+                            cleanup_deadline = self._default_cleanup_deadline()
+                            if deadline is not None:
+                                cleanup_deadline = min(cleanup_deadline, deadline)
                             self._termination_result = stop_process_group(
                                 self.process.pid,
-                                cleanup_deadline=self._default_cleanup_deadline(),
+                                cleanup_deadline=cleanup_deadline,
                             )
                             termination_incomplete = not self._termination_result.group_drained
                         if not selector.get_map():
@@ -190,10 +219,13 @@ class PackwizPtySession:
                             else:
                                 break
                     elif not selector.get_map():
+                        cleanup_deadline = self._default_cleanup_deadline()
+                        if deadline is not None:
+                            cleanup_deadline = min(cleanup_deadline, deadline)
                         self._termination_result = stop_process_group(
                             self.process.pid,
                             parent=self.process,
-                            cleanup_deadline=self._default_cleanup_deadline(),
+                            cleanup_deadline=cleanup_deadline,
                         )
                         termination_incomplete = not (
                             self._termination_result.group_drained
@@ -202,6 +234,8 @@ class PackwizPtySession:
                         break
         except BaseException:
             cleanup_deadline = self._default_cleanup_deadline()
+            if deadline is not None:
+                cleanup_deadline = min(cleanup_deadline, deadline)
             if self._cancel_deadline is not None:
                 cleanup_deadline = min(cleanup_deadline, self._cancel_deadline)
             self._termination_result = stop_process_group(
@@ -237,6 +271,7 @@ class PackwizPtySession:
             normalized_text=normalized_text,
             termination_result=self._termination_result,
             cancelled=self._cancelled.is_set(),
+            timed_out=timed_out,
             orphaned_descendants=orphaned_descendants,
             termination_incomplete=termination_incomplete,
         )
