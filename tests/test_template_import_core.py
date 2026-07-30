@@ -271,7 +271,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         self.assertEqual(core.tree_digest_snapshot(self.source), before)
         self.assertTrue((self.source / "mods/dependency.pw.toml").is_file())
         self.assertFalse((self.source / "mods/root.pw.toml").exists())
-        self.assertFalse(operation.transaction.root.exists())
+        self.assertTrue(operation.transaction.root.is_dir())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
     def test_removed_requirement_reports_every_requiring_root(self) -> None:
@@ -389,7 +389,7 @@ class TemplateImportCoreTest(unittest.TestCase):
         self.assertIn("reintroduced Pack MODs", str(operation.error))
         self.assertIsNone(operation.preview)
         self.assertEqual(core.tree_digest_snapshot(self.source), before)
-        self.assertFalse(operation.transaction.root.exists())
+        self.assertTrue(operation.transaction.root.is_dir())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
 
     def test_cli_dependency_reintroduction_returns_one_without_preview(self) -> None:

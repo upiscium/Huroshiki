@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -249,22 +250,19 @@ class ProjectLockTest(unittest.TestCase):
                 "https://example.invalid/private.jar", "00", ("neoforge",),
             )
 
-        original_wait = operation.wait
-        operation.wait = lambda timeout=None: (
-            False if timeout is not None else original_wait(None)
-        )
-        original_finish = transaction._finish_discard
+        original_finish = transaction._finish_discard_once
 
-        def finish_discard() -> None:
-            original_finish()
+        def finish_discard(*, deadline: float) -> None:
+            original_finish(deadline=deadline)
             cleaned.set()
 
-        transaction._finish_discard = finish_discard
+        transaction._finish_discard_once = finish_discard
         with patch.object(core, "download_url_artifact", side_effect=blocked_download):
             worker = threading.Thread(target=operation.run)
             worker.start()
             self.assertTrue(entered.wait(2))
-            transaction.discard()
+            with self.assertRaises(core.TransactionDiscardTimeout):
+                transaction.discard(deadline=time.monotonic() + 0.02)
 
             self.assertTrue(transaction.root.is_dir())
             self.assertTrue(packctl.project_lock_is_active("pack:demo"))
@@ -274,9 +272,12 @@ class ProjectLockTest(unittest.TestCase):
             release.set()
             worker.join(2)
             self.assertFalse(worker.is_alive())
+            retry = transaction.retry_discard(deadline=time.monotonic() + 1)
+            self.assertTrue(retry.wait(1))
+            retry.raise_for_error()
             self.assertTrue(cleaned.wait(2))
 
-        self.assertFalse(transaction.root.exists())
+        self.assertTrue(transaction.root.is_dir())
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
         self.assertFalse((transaction.root / "source" / "mods" / "private.pw.toml").exists())
 

@@ -68,6 +68,9 @@ from template_import import (
 )
 
 
+APP_TRANSACTION_SHUTDOWN_TIMEOUT_SECONDS = 30.0
+
+
 def enabled_marker(enabled: bool) -> str:
     return "+" if enabled else "-"
 
@@ -110,6 +113,15 @@ class HuroshikiApp(App[None]):
         self.initial_project = initial_project
         self.selected_project: str | None = None
         self.transactions: dict[str, core.PackTransaction] = {}
+        self._transaction_discards: dict[
+            str,
+            tuple[
+                core.PackTransaction,
+                core.TransactionDiscardOperation,
+                Callable[[], None],
+            ],
+        ] = {}
+        self._transaction_discard_timer: Timer | None = None
 
     def on_mount(self) -> None:
         if self.initial_project:
@@ -122,9 +134,21 @@ class HuroshikiApp(App[None]):
             self.push_screen(MainMenuScreen())
 
     def on_unmount(self) -> None:
-        for transaction in self.transactions.values():
-            transaction.discard()
-        self.transactions.clear()
+        if self._transaction_discard_timer is not None:
+            self._transaction_discard_timer.stop()
+            self._transaction_discard_timer = None
+        deadline = time.monotonic() + APP_TRANSACTION_SHUTDOWN_TIMEOUT_SECONDS
+        for project_key, transaction in tuple(self.transactions.items()):
+            try:
+                transaction.discard(deadline=deadline)
+            except BaseException as error:
+                print(
+                    f"Failed to discard transaction for {project_key}: {error}",
+                    file=sys.stderr,
+                )
+            else:
+                if self.transactions.get(project_key) is transaction:
+                    self.transactions.pop(project_key, None)
 
     def go_main(self) -> None:
         self.selected_project = None
@@ -231,9 +255,63 @@ class HuroshikiApp(App[None]):
         *,
         discard: bool = False,
     ) -> None:
-        transaction = self.transactions.pop(project_key, None)
-        if discard and transaction is not None:
+        transaction = self.transactions.get(project_key)
+        if transaction is None:
+            return
+        if discard:
             transaction.discard()
+        if self.transactions.get(project_key) is transaction:
+            self.transactions.pop(project_key, None)
+
+    def discard_transaction(
+        self,
+        project_key: str,
+        destination: Callable[[], None],
+    ) -> None:
+        if project_key in self._transaction_discards:
+            self.notify("Transaction cleanup is already running", severity="warning")
+            return
+        transaction = self.transactions.get(project_key)
+        if transaction is None:
+            destination()
+            return
+        try:
+            operation = transaction.begin_discard()
+            operation.start()
+        except BaseException as error:
+            self.notify(str(error), severity="error")
+            return
+        self._transaction_discards[project_key] = (
+            transaction,
+            operation,
+            destination,
+        )
+        if self._transaction_discard_timer is None:
+            self._transaction_discard_timer = self.set_interval(
+                0.05,
+                self._poll_transaction_discards,
+            )
+
+    def _poll_transaction_discards(self) -> None:
+        for project_key, pending in tuple(self._transaction_discards.items()):
+            transaction, operation, destination = pending
+            if not operation.done.is_set():
+                continue
+            self._transaction_discards.pop(project_key, None)
+            try:
+                operation.raise_for_error()
+            except BaseException as error:
+                self.notify(str(error), severity="error")
+                continue
+            if self.transactions.get(project_key) is transaction:
+                self.transactions.pop(project_key, None)
+            try:
+                destination()
+            except BaseException as error:
+                self.notify(str(error), severity="error")
+        if not self._transaction_discards and self._transaction_discard_timer is not None:
+            self._transaction_discard_timer.stop()
+            self._transaction_discard_timer = None
 
 
 class ConfirmModal(ModalScreen[bool]):
@@ -773,8 +851,13 @@ class MainMenuScreen(FilterListScreen):
     ) -> None:
         if not confirmed:
             return
+        self.app.discard_transaction(
+            project_key,
+            lambda: self._delete_after_discard(project_key),
+        )
+
+    def _delete_after_discard(self, project_key: str) -> None:
         try:
-            self.app.remove_transaction(project_key, discard=True)
             entry = core.delete_project(project_key)
             self.app.notify(f"Moved {project_key} to trash as {entry.name}")
             self.reload_projects(self.query_one("#pack-search", Input).value)
@@ -3218,6 +3301,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         self._pending_navigation: Callable[[], None] | None = None
         self._pending_operation: object | None = None
         self._navigation_timer: Timer | None = None
+        self._navigation_deadline: float | None = None
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -3357,15 +3441,31 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         if self._pending_navigation is not None:
             return
         operation = self.operation
-        if operation is None or operation.done.is_set():
+        if operation is None:
+            destination()
+            return
+        if operation.done.is_set():
+            integrity_error = self._operation_cleanup_integrity_error(operation)
+            if integrity_error is not None:
+                self._report_navigation_cleanup_error(integrity_error)
+                return
             destination()
             return
 
         self._pending_navigation = destination
         self._pending_operation = operation
+        self._navigation_deadline = (
+            time.monotonic() + core.TRANSACTION_DISCARD_TIMEOUT_SECONDS
+        )
         self.set_status("Cancelling Packwiz operation before leaving...")
         try:
-            operation.cancel()
+            if isinstance(
+                operation,
+                (core.PackwizAddOperation, core.ResolvedAddOperation),
+            ):
+                operation.cancel(deadline=self._navigation_deadline)
+            else:
+                operation.cancel()
         except Exception as error:
             self._pending_navigation = None
             self._pending_operation = None
@@ -3378,14 +3478,59 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
     def _complete_pending_navigation(self) -> None:
         destination = self._pending_navigation
         operation = self._pending_operation
-        if destination is None or operation is None or not operation.done.is_set():
+        if destination is None or operation is None:
+            return
+        if not operation.done.is_set():
+            if (
+                self._navigation_deadline is not None
+                and time.monotonic() >= self._navigation_deadline
+            ):
+                if self._navigation_timer is not None:
+                    self._navigation_timer.stop()
+                    self._navigation_timer = None
+                self._pending_navigation = None
+                self._pending_operation = None
+                self._navigation_deadline = None
+                self.set_status("Operation cleanup did not finish; remaining on Install")
+                self.app.notify(
+                    "Add operation cleanup did not finish before the navigation deadline",
+                    severity="error",
+                )
+            return
+        integrity_error = self._operation_cleanup_integrity_error(operation)
+        if integrity_error is not None:
+            if self._navigation_timer is not None:
+                self._navigation_timer.stop()
+                self._navigation_timer = None
+            self._pending_navigation = None
+            self._pending_operation = None
+            self._navigation_deadline = None
+            self._report_navigation_cleanup_error(integrity_error)
             return
         if self._navigation_timer is not None:
-            self._navigation_timer.pause()
+            self._navigation_timer.stop()
             self._navigation_timer = None
         self._pending_navigation = None
         self._pending_operation = None
+        self._navigation_deadline = None
         destination()
+
+    @staticmethod
+    def _operation_cleanup_integrity_error(operation: object) -> str | None:
+        cleanup_error = getattr(operation, "cleanup_error", None)
+        if cleanup_error is not None:
+            return f"Add operation cleanup failed: {cleanup_error}"
+        termination = getattr(operation, "termination_result", None)
+        if getattr(operation, "termination_incomplete", False) or (
+            termination is not None
+            and not (termination.group_drained and termination.parent_reaped)
+        ):
+            return "Add operation process-group cleanup was incomplete"
+        return None
+
+    def _report_navigation_cleanup_error(self, message: str) -> None:
+        self.set_status(f"{message}; remaining on Install")
+        self.app.notify(message, severity="error")
 
     def discard_search_results(self) -> None:
         if not self.search_results:
@@ -3468,7 +3613,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             target=target,
             args=(operation,),
             name=f"huroshiki-provider-search-{self.project_key}",
-            daemon=True,
+            daemon=False,
         )
         self.operation_thread.start()
 
@@ -3507,7 +3652,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             target=self._run_operation,
             args=(operation,),
             name=f"huroshiki-resolved-add-{self.project_key}",
-            daemon=True,
+            daemon=False,
         )
         self.operation_thread.start()
 
@@ -4043,6 +4188,11 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
         self.selected_paths: set[Path] = set()
         self.operation_thread: threading.Thread | None = None
         self.operation_timer: Timer | None = None
+        self.transaction_cancel_event: threading.Event | None = None
+        self.transaction_deadline: float | None = None
+        self.discard_operation: core.TransactionDiscardOperation | None = None
+        self.discard_timer: Timer | None = None
+        self.pending_destination: Callable[[], None] | None = None
         self.leave_after_cancel = False
 
     def compose(self) -> ComposeResult:
@@ -4115,6 +4265,7 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
                 self.return_to_project()
             return
         self.transaction = operation.claim_transaction()
+        self.app.transactions[self.project_key] = self.transaction
         self.transaction_cancel_event = operation.cancel_event
         self.transaction_deadline = operation.deadline
         self.candidates = list(operation.candidates)
@@ -4214,6 +4365,8 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
                     deadline=self.transaction_deadline,
                 )
             self.app.notify(f"Applied {len(self.selected_paths)} MOD update(s)")
+            if self.app.transactions.get(self.project_key) is self.transaction:
+                self.app.transactions.pop(self.project_key, None)
             self.transaction = None
             self.transaction_cancel_event = None
             self.transaction_deadline = None
@@ -4222,6 +4375,9 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
             self.app.notify(str(error), severity="error")
 
     def discard_and_leave(self) -> None:
+        if self.discard_operation is not None:
+            self.app.notify("Transaction cleanup is already running", severity="warning")
+            return
         if self.operation is not None:
             self.leave_after_cancel = True
             self.operation.cancel()
@@ -4229,20 +4385,55 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
                 "Cancelling update preparation..."
             )
             return
-        if self.transaction is not None:
-            self.transaction.discard()
-            self.transaction = None
-            self.transaction_cancel_event = None
-            self.transaction_deadline = None
-        self.return_to_project()
+        self._begin_transaction_discard(self.return_to_project)
 
     def discard_and_navigate(self, destination: Callable[[], None]) -> None:
-        if self.transaction is not None:
-            self.transaction.discard()
-            self.transaction = None
-            self.transaction_cancel_event = None
-            self.transaction_deadline = None
-        destination()
+        if self.discard_operation is not None:
+            self.app.notify("Transaction cleanup is already running", severity="warning")
+            return
+        self._begin_transaction_discard(destination)
+
+    def _begin_transaction_discard(self, destination: Callable[[], None]) -> None:
+        transaction = self.transaction
+        if transaction is None:
+            destination()
+            return
+        try:
+            operation = transaction.begin_discard()
+            operation.start()
+        except BaseException as error:
+            self.app.notify(str(error), severity="error")
+            return
+        self.discard_operation = operation
+        self.pending_destination = destination
+        self.query_one("#update-message", Static).update(
+            "Discarding staged update transaction..."
+        )
+        self.discard_timer = self.set_interval(0.05, self._poll_discard)
+
+    def _poll_discard(self) -> None:
+        operation = self.discard_operation
+        if operation is None or not operation.done.is_set():
+            return
+        if self.discard_timer is not None:
+            self.discard_timer.stop()
+            self.discard_timer = None
+        destination = self.pending_destination
+        self.pending_destination = None
+        self.discard_operation = None
+        try:
+            operation.raise_for_error()
+        except BaseException as error:
+            self.query_one("#update-message", Static).update(str(error))
+            self.app.notify(str(error), severity="error")
+            return
+        self.transaction = None
+        if self.app.transactions.get(self.project_key) is operation.transaction:
+            self.app.transactions.pop(self.project_key, None)
+        self.transaction_cancel_event = None
+        self.transaction_deadline = None
+        if destination is not None:
+            destination()
 
     def on_unmount(self) -> None:
         if self.operation_timer is not None:
@@ -4250,10 +4441,27 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
             self.operation_timer = None
         if self.operation is not None:
             self.operation.cancel()
+        if self.discard_timer is not None:
+            self.discard_timer.stop()
+            self.discard_timer = None
+        if self.transaction is not None and self.discard_operation is None:
+            try:
+                self.discard_operation = self.transaction.begin_discard()
+                self.discard_operation.start()
+            except BaseException as error:
+                print(
+                    f"Failed to start Update transaction discard for "
+                    f"{self.project_key}: {error}",
+                    file=sys.stderr,
+                )
 
     def on_key(self, event: events.Key) -> None:
         table = self.query_one("#update-options", DataTable)
         key = event.key
+        if self.discard_operation is not None:
+            self.app.notify("Wait for transaction cleanup to finish", severity="warning")
+            event.stop()
+            return
         if self.operation is not None:
             if key in {"escape", "p"}:
                 self.discard_and_leave()
