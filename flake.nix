@@ -7,6 +7,9 @@
 
   outputs = { nixpkgs, ... }:
     let
+      version = nixpkgs.lib.removeSuffix "\n" (
+        builtins.readFile ./shared/scripts/VERSION
+      );
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       perSystem = system:
@@ -25,7 +28,7 @@
           ];
           huroshiki = pkgs.stdenvNoCC.mkDerivation {
             pname = "huroshiki";
-            version = "0.1.0";
+            inherit version;
             src = ./shared;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             propagatedBuildInputs = [ python ] ++ runtimeInputs;
@@ -33,7 +36,7 @@
             installPhase = ''
               runHook preInstall
               mkdir -p "$out/lib/huroshiki" "$out/bin" "$out/share/huroshiki" "$out/share/zsh/site-functions"
-              cp scripts/*.py scripts/*.tcss scripts/huroshiki-launcher.sh "$out/lib/huroshiki/"
+              cp scripts/*.py scripts/*.tcss scripts/VERSION scripts/huroshiki-launcher.sh "$out/lib/huroshiki/"
               chmod 0755 "$out/lib/huroshiki/huroshiki-launcher.sh"
               cp profiles.yaml "$out/share/huroshiki/profiles.yaml"
               cp completions/zsh/_packctl completions/zsh/_huroshiki "$out/share/zsh/site-functions/"
@@ -48,10 +51,14 @@
               runHook postInstall
             '';
           };
-          smoke = pkgs.runCommand "huroshiki-smoke" { } ''
+          smoke = assert huroshiki.version == version; pkgs.runCommand "huroshiki-smoke" { } ''
             root="$TMPDIR/external-root"
             mkdir -p "$root/packs/example" "$root/templates"
             printf 'id: example\n' > "$root/packs/example/pack.yaml"
+            test "$(${huroshiki}/bin/huroshiki --version)" = "huroshiki ${version}"
+            test "$(${huroshiki}/bin/packctl --version)" = "packctl ${version}"
+            test "$(${huroshiki}/bin/huroshiki --root "$root" --version)" = "huroshiki ${version}"
+            test "$(${huroshiki}/bin/packctl --root "$root" --version)" = "packctl ${version}"
             ${huroshiki}/bin/huroshiki --root "$root" --help > /dev/null
             ${huroshiki}/bin/packctl --root "$root" --help > /dev/null
             ! ${huroshiki}/bin/packctl --root "$root" --help | grep -E 'migrate-template|[,{](use|current)[,}]'
@@ -60,22 +67,41 @@
             HUROSHIKI_PYTHON=${python}/bin/python \
               ${huroshiki}/lib/huroshiki/huroshiki-launcher.sh --root "$root" --help > /dev/null
             test -f ${huroshiki}/lib/huroshiki/huroshiki.tcss
+            test -f ${huroshiki}/lib/huroshiki/VERSION
+            test -f ${huroshiki}/lib/huroshiki/huroshiki.py
             test -f ${huroshiki}/lib/huroshiki/huroshiki_core.py
+            test -f ${huroshiki}/lib/huroshiki/packctl.py
+            test -f ${huroshiki}/lib/huroshiki/packwiz_pty.py
+            test -f ${huroshiki}/lib/huroshiki/packwiz_parser.py
+            test -f ${huroshiki}/lib/huroshiki/process_runner.py
             test -f ${huroshiki}/lib/huroshiki/overlay_policy.py
             test -f ${huroshiki}/lib/huroshiki/portable_paths.py
             test -f ${huroshiki}/lib/huroshiki/provider_lookup.py
+            test -f ${huroshiki}/lib/huroshiki/template_import.py
             test -f ${huroshiki}/lib/huroshiki/template_merge.py
+            test -f ${huroshiki}/lib/huroshiki/deploy_support.py
+            test -f ${huroshiki}/lib/huroshiki/url_artifacts.py
+            test -f ${huroshiki}/lib/huroshiki/project_locks.py
+            test -f ${huroshiki}/lib/huroshiki/packctl_errors.py
+            test -f ${huroshiki}/lib/huroshiki/huroshiki_paths.py
+            test -f ${huroshiki}/lib/huroshiki/huroshiki_version.py
             test -f ${huroshiki}/lib/huroshiki/huroshiki-launcher.sh
             test -x ${huroshiki}/lib/huroshiki/huroshiki-launcher.sh
             test -f ${huroshiki}/share/huroshiki/profiles.yaml
             test -f ${huroshiki}/share/zsh/site-functions/_packctl
             test -f ${huroshiki}/share/zsh/site-functions/_huroshiki
+            grep -q "loader-version" ${huroshiki}/share/zsh/site-functions/_packctl
+            grep -q "apply-template" ${huroshiki}/share/zsh/site-functions/_packctl
+            grep -q "show-deployment" ${huroshiki}/share/zsh/site-functions/_packctl
+            grep -q "set-deployment" ${huroshiki}/share/zsh/site-functions/_packctl
+            grep -q "show-pack-url" ${huroshiki}/share/zsh/site-functions/_packctl
+            grep -q "set-pack-url" ${huroshiki}/share/zsh/site-functions/_packctl
             test ! -e ${huroshiki}/share/zsh/site-functions/_just
             touch "$out"
           '';
           unitTests = pkgs.stdenvNoCC.mkDerivation {
             pname = "huroshiki-unit-tests";
-            version = "0.1.0";
+            inherit version;
             src = ./.;
             nativeBuildInputs = [ python pkgs.git ] ++ runtimeInputs;
             dontBuild = true;

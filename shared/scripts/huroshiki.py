@@ -10,6 +10,7 @@ import time
 from typing import Callable, Iterable
 
 from huroshiki_paths import resolve_root, set_import_root
+from huroshiki_version import VERSION
 
 
 def argument_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
@@ -21,6 +22,11 @@ def argument_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
         "--root",
         metavar="PATH",
         help="managed repository root (default: HUROSHIKI_ROOT, then current directory)",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"huroshiki {VERSION}",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
