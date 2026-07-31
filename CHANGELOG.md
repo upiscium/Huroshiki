@@ -22,6 +22,10 @@
 
 ### Reliability and Transaction Safety
 
+- Added the core snapshot and transaction foundation for copy-based Pack migration. It safely scans
+  and streams a detached source copy, holds source and target locks in canonical order, records a
+  staged migration plan without rewriting target versions, and provides an internally gated atomic
+  no-replace publication primitive for later resolver integration.
 - Install checkpoint preparation now runs inside the add-operation worker and shares cancellation
   plus one operation-wide absolute deadline across copy, resolution, URL download, merge, rollback,
   interactive PTY polling, cleanup, and navigation. Checkpoints, resolver trees, and failed staged
