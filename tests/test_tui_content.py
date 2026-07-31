@@ -90,6 +90,45 @@ CONFLICTS = (
     ),
 )
 BROWSE = core.ContentBrowseResult(ENTRIES, SNAPSHOT, CONFLICTS)
+COMMITTED_ENTRY = core.ContentEntry(
+    "common",
+    Path("config/committed.txt"),
+    "file",
+    9,
+    0o644,
+    False,
+    "d" * 64,
+    "utf8",
+    "config",
+    (),
+)
+UPDATED_SNAPSHOT = core.ContentSnapshot(
+    "pack:demo",
+    IDENTITY,
+    IDENTITY,
+    IDENTITY,
+    (
+        *SNAPSHOT_ENTRIES,
+        core.ContentSnapshotEntry(
+            COMMITTED_ENTRY.side,
+            COMMITTED_ENTRY.relative_path,
+            ("common", "config/committed.txt"),
+            "file",
+            0o644,
+            9,
+            "d" * 64,
+            1,
+            99,
+            (),
+        ),
+    ),
+    "e" * 64,
+)
+UPDATED_BROWSE = core.ContentBrowseResult(
+    (*ENTRIES, COMMITTED_ENTRY),
+    UPDATED_SNAPSHOT,
+    CONFLICTS,
+)
 DOCUMENT = core.ContentTextDocument(
     "pack:demo",
     "common",
@@ -133,7 +172,14 @@ class _Discard:
 
 
 class _Plan:
-    def __init__(self, operations=(), *, conflicts=(), discard_error=None) -> None:
+    def __init__(
+        self,
+        operations=(),
+        *,
+        conflicts=(),
+        discard_error=None,
+        discard_state="discarded",
+    ) -> None:
         self.operations = tuple(operations)
         self.changes = (
             core.ContentChange("updated", "common", Path("config/demo.txt"), before_digest="a", after_digest="b"),
@@ -144,6 +190,7 @@ class _Plan:
         self.cleanup_error = None
         self._project_lock = object()
         self.discard_error = discard_error
+        self.discard_state = discard_state
         self.discard_operation: _Discard | None = None
 
     def begin_discard(self, *, deadline=None):
@@ -154,7 +201,7 @@ class _Plan:
         if self.discard_error is not None:
             raise self.discard_error
         self._project_lock = None
-        self.state = "discarded"
+        self.state = self.discard_state
 
 
 class _ContentApp(App[None]):
@@ -596,6 +643,96 @@ class ContentTuiTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.15)
                 self.assertNotIn("pack:demo", app.content_plans)
                 self.assertIsInstance(app.screen, huroshiki.ContentScreen)
+
+    async def test_committed_cleanup_from_editor_reloads_canonical_browser(self) -> None:
+        plan = _Plan(discard_state="applied")
+
+        def committed_failure(current, **_kwargs):
+            current.state = "failed"
+            current.cleanup_error = core.ContentCleanupError("lock release failed")
+            raise current.cleanup_error
+
+        with self.patches(), patch.object(
+            huroshiki.core,
+            "load_content_browser",
+            return_value=UPDATED_BROWSE,
+        ), patch.object(
+            huroshiki.core,
+            "load_content_text_document",
+            return_value=DOCUMENT,
+        ), patch.object(
+            huroshiki.core,
+            "plan_content_changes",
+            return_value=plan,
+        ), patch.object(
+            huroshiki.core,
+            "apply_content_changes",
+            side_effect=committed_failure,
+        ):
+            editor_screen = huroshiki.ContentEditorScreen(
+                "pack:demo", ENTRIES[0], SNAPSHOT
+            )
+            app = _ContentApp(editor_screen)
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                editor_screen.query_one("#content-editor", TextArea).text = "committed\n"
+                await pilot.press("ctrl+s")
+                await pilot.pause(0.15)
+                await pilot.press("enter")
+                await pilot.pause(0.15)
+                self.assertIsInstance(app.screen, huroshiki.ContentPlanPreviewScreen)
+                await pilot.press("escape")
+                await pilot.pause(0.15)
+                self.assertIsInstance(app.screen, huroshiki.ContentScreen)
+                self.assertIsNot(app.screen, editor_screen)
+                self.assertNotIn("pack:demo", app.content_plans)
+                self.assertIs(app.screen.result, UPDATED_BROWSE)
+                self.assertIn(COMMITTED_ENTRY, app.screen.visible_entries)
+
+    async def test_committed_cleanup_after_apply_cancel_reloads_browser_origin(self) -> None:
+        plan = _Plan(discard_state="applied")
+        apply_started = threading.Event()
+
+        def committed_then_cancelled(current, *, cancel_event, **_kwargs):
+            current.state = "failed"
+            current.cleanup_error = core.ContentCleanupError("lock release failed")
+            apply_started.set()
+            cancel_event.wait(2)
+            raise current.cleanup_error
+
+        browse_results = iter((BROWSE, UPDATED_BROWSE))
+        with self.patches(), patch.object(
+            huroshiki.core,
+            "load_content_browser",
+            side_effect=lambda *_args, **_kwargs: next(browse_results),
+        ), patch.object(
+            huroshiki.core,
+            "plan_content_changes",
+            return_value=plan,
+        ), patch.object(
+            huroshiki.core,
+            "apply_content_changes",
+            side_effect=committed_then_cancelled,
+        ):
+            browser_screen = huroshiki.ContentScreen("pack:demo")
+            app = _ContentApp(browser_screen)
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                browser_screen.start_plan(
+                    (core.ContentCreateFile("common", Path("config/committed.txt"), b"committed"),)
+                )
+                await pilot.pause(0.15)
+                self.assertIsInstance(app.screen, huroshiki.ContentPlanPreviewScreen)
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertTrue(apply_started.is_set())
+                await pilot.press("escape")
+                await pilot.pause(0.2)
+                self.assertIsInstance(app.screen, huroshiki.ContentScreen)
+                self.assertIsNot(app.screen, browser_screen)
+                self.assertNotIn("pack:demo", app.content_plans)
+                self.assertIs(app.screen.result, UPDATED_BROWSE)
+                self.assertIn(COMMITTED_ENTRY, app.screen.visible_entries)
 
     async def test_plan_and_apply_cancel_wait_for_completion_and_discard(self) -> None:
         plan_started = threading.Event()

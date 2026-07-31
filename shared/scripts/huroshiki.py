@@ -2906,6 +2906,16 @@ class ContentPlanPreviewScreen(ProjectChildScreen, BaseScreen):
         self.app.switch_screen(ContentScreen(self.project_key, select_key=self.select_key))
 
     def return_after_discard(self) -> None:
+        if self.plan.state == "applied":
+            if self.return_to_origin:
+                self.app.pop_screen()
+            self.app.notify(
+                "Content publication succeeded and cleanup completed"
+            )
+            self.app.switch_screen(
+                ContentScreen(self.project_key, select_key=self.select_key)
+            )
+            return
         if self.return_to_origin:
             self.app.pop_screen()
         else:
