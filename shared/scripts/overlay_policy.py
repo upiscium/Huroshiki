@@ -55,6 +55,15 @@ class OverlayFileInspection:
 
 
 @dataclass(frozen=True)
+class OverlayEntryInspection:
+    kind: Literal["file", "directory", "invalid"]
+    size: int
+    mode: int
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
 class OverlayIssue:
     relative_path: Path
     message: str
@@ -394,6 +403,65 @@ def inspect_overlay_file(
                 digest.hexdigest(),
                 "utf8" if valid_utf8 and not contains_nul else "binary",
                 bytes(probe),
+            )
+        finally:
+            os.close(fd)
+
+
+def inspect_overlay_entry(
+    content_root: Path,
+    target: str,
+    relative_path: str | Path,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> OverlayEntryInspection:
+    relative = normalize_overlay_relative_path(relative_path)
+    if checkpoint is not None:
+        checkpoint()
+    with _open_overlay_parent(content_root, target, relative, create=False) as parent:
+        if checkpoint is not None:
+            checkpoint()
+        try:
+            current = os.stat(
+                relative.name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise OverlayPolicyError(
+                f"Overlay entry does not exist: {target}/{relative}"
+            ) from error
+        mode = stat.S_IMODE(current.st_mode)
+        if stat.S_ISREG(current.st_mode):
+            return OverlayEntryInspection(
+                "file", current.st_size, mode, current.st_dev, current.st_ino
+            )
+        if not stat.S_ISDIR(current.st_mode):
+            return OverlayEntryInspection(
+                "invalid", current.st_size, mode, current.st_dev, current.st_ino
+            )
+        fd = os.open(relative.name, _DIRECTORY_FLAGS, dir_fd=parent.fd)
+        try:
+            opened = os.fstat(fd)
+            after = os.stat(
+                relative.name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            identity = (opened.st_dev, opened.st_ino)
+            if identity != (current.st_dev, current.st_ino) or identity != (
+                after.st_dev,
+                after.st_ino,
+            ):
+                raise OverlayPolicyError(
+                    f"Overlay directory changed while inspecting: {target}/{relative}"
+                )
+            return OverlayEntryInspection(
+                "directory",
+                0,
+                stat.S_IMODE(opened.st_mode),
+                opened.st_dev,
+                opened.st_ino,
             )
         finally:
             os.close(fd)

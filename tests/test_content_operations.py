@@ -252,6 +252,172 @@ class ContentOperationsTest(unittest.TestCase):
         with self.assertRaises(core.ContentOperationDeadlineExceeded):
             core.load_content_browser("pack:demo", deadline=time.monotonic() - 1)
 
+    def test_path_info_reports_file_directory_invalid_and_all_sides_read_only(self) -> None:
+        common = self.content / "common/config/run.sh"
+        common.parent.mkdir(parents=True)
+        common.write_bytes(b"#!/bin/sh\n")
+        common.chmod(0o755)
+        client_directory = self.content / "client/resourcepacks/empty"
+        client_directory.mkdir(parents=True)
+        invalid = self.content / "server/config-link"
+        invalid.symlink_to("/outside")
+        browser = core.load_content_browser("pack:demo")
+
+        file_info = core.resolve_content_path_info(
+            "pack:demo",
+            "common",
+            "config/run.sh",
+            expected_snapshot=browser.snapshot,
+        )
+        self.assertEqual(file_info.project_key, "pack:demo")
+        self.assertEqual(file_info.relative_path, Path("config/run.sh"))
+        self.assertEqual(
+            file_info.repository_relative_path,
+            Path("packs/demo/content/common/config/run.sh"),
+        )
+        self.assertEqual(file_info.absolute_path, common)
+        self.assertEqual(file_info.kind, "file")
+        self.assertEqual(file_info.size, len(b"#!/bin/sh\n"))
+        self.assertEqual(file_info.mode, 0o755)
+        self.assertTrue(file_info.executable)
+        self.assertEqual(
+            file_info.digest,
+            hashlib.sha256(b"#!/bin/sh\n").hexdigest(),
+        )
+        self.assertEqual(file_info.snapshot_digest, browser.snapshot.digest)
+        self.assertEqual(file_info.errors, ())
+
+        directory_info = core.resolve_content_path_info(
+            "pack:demo",
+            "client",
+            "resourcepacks/empty",
+            expected_snapshot=browser.snapshot,
+        )
+        self.assertEqual(directory_info.kind, "directory")
+        self.assertEqual(directory_info.size, 0)
+        self.assertIsNone(directory_info.digest)
+
+        invalid_info = core.resolve_content_path_info(
+            "pack:demo",
+            "server",
+            "config-link",
+            expected_snapshot=browser.snapshot,
+        )
+        self.assertEqual(invalid_info.kind, "invalid")
+        self.assertTrue(invalid_info.errors)
+        self.assertEqual(invalid_info.absolute_path, invalid)
+        self.assertFalse((self.state / "transactions").exists())
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_path_info_rejects_stale_races_invalid_paths_and_templates(self) -> None:
+        target = self.content / "common/config/value.txt"
+        target.parent.mkdir(parents=True)
+        target.write_text("before", encoding="utf-8")
+        browser = core.load_content_browser("pack:demo")
+        target.write_text("after", encoding="utf-8")
+        with self.assertRaisesRegex(core.ContentPlanStale, "reload Content"):
+            core.resolve_content_path_info(
+                "pack:demo",
+                "common",
+                "config/value.txt",
+                expected_snapshot=browser.snapshot,
+            )
+
+        target.write_text("before", encoding="utf-8")
+        browser = core.load_content_browser("pack:demo")
+        original_inspect = content_operations.inspect_overlay_entry
+
+        def replace_after_entry_inspection(*args, **kwargs):
+            result = original_inspect(*args, **kwargs)
+            target.unlink()
+            target.write_text("replacement", encoding="utf-8")
+            return result
+
+        with patch.object(
+            content_operations,
+            "inspect_overlay_entry",
+            side_effect=replace_after_entry_inspection,
+        ):
+            with self.assertRaises(core.ContentPlanStale):
+                core.resolve_content_path_info(
+                    "pack:demo",
+                    "common",
+                    "config/value.txt",
+                    expected_snapshot=browser.snapshot,
+                )
+
+        for path in ("../escape", "/absolute", "pack.toml", ".gitkeep", "CON/file"):
+            with self.subTest(path=path):
+                with self.assertRaises(core.ContentOperationError):
+                    core.resolve_content_path_info(
+                        "pack:demo",
+                        "common",
+                        path,
+                        expected_snapshot=browser.snapshot,
+                    )
+        with self.assertRaises(core.ContentPlanStale):
+            core.resolve_content_path_info(
+                "pack:demo",
+                "common",
+                "config/value.txt",
+                expected_snapshot=core.ContentSnapshot(
+                    "pack:other",
+                    browser.snapshot.project_identity,
+                    browser.snapshot.content_parent_identity,
+                    browser.snapshot.content_identity,
+                    browser.snapshot.entries,
+                    browser.snapshot.digest,
+                ),
+            )
+        with self.assertRaisesRegex(core.HuroshikiError, "only for packs"):
+            core.resolve_content_path_info(
+                "template:base",
+                "common",
+                "config/value.txt",
+                expected_snapshot=browser.snapshot,
+            )
+
+    def test_path_info_deadline_and_cancellation_are_checked_during_resolution(self) -> None:
+        target = self.content / "common/config/large.bin"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"x" * (2 * 1024 * 1024))
+        browser = core.load_content_browser("pack:demo")
+        with patch.object(
+            Path,
+            "lstat",
+            side_effect=AssertionError("filesystem accessed before deadline check"),
+        ):
+            with self.assertRaises(core.ContentOperationDeadlineExceeded):
+                core.resolve_content_path_info(
+                    "pack:demo",
+                    "common",
+                    "config/large.bin",
+                    expected_snapshot=browser.snapshot,
+                    deadline=time.monotonic() - 1,
+                )
+
+        cancelled = threading.Event()
+        original_read = overlay_policy.os.read
+        reads = 0
+
+        def cancel_during_read(fd: int, count: int) -> bytes:
+            nonlocal reads
+            data = original_read(fd, count)
+            reads += 1
+            if reads == 1:
+                cancelled.set()
+            return data
+
+        with patch.object(overlay_policy.os, "read", side_effect=cancel_during_read):
+            with self.assertRaises(core.ContentOperationCancelled):
+                core.resolve_content_path_info(
+                    "pack:demo",
+                    "common",
+                    "config/large.bin",
+                    expected_snapshot=browser.snapshot,
+                    cancel_event=cancelled,
+                )
+
     def test_overlay_scan_checkpoint_precedes_access_and_interrupts_traversal(self) -> None:
         cancel_event = threading.Event()
         cancel_event.set()
