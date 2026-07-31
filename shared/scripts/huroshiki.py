@@ -2072,18 +2072,27 @@ def content_create_operation(
     path = values["path"].strip()
     mode = _parse_content_mode(values["mode"])
     presets = {
-        "startup": ("common", "kubejs/startup_scripts"),
-        "server": ("server", "kubejs/server_scripts"),
-        "client": ("client", "kubejs/client_scripts"),
+        "startup": ("common", "kubejs/startup_scripts", True),
+        "server": ("server", "kubejs/server_scripts", True),
+        "client": ("client", "kubejs/client_scripts", True),
+        "assets": ("common", "kubejs/assets", False),
+        "data": ("common", "kubejs/data", False),
     }
     if kind in presets:
-        default_side, prefix = presets[kind]
+        default_side, prefix, script = presets[kind]
         if not side:
             side = default_side
-        if "/" not in path:
+        if not path.lower().startswith("kubejs/"):
             path = f"{prefix}/{path}"
-        if not path.lower().endswith(".js"):
-            path += ".js"
+        if script and not path.lower().endswith((".js", ".ts")):
+            extension = values.get("extension", ".js").strip().lower()
+            if not extension.startswith("."):
+                extension = f".{extension}"
+            if extension not in {".js", ".ts"}:
+                raise core.ContentOperationError(
+                    "KubeJS script extension must be .js or .ts"
+                )
+            path += extension
         operation: core.ContentOperation = core.ContentCreateFile(
             side,
             Path(path),
@@ -2101,7 +2110,7 @@ def content_create_operation(
         operation = core.ContentCreateDirectory(side, Path(path), mode)
     else:
         raise core.ContentOperationError(
-            "Content kind must be file, directory, startup, server, or client"
+            "Content kind must be file, directory, startup, server, client, assets, or data"
         )
     return operation, (side, Path(path))
 
@@ -2115,6 +2124,7 @@ class ContentCreateModal(ModalScreen[dict[str, str] | None]):
         "content-create-kind",
         "content-create-side",
         "content-create-path",
+        "content-create-extension",
         "content-create-mode",
     )
 
@@ -2128,19 +2138,21 @@ class ContentCreateModal(ModalScreen[dict[str, str] | None]):
             yield Static("Kind / preset")
             yield Input(
                 value="file",
-                placeholder="file / directory / startup / server / client",
+                placeholder="file / directory / startup / server / client / assets / data",
                 id="content-create-kind",
             )
             yield Static("Side")
             yield Input(value="common", id="content-create-side")
             yield Static("Relative path or preset file name")
             yield Input(placeholder="config/example.toml", id="content-create-path")
+            yield Static("KubeJS script extension")
+            yield Input(value=".js", placeholder=".js / .ts", id="content-create-extension")
             yield Static("Mode")
             yield Input(value="0644", id="content-create-mode")
             yield Static("Initial UTF-8 text")
             yield TextArea("", id="content-create-text")
             yield Static(
-                "Presets create .js files under kubejs startup/server/client scripts. "
+                "Presets cover kubejs startup/server/client scripts plus assets/data. "
                 "Parents are never created implicitly. Ctrl+Enter: preview  Esc: cancel",
                 classes="modal-help",
             )
@@ -2155,6 +2167,8 @@ class ContentCreateModal(ModalScreen[dict[str, str] | None]):
             "startup": "common",
             "server": "server",
             "client": "client",
+            "assets": "common",
+            "data": "common",
         }.get(kind)
         side = self.query_one("#content-create-side", Input)
         if default_side is not None and side.value.strip().lower() == self._preset_side:
@@ -2180,6 +2194,9 @@ class ContentCreateModal(ModalScreen[dict[str, str] | None]):
             "kind": self.query_one("#content-create-kind", Input).value.strip(),
             "side": self.query_one("#content-create-side", Input).value.strip(),
             "path": self.query_one("#content-create-path", Input).value.strip(),
+            "extension": self.query_one(
+                "#content-create-extension", Input
+            ).value.strip(),
             "mode": self.query_one("#content-create-mode", Input).value.strip(),
             "text": self.query_one("#content-create-text", TextArea).text,
         }

@@ -1132,6 +1132,44 @@ class ContentCreateModelTest(unittest.TestCase):
             self.assertIsInstance(operation, core.ContentCreateFile)
             self.assertEqual(key, (side, Path(f"{prefix}/demo.js")))
             self.assertEqual(operation.mode, 0o644)
+        typescript, key = huroshiki.content_create_operation(
+            {
+                "kind": "startup",
+                "side": "common",
+                "path": "typed",
+                "extension": ".ts",
+                "mode": "0644",
+                "text": "",
+            }
+        )
+        self.assertIsInstance(typescript, core.ContentCreateFile)
+        self.assertEqual(key, ("common", Path("kubejs/startup_scripts/typed.ts")))
+        explicit_typescript, key = huroshiki.content_create_operation(
+            {
+                "kind": "client",
+                "side": "client",
+                "path": "existing.ts",
+                "extension": ".js",
+                "mode": "0644",
+                "text": "",
+            }
+        )
+        self.assertIsInstance(explicit_typescript, core.ContentCreateFile)
+        self.assertEqual(key, ("client", Path("kubejs/client_scripts/existing.ts")))
+        for kind, path in (
+            ("assets", "example/textures/item.png"),
+            ("data", "example/recipes/item.json"),
+        ):
+            _, key = huroshiki.content_create_operation(
+                {
+                    "kind": kind,
+                    "side": "common",
+                    "path": path,
+                    "mode": "0644",
+                    "text": "",
+                }
+            )
+            self.assertEqual(key, ("common", Path("kubejs") / kind / path))
         directory, _ = huroshiki.content_create_operation(
             {"kind": "directory", "side": "common", "path": "config/empty", "mode": "0755", "text": ""}
         )
