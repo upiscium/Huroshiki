@@ -62,6 +62,7 @@ except ModuleNotFoundError as error:
     raise
 
 import huroshiki_core as core
+from content_workers import ContentWorker
 from template_import import (
     ActualIdentityConflict,
     CandidateNameConflict,
@@ -75,6 +76,9 @@ from template_import import (
 
 
 APP_TRANSACTION_SHUTDOWN_TIMEOUT_SECONDS = 30.0
+APP_CONTENT_SHUTDOWN_TIMEOUT_SECONDS = 30.0
+CONTENT_WORKER_TIMEOUT_SECONDS = 600.0
+CONTENT_DISCARD_TIMEOUT_SECONDS = 10.0
 
 
 def enabled_marker(enabled: bool) -> str:
@@ -128,6 +132,17 @@ class HuroshikiApp(App[None]):
             ],
         ] = {}
         self._transaction_discard_timer: Timer | None = None
+        self.content_workers: dict[str, ContentWorker[object]] = {}
+        self.content_plans: dict[str, core.ContentChangePlan] = {}
+        self._content_discards: dict[
+            str,
+            tuple[
+                core.ContentChangePlan,
+                core.ContentDiscardOperation,
+                Callable[[], None],
+            ],
+        ] = {}
+        self._content_discard_timer: Timer | None = None
 
     def on_mount(self) -> None:
         if self.initial_project:
@@ -143,7 +158,78 @@ class HuroshikiApp(App[None]):
         if self._transaction_discard_timer is not None:
             self._transaction_discard_timer.stop()
             self._transaction_discard_timer = None
-        deadline = time.monotonic() + APP_TRANSACTION_SHUTDOWN_TIMEOUT_SECONDS
+        if self._content_discard_timer is not None:
+            self._content_discard_timer.stop()
+            self._content_discard_timer = None
+        deadline = time.monotonic() + min(
+            APP_TRANSACTION_SHUTDOWN_TIMEOUT_SECONDS,
+            APP_CONTENT_SHUTDOWN_TIMEOUT_SECONDS,
+        )
+        for worker in tuple(self.content_workers.values()):
+            worker.cancel()
+        unfinished_content_workers: set[str] = set()
+        for project_key, worker in tuple(self.content_workers.items()):
+            if not worker.wait(deadline):
+                unfinished_content_workers.add(project_key)
+                plan = self.content_plans.get(project_key)
+                location = (
+                    f"; transaction retained at {plan.transaction_root}"
+                    if plan is not None
+                    else ""
+                )
+                print(
+                    f"Content worker did not stop before shutdown for {project_key}{location}",
+                    file=sys.stderr,
+                )
+                continue
+            if isinstance(worker.result, core.ContentChangePlan):
+                self.content_plans.setdefault(project_key, worker.result)
+            if self.content_workers.get(project_key) is worker:
+                self.content_workers.pop(project_key, None)
+        for project_key, pending in tuple(self._content_discards.items()):
+            plan, operation, _destination = pending
+            remaining = max(0.0, deadline - time.monotonic())
+            if not operation.done.wait(remaining):
+                print(
+                    "Content plan cleanup did not finish before shutdown at "
+                    f"{plan.transaction_root}",
+                    file=sys.stderr,
+                )
+                continue
+            try:
+                operation.raise_for_error()
+            except BaseException as error:
+                print(
+                    f"Content plan cleanup failed at {plan.transaction_root}: {error}",
+                    file=sys.stderr,
+                )
+            else:
+                self._content_discards.pop(project_key, None)
+                if self.content_plans.get(project_key) is plan:
+                    self.content_plans.pop(project_key, None)
+        for project_key, plan in tuple(self.content_plans.items()):
+            if (
+                project_key in self._content_discards
+                or project_key in unfinished_content_workers
+            ):
+                continue
+            try:
+                operation = plan.begin_discard(deadline=deadline)
+                operation.start()
+                remaining = max(0.0, deadline - time.monotonic())
+                if not operation.done.wait(remaining):
+                    raise core.ContentCleanupError(
+                        "Content plan cleanup did not finish before shutdown"
+                    )
+                operation.raise_for_error()
+            except BaseException as error:
+                print(
+                    f"Content plan cleanup failed at {plan.transaction_root}: {error}",
+                    file=sys.stderr,
+                )
+            else:
+                if self.content_plans.get(project_key) is plan:
+                    self.content_plans.pop(project_key, None)
         for project_key, transaction in tuple(self.transactions.items()):
             try:
                 transaction.discard(deadline=deadline)
@@ -231,6 +317,154 @@ class HuroshikiApp(App[None]):
             return
         self.selected_project = project_key
         self.switch_screen(TemplateScreen(project_key))
+
+    def open_content(self, project_key: str) -> None:
+        if not self.project_is_usable(project_key):
+            return
+        project = core.project_info(project_key)
+        if project.kind != "pack":
+            self.notify(
+                "Content management is currently available only for packs",
+                severity="warning",
+            )
+            return
+        if project_key in self._content_discards:
+            self.notify("Content plan cleanup is still running", severity="warning")
+            return
+        if project_key in self.content_workers:
+            self.notify(
+                "A Content operation is already active for this pack",
+                severity="warning",
+            )
+            return
+        if project_key in self.content_plans:
+            self.notify(
+                "A Content operation is already active for this pack",
+                severity="warning",
+            )
+            return
+        self.selected_project = project_key
+        self.switch_screen(ContentScreen(project_key))
+
+    def start_content_worker(
+        self,
+        project_key: str,
+        purpose: str,
+        target: Callable[[threading.Event, float], object],
+    ) -> ContentWorker[object]:
+        if project_key in self.content_workers:
+            raise core.ContentOperationError(
+                "A Content operation is already active for this pack"
+            )
+        if purpose == "plan" and project_key in self.content_plans:
+            raise core.ContentOperationError(
+                "A Content operation is already active for this pack"
+            )
+        worker = ContentWorker(
+            f"huroshiki-content-{purpose}-{project_key.replace(':', '-')}",
+            target,
+            timeout_seconds=CONTENT_WORKER_TIMEOUT_SECONDS,
+        )
+        worker.start()
+        self.content_workers[project_key] = worker
+        return worker
+
+    def finish_content_worker(
+        self,
+        project_key: str,
+        worker: ContentWorker[object],
+    ) -> object | None:
+        if self.content_workers.get(project_key) is not worker:
+            raise core.ContentOperationError("Content worker ownership changed")
+        if not worker.done.is_set():
+            raise core.ContentOperationError("Content worker is still running")
+        self.content_workers.pop(project_key, None)
+        worker.raise_for_error()
+        return worker.result
+
+    def register_content_plan(
+        self,
+        project_key: str,
+        plan: core.ContentChangePlan,
+    ) -> None:
+        existing = self.content_plans.get(project_key)
+        if existing is not None and existing is not plan:
+            raise core.ContentOperationError(
+                "A Content operation is already active for this pack"
+            )
+        self.content_plans[project_key] = plan
+
+    def begin_content_discard(
+        self,
+        project_key: str,
+        destination: Callable[[], None],
+    ) -> None:
+        if project_key in self._content_discards:
+            self.notify("Content plan cleanup is already running", severity="warning")
+            return
+        plan = self.content_plans.get(project_key)
+        if plan is None:
+            destination()
+            return
+        try:
+            operation = plan.begin_discard(
+                deadline=time.monotonic() + CONTENT_DISCARD_TIMEOUT_SECONDS
+            )
+            operation.start()
+        except BaseException as error:
+            screen = self.screen
+            if (
+                isinstance(screen, ContentPlanPreviewScreen)
+                and screen.plan is plan
+            ):
+                screen.query_one("#content-operation-status", Static).update(
+                    "Content plan cleanup could not start.\n"
+                    f"Transaction state retained at:\n{plan.transaction_root}\n\n{error}"
+                )
+            self.notify(str(error), severity="error")
+            return
+        self._content_discards[project_key] = (plan, operation, destination)
+        if self._content_discard_timer is None:
+            self._content_discard_timer = self.set_interval(
+                0.05,
+                self._poll_content_discards,
+            )
+
+    def _poll_content_discards(self) -> None:
+        for project_key, pending in tuple(self._content_discards.items()):
+            plan, operation, destination = pending
+            if not operation.done.is_set():
+                continue
+            self._content_discards.pop(project_key, None)
+            try:
+                operation.raise_for_error()
+            except BaseException as error:
+                message = (
+                    "Content plan cleanup failed.\n"
+                    "Transaction state retained at:\n"
+                    f"{plan.transaction_root}\n\n{error}\n"
+                    "Press r to retry cleanup before leaving this screen."
+                )
+                screen = self.screen
+                if (
+                    isinstance(screen, ContentPlanPreviewScreen)
+                    and screen.plan is plan
+                ):
+                    screen.query_one("#content-operation-status", Static).update(message)
+                self.notify(
+                    f"Content plan cleanup failed at {plan.transaction_root}: {error}",
+                    severity="error",
+                )
+                continue
+            if self.content_plans.get(project_key) is plan:
+                self.content_plans.pop(project_key, None)
+            try:
+                destination()
+            except BaseException as error:
+                self.notify(str(error), severity="error")
+        if not self._content_discards and self._content_discard_timer is not None:
+            self._content_discard_timer.stop()
+            self._content_discard_timer = None
 
     def open_template_editor(
         self,
@@ -1111,9 +1345,9 @@ class ProjectScreen(BaseScreen):
         )
         self.actions = core.project_actions(project_key)
         if self.project.kind == "pack":
-            self.actions = (*self.actions, "Apply Template", "settings")
+            self.actions = (*self.actions, "Content", "Apply Template", "settings")
             self.help_text = (
-                "i: install  l: list  u: update  t: files  s: settings  "
+                "i: install  l: list  u: update  t: Content  s: settings  "
                 "j/k: move  Enter: run  Esc: main"
             )
         else:
@@ -1143,6 +1377,9 @@ class ProjectScreen(BaseScreen):
         if index is None:
             return
         action = self.actions[index]
+        if action == "Content":
+            self.app.open_content(self.project_key)
+            return
         if action == "Apply Template":
             self.app.open_template_import(self.project_key)
             return
@@ -1274,10 +1511,10 @@ class ProjectScreen(BaseScreen):
                 )
         elif key == "t":
             if self.project.kind == "pack":
-                self.app.open_templates(self.project_key)
+                self.app.open_content(self.project_key)
             else:
                 self.app.notify(
-                    "Templates store MOD entries only",
+                    "Content management is currently available only for packs",
                     severity="warning",
                 )
         elif key == "s" and self.project.kind == "pack":
@@ -1759,6 +1996,975 @@ class VersionsScreen(BaseScreen):
                 self.operation.discard()
             else:
                 self.operation.cancel()
+
+
+def _parse_content_mode(value: str) -> int:
+    try:
+        mode = int(value.strip(), 8)
+    except ValueError as error:
+        raise core.ContentOperationError("Content mode must be an octal value") from error
+    if mode < 0 or mode > 0o777:
+        raise core.ContentOperationError("Content mode must be between 0000 and 0777")
+    return mode
+
+
+def content_create_operation(
+    values: dict[str, str],
+) -> tuple[core.ContentOperation, tuple[str, Path]]:
+    kind = values["kind"].strip().lower()
+    side = values["side"].strip().lower()
+    path = values["path"].strip()
+    mode = _parse_content_mode(values["mode"])
+    presets = {
+        "startup": ("common", "kubejs/startup_scripts"),
+        "server": ("server", "kubejs/server_scripts"),
+        "client": ("client", "kubejs/client_scripts"),
+    }
+    if kind in presets:
+        default_side, prefix = presets[kind]
+        if not side:
+            side = default_side
+        if "/" not in path:
+            path = f"{prefix}/{path}"
+        if not path.lower().endswith(".js"):
+            path += ".js"
+        operation: core.ContentOperation = core.ContentCreateFile(
+            side,
+            Path(path),
+            values.get("text", "").encode("utf-8"),
+            mode,
+        )
+    elif kind in {"file", "text", "text file"}:
+        operation = core.ContentCreateFile(
+            side,
+            Path(path),
+            values.get("text", "").encode("utf-8"),
+            mode,
+        )
+    elif kind in {"directory", "dir"}:
+        operation = core.ContentCreateDirectory(side, Path(path), mode)
+    else:
+        raise core.ContentOperationError(
+            "Content kind must be file, directory, startup, server, or client"
+        )
+    return operation, (side, Path(path))
+
+
+class ContentCreateModal(ModalScreen[dict[str, str] | None]):
+    BINDINGS = [
+        Binding("ctrl+enter", "submit", "Preview"),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+    FIELD_IDS = (
+        "content-create-kind",
+        "content-create-side",
+        "content-create-path",
+        "content-create-mode",
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._preset_side = "common"
+
+    def compose(self) -> ComposeResult:
+        with Container(id="modal-dialog", classes="form-dialog"):
+            yield Static("Create Content entry", classes="modal-title")
+            yield Static("Kind / preset")
+            yield Input(
+                value="file",
+                placeholder="file / directory / startup / server / client",
+                id="content-create-kind",
+            )
+            yield Static("Side")
+            yield Input(value="common", id="content-create-side")
+            yield Static("Relative path or preset file name")
+            yield Input(placeholder="config/example.toml", id="content-create-path")
+            yield Static("Mode")
+            yield Input(value="0644", id="content-create-mode")
+            yield Static("Initial UTF-8 text")
+            yield TextArea("", id="content-create-text")
+            yield Static(
+                "Presets create .js files under kubejs startup/server/client scripts. "
+                "Parents are never created implicitly. Ctrl+Enter: preview  Esc: cancel",
+                classes="modal-help",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#content-create-kind", Input).focus()
+
+    @on(Input.Changed, "#content-create-kind")
+    def kind_changed(self, event: Input.Changed) -> None:
+        kind = event.value.strip().lower()
+        default_side = {
+            "startup": "common",
+            "server": "server",
+            "client": "client",
+        }.get(kind)
+        side = self.query_one("#content-create-side", Input)
+        if default_side is not None and side.value.strip().lower() == self._preset_side:
+            side.value = default_side
+            self._preset_side = default_side
+        mode = self.query_one("#content-create-mode", Input)
+        if kind in {"directory", "dir"} and mode.value == "0644":
+            mode.value = "0755"
+        elif kind != "directory" and mode.value == "0755":
+            mode.value = "0644"
+
+    @on(Input.Submitted)
+    def submitted(self, event: Input.Submitted) -> None:
+        inputs = [self.query_one(f"#{item}", Input) for item in self.FIELD_IDS]
+        index = inputs.index(event.input)
+        if index < len(inputs) - 1:
+            inputs[index + 1].focus()
+        else:
+            self.query_one("#content-create-text", TextArea).focus()
+
+    def action_submit(self) -> None:
+        values = {
+            "kind": self.query_one("#content-create-kind", Input).value.strip(),
+            "side": self.query_one("#content-create-side", Input).value.strip(),
+            "path": self.query_one("#content-create-path", Input).value.strip(),
+            "mode": self.query_one("#content-create-mode", Input).value.strip(),
+            "text": self.query_one("#content-create-text", TextArea).text,
+        }
+        if not all(values[key] for key in ("kind", "side", "path", "mode")):
+            self.app.notify("Kind, side, path, and mode are required", severity="error")
+            return
+        try:
+            content_create_operation(values)
+        except Exception as error:
+            self.app.notify(str(error), severity="error")
+            return
+        self.dismiss(values)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ContentMoveModal(ModalScreen[dict[str, str] | None]):
+    BINDINGS = [
+        Binding("ctrl+enter", "submit", "Preview"),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, entry: core.ContentEntry) -> None:
+        super().__init__()
+        self.entry = entry
+
+    def compose(self) -> ComposeResult:
+        with Container(id="modal-dialog", classes="form-dialog"):
+            yield Static("Move or rename Content", classes="modal-title")
+            yield Static(f"Source: {self.entry.side}/{self.entry.relative_path}")
+            yield Static("Destination side")
+            yield Input(value=self.entry.side, id="content-move-side")
+            yield Static("Destination relative path")
+            yield Input(value=str(self.entry.relative_path), id="content-move-path")
+            yield Static(
+                "Destination overwrite is not allowed. Ctrl+Enter: preview  Esc: cancel",
+                classes="modal-help",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#content-move-side", Input).focus()
+
+    @on(Input.Submitted)
+    def submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "content-move-side":
+            self.query_one("#content-move-path", Input).focus()
+        else:
+            self.action_submit()
+
+    def action_submit(self) -> None:
+        side = self.query_one("#content-move-side", Input).value.strip()
+        path = self.query_one("#content-move-path", Input).value.strip()
+        if not side or not path:
+            self.app.notify("Destination side and path are required", severity="error")
+            return
+        self.dismiss({"side": side, "path": path})
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+def _content_filter_text(entry: core.ContentEntry) -> str:
+    return " ".join(
+        (
+            entry.side,
+            str(entry.relative_path),
+            entry.kind,
+            entry.category,
+            entry.text_kind,
+            *entry.errors,
+        )
+    ).casefold()
+
+
+class ContentScreen(ProjectChildScreen, FilterListScreen):
+    BINDINGS = FilterListScreen.BINDINGS
+    filter_input_id = "content-search"
+    filter_table_id = "content-table"
+    help_text = (
+        "Tab: focus  Enter/e: edit  c: create  d: delete  m: move  s: side  "
+        "r: reload  q: clear filter  p/Esc: project"
+    )
+    SIDES = ("all", "common", "client", "server")
+
+    def __init__(self, project_key: str, *, select_key: tuple[str, Path] | None = None) -> None:
+        super().__init__()
+        self.project_key = project_key
+        project = core.project_info(project_key)
+        self.screen_title = f"{project.display_name} / Content"
+        self.result: core.ContentBrowseResult | None = None
+        self.visible_entries: list[core.ContentEntry] = []
+        self.side_filter = "all"
+        self.selected_key = select_key
+        self.worker: ContentWorker[object] | None = None
+        self.worker_kind: str | None = None
+        self.worker_timer: Timer | None = None
+        self.pending_destination: Callable[[], None] | None = None
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        yield FilterInput(placeholder="Filter Content", id="content-search")
+        yield Static("Loading Content...", id="content-status", markup=False)
+        yield DataTable(id="content-table")
+        yield Static("", id="content-detail", markup=False)
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#content-table", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns(
+            "Side", "Path", "Kind", "Bytes", "Mode", "Type", "Category", "Status"
+        )
+        table.focus()
+        self.start_browser_load()
+
+    def _start_worker(
+        self,
+        kind: str,
+        target: Callable[[threading.Event, float], object],
+    ) -> bool:
+        if self.worker is not None:
+            self.app.notify("Content reload is already running", severity="warning")
+            return False
+        try:
+            self.worker = self.app.start_content_worker(self.project_key, kind, target)
+        except BaseException as error:
+            self.query_one("#content-status", Static).update(str(error))
+            self.app.notify(str(error), severity="error")
+            return False
+        self.worker_kind = kind
+        self.worker_timer = self.set_interval(0.05, self._poll_worker)
+        return True
+
+    def start_browser_load(self) -> None:
+        if self._start_worker(
+            "browser",
+            lambda cancel, deadline: core.load_content_browser(
+                self.project_key,
+                cancel_event=cancel,
+                deadline=deadline,
+            ),
+        ):
+            self.query_one("#content-status", Static).update("Loading Content...")
+
+    def _poll_worker(self) -> None:
+        worker = self.worker
+        if worker is None or not worker.done.is_set():
+            return
+        if self.worker_timer is not None:
+            self.worker_timer.stop()
+            self.worker_timer = None
+        kind = self.worker_kind
+        self.worker = None
+        self.worker_kind = None
+        try:
+            result = self.app.finish_content_worker(self.project_key, worker)
+        except BaseException as error:
+            if self.pending_destination is None:
+                self.query_one("#content-status", Static).update(str(error))
+                self.app.notify(str(error), severity="error")
+        else:
+            if kind == "browser" and isinstance(result, core.ContentBrowseResult):
+                self.result = result
+                self.reload_rows()
+            elif kind == "plan" and isinstance(result, core.ContentChangePlan):
+                self.app.register_content_plan(self.project_key, result)
+                if self.pending_destination is not None:
+                    destination = self.pending_destination
+                    self.pending_destination = None
+                    self.query_one("#content-status", Static).update(
+                        "Discarding cancelled Content plan..."
+                    )
+                    self.app.begin_content_discard(self.project_key, destination)
+                    return
+                self.app.push_screen(
+                    ContentPlanPreviewScreen(
+                        self.project_key,
+                        result,
+                        select_key=self.selected_key,
+                        return_to_origin=True,
+                    )
+                )
+                return
+        if self.pending_destination is not None:
+            destination = self.pending_destination
+            self.pending_destination = None
+            destination()
+
+    def reload_rows(self) -> None:
+        if self.result is None:
+            return
+        table = self.query_one("#content-table", DataTable)
+        previous_index = table.cursor_row
+        current = self.current_entry()
+        if current is not None:
+            self.selected_key = (current.side, current.relative_path)
+        query = self.query_one("#content-search", Input).value.casefold().strip()
+        self.visible_entries = [
+            entry
+            for entry in self.result.entries
+            if (self.side_filter == "all" or entry.side == self.side_filter)
+            and (not query or query in _content_filter_text(entry))
+        ]
+        table.clear()
+        for entry in self.visible_entries:
+            table.add_row(
+                entry.side,
+                str(entry.relative_path),
+                entry.kind,
+                str(entry.size) if entry.kind != "invalid" else "-",
+                f"{entry.mode:04o}" if entry.kind != "invalid" else "----",
+                "text" if entry.text_kind == "utf8" else entry.text_kind,
+                entry.category,
+                "; ".join(entry.errors) if entry.errors else "valid",
+            )
+        row = min(previous_index, max(0, len(self.visible_entries) - 1))
+        if self.selected_key is not None:
+            for index, entry in enumerate(self.visible_entries):
+                if (entry.side, entry.relative_path) == self.selected_key:
+                    row = index
+                    break
+        if self.visible_entries:
+            table.move_cursor(row=row)
+        self.update_summary()
+        self.update_detail()
+
+    def update_summary(self) -> None:
+        if self.result is None:
+            return
+        entries = self.result.entries
+        warnings = sum(item.severity == "warning" for item in self.result.conflicts)
+        fatal = sum(item.severity == "error" for item in self.result.conflicts)
+        self.query_one("#content-status", Static).update(
+            f"Side: {self.side_filter}  Entries: {len(entries)}  "
+            f"Files: {sum(item.kind == 'file' for item in entries)}  "
+            f"Directories: {sum(item.kind == 'directory' for item in entries)}  "
+            f"Invalid: {sum(item.kind == 'invalid' for item in entries)}  "
+            f"Warnings: {warnings}  Fatal conflicts: {fatal}  "
+            f"Snapshot: {self.result.snapshot.digest[:12]}"
+        )
+
+    def update_detail(self) -> None:
+        entry = self.current_entry()
+        if entry is None:
+            self.query_one("#content-detail", Static).update("")
+            return
+        details = (
+            f"{entry.side}/{entry.relative_path} | {entry.kind} | {entry.size} bytes | "
+            f"mode {entry.mode:04o} | {entry.text_kind} | {entry.category}"
+        )
+        if entry.errors:
+            details += " | " + "; ".join(entry.errors)
+        if self.result is not None:
+            conflicts = [
+                conflict.kind
+                for conflict in self.result.conflicts
+                if (entry.side, entry.relative_path) in conflict.entries
+            ]
+            if conflicts:
+                details += " | conflicts: " + ", ".join(conflicts)
+        self.query_one("#content-detail", Static).update(details)
+
+    def reload_filter_rows(self, query: str) -> None:
+        self.reload_rows()
+
+    def filter_row_count(self) -> int:
+        return len(self.visible_entries)
+
+    @on(Input.Changed, "#content-search")
+    def filter_changed(self, _event: Input.Changed) -> None:
+        self.reload_rows()
+
+    @on(DataTable.RowHighlighted, "#content-table")
+    def row_highlighted(self, _event: DataTable.RowHighlighted) -> None:
+        self.update_detail()
+
+    def current_entry(self) -> core.ContentEntry | None:
+        table = self.query_one("#content-table", DataTable)
+        index = self.current_index(table, len(self.visible_entries))
+        return None if index is None else self.visible_entries[index]
+
+    def edit_current(self) -> None:
+        entry = self.current_entry()
+        if entry is None or self.result is None:
+            self.app.notify("No Content entry is selected", severity="warning")
+            return
+        if entry.kind != "file" or entry.errors or entry.text_kind != "utf8":
+            self.app.notify(
+                "Only valid UTF-8 Content files can be opened in the editor",
+                severity="warning",
+            )
+            return
+        if entry.size > core.CONTENT_EDITOR_MAX_BYTES:
+            self.app.push_screen(
+                MessageModal(
+                    "Content file is too large for the internal editor",
+                    (
+                        f"Path: {entry.side}/{entry.relative_path}",
+                        f"Kind: {entry.kind}",
+                        f"Category: {entry.category}",
+                        f"Size: {entry.size} bytes",
+                        f"Internal editor limit: {core.CONTENT_EDITOR_MAX_BYTES} bytes",
+                        "",
+                        "Use an external editor for this file.",
+                    ),
+                )
+            )
+            return
+        self.app.switch_screen(
+            ContentEditorScreen(
+                self.project_key,
+                entry,
+                self.result.snapshot,
+            )
+        )
+
+    def create_entry(self, values: dict[str, str] | None) -> None:
+        if values is None or self.result is None:
+            return
+        try:
+            operation, select_key = content_create_operation(values)
+        except BaseException as error:
+            self.app.notify(str(error), severity="error")
+            return
+        self.selected_key = select_key
+        self.start_plan((operation,))
+
+    def request_delete(self) -> None:
+        entry = self.current_entry()
+        if entry is None:
+            self.app.notify("No Content entry is selected", severity="warning")
+            return
+        if entry.kind == "invalid" or entry.errors:
+            self.app.notify(
+                "Invalid entries cannot be modified from the Content TUI. "
+                "Repair or remove the entry outside Huroshiki, then reload.",
+                severity="warning",
+            )
+            return
+        self.app.push_screen(
+            ConfirmModal(
+                "Delete Content entry?",
+                (
+                    f"Side: {entry.side}",
+                    f"Path: {entry.relative_path}",
+                    "Directories must be empty. Recursive deletion is not supported.",
+                ),
+            ),
+            lambda confirmed: self.delete_confirmed(entry, confirmed),
+        )
+
+    def delete_confirmed(self, entry: core.ContentEntry, confirmed: bool | None) -> None:
+        if not confirmed:
+            return
+        operation: core.ContentOperation
+        if entry.kind == "file":
+            operation = core.ContentDeleteFile(entry.side, entry.relative_path)
+        else:
+            operation = core.ContentDeleteDirectory(entry.side, entry.relative_path)
+        self.start_plan((operation,))
+
+    def move_current(self, values: dict[str, str] | None = None) -> None:
+        entry = self.current_entry()
+        if entry is None:
+            self.app.notify("No Content entry is selected", severity="warning")
+            return
+        if entry.kind == "invalid" or entry.errors:
+            self.app.notify("Invalid Content entries cannot be moved", severity="warning")
+            return
+        if values is None:
+            self.app.push_screen(
+                ContentMoveModal(entry),
+                lambda result: self.move_confirmed(entry, result),
+            )
+
+    def move_confirmed(
+        self,
+        entry: core.ContentEntry,
+        values: dict[str, str] | None,
+    ) -> None:
+        if values is None:
+            return
+        self.selected_key = (values["side"], Path(values["path"]))
+        self.start_plan(
+            (
+                core.ContentMove(
+                    entry.side,
+                    entry.relative_path,
+                    values["side"],
+                    Path(values["path"]),
+                ),
+            )
+        )
+
+    def start_plan(self, operations: tuple[core.ContentOperation, ...]) -> None:
+        if self.result is None:
+            return
+        snapshot = self.result.snapshot
+        if self._start_worker(
+            "plan",
+            lambda cancel, deadline: core.plan_content_changes(
+                self.project_key,
+                operations,
+                expected_snapshot=snapshot,
+                cancel_event=cancel,
+                deadline=deadline,
+            ),
+        ):
+            self.query_one("#content-status", Static).update("Planning Content changes...")
+
+    def leave(self) -> None:
+        if self.worker is not None:
+            self.pending_destination = self.return_to_project
+            self.worker.cancel()
+            self.query_one("#content-status", Static).update(
+                "Cancelling Content operation before leaving..."
+            )
+            return
+        self.return_to_project()
+
+    def on_unmount(self) -> None:
+        if self.worker_timer is not None:
+            self.worker_timer.stop()
+            self.worker_timer = None
+        if self.worker is not None:
+            self.worker.cancel()
+
+    def on_key(self, event: events.Key) -> None:
+        table = self.query_one("#content-table", DataTable)
+        focused = self.focused
+        if self.worker is not None:
+            if event.key in {"escape", "p"}:
+                self.leave()
+            else:
+                self.app.notify("Wait for Content operation or press Esc to cancel", severity="warning")
+            event.stop()
+            return
+        if isinstance(focused, Input):
+            if event.key == "escape":
+                self.leave()
+                event.stop()
+            return
+        key = event.key
+        if focused is table and key == "j":
+            self.move_table(table, len(self.visible_entries), 1)
+        elif focused is table and key == "k":
+            self.move_table(table, len(self.visible_entries), -1)
+        elif focused is table and key in {"enter", "e"}:
+            self.edit_current()
+        elif key == "c":
+            self.app.push_screen(ContentCreateModal(), self.create_entry)
+        elif key == "d":
+            self.request_delete()
+        elif key == "m":
+            self.move_current()
+        elif key == "s":
+            self.side_filter = self.SIDES[(self.SIDES.index(self.side_filter) + 1) % len(self.SIDES)]
+            self.reload_rows()
+        elif key == "r":
+            self.start_browser_load()
+        elif key in {"p", "escape"}:
+            self.leave()
+        else:
+            return
+        event.stop()
+
+
+class ContentEditorScreen(ProjectChildScreen, BaseScreen):
+    BINDINGS = [
+        Binding("ctrl+s", "save", "Preview save", priority=True),
+        Binding("escape", "back", "Back", priority=True),
+    ]
+    help_text = "Ctrl+S: preview save  Esc: Content browser"
+
+    def __init__(
+        self,
+        project_key: str,
+        entry: core.ContentEntry,
+        expected_snapshot: core.ContentSnapshot,
+    ) -> None:
+        super().__init__()
+        self.project_key = project_key
+        self.entry = entry
+        self.expected_snapshot = expected_snapshot
+        project = core.project_info(project_key)
+        self.screen_title = f"{project.display_name} / Content / {entry.side}/{entry.relative_path}"
+        self.document: core.ContentTextDocument | None = None
+        self.initial_text = ""
+        self.worker: ContentWorker[object] | None = None
+        self.worker_kind: str | None = None
+        self.worker_timer: Timer | None = None
+        self.pending_back = False
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        yield Static("Loading Content document...", id="content-editor-status", markup=False)
+        yield TextArea("", id="content-editor", disabled=True)
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        self.start_document_load()
+
+    def _start_worker(
+        self,
+        kind: str,
+        target: Callable[[threading.Event, float], object],
+    ) -> bool:
+        if self.worker is not None:
+            return False
+        try:
+            self.worker = self.app.start_content_worker(self.project_key, kind, target)
+        except BaseException as error:
+            self.query_one("#content-editor-status", Static).update(str(error))
+            self.app.notify(str(error), severity="error")
+            return False
+        self.worker_kind = kind
+        self.worker_timer = self.set_interval(0.05, self._poll_worker)
+        return True
+
+    def start_document_load(self) -> None:
+        self._start_worker(
+            "read",
+            lambda cancel, deadline: core.load_content_text_document(
+                self.project_key,
+                self.entry.side,
+                self.entry.relative_path,
+                expected_snapshot=self.expected_snapshot,
+                max_bytes=core.CONTENT_EDITOR_MAX_BYTES,
+                cancel_event=cancel,
+                deadline=deadline,
+            ),
+        )
+
+    def _poll_worker(self) -> None:
+        worker = self.worker
+        if worker is None or not worker.done.is_set():
+            return
+        if self.worker_timer is not None:
+            self.worker_timer.stop()
+            self.worker_timer = None
+        kind = self.worker_kind
+        self.worker = None
+        self.worker_kind = None
+        try:
+            result = self.app.finish_content_worker(self.project_key, worker)
+        except BaseException as error:
+            self.query_one("#content-editor-status", Static).update(str(error))
+            self.app.notify(str(error), severity="error")
+            if kind == "plan" and self.document is not None:
+                self.query_one("#content-editor", TextArea).disabled = False
+            if self.pending_back:
+                self.app.switch_screen(ContentScreen(self.project_key))
+            return
+        if kind == "read" and isinstance(result, core.ContentTextDocument):
+            self.document = result
+            self.initial_text = result.text
+            editor = self.query_one("#content-editor", TextArea)
+            editor.text = result.text
+            editor.disabled = False
+            editor.focus()
+            warning = (
+                " Mixed newlines will be normalized to LF in the save preview."
+                if result.newline_policy == "mixed"
+                else ""
+            )
+            self.query_one("#content-editor-status", Static).update(
+                f"{result.size} bytes | mode {result.mode:04o} | "
+                f"newlines {result.newline_policy.upper()}.{warning}"
+            )
+        elif kind == "plan" and isinstance(result, core.ContentChangePlan):
+            self.app.register_content_plan(self.project_key, result)
+            if self.pending_back:
+                self.query_one("#content-editor-status", Static).update(
+                    "Discarding cancelled Content plan..."
+                )
+                self.app.begin_content_discard(
+                    self.project_key,
+                    lambda: self.app.switch_screen(ContentScreen(self.project_key)),
+                )
+                return
+            self.query_one("#content-editor", TextArea).disabled = False
+            notes = (
+                ("Mixed newlines -> LF when this save is applied.",)
+                if self.document is not None
+                and self.document.newline_policy == "mixed"
+                else ()
+            )
+            self.app.push_screen(
+                ContentPlanPreviewScreen(
+                    self.project_key,
+                    result,
+                    select_key=(self.entry.side, self.entry.relative_path),
+                    return_to_origin=True,
+                    notes=notes,
+                )
+            )
+            return
+        if self.pending_back:
+            self.app.switch_screen(ContentScreen(self.project_key))
+
+    def current_text(self) -> str:
+        return self.query_one("#content-editor", TextArea).text
+
+    def action_save(self) -> None:
+        document = self.document
+        if document is None or self.worker is not None:
+            self.app.notify("Content document is not ready", severity="warning")
+            return
+        current_text = self.current_text()
+        if current_text == self.initial_text:
+            self.app.notify("Content file is unchanged")
+            return
+        self.query_one("#content-editor", TextArea).disabled = True
+        self.query_one("#content-editor-status", Static).update("Planning Content save...")
+
+        def plan(cancel: threading.Event, deadline: float) -> core.ContentChangePlan:
+            contents = core.encode_content_editor_text(
+                current_text,
+                document.newline_policy,
+            )
+            return core.plan_content_changes(
+                self.project_key,
+                (
+                    core.ContentReplaceFile(
+                        document.side,
+                        document.relative_path,
+                        contents,
+                        expected_digest=document.digest,
+                        mode=None,
+                    ),
+                ),
+                expected_snapshot=document.snapshot,
+                cancel_event=cancel,
+                deadline=deadline,
+            )
+
+        if not self._start_worker("plan", plan):
+            self.query_one("#content-editor", TextArea).disabled = False
+
+    def action_back(self) -> None:
+        if self.worker is not None:
+            self.pending_back = True
+            self.worker.cancel()
+            self.query_one("#content-editor-status", Static).update(
+                "Cancelling Content operation before leaving..."
+            )
+            return
+        if self.document is None or self.current_text() == self.initial_text:
+            self.app.switch_screen(ContentScreen(self.project_key))
+            return
+        self.app.push_screen(
+            ConfirmModal(
+                "Discard unsaved Content changes?",
+                (str(self.entry.relative_path), "The editor has unsaved changes."),
+            ),
+            lambda confirmed: self.app.switch_screen(ContentScreen(self.project_key)) if confirmed else None,
+        )
+
+    def on_unmount(self) -> None:
+        if self.worker_timer is not None:
+            self.worker_timer.stop()
+            self.worker_timer = None
+        if self.worker is not None:
+            self.worker.cancel()
+
+
+class ContentPlanPreviewScreen(ProjectChildScreen, BaseScreen):
+    help_text = "Enter: apply  Esc: discard  r: retry cleanup"
+
+    def __init__(
+        self,
+        project_key: str,
+        plan: core.ContentChangePlan,
+        *,
+        select_key: tuple[str, Path] | None = None,
+        return_to_origin: bool = False,
+        notes: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__()
+        self.project_key = project_key
+        self.plan = plan
+        self.select_key = select_key
+        self.return_to_origin = return_to_origin
+        self.notes = notes
+        project = core.project_info(project_key)
+        self.screen_title = f"{project.display_name} / Content change preview"
+        self.worker: ContentWorker[object] | None = None
+        self.worker_timer: Timer | None = None
+        self.leave_after_cancel = False
+
+    @property
+    def fatal(self) -> bool:
+        return any(item.severity == "error" for item in self.plan.conflicts)
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        yield Static(self.preview_text(), id="content-plan-preview", markup=False)
+        yield Static("Preview ready", id="content-operation-status", markup=False)
+        yield from self.compose_footer()
+
+    def preview_text(self) -> str:
+        lines = ["Changes:"]
+        visible = [change for change in self.plan.changes if change.action != "unchanged"]
+        for change in visible:
+            if change.action == "moved":
+                lines.append(
+                    f"  moved: {change.source_side}/{change.source_path} -> "
+                    f"{change.side}/{change.relative_path}"
+                )
+            else:
+                lines.append(f"  {change.action}: {change.side}/{change.relative_path}")
+            if change.before_digest != change.after_digest:
+                lines.append(
+                    f"    SHA-256: {(change.before_digest or '-')[:12]} -> "
+                    f"{(change.after_digest or '-')[:12]}"
+                )
+        if not visible:
+            lines.append("  none")
+        warnings = [item for item in self.plan.conflicts if item.severity == "warning"]
+        fatal = [item for item in self.plan.conflicts if item.severity == "error"]
+        lines.extend(("", f"Warnings: {len(warnings)}"))
+        lines.extend(f"  {item.kind}: {item.message}" for item in warnings)
+        lines.extend(("", f"Fatal conflicts: {len(fatal)}"))
+        lines.extend(f"  {item.kind}: {item.message}" for item in fatal)
+        if self.notes:
+            lines.extend(("", "Notes:"))
+            lines.extend(f"  {note}" for note in self.notes)
+        lines.extend(("", f"Transaction: {self.plan.transaction_root}"))
+        if fatal:
+            lines.append("Apply disabled until fatal conflicts are resolved.")
+        return "\n".join(lines)
+
+    def start_apply(self) -> None:
+        if self.fatal:
+            self.app.notify("Fatal Content conflicts disable apply", severity="warning")
+            return
+        if self.worker is not None:
+            return
+        try:
+            self.worker = self.app.start_content_worker(
+                self.project_key,
+                "apply",
+                lambda cancel, deadline: core.apply_content_changes(
+                    self.plan,
+                    cancel_event=cancel,
+                    deadline=deadline,
+                ),
+            )
+        except BaseException as error:
+            self.query_one("#content-operation-status", Static).update(str(error))
+            self.app.notify(str(error), severity="error")
+            return
+        self.query_one("#content-operation-status", Static).update("Applying Content changes...")
+        self.worker_timer = self.set_interval(0.05, self._poll_apply)
+
+    def _poll_apply(self) -> None:
+        worker = self.worker
+        if worker is None or not worker.done.is_set():
+            return
+        if self.worker_timer is not None:
+            self.worker_timer.stop()
+            self.worker_timer = None
+        self.worker = None
+        try:
+            self.app.finish_content_worker(self.project_key, worker)
+        except BaseException as error:
+            details = f"{error}\nTransaction state retained at:\n{self.plan.transaction_root}"
+            self.query_one("#content-operation-status", Static).update(details)
+            self.app.notify(str(error), severity="error")
+            if self.leave_after_cancel:
+                self.begin_discard()
+            return
+        if self.app.content_plans.get(self.project_key) is self.plan:
+            self.app.content_plans.pop(self.project_key, None)
+        self.app.notify("Content changes applied atomically")
+        if self.return_to_origin:
+            self.app.pop_screen()
+        self.app.switch_screen(ContentScreen(self.project_key, select_key=self.select_key))
+
+    def return_after_discard(self) -> None:
+        if self.plan.state == "applied":
+            if self.return_to_origin:
+                self.app.pop_screen()
+            self.app.notify(
+                "Content publication succeeded and cleanup completed"
+            )
+            self.app.switch_screen(
+                ContentScreen(self.project_key, select_key=self.select_key)
+            )
+            return
+        if self.return_to_origin:
+            self.app.pop_screen()
+        else:
+            self.app.switch_screen(
+                ContentScreen(self.project_key, select_key=self.select_key)
+            )
+
+    def begin_discard(self) -> None:
+        if self.project_key in self.app._content_discards:
+            self.app.notify("Content plan cleanup is already running", severity="warning")
+            return
+        self.query_one("#content-operation-status", Static).update(
+            "Discarding Content plan..."
+        )
+        self.app.begin_content_discard(
+            self.project_key,
+            self.return_after_discard,
+        )
+
+    def on_unmount(self) -> None:
+        if self.worker_timer is not None:
+            self.worker_timer.stop()
+            self.worker_timer = None
+        if self.worker is not None:
+            self.worker.cancel()
+
+    def on_key(self, event: events.Key) -> None:
+        if self.project_key in self.app._content_discards:
+            self.app.notify("Wait for Content plan cleanup to finish", severity="warning")
+            event.stop()
+            return
+        if self.worker is not None:
+            if event.key == "escape":
+                self.leave_after_cancel = True
+                self.worker.cancel()
+                self.query_one("#content-operation-status", Static).update(
+                    "Cancelling apply before cleanup..."
+                )
+            else:
+                self.app.notify("Wait for Content apply or press Esc to cancel", severity="warning")
+            event.stop()
+            return
+        if event.key == "enter":
+            self.start_apply()
+        elif event.key in {"escape", "r"}:
+            self.begin_discard()
+        else:
+            return
+        event.stop()
 
 
 class TemplateEditorScreen(ProjectChildScreen, BaseScreen):

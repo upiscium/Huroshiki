@@ -149,7 +149,9 @@ MessageModal,
 PublicPackUrlEditModal,
 NewPackModal,
 CreateFromTemplateModal,
-NewTemplateModal {
+NewTemplateModal,
+ContentCreateModal,
+ContentMoveModal {
     align: center middle;
     background: $background 60%;
 }
@@ -224,4 +226,43 @@ NewTemplateModal {
     height: 1fr;
     margin: 1 2;
     border: round $primary;
+}
+
+#content-status,
+#content-detail,
+#content-editor-status,
+#content-operation-status {
+    height: auto;
+    min-height: 2;
+    margin: 0 2;
+    padding: 0 1;
+}
+
+#content-detail,
+#content-editor-status {
+    color: $text-muted;
+}
+
+#content-table {
+    min-height: 8;
+}
+
+#content-editor {
+    height: 1fr;
+    margin: 1 2;
+    border: round $primary;
+}
+
+#content-create-text {
+    height: 8;
+    margin-bottom: 1;
+    border: round $primary;
+}
+
+#content-plan-preview {
+    height: 1fr;
+    margin: 1 2;
+    padding: 1 2;
+    border: round $primary;
+    overflow-y: auto;
 }
