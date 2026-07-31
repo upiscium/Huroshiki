@@ -51,7 +51,7 @@ try:
     from textual.containers import Container
     from textual.screen import ModalScreen, Screen
     from textual.timer import Timer
-    from textual.widgets import DataTable, Input, Static, TextArea
+    from textual.widgets import DataTable, Input, Select, Static, TextArea
 except ModuleNotFoundError as error:
     if error.name == "textual":
         print(
@@ -2186,6 +2186,84 @@ class ContentMoveModal(ModalScreen[dict[str, str] | None]):
         self.dismiss(None)
 
 
+class ContentImportModal(ModalScreen[dict[str, str] | None]):
+    BINDINGS = [
+        Binding("ctrl+enter", "submit", "Preview"),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="modal-dialog", classes="form-dialog"):
+            yield Static("Import local Content", classes="modal-title")
+            yield Static("Source absolute path (~ is expanded)")
+            yield Input(placeholder="/path/to/file-or-directory", id="content-import-source")
+            yield Static("Destination side")
+            yield Select(
+                (("Common", "common"), ("Client", "client"), ("Server", "server")),
+                value="common",
+                id="content-import-side",
+            )
+            yield Static("Destination relative path")
+            yield Input(placeholder="config/example", id="content-import-target")
+            yield Static("Source placement")
+            yield Select(
+                (("File", "file"), ("Directory contents", "directory")),
+                value="file",
+                id="content-import-placement",
+            )
+            yield Static("Overwrite policy")
+            yield Select(
+                (
+                    ("Reject existing targets", "reject"),
+                    ("Replace files", "replace-files"),
+                    ("Merge directories", "merge-directories"),
+                    ("Merge and replace files", "merge-and-replace-files"),
+                ),
+                value="reject",
+                id="content-import-overwrite",
+            )
+            yield Static(
+                "Source inspection and copying run only after submit. "
+                "Ctrl+Enter: preview  Esc: cancel",
+                classes="modal-help",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#content-import-source", Input).focus()
+
+    @on(Input.Submitted)
+    def submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "content-import-source":
+            self.query_one("#content-import-target", Input).focus()
+        else:
+            self.action_submit()
+
+    def action_submit(self) -> None:
+        source = self.query_one("#content-import-source", Input).value.strip()
+        target = self.query_one("#content-import-target", Input).value.strip()
+        side = self.query_one("#content-import-side", Select).value
+        placement = self.query_one("#content-import-placement", Select).value
+        overwrite = self.query_one("#content-import-overwrite", Select).value
+        if not source or not target:
+            self.app.notify("Source and destination path are required", severity="error")
+            return
+        if not all(isinstance(value, str) for value in (side, placement, overwrite)):
+            self.app.notify("Side, placement, and overwrite policy are required", severity="error")
+            return
+        self.dismiss(
+            {
+                "source": source,
+                "side": side,
+                "target": target,
+                "placement": placement,
+                "overwrite": overwrite,
+            }
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 def _content_filter_text(entry: core.ContentEntry) -> str:
     return " ".join(
         (
@@ -2204,7 +2282,7 @@ class ContentScreen(ProjectChildScreen, FilterListScreen):
     filter_input_id = "content-search"
     filter_table_id = "content-table"
     help_text = (
-        "Tab: focus  Enter/e: edit  c: create  d: delete  m: move  s: side  "
+        "Tab: focus  Enter/e: edit  c: create  i: import  d: delete  m: move  s: side  "
         "r: reload  q: clear filter  p/Esc: project"
     )
     SIDES = ("all", "common", "client", "server")
@@ -2453,6 +2531,43 @@ class ContentScreen(ProjectChildScreen, FilterListScreen):
         self.selected_key = select_key
         self.start_plan((operation,))
 
+    def import_content(self, values: dict[str, str] | None) -> None:
+        if values is None or self.result is None:
+            return
+        snapshot = self.result.snapshot
+        source_path = values["source"]
+        side = values["side"]
+        target = Path(values["target"])
+        placement = values["placement"]
+        overwrite = values["overwrite"]
+
+        def plan(cancel: threading.Event, deadline: float) -> core.ContentChangePlan:
+            source = core.inspect_content_import_source(
+                source_path,
+                cancel_event=cancel,
+                deadline=deadline,
+            )
+            request = core.ContentImportRequest(
+                source,
+                side,
+                target,
+                placement,
+                overwrite,
+            )
+            return core.plan_content_import(
+                self.project_key,
+                request,
+                expected_snapshot=snapshot,
+                cancel_event=cancel,
+                deadline=deadline,
+            )
+
+        self.selected_key = (side, target)
+        if self._start_worker("plan", plan):
+            self.query_one("#content-status", Static).update(
+                "Inspecting and planning local Content import..."
+            )
+
     def request_delete(self) -> None:
         entry = self.current_entry()
         if entry is None:
@@ -2577,6 +2692,8 @@ class ContentScreen(ProjectChildScreen, FilterListScreen):
             self.edit_current()
         elif key == "c":
             self.app.push_screen(ContentCreateModal(), self.create_entry)
+        elif key == "i":
+            self.app.push_screen(ContentImportModal(), self.import_content)
         elif key == "d":
             self.request_delete()
         elif key == "m":
@@ -2818,7 +2935,9 @@ class ContentPlanPreviewScreen(ProjectChildScreen, BaseScreen):
 
     @property
     def fatal(self) -> bool:
-        return any(item.severity == "error" for item in self.plan.conflicts)
+        return self.plan.state != "ready" or any(
+            item.severity == "error" for item in self.plan.conflicts
+        )
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -2827,7 +2946,33 @@ class ContentPlanPreviewScreen(ProjectChildScreen, BaseScreen):
         yield from self.compose_footer()
 
     def preview_text(self) -> str:
-        lines = ["Changes:"]
+        lines: list[str] = []
+        summary = self.plan.import_summary
+        if summary is not None:
+            lines.extend(
+                (
+                    "Import:",
+                    f"  Source: {summary.submitted_source_path}",
+                    f"  Resolved source: {summary.source_path}",
+                    f"  Snapshot: {summary.source_digest}",
+                    f"  Target: {summary.side}/{summary.target_relative_path}",
+                    f"  Placement: {summary.placement}",
+                    f"  Overwrite policy: {summary.overwrite_policy}",
+                    f"  Files: {summary.files}",
+                    f"  Directories: {summary.directories}",
+                    f"  Bytes: {summary.total_bytes}",
+                    f"  Created: {len(summary.created)}",
+                    f"  Updated: {len(summary.updated)}",
+                    f"  Unchanged: {len(summary.unchanged)}",
+                    f"  Rejected: {len(summary.rejected)}",
+                )
+            )
+            lines.extend(f"    {item}" for item in summary.rejected)
+            if summary.conflicts:
+                lines.append(f"  Import conflicts: {len(summary.conflicts)}")
+                lines.extend(f"    {item}" for item in summary.conflicts)
+            lines.append("")
+        lines.append("Changes:")
         visible = [change for change in self.plan.changes if change.action != "unchanged"]
         for change in visible:
             if change.action == "moved":

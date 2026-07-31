@@ -43,6 +43,10 @@ from content_operations import (
     ContentDiscardOperation,
     ContentEntry,
     ContentFile,
+    ContentImportRequest,
+    ContentImportSourceEntry,
+    ContentImportSourceSnapshot,
+    ContentImportSummary,
     ContentMove,
     ContentOperation,
     ContentOperationCancelled,
@@ -62,6 +66,8 @@ from content_operations import (
     load_content_browser_at,
     load_content_text_document_at,
     encode_content_editor_text,
+    inspect_content_import_source_at,
+    plan_content_import_at,
     plan_content_changes_at,
     read_content_file_at,
 )
@@ -2877,6 +2883,21 @@ def content_snapshot(
     return content_snapshot_at(project_key_value, root, checkpoint=checkpoint)
 
 
+def inspect_content_import_source(
+    source_path: str | Path,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> ContentImportSourceSnapshot:
+    return inspect_content_import_source_at(
+        source_path,
+        repository_root=ROOT,
+        state_root=STATE_ROOT,
+        cancel_event=cancel_event,
+        deadline=deadline,
+    )
+
+
 def content_checkpoint(
     cancel_event: threading.Event | None,
     deadline: float | None,
@@ -2940,6 +2961,28 @@ def plan_content_changes(
         TRANSACTION_ROOT,
         tuple(operations),
         expected_snapshot=expected_snapshot,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+
+
+def plan_content_import(
+    project_key_value: str,
+    request: ContentImportRequest,
+    *,
+    expected_snapshot: ContentSnapshot,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> ContentChangePlan:
+    root = _pack_content_root(project_key_value)
+    return plan_content_import_at(
+        project_key_value,
+        root,
+        TRANSACTION_ROOT,
+        request,
+        expected_snapshot=expected_snapshot,
+        repository_root=ROOT,
+        state_root=STATE_ROOT,
         deadline=deadline,
         cancel_event=cancel_event,
     )

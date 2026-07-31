@@ -14,8 +14,9 @@
   overlays, including filtered metadata views, KubeJS script presets, safe create/delete/move
   operations, conflict previews, stale-edit protection, and atomic application through the
   Content transaction core. Save previews preserve the active editor draft when cancelled, and
-  recursive browser scans remain cancellable. Local Content import and binary editing remain
-  unsupported.
+  recursive browser scans remain cancellable. Binary editing remains unsupported.
+- Added bounded local file and directory import for Pack Content, including immutable source
+  inspection, overwrite policies, conflict summaries, and transactional preview/apply.
 
 ### Reliability and Transaction Safety
 

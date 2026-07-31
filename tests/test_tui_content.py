@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from textual.app import App
-from textual.widgets import DataTable, Input, Static, TextArea
+from textual.widgets import DataTable, Input, Select, Static, TextArea
 
 import huroshiki
 import huroshiki_core as core
@@ -151,6 +151,37 @@ MIXED_DOCUMENT = core.ContentTextDocument(
     "mixed",
     10,
 )
+IMPORT_SOURCE_ENTRY = core.ContentImportSourceEntry(
+    Path("."), "file", 0o755, True, 12, "f" * 64, 3, 4, 5, 6, None, ()
+)
+IMPORT_SOURCE = core.ContentImportSourceSnapshot(
+    Path("~/demo.bin"),
+    Path("/tmp/demo.bin"),
+    "file",
+    (IMPORT_SOURCE_ENTRY,),
+    "1" * 64,
+    1,
+    0,
+    12,
+    (),
+)
+IMPORT_SUMMARY = core.ContentImportSummary(
+    Path("~/demo.bin"),
+    Path("/tmp/demo.bin"),
+    "1" * 64,
+    1,
+    0,
+    12,
+    (Path("resourcepacks/demo.bin"),),
+    (),
+    (),
+    (),
+    (),
+    "reject",
+    "client",
+    Path("resourcepacks/demo.bin"),
+    "file",
+)
 
 
 class _Discard:
@@ -179,6 +210,7 @@ class _Plan:
         conflicts=(),
         discard_error=None,
         discard_state="discarded",
+        import_summary=None,
     ) -> None:
         self.operations = tuple(operations)
         self.changes = (
@@ -191,6 +223,7 @@ class _Plan:
         self._project_lock = object()
         self.discard_error = discard_error
         self.discard_state = discard_state
+        self.import_summary = import_summary
         self.discard_operation: _Discard | None = None
 
     def begin_discard(self, *, deadline=None):
@@ -563,6 +596,90 @@ class ContentTuiTest(unittest.IsolatedAsyncioTestCase):
                     operation.relative_path,
                     Path("kubejs/server_scripts/tick.js"),
                 )
+
+    async def test_import_form_runs_inspection_and_planning_off_loop_and_previews_summary(self) -> None:
+        plan = _Plan(import_summary=IMPORT_SUMMARY)
+        calls: list[tuple[str, object]] = []
+
+        def inspect(source, **_kwargs):
+            calls.append((threading.current_thread().name, source))
+            return IMPORT_SOURCE
+
+        def plan_import(_key, request, **_kwargs):
+            calls.append((threading.current_thread().name, request))
+            return plan
+
+        with self.patches(), patch.object(
+            huroshiki.core,
+            "inspect_content_import_source",
+            side_effect=inspect,
+        ), patch.object(
+            huroshiki.core,
+            "plan_content_import",
+            side_effect=plan_import,
+        ):
+            screen = huroshiki.ContentScreen("pack:demo")
+            app = _ContentApp(screen)
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                await pilot.press("i")
+                await pilot.pause()
+                modal = app.screen
+                self.assertIsInstance(modal, huroshiki.ContentImportModal)
+                modal.query_one("#content-import-source", Input).value = "~/demo.bin"
+                modal.query_one("#content-import-target", Input).value = (
+                    "resourcepacks/demo.bin"
+                )
+                modal.query_one("#content-import-side", Select).value = "client"
+                modal.action_submit()
+                await pilot.pause(0.2)
+                self.assertIsInstance(app.screen, huroshiki.ContentPlanPreviewScreen)
+                self.assertTrue(
+                    all(name.startswith("huroshiki-content-plan-") for name, _ in calls)
+                )
+                request = calls[1][1]
+                self.assertIsInstance(request, core.ContentImportRequest)
+                self.assertEqual(request.target_relative_path, Path("resourcepacks/demo.bin"))
+                preview = str(
+                    app.screen.query_one("#content-plan-preview", Static).content
+                )
+                self.assertIn("Resolved source: /tmp/demo.bin", preview)
+                self.assertIn("Files: 1", preview)
+                self.assertIn("Bytes: 12", preview)
+                self.assertIn("Overwrite policy: reject", preview)
+
+    async def test_rejected_import_summary_disables_apply(self) -> None:
+        summary = core.ContentImportSummary(
+            IMPORT_SUMMARY.submitted_source_path,
+            IMPORT_SUMMARY.source_path,
+            IMPORT_SUMMARY.source_digest,
+            IMPORT_SUMMARY.files,
+            IMPORT_SUMMARY.directories,
+            IMPORT_SUMMARY.total_bytes,
+            (),
+            (),
+            (),
+            ("link: symlink is not allowed",),
+            ("link: symlink is not allowed",),
+            IMPORT_SUMMARY.overwrite_policy,
+            IMPORT_SUMMARY.side,
+            IMPORT_SUMMARY.target_relative_path,
+            IMPORT_SUMMARY.placement,
+        )
+        plan = _Plan(import_summary=summary)
+        plan.state = "failed"
+        with self.patches():
+            app = _ContentApp(huroshiki.ContentPlanPreviewScreen("pack:demo", plan))
+            app.content_plans["pack:demo"] = plan
+            async with app.run_test() as pilot:
+                preview = str(
+                    app.screen.query_one("#content-plan-preview", Static).content
+                )
+                self.assertIn("Rejected: 1", preview)
+                self.assertIn("symlink is not allowed", preview)
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertIsNone(app.screen.worker)
 
     async def test_fatal_preview_disables_apply_and_cleanup_failure_retains_plan(self) -> None:
         plan = _Plan(conflicts=(CONFLICTS[1],), discard_error=RuntimeError("cleanup failed"))
