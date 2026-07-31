@@ -445,11 +445,11 @@ def set_overlay_directory_mode(
             os.close(directory_fd)
 
 
-def write_overlay_bytes(
+def _write_overlay_file(
     content_root: Path,
     target: str,
     relative_path: str | Path,
-    contents: bytes,
+    writer: Callable[[int], None],
     *,
     mode: int | None = 0o644,
     create: bool,
@@ -494,18 +494,7 @@ def write_overlay_bytes(
                 mode,
                 dir_fd=parent.fd,
             )
-            view = memoryview(contents)
-            offset = 0
-            while offset < len(view):
-                if checkpoint is not None:
-                    checkpoint()
-                chunk = view[offset : offset + 1024 * 1024]
-                while chunk:
-                    written = os.write(temporary_fd, chunk)
-                    if written == 0:
-                        raise OSError(errno.EIO, "short overlay write")
-                    offset += written
-                    chunk = chunk[written:]
+            writer(temporary_fd)
             os.fchmod(temporary_fd, mode)
             os.close(temporary_fd)
             temporary_fd = -1
@@ -601,6 +590,43 @@ def write_overlay_bytes(
                     os.unlink(temporary_name, dir_fd=parent.fd)
                 except FileNotFoundError:
                     pass
+
+
+def write_overlay_bytes(
+    content_root: Path,
+    target: str,
+    relative_path: str | Path,
+    contents: bytes,
+    *,
+    mode: int | None = 0o644,
+    create: bool,
+    expected_digest: str | None = None,
+    checkpoint: Callable[[], None] | None = None,
+) -> None:
+    def write(output_fd: int) -> None:
+        view = memoryview(contents)
+        offset = 0
+        while offset < len(view):
+            if checkpoint is not None:
+                checkpoint()
+            chunk = view[offset : offset + _STREAM_CHUNK_SIZE]
+            while chunk:
+                written = os.write(output_fd, chunk)
+                if written == 0:
+                    raise OSError(errno.EIO, "short overlay write")
+                offset += written
+                chunk = chunk[written:]
+
+    _write_overlay_file(
+        content_root,
+        target,
+        relative_path,
+        write,
+        mode=mode,
+        create=create,
+        expected_digest=expected_digest,
+        checkpoint=checkpoint,
+    )
 
 
 def delete_overlay_entry(
@@ -1705,8 +1731,13 @@ def _inspect_local_import_directory(
         )
     )
     try:
+        children: list[os.DirEntry[str]] = []
         with os.scandir(directory_fd) as iterator:
-            children = sorted(iterator, key=lambda child: child.name)
+            for child in iterator:
+                if checkpoint is not None:
+                    checkpoint()
+                children.append(child)
+        children.sort(key=lambda child: child.name)
     except OSError as error:
         entries[-1] = LocalImportEntry(
             relative_path, "invalid", 0, stat.S_IMODE(opened.st_mode),
@@ -1995,9 +2026,81 @@ def copy_import_source(
         raise OverlayPolicyError("Local import source changed while copying")
 
 
+def copy_import_source_to_overlay(
+    expected: LocalImportScan,
+    content_root: Path,
+    target: str,
+    relative_path: str | Path,
+    *,
+    mode: int | None,
+    create: bool,
+    expected_digest: str | None = None,
+    checkpoint: Callable[[], None] | None = None,
+) -> None:
+    if expected.kind != "file" or len(expected.entries) != 1:
+        raise OverlayPolicyError("Only a regular import file can be written to an overlay")
+    if checkpoint is not None:
+        checkpoint()
+    current = scan_import_source(expected.root, checkpoint=checkpoint)
+    if current != expected:
+        raise OverlayPolicyError("Local import source changed after inspection")
+
+    source_parent_fd = os.open(expected.root.parent, _DIRECTORY_FLAGS)
+    source_fd = -1
+    try:
+        source_fd = os.open(
+            expected.root.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+            dir_fd=source_parent_fd,
+        )
+
+        def write(output_fd: int) -> None:
+            _stream_verified_import_file(
+                source_fd,
+                output_fd,
+                expected.entries[0],
+                checkpoint,
+            )
+
+        _write_overlay_file(
+            content_root,
+            target,
+            relative_path,
+            write,
+            mode=mode,
+            create=create,
+            expected_digest=expected_digest,
+            checkpoint=checkpoint,
+        )
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        os.close(source_parent_fd)
+    after = scan_import_source(expected.root, checkpoint=checkpoint)
+    if after != expected:
+        raise OverlayPolicyError("Local import source changed while copying")
+
+
 def _copy_verified_import_file(
     source_fd: int,
     destination: Path,
+    expected: LocalImportEntry,
+    checkpoint: Callable[[], None] | None,
+) -> None:
+    output_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        expected.mode,
+    )
+    try:
+        _stream_verified_import_file(source_fd, output_fd, expected, checkpoint)
+    finally:
+        os.close(output_fd)
+
+
+def _stream_verified_import_file(
+    source_fd: int,
+    output_fd: int,
     expected: LocalImportEntry,
     checkpoint: Callable[[], None] | None,
 ) -> None:
@@ -2012,38 +2115,30 @@ def _copy_verified_import_file(
     ):
         raise OverlayPolicyError(f"Local import source changed: {expected.relative_path}")
     digest = hashlib.sha256()
-    output_fd = os.open(
-        destination,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-        expected.mode,
-    )
-    try:
-        while True:
+    while True:
+        if checkpoint is not None:
+            checkpoint()
+        chunk = os.read(source_fd, _STREAM_CHUNK_SIZE)
+        if not chunk:
+            break
+        digest.update(chunk)
+        view = memoryview(chunk)
+        while view:
             if checkpoint is not None:
                 checkpoint()
-            chunk = os.read(source_fd, _STREAM_CHUNK_SIZE)
-            if not chunk:
-                break
-            digest.update(chunk)
-            view = memoryview(chunk)
-            while view:
-                if checkpoint is not None:
-                    checkpoint()
-                written = os.write(output_fd, view)
-                if written == 0:
-                    raise OSError(errno.EIO, "short local import write")
-                view = view[written:]
-        os.fchmod(output_fd, expected.mode)
-        after = os.fstat(source_fd)
-        if (
-            identity != (after.st_dev, after.st_ino)
-            or opened.st_size != after.st_size
-            or opened.st_mtime_ns != after.st_mtime_ns
-            or opened.st_ctime_ns != after.st_ctime_ns
-            or digest.hexdigest() != expected.digest
-        ):
-            raise OverlayPolicyError(
-                f"Local import source changed while copying: {expected.relative_path}"
-            )
-    finally:
-        os.close(output_fd)
+            written = os.write(output_fd, view)
+            if written == 0:
+                raise OSError(errno.EIO, "short local import write")
+            view = view[written:]
+    os.fchmod(output_fd, expected.mode)
+    after = os.fstat(source_fd)
+    if (
+        identity != (after.st_dev, after.st_ino)
+        or opened.st_size != after.st_size
+        or opened.st_mtime_ns != after.st_mtime_ns
+        or opened.st_ctime_ns != after.st_ctime_ns
+        or digest.hexdigest() != expected.digest
+    ):
+        raise OverlayPolicyError(
+            f"Local import source changed while copying: {expected.relative_path}"
+        )

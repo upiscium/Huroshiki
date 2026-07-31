@@ -314,6 +314,60 @@ class ContentImportTest(unittest.TestCase):
                 )
         self.assertFalse((self.content / "common/changing.bin").exists())
 
+    def test_staging_parent_replacement_cannot_redirect_import_write(self) -> None:
+        source = self.imports / "race.bin"
+        source.write_bytes(b"race payload")
+        original_stream = overlay_policy._stream_verified_import_file
+
+        for policy in ("reject", "replace-files"):
+            with self.subTest(policy=policy):
+                target = self.content / "common/config/race.bin"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if policy == "replace-files":
+                    target.write_bytes(b"original")
+                elif target.exists():
+                    target.unlink()
+                outside = self.root / f"outside-{policy}"
+                outside.mkdir()
+                stream_calls = 0
+
+                def replace_parent(source_fd, output_fd, expected, checkpoint):
+                    nonlocal stream_calls
+                    stream_calls += 1
+                    if stream_calls == 2:
+                        temporary = Path(os.readlink(f"/proc/self/fd/{output_fd}"))
+                        parent = temporary.parent
+                        retained = parent.with_name(parent.name + "-pinned")
+                        parent.rename(retained)
+                        parent.symlink_to(outside, target_is_directory=True)
+                    return original_stream(
+                        source_fd,
+                        output_fd,
+                        expected,
+                        checkpoint,
+                    )
+
+                with patch.object(
+                    overlay_policy,
+                    "_stream_verified_import_file",
+                    side_effect=replace_parent,
+                ):
+                    with self.assertRaises(core.ContentOperationError):
+                        core.plan_content_import(
+                            "pack:demo",
+                            self.request(
+                                source,
+                                "config/race.bin",
+                                policy=policy,
+                            ),
+                            expected_snapshot=self.snapshot(),
+                        )
+                self.assertEqual(list(outside.iterdir()), [])
+                if policy == "replace-files":
+                    self.assertEqual(target.read_bytes(), b"original")
+                else:
+                    self.assertFalse(target.exists())
+
     def test_planning_cleanup_failure_returns_owned_retryable_plan(self) -> None:
         source = self.imports / "cleanup.txt"
         source.write_text("cleanup", encoding="utf-8")

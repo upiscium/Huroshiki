@@ -18,6 +18,7 @@ from overlay_policy import (
     OVERLAY_TARGETS,
     OverlayPolicyError,
     copy_import_source,
+    copy_import_source_to_overlay,
     copy_content_tree,
     create_overlay_directory,
     delete_overlay_entry,
@@ -875,13 +876,15 @@ def _apply_operation(
     try:
         if isinstance(operation, ContentCreateFile):
             if isinstance(operation.contents, LocalImportScan):
-                destination = staging / operation.side / operation.relative_path
-                copy_import_source(
+                copy_import_source_to_overlay(
                     operation.contents,
-                    destination,
+                    staging,
+                    operation.side,
+                    operation.relative_path,
+                    mode=operation.mode,
+                    create=True,
                     checkpoint=checkpoint,
                 )
-                destination.chmod(operation.mode)
             else:
                 write_overlay_bytes(
                     staging,
@@ -894,34 +897,16 @@ def _apply_operation(
                 )
         elif isinstance(operation, ContentReplaceFile):
             if isinstance(operation.contents, LocalImportScan):
-                current = inspect_overlay_file(
-                    staging,
-                    operation.side,
-                    operation.relative_path,
-                    checkpoint=checkpoint,
-                )
-                if (
-                    operation.expected_digest is not None
-                    and current.digest != operation.expected_digest
-                ):
-                    raise OverlayPolicyError(
-                        "Overlay file digest changed: "
-                        f"{operation.side}/{operation.relative_path}"
-                    )
-                delete_overlay_entry(
-                    staging,
-                    operation.side,
-                    operation.relative_path,
-                    directory=False,
-                )
-                destination = staging / operation.side / operation.relative_path
-                copy_import_source(
+                copy_import_source_to_overlay(
                     operation.contents,
-                    destination,
+                    staging,
+                    operation.side,
+                    operation.relative_path,
+                    mode=operation.mode,
+                    create=False,
+                    expected_digest=operation.expected_digest,
                     checkpoint=checkpoint,
                 )
-                if operation.mode is not None:
-                    destination.chmod(operation.mode)
             else:
                 write_overlay_bytes(
                     staging,
