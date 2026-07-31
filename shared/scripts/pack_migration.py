@@ -557,6 +557,7 @@ class PackMigrationPlan:
         self._resolver_work_root: Path | None = None
         self._resolver_work_identity: tuple[int, int] | None = None
         self._resolved_staging_digest: str | None = None
+        self._provenance_committed = False
         self._lock = threading.RLock()
 
     @property

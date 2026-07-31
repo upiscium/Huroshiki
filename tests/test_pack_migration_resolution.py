@@ -10,6 +10,10 @@ import pack_migration
 import pack_migration_resolution as resolution
 import packctl
 from pack_migration_roots import PackRootRecord, write_pack_root_manifest
+from pack_migration_roots import (
+    PackMigrationRootSelection,
+    read_pack_root_manifest,
+)
 from tests import test_pack_migration_core as migration_fixture
 
 
@@ -227,6 +231,172 @@ class PackMigrationResolutionTest(unittest.TestCase):
         self.assertEqual(compatible.status, "compatible")
         self.assertEqual(unknown.status, "unknown")
         self.assertEqual(incompatible.status, "incompatible")
+
+    def test_existing_pack_bootstraps_explicit_roots_before_resolution(self) -> None:
+        (self.source / ".huroshiki-roots.json").unlink()
+        (self.source / ".packwizignore").write_text("*.log\n", encoding="utf-8")
+        (self.source / "mods" / "dependency.pw.toml").write_bytes(
+            metadata("v1", dependency=True).contents
+        )
+        first_plan = self.plan()
+        original_staging = pack_migration.scan_pack_migration_source(
+            first_plan.target_staging_root / "source", checkpoint=lambda: None
+        ).content_digest
+
+        first_result = resolution.resolve_pack_migration_plan_at(
+            first_plan,
+            repository_root=self.root,
+            state_root=self.state,
+        )
+
+        self.assertEqual(first_result.state, "resolution-required")
+        self.assertTrue(first_result.provenance_required)
+        self.assertEqual(first_result.roots, ())
+        self.assertEqual(len(first_result.root_candidates), 2)
+        self.assertTrue(
+            all(
+                unresolved.reason_code == "root-provenance-required"
+                for unresolved in first_result.unresolved_roots
+            )
+        )
+        self.assertFalse((first_plan.transaction_root / "resolver-work").exists())
+        diagnostic = json.loads((first_plan.transaction_root / "plan.json").read_text())
+        self.assertTrue(diagnostic["resolution"]["provenance_required"])
+        self.assertEqual(diagnostic["resolution"]["root_candidates"], 2)
+        self.assertEqual(
+            pack_migration.scan_pack_migration_source(
+                first_plan.target_staging_root / "source", checkpoint=lambda: None
+            ).content_digest,
+            original_staging,
+        )
+
+        selected = resolution.commit_pack_migration_root_selection_at(
+            first_plan,
+            (
+                PackMigrationRootSelection(
+                    Path("mods/example.pw.toml"),
+                    "modrinth",
+                    "root-project",
+                ),
+            ),
+            repository_root=self.root,
+        )
+        self.assertEqual(first_plan.state, "discarded")
+        self.assertEqual(
+            [record.canonical_identity for record in selected],
+            ["modrinth:root-project"],
+        )
+        self.assertEqual(
+            [record.canonical_identity for record in read_pack_root_manifest(self.source)],
+            ["modrinth:root-project"],
+        )
+        self.assertIn(
+            "/.huroshiki-roots.json",
+            (self.source / ".packwizignore").read_text(encoding="utf-8").splitlines(),
+        )
+
+        second_plan = self.plan()
+        with patch.object(packctl, "init_packwiz_project", side_effect=self.fake_init), patch.object(
+            core, "resolve_mod_closure", side_effect=self.fake_closure
+        ), patch.object(core, "resolve_project_selector", side_effect=self.fake_selector), patch.object(
+            packctl, "run_packwiz"
+        ):
+            second_result = resolution.resolve_pack_migration_plan_at(
+                second_plan,
+                repository_root=self.root,
+                state_root=self.state,
+            )
+        self.assertEqual(second_result.state, "resolved")
+        self.assertFalse(second_result.provenance_required)
+        pack_migration.discard_pack_migration_plan(second_plan)
+
+    def test_provenance_exchange_exception_rolls_live_source_back(self) -> None:
+        (self.source / ".huroshiki-roots.json").unlink()
+        plan = self.plan()
+        result = resolution.resolve_pack_migration_plan_at(
+            plan,
+            repository_root=self.root,
+            state_root=self.state,
+        )
+        self.assertTrue(result.provenance_required)
+        real_renameat2 = packctl.renameat2
+        injected = False
+
+        def fail_after_exchange(
+            old_dir_fd: int,
+            old_path: str,
+            new_dir_fd: int,
+            new_path: str,
+            flags: int,
+        ) -> None:
+            nonlocal injected
+            real_renameat2(old_dir_fd, old_path, new_dir_fd, new_path, flags)
+            if (
+                not injected
+                and old_path == "source"
+                and new_path == "provenance-staging"
+                and flags == packctl.RENAME_EXCHANGE
+            ):
+                injected = True
+                raise OSError("injected provenance exchange uncertainty")
+
+        with patch.object(packctl, "renameat2", side_effect=fail_after_exchange):
+            with self.assertRaisesRegex(OSError, "exchange uncertainty"):
+                resolution.commit_pack_migration_root_selection_at(
+                    plan,
+                    (
+                        PackMigrationRootSelection(
+                            Path("mods/example.pw.toml"),
+                            "modrinth",
+                            "root-project",
+                        ),
+                    ),
+                    repository_root=self.root,
+                )
+        self.assertFalse((self.source / ".huroshiki-roots.json").exists())
+        self.assertEqual(plan.state, "failed")
+        self.assertTrue(packctl.project_lock_is_active("pack:demo"))
+        pack_migration.discard_pack_migration_plan(plan)
+
+    def test_legacy_url_root_selection_persists_identity_and_refreshes(self) -> None:
+        (self.source / ".huroshiki-roots.json").unlink()
+        (self.source / "mods" / "example.pw.toml").write_text(
+            '''name = "Legacy URL"
+filename = "legacy.jar"
+side = "both"
+[download]
+url = "https://example.invalid/legacy.jar"
+''',
+            encoding="utf-8",
+        )
+        plan = self.plan()
+        result = resolution.resolve_pack_migration_plan_at(
+            plan,
+            repository_root=self.root,
+            state_root=self.state,
+        )
+        self.assertIsNone(result.root_candidates[0].canonical_identity)
+        with patch.object(packctl, "run_packwiz") as refresh:
+            resolution.commit_pack_migration_root_selection_at(
+                plan,
+                (
+                    PackMigrationRootSelection(
+                        Path("mods/example.pw.toml"),
+                        "url",
+                        "legacy-url-id",
+                    ),
+                ),
+                repository_root=self.root,
+            )
+        refresh.assert_called_once()
+        self.assertIn(
+            'project-id = "legacy-url-id"',
+            (self.source / "mods" / "example.pw.toml").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            read_pack_root_manifest(self.source)[0].canonical_identity,
+            "url:legacy-url-id",
+        )
 
 
 if __name__ == "__main__":

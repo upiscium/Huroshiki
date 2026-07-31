@@ -23,12 +23,28 @@ from pack_migration import (
 )
 from pack_migration_roots import (
     PackMigrationRoot,
+    PackMigrationRootCandidate,
     PackMigrationRootError,
+    PackMigrationRootManifestMissing,
+    PackMigrationRootSelection,
+    PackRootRecord,
+    ensure_pack_root_manifest_ignored,
+    extract_pack_migration_root_candidates,
     extract_pack_migration_roots,
+    set_url_metadata_project_id,
+    write_pack_root_manifest,
     _read_relative_file,
 )
-from pack_tree_policy import PackTreeScan, scan_pack_migration_source
-from provider_identity import ProviderIdentityError, parse_provider_metadata
+from pack_tree_policy import (
+    PackTreeScan,
+    copy_pack_tree_snapshot,
+    scan_pack_migration_source,
+)
+from provider_identity import (
+    ProviderIdentityError,
+    canonical_identity,
+    parse_provider_metadata,
+)
 
 
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -60,6 +76,7 @@ UnresolvedReason = Literal[
     "path-collision",
     "filename-collision",
     "identity-collision",
+    "root-provenance-required",
 ]
 
 
@@ -78,7 +95,7 @@ class PackMigrationResolvedRoot:
 
 @dataclass(frozen=True)
 class PackMigrationUnresolvedRoot:
-    source_root: PackMigrationRoot
+    source_root: PackMigrationRoot | PackMigrationRootCandidate
     reason_code: UnresolvedReason
     message: str
     retryable: bool
@@ -151,6 +168,7 @@ class PackMigrationResolutionPlan:
     source_snapshot_digest: str
     target: PackMigrationTarget
     roots: tuple[PackMigrationRoot, ...]
+    root_candidates: tuple[PackMigrationRootCandidate, ...]
     resolved_roots: tuple[PackMigrationResolvedRoot, ...]
     unresolved_roots: tuple[PackMigrationUnresolvedRoot, ...]
     dependency_delta: PackMigrationDependencyDelta
@@ -162,11 +180,14 @@ class PackMigrationResolutionPlan:
     url_compatibility: tuple[tuple[str, UrlMigrationCompatibility], ...]
     target_source_snapshot: PackTreeScan | None
     state: Literal["resolved", "resolution-required"]
+    provenance_required: bool = False
 
     def diagnostic_summary(self) -> dict[str, object]:
         delta = self.dependency_delta
         return {
             "roots": len(self.roots),
+            "root_candidates": len(self.root_candidates),
+            "provenance_required": self.provenance_required,
             "resolved": len(self.resolved_roots),
             "unresolved": len(self.unresolved_roots),
             "identity_changes": len(self.identity_changes),
@@ -538,7 +559,7 @@ def _exchange_target_source(
         raise PackMigrationStale("Target staging changed before resolver handoff")
     staging_fd = os.open(plan.target_staging_root, _DIRECTORY_FLAGS)
     workspace_fd = os.open(workspace, _DIRECTORY_FLAGS)
-    exchanged_sources = False
+    exchange_attempted = False
     try:
         opened_staging = os.fstat(staging_fd)
         if (opened_staging.st_dev, opened_staging.st_ino) != plan._staging_identity:
@@ -550,6 +571,7 @@ def _exchange_target_source(
         new_source = os.stat("source", dir_fd=workspace_fd, follow_symlinks=False)
         if (new_source.st_dev, new_source.st_ino) != expected_resolver_scan.root_identity:
             raise PackMigrationStale("Resolver source changed before handoff")
+        exchange_attempted = True
         packctl.renameat2(
             staging_fd,
             "source",
@@ -557,7 +579,6 @@ def _exchange_target_source(
             "source",
             packctl.RENAME_EXCHANGE,
         )
-        exchanged_sources = True
         installed = os.stat("source", dir_fd=staging_fd, follow_symlinks=False)
         displaced = os.stat("source", dir_fd=workspace_fd, follow_symlinks=False)
         if (installed.st_dev, installed.st_ino) != (new_source.st_dev, new_source.st_ino) or (
@@ -600,30 +621,31 @@ def _exchange_target_source(
             "original-source",
             packctl.RENAME_NOREPLACE,
         )
-        exchanged_sources = False
+        exchange_attempted = False
         return result
     except BaseException:
-        if exchanged_sources:
+        if exchange_attempted:
             try:
                 installed = os.stat("source", dir_fd=staging_fd, follow_symlinks=False)
                 displaced = os.stat("source", dir_fd=workspace_fd, follow_symlinks=False)
-                if (installed.st_dev, installed.st_ino) != (
-                    new_source.st_dev,
-                    new_source.st_ino,
-                ) or (displaced.st_dev, displaced.st_ino) != (
-                    old_source.st_dev,
-                    old_source.st_ino,
-                ):
+                installed_identity = (installed.st_dev, installed.st_ino)
+                displaced_identity = (displaced.st_dev, displaced.st_ino)
+                new_identity = (new_source.st_dev, new_source.st_ino)
+                old_identity = (old_source.st_dev, old_source.st_ino)
+                if installed_identity == old_identity and displaced_identity == new_identity:
+                    pass
+                elif installed_identity == new_identity and displaced_identity == old_identity:
+                    packctl.renameat2(
+                        staging_fd,
+                        "source",
+                        workspace_fd,
+                        "source",
+                        packctl.RENAME_EXCHANGE,
+                    )
+                else:
                     raise PackMigrationResolutionError(
                         "Resolver source handoff rollback identity is uncertain"
                     )
-                packctl.renameat2(
-                    staging_fd,
-                    "source",
-                    workspace_fd,
-                    "source",
-                    packctl.RENAME_EXCHANGE,
-                )
             except BaseException as rollback_error:
                 raise PackMigrationResolutionError(
                     f"Resolver source handoff rollback failed: {rollback_error}"
@@ -632,6 +654,298 @@ def _exchange_target_source(
     finally:
         os.close(workspace_fd)
         os.close(staging_fd)
+
+
+def _commit_root_provenance_source(
+    plan: PackMigrationPlan,
+    provenance_source: Path,
+    expected_provenance_scan: PackTreeScan,
+    checkpoint: Callable[[], None],
+) -> None:
+    source_entry = next(
+        (
+            entry
+            for entry in plan.source_snapshot.entries
+            if entry.relative_path == Path("source")
+        ),
+        None,
+    )
+    if source_entry is None or source_entry.kind != "directory":
+        raise PackMigrationResolutionError("Source Packwiz directory is missing")
+    pack_fd = os.open(plan.source_root, _DIRECTORY_FLAGS)
+    transaction_fd = os.open(plan.transaction_root, _DIRECTORY_FLAGS)
+    exchange_attempted = False
+    try:
+        opened_pack = os.fstat(pack_fd)
+        opened_transaction = os.fstat(transaction_fd)
+        if (opened_pack.st_dev, opened_pack.st_ino) != plan.source_snapshot.project_identity:
+            raise PackMigrationStale("Source Pack root was replaced before provenance commit")
+        if (opened_transaction.st_dev, opened_transaction.st_ino) != plan._transaction_identity:
+            raise PackMigrationStale(
+                "Pack migration transaction was replaced before provenance commit"
+            )
+        live = os.stat("source", dir_fd=pack_fd, follow_symlinks=False)
+        staged = os.stat(
+            provenance_source.name,
+            dir_fd=transaction_fd,
+            follow_symlinks=False,
+        )
+        if (live.st_dev, live.st_ino) != (source_entry.device, source_entry.inode):
+            raise PackMigrationStale("Source Packwiz directory changed before provenance commit")
+        if (staged.st_dev, staged.st_ino) != expected_provenance_scan.root_identity:
+            raise PackMigrationStale("Provenance staging changed before commit")
+        exchange_attempted = True
+        packctl.renameat2(
+            pack_fd,
+            "source",
+            transaction_fd,
+            provenance_source.name,
+            packctl.RENAME_EXCHANGE,
+        )
+        installed = os.stat("source", dir_fd=pack_fd, follow_symlinks=False)
+        displaced = os.stat(
+            provenance_source.name,
+            dir_fd=transaction_fd,
+            follow_symlinks=False,
+        )
+        if (installed.st_dev, installed.st_ino) != (staged.st_dev, staged.st_ino) or (
+            displaced.st_dev,
+            displaced.st_ino,
+        ) != (live.st_dev, live.st_ino):
+            raise PackMigrationStale("Provenance source exchange verification failed")
+        installed_scan = scan_pack_migration_source(
+            plan.source_root / "source", checkpoint=checkpoint
+        )
+        expected_identities = {
+            entry.relative_path: (entry.device, entry.inode)
+            for entry in expected_provenance_scan.entries
+        }
+        installed_identities = {
+            entry.relative_path: (entry.device, entry.inode)
+            for entry in installed_scan.entries
+        }
+        if (
+            installed_scan.root_identity != expected_provenance_scan.root_identity
+            or installed_scan.content_digest != expected_provenance_scan.content_digest
+            or installed_identities != expected_identities
+        ):
+            raise PackMigrationStale("Committed provenance source verification failed")
+        exchange_attempted = False
+    except BaseException:
+        if exchange_attempted:
+            try:
+                installed = os.stat("source", dir_fd=pack_fd, follow_symlinks=False)
+                displaced = os.stat(
+                    provenance_source.name,
+                    dir_fd=transaction_fd,
+                    follow_symlinks=False,
+                )
+                installed_identity = (installed.st_dev, installed.st_ino)
+                displaced_identity = (displaced.st_dev, displaced.st_ino)
+                staged_identity = (staged.st_dev, staged.st_ino)
+                live_identity = (live.st_dev, live.st_ino)
+                if installed_identity == live_identity and displaced_identity == staged_identity:
+                    pass
+                elif installed_identity == staged_identity and displaced_identity == live_identity:
+                    packctl.renameat2(
+                        pack_fd,
+                        "source",
+                        transaction_fd,
+                        provenance_source.name,
+                        packctl.RENAME_EXCHANGE,
+                    )
+                else:
+                    raise PackMigrationResolutionError(
+                        "Provenance commit rollback identity is uncertain"
+                    )
+            except BaseException as rollback_error:
+                raise PackMigrationResolutionError(
+                    f"Provenance commit rollback failed: {rollback_error}"
+                ) from rollback_error
+        raise
+    finally:
+        os.close(transaction_fd)
+        os.close(pack_fd)
+
+
+def commit_pack_migration_root_selection_at(
+    plan: PackMigrationPlan,
+    selections: tuple[PackMigrationRootSelection, ...],
+    *,
+    repository_root: Path,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> tuple[PackRootRecord, ...]:
+    """Atomically persist explicit roots, then discard the stale migration plan."""
+    effective_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + PACK_MIGRATION_TIMEOUT_SECONDS
+    )
+    checkpoint = lambda: _checkpoint(cancel_event, effective_deadline)
+    with plan._lock:
+        resolution = plan.resolution
+        if (
+            plan.state != "resolution-required"
+            or not isinstance(resolution, PackMigrationResolutionPlan)
+            or not resolution.provenance_required
+        ):
+            raise PackMigrationResolutionError(
+                "Root selection requires a provenance resolution result"
+            )
+        if plan._provenance_committed:
+            raise PackMigrationResolutionError("Root provenance was already committed")
+        if set(plan._lock_set.owned_keys) != {
+            plan.source_key,
+            f"pack:{plan.target.target_id}",
+        }:
+            raise PackMigrationResolutionError("Pack migration locks are not fully owned")
+        candidates = {
+            candidate.source_metadata_path: candidate
+            for candidate in resolution.root_candidates
+        }
+        if len(candidates) != len(resolution.root_candidates):
+            raise PackMigrationResolutionError("Root candidate paths are ambiguous")
+        selected_paths: set[Path] = set()
+        records: list[PackRootRecord] = []
+        legacy_url_selections: list[tuple[Path, str]] = []
+        identities: set[str] = set()
+        for selection in selections:
+            checkpoint()
+            if selection.source_metadata_path in selected_paths:
+                raise PackMigrationResolutionError(
+                    f"Duplicate root selection: {selection.source_metadata_path}"
+                )
+            candidate = candidates.get(selection.source_metadata_path)
+            if candidate is None:
+                raise PackMigrationResolutionError(
+                    f"Unknown root candidate: {selection.source_metadata_path}"
+                )
+            if selection.provider != candidate.provider:
+                raise PackMigrationResolutionError(
+                    f"Root provider disagrees with metadata: {selection.source_metadata_path}"
+                )
+            try:
+                identity = canonical_identity(selection.provider, selection.project_id)
+            except ProviderIdentityError as error:
+                raise PackMigrationResolutionError(str(error)) from error
+            if (
+                candidate.canonical_identity is not None
+                and identity != candidate.canonical_identity
+            ):
+                raise PackMigrationResolutionError(
+                    f"Root identity disagrees with metadata: {selection.source_metadata_path}"
+                )
+            if identity in identities:
+                raise PackMigrationResolutionError(f"Duplicate selected root identity: {identity}")
+            selected_paths.add(selection.source_metadata_path)
+            identities.add(identity)
+            normalized_project_id = identity.partition(":")[2]
+            records.append(
+                PackRootRecord(
+                    selection.provider,
+                    normalized_project_id,
+                    candidate.source_side,
+                )
+            )
+            if candidate.provider == "url" and candidate.canonical_identity is None:
+                legacy_url_selections.append(
+                    (candidate.source_metadata_path, normalized_project_id)
+                )
+        missing_legacy_urls = [
+            candidate.source_metadata_path
+            for candidate in resolution.root_candidates
+            if candidate.provider == "url"
+            and candidate.canonical_identity is None
+            and candidate.source_metadata_path not in selected_paths
+        ]
+        if missing_legacy_urls:
+            raise PackMigrationResolutionError(
+                "Legacy URL metadata requires an explicit root identity: "
+                f"{missing_legacy_urls[0]}"
+            )
+        checkpoint()
+        _validate_detached_snapshot(plan, checkpoint)
+        _validate_live_source(
+            plan,
+            repository_root,
+            cancel_event,
+            effective_deadline,
+        )
+        detached_source = plan.source_snapshot_root / "source"
+        detached_scan = scan_pack_migration_source(
+            detached_source, checkpoint=checkpoint
+        )
+        provenance_source = plan.transaction_root / "provenance-staging"
+        top_level = tuple(
+            sorted(
+                {
+                    Path(entry.relative_path.parts[0])
+                    for entry in detached_scan.entries[1:]
+                },
+                key=lambda path: path.as_posix(),
+            )
+        )
+        try:
+            copy_pack_tree_snapshot(
+                detached_scan,
+                provenance_source,
+                include=top_level,
+                checkpoint=checkpoint,
+                destination_parent_identity=plan._transaction_identity,
+            )
+            ensure_pack_root_manifest_ignored(provenance_source)
+            for relative_path, project_id in legacy_url_selections:
+                checkpoint()
+                set_url_metadata_project_id(
+                    provenance_source,
+                    relative_path,
+                    project_id,
+                )
+            write_pack_root_manifest(provenance_source, tuple(records))
+            if legacy_url_selections:
+                packctl.run_packwiz(
+                    ["packwiz", "refresh"],
+                    cwd=provenance_source,
+                    cancel_event=cancel_event,
+                    deadline=effective_deadline,
+                )
+            provenance_scan = scan_pack_migration_source(
+                provenance_source, checkpoint=checkpoint
+            )
+            extracted = extract_pack_migration_roots(
+                provenance_source,
+                expected_identity=provenance_scan.root_identity,
+                expected_snapshot_digest=provenance_scan.snapshot_digest,
+                checkpoint=checkpoint,
+            )
+            if {root.canonical_identity for root in extracted} != identities:
+                raise PackMigrationResolutionError(
+                    "Committed root manifest does not match the selected identities"
+                )
+            _validate_detached_snapshot(plan, checkpoint)
+            _validate_live_source(
+                plan,
+                repository_root,
+                cancel_event,
+                effective_deadline,
+            )
+            _commit_root_provenance_source(
+                plan,
+                provenance_source,
+                provenance_scan,
+                checkpoint,
+            )
+            plan._provenance_committed = True
+        except BaseException as error:
+            plan._state = "failed"
+            plan.cleanup_error = error
+            _record_plan_diagnostic(plan)
+            raise
+        from pack_migration import discard_pack_migration_plan
+
+        discard_pack_migration_plan(plan, deadline=effective_deadline)
+        return tuple(sorted(records, key=lambda record: record.canonical_identity))
 
 
 def resolve_pack_migration_plan_at(
@@ -703,12 +1017,58 @@ def resolve_pack_migration_plan_at(
                 != detached_source_scan.root_identity
             ):
                 raise PackMigrationStale("Detached Packwiz source was replaced")
-            roots = extract_pack_migration_roots(
-                detached_source,
-                expected_identity=detached_source_scan.root_identity,
-                expected_snapshot_digest=detached_source_scan.snapshot_digest,
-                checkpoint=checkpoint,
-            )
+            try:
+                roots = extract_pack_migration_roots(
+                    detached_source,
+                    expected_identity=detached_source_scan.root_identity,
+                    expected_snapshot_digest=detached_source_scan.snapshot_digest,
+                    checkpoint=checkpoint,
+                )
+            except PackMigrationRootManifestMissing:
+                candidates = extract_pack_migration_root_candidates(
+                    detached_source,
+                    expected_identity=detached_source_scan.root_identity,
+                    expected_snapshot_digest=detached_source_scan.snapshot_digest,
+                    checkpoint=checkpoint,
+                )
+                _validate_detached_snapshot(plan, checkpoint)
+                _validate_live_source(
+                    plan,
+                    repository_root,
+                    cancel_event,
+                    effective_deadline,
+                )
+                result = PackMigrationResolutionPlan(
+                    plan.source_snapshot.snapshot_digest,
+                    plan.target,
+                    (),
+                    candidates,
+                    (),
+                    tuple(
+                        PackMigrationUnresolvedRoot(
+                            candidate,
+                            "root-provenance-required",
+                            "Select whether this installed MOD is an explicit root",
+                            False,
+                            True,
+                        )
+                        for candidate in candidates
+                    ),
+                    PackMigrationDependencyDelta(),
+                    (),
+                    (),
+                    (),
+                    (),
+                    (),
+                    (),
+                    None,
+                    "resolution-required",
+                    True,
+                )
+                plan.resolution = result
+                plan._state = "resolution-required"
+                _record_plan_diagnostic(plan)
+                return result
             workspace = _create_workspace(plan)
             resolver_workspace_fd = os.open(workspace, _DIRECTORY_FLAGS)
             opened_workspace = os.fstat(resolver_workspace_fd)
@@ -941,6 +1301,7 @@ def resolve_pack_migration_plan_at(
                     plan.source_snapshot.snapshot_digest,
                     plan.target,
                     roots,
+                    (),
                     tuple(resolved),
                     tuple(unresolved),
                     PackMigrationDependencyDelta(),
@@ -1029,6 +1390,7 @@ def resolve_pack_migration_plan_at(
                 plan.source_snapshot.snapshot_digest,
                 plan.target,
                 roots,
+                (),
                 tuple(resolved),
                 (),
                 delta,
@@ -1069,6 +1431,7 @@ __all__ = [
     "PackMigrationResolvedRoot",
     "PackMigrationUnresolvedRoot",
     "UrlMigrationCompatibility",
+    "commit_pack_migration_root_selection_at",
     "initialize_target_packwiz_source",
     "resolve_pack_migration_plan_at",
 ]

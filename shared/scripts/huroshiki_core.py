@@ -44,6 +44,7 @@ if TYPE_CHECKING:
         PackMigrationProgress,
         PackMigrationResolutionPlan,
     )
+    from pack_migration_roots import PackMigrationRootSelection
 from content_operations import (
     CONTENT_EDITOR_MAX_BYTES,
     ContentBrowseResult,
@@ -3222,6 +3223,24 @@ def resolve_pack_migration_plan(
         cancel_event=cancel_event,
         deadline=deadline,
         progress=progress,
+    )
+
+
+def commit_pack_migration_root_selection(
+    plan: PackMigrationPlan,
+    selections: tuple["PackMigrationRootSelection", ...],
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> tuple["PackRootRecord", ...]:
+    from pack_migration_resolution import commit_pack_migration_root_selection_at
+
+    return commit_pack_migration_root_selection_at(
+        plan,
+        selections,
+        repository_root=ROOT,
+        cancel_event=cancel_event,
+        deadline=deadline,
     )
 
 

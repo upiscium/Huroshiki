@@ -9,6 +9,7 @@ from typing import Callable, Literal
 from uuid import uuid4
 
 import packctl
+import tomlkit
 from pack_tree_policy import PackTreeScan, scan_pack_migration_source
 from provider_identity import (
     ProviderIdentityError,
@@ -18,6 +19,7 @@ from provider_identity import (
     canonical_identity,
     canonical_provider,
     parse_provider_metadata,
+    parse_provider_metadata_candidate,
 )
 
 
@@ -28,6 +30,10 @@ _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 class PackMigrationRootError(RuntimeError):
+    pass
+
+
+class PackMigrationRootManifestMissing(PackMigrationRootError):
     pass
 
 
@@ -54,6 +60,26 @@ class PackMigrationRoot:
     source_filename: str
     is_explicit_root: bool
     source_download_url: str | None = None
+
+
+@dataclass(frozen=True)
+class PackMigrationRootCandidate:
+    canonical_identity: str | None
+    provider: ProviderName
+    project_id: str | None
+    source_file_id: str | None
+    source_version: str | None
+    source_side: Side
+    source_metadata_path: Path
+    source_filename: str
+    source_download_url: str | None = None
+
+
+@dataclass(frozen=True)
+class PackMigrationRootSelection:
+    source_metadata_path: Path
+    provider: ProviderName
+    project_id: str
 
 
 def _read_relative_file(
@@ -216,6 +242,164 @@ def write_pack_root_manifest(
         os.close(root_fd)
 
 
+def _atomic_write_relative(
+    source_root: Path,
+    relative: Path,
+    contents: bytes,
+    *,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> None:
+    root_fd = os.open(source_root, _DIRECTORY_FLAGS)
+    opened: list[int] = []
+    descriptor = -1
+    temporary = f".{relative.name}.huroshiki-{uuid4().hex}.tmp"
+    try:
+        opened_root = os.fstat(root_fd)
+        if expected_root_identity is not None and (
+            opened_root.st_dev,
+            opened_root.st_ino,
+        ) != expected_root_identity:
+            raise PackMigrationRootError("Provenance staging root was replaced")
+        parent_fd = root_fd
+        for part in relative.parts[:-1]:
+            child = os.open(part, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            opened.append(child)
+            parent_fd = child
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        view = memoryview(contents)
+        while view:
+            written = os.write(descriptor, view)
+            if written == 0:
+                raise OSError("short provenance write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        try:
+            existing = os.stat(
+                relative.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            packctl.renameat2(
+                parent_fd,
+                temporary,
+                parent_fd,
+                relative.name,
+                packctl.RENAME_NOREPLACE,
+            )
+        else:
+            if not stat.S_ISREG(existing.st_mode):
+                raise PackMigrationRootError(
+                    f"Provenance target is not a regular file: {relative}"
+                )
+            packctl.renameat2(
+                parent_fd,
+                temporary,
+                parent_fd,
+                relative.name,
+                packctl.RENAME_EXCHANGE,
+            )
+            os.unlink(temporary, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        parent_fd = opened[-1] if opened else root_fd
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        for item in reversed(opened):
+            os.close(item)
+        os.close(root_fd)
+
+
+def ensure_pack_root_manifest_ignored(source_root: Path) -> None:
+    scan = scan_pack_migration_source(source_root, checkpoint=lambda: None)
+    ignore_entry = next(
+        (
+            entry
+            for entry in scan.entries
+            if entry.relative_path == Path(".packwizignore")
+        ),
+        None,
+    )
+    contents = (
+        b""
+        if ignore_entry is None
+        else _read_relative_file(
+            source_root,
+            scan,
+            Path(".packwizignore"),
+            max_bytes=1024 * 1024,
+        )
+    )
+    try:
+        text = contents.decode("utf-8")
+    except UnicodeError as error:
+        raise PackMigrationRootError(".packwizignore is not valid UTF-8") from error
+    if "/.huroshiki-roots.json" in {line.strip() for line in text.splitlines()}:
+        return
+    if text and not text.endswith("\n"):
+        text += "\n"
+    _atomic_write_relative(
+        source_root,
+        Path(".packwizignore"),
+        (text + "/.huroshiki-roots.json\n").encode("utf-8"),
+        expected_root_identity=scan.root_identity,
+    )
+
+
+def set_url_metadata_project_id(
+    source_root: Path,
+    relative_path: Path,
+    project_id: str,
+) -> None:
+    canonical_identity("url", project_id)
+    scan = scan_pack_migration_source(source_root, checkpoint=lambda: None)
+    try:
+        document = tomlkit.parse(
+            _read_relative_file(
+                source_root,
+                scan,
+                relative_path,
+                max_bytes=2 * 1024 * 1024,
+            ).decode("utf-8")
+        )
+    except (OSError, UnicodeError, tomlkit.exceptions.ParseError) as error:
+        raise PackMigrationRootError(f"Invalid URL metadata {relative_path}") from error
+    update = document.get("update")
+    if isinstance(update, dict) and update:
+        raise PackMigrationRootError(
+            f"Provider metadata cannot be rewritten as URL metadata: {relative_path}"
+        )
+    huroshiki = document.get("huroshiki")
+    if huroshiki is None:
+        huroshiki = tomlkit.table()
+        document["huroshiki"] = huroshiki
+    if not isinstance(huroshiki, dict):
+        raise PackMigrationRootError(f"Invalid huroshiki metadata: {relative_path}")
+    existing = huroshiki.get("project-id")
+    if existing is not None and str(existing) != project_id:
+        raise PackMigrationRootError(
+            f"URL metadata identity disagrees with selection: {relative_path}"
+        )
+    huroshiki["project-id"] = project_id
+    _atomic_write_relative(
+        source_root,
+        relative_path,
+        tomlkit.dumps(document).encode("utf-8"),
+        expected_root_identity=scan.root_identity,
+    )
+
+
 def record_pack_root(
     source_root: Path,
     provider: str,
@@ -272,6 +456,69 @@ def identify_pack_metadata_by_slug(source_root: Path, slug: str) -> str | None:
     return metadata.canonical_identity
 
 
+def extract_pack_migration_root_candidates(
+    detached_source_root: Path,
+    *,
+    expected_identity: tuple[int, int],
+    checkpoint: Callable[[], None],
+    expected_snapshot_digest: str | None = None,
+) -> tuple[PackMigrationRootCandidate, ...]:
+    checkpoint()
+    scan = scan_pack_migration_source(detached_source_root, checkpoint=checkpoint)
+    if scan.root_identity != expected_identity or (
+        expected_snapshot_digest is not None
+        and scan.snapshot_digest != expected_snapshot_digest
+    ):
+        raise PackMigrationRootError("Detached source changed before root inspection")
+    unsafe = [
+        entry.relative_path
+        for entry in scan.entries
+        if entry.kind == "invalid" or entry.errors
+    ]
+    if unsafe:
+        raise PackMigrationRootError(f"Detached source contains unsafe entry: {unsafe[0]}")
+    candidates: list[PackMigrationRootCandidate] = []
+    seen: set[str] = set()
+    for entry in scan.entries:
+        checkpoint()
+        if entry.kind != "file" or not entry.relative_path.name.endswith(".pw.toml"):
+            continue
+        contents = _read_relative_file(
+            detached_source_root,
+            scan,
+            entry.relative_path,
+            max_bytes=2 * 1024 * 1024,
+        )
+        try:
+            metadata = parse_provider_metadata_candidate(entry.relative_path, contents)
+        except ProviderIdentityError as error:
+            raise PackMigrationRootError(str(error)) from error
+        if metadata.canonical_identity is not None:
+            if metadata.canonical_identity in seen:
+                raise PackMigrationRootError(
+                    f"Duplicate metadata identity: {metadata.canonical_identity}"
+                )
+            seen.add(metadata.canonical_identity)
+        candidates.append(
+            PackMigrationRootCandidate(
+                metadata.canonical_identity,
+                metadata.provider,
+                metadata.project_id,
+                metadata.file_id,
+                metadata.version,
+                metadata.side,
+                metadata.metadata_path,
+                metadata.filename,
+                metadata.download_url,
+            )
+        )
+    checkpoint()
+    final_scan = scan_pack_migration_source(detached_source_root, checkpoint=checkpoint)
+    if final_scan != scan:
+        raise PackMigrationRootError("Detached source changed during root inspection")
+    return tuple(sorted(candidates, key=lambda item: item.source_metadata_path.as_posix()))
+
+
 def extract_pack_migration_roots(
     detached_source_root: Path,
     *,
@@ -293,6 +540,10 @@ def extract_pack_migration_roots(
     ]
     if unsafe:
         raise PackMigrationRootError(f"Detached source contains unsafe entry: {unsafe[0]}")
+    if not any(entry.relative_path == ROOT_MANIFEST_PATH for entry in scan.entries):
+        raise PackMigrationRootManifestMissing(
+            "Pack root provenance has not been initialized"
+        )
     manifest = _manifest_records(
         _read_relative_file(
             detached_source_root,

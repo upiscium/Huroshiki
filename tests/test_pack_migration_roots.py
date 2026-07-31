@@ -12,6 +12,7 @@ from pack_migration_roots import (
     PackMigrationRootError,
     PackRootRecord,
     extract_pack_migration_roots,
+    extract_pack_migration_root_candidates,
     identify_pack_metadata_by_slug,
     read_pack_root_manifest,
     write_pack_root_manifest,
@@ -117,10 +118,35 @@ version = "1.0"
         self.assertEqual(roots[0].source_file_id, "456")
         self.assertEqual(roots[2].source_download_url, "https://example.invalid/url.jar")
 
+    def test_legacy_url_metadata_is_candidate_without_inferred_identity(self) -> None:
+        (self.source / "mods" / "root.pw.toml").unlink()
+        (self.source / "mods" / "dependency.pw.toml").unlink()
+        (self.source / ".huroshiki-roots.json").unlink()
+        (self.source / "mods" / "legacy-url.pw.toml").write_text(
+            '''name = "Legacy URL"
+filename = "legacy.jar"
+side = "both"
+[download]
+url = "https://example.invalid/legacy.jar"
+''',
+            encoding="utf-8",
+        )
+        scan = scan_pack_migration_source(self.source, checkpoint=lambda: None)
+        candidates = extract_pack_migration_root_candidates(
+            self.source,
+            expected_identity=scan.root_identity,
+            expected_snapshot_digest=scan.snapshot_digest,
+            checkpoint=lambda: None,
+        )
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].provider, "url")
+        self.assertIsNone(candidates[0].canonical_identity)
+        self.assertEqual(candidates[0].source_metadata_path, Path("mods/legacy-url.pw.toml"))
+
     def test_missing_manifest_and_duplicate_identity_fail_closed(self) -> None:
         (self.source / ".huroshiki-roots.json").unlink()
         scan = scan_pack_migration_source(self.source, checkpoint=lambda: None)
-        with self.assertRaisesRegex(PackMigrationRootError, "Missing regular file"):
+        with self.assertRaisesRegex(PackMigrationRootError, "provenance"):
             extract_pack_migration_roots(
                 self.source,
                 expected_identity=scan.root_identity,

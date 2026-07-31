@@ -33,6 +33,11 @@
   then stops at `resolved` or `resolution-required` without authorizing publication. Successful target
   source handoff uses a verified descriptor-relative atomic exchange; unresolved, cancelled, stale, or
   cleanup-uncertain operations retain diagnostic transaction and lock ownership.
+- Existing Packs without committed root provenance now enter `resolution-required` with explicit
+  metadata candidates instead of failing before migration planning. Selected roots are checked against
+  the fixed detached source and committed atomically with the Packwiz ignore rule; no dependency is
+  implicitly promoted to a root. Legacy URL metadata requires an explicit canonical ID and is refreshed
+  before the provenance source exchange.
 - Install checkpoint preparation now runs inside the add-operation worker and shares cancellation
   plus one operation-wide absolute deadline across copy, resolution, URL download, merge, rollback,
   interactive PTY polling, cleanup, and navigation. Checkpoints, resolver trees, and failed staged
