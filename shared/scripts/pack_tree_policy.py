@@ -374,13 +374,22 @@ def scan_pack_migration_source(
     checkpoint: Callable[[], None],
 ) -> PackTreeScan:
     checkpoint()
-    parent_fd = os.open(pack_root.parent, _DIRECTORY_FLAGS)
+    descriptor_bound_path = (
+        pack_root.parent.parent == Path("/proc/self/fd")
+        and pack_root.parent.name.isdecimal()
+    )
+    parent_fd = -1
     root_fd = -1
     try:
-        listed = os.stat(pack_root.name, dir_fd=parent_fd, follow_symlinks=False)
+        if descriptor_bound_path:
+            listed = os.stat(pack_root, follow_symlinks=False)
+            root_fd = os.open(pack_root, _DIRECTORY_FLAGS)
+        else:
+            parent_fd = os.open(pack_root.parent, _DIRECTORY_FLAGS)
+            listed = os.stat(pack_root.name, dir_fd=parent_fd, follow_symlinks=False)
+            root_fd = os.open(pack_root.name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
         if not stat.S_ISDIR(listed.st_mode) or stat.S_ISLNK(listed.st_mode):
             raise PackTreePolicyError("Pack migration source must be an ordinary directory")
-        root_fd = os.open(pack_root.name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
         opened = os.fstat(root_fd)
         if (listed.st_dev, listed.st_ino) != (opened.st_dev, opened.st_ino):
             raise PackTreePolicyError("Pack migration source changed while opening")
@@ -388,10 +397,14 @@ def scan_pack_migration_source(
         _scan_directory(root_fd, Path("."), entries, checkpoint)
         checkpoint()
         try:
-            bound = os.stat(
-                pack_root.name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
+            bound = (
+                os.stat(pack_root, follow_symlinks=False)
+                if descriptor_bound_path
+                else os.stat(
+                    pack_root.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
             )
         except OSError as error:
             raise PackTreePolicyError(
@@ -410,7 +423,8 @@ def scan_pack_migration_source(
     finally:
         if root_fd >= 0:
             os.close(root_fd)
-        os.close(parent_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def _selected_entries(
@@ -432,11 +446,31 @@ def _selected_entries(
     return tuple(selected)
 
 
-def _open_relative_parent(root_fd: int, relative: Path) -> tuple[int, list[int]]:
+def _open_relative_parent(
+    root_fd: int,
+    relative: Path,
+    expected_identities: dict[Path, tuple[int, int]] | None = None,
+) -> tuple[int, list[int]]:
     current = root_fd
     opened: list[int] = []
+    current_relative = Path(".")
     for part in relative.parts[:-1]:
         descriptor = os.open(part, _DIRECTORY_FLAGS, dir_fd=current)
+        current_relative = (
+            Path(part)
+            if current_relative == Path(".")
+            else current_relative / part
+        )
+        if expected_identities is not None:
+            expected = expected_identities.get(current_relative)
+            opened_metadata = os.fstat(descriptor)
+            if expected is None or (opened_metadata.st_dev, opened_metadata.st_ino) != expected:
+                os.close(descriptor)
+                for item in reversed(opened):
+                    os.close(item)
+                raise PackTreePolicyError(
+                    f"Pack migration directory changed: {current_relative}"
+                )
         opened.append(descriptor)
         current = descriptor
     return current, opened
@@ -447,12 +481,14 @@ def _copy_file_at(
     destination_root_fd: int,
     entry: PackMigrationTreeEntry,
     checkpoint: Callable[[], None],
-) -> None:
+    source_identities: dict[Path, tuple[int, int]],
+    destination_identities: dict[Path, tuple[int, int]],
+) -> tuple[int, int]:
     source_parent, source_opened = _open_relative_parent(
-        source_root_fd, entry.relative_path
+        source_root_fd, entry.relative_path, source_identities
     )
     destination_parent, destination_opened = _open_relative_parent(
-        destination_root_fd, entry.relative_path
+        destination_root_fd, entry.relative_path, destination_identities
     )
     source_fd = temporary_fd = -1
     temporary_name = f".{entry.relative_path.name}.huroshiki-{uuid4().hex}.tmp"
@@ -516,6 +552,16 @@ def _copy_file_at(
             entry.relative_path.name,
             packctl.RENAME_NOREPLACE,
         )
+        installed = os.stat(
+            entry.relative_path.name,
+            dir_fd=destination_parent,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(installed.st_mode):
+            raise PackTreePolicyError(
+                f"Pack migration destination file changed: {entry.relative_path}"
+            )
+        return installed.st_dev, installed.st_ino
     finally:
         if temporary_fd >= 0:
             os.close(temporary_fd)
@@ -546,6 +592,11 @@ def copy_pack_tree_snapshot(
     if current != expected:
         raise PackTreePolicyError("Pack migration source changed after snapshot")
     selected = _selected_entries(expected, include)
+    source_identities = {
+        entry.relative_path: (entry.device, entry.inode)
+        for entry in selected
+        if entry.kind == "directory"
+    }
     source_fd = os.open(expected.root, _DIRECTORY_FLAGS)
     destination_parent_fd = os.open(destination_root.parent, _DIRECTORY_FLAGS)
     destination_fd = -1
@@ -573,24 +624,51 @@ def copy_pack_tree_snapshot(
             dir_fd=destination_parent_fd,
         )
         destination_identity = os.fstat(destination_fd)
+        destination_identities = {
+            Path("."): (destination_identity.st_dev, destination_identity.st_ino)
+        }
         directories = [entry for entry in selected[1:] if entry.kind == "directory"]
         files = [entry for entry in selected[1:] if entry.kind == "file"]
         for entry in directories:
             checkpoint()
             parent_fd, opened = _open_relative_parent(
-                destination_fd, entry.relative_path
+                destination_fd,
+                entry.relative_path,
+                destination_identities,
             )
+            child_fd = -1
             try:
                 os.mkdir(entry.relative_path.name, 0o700, dir_fd=parent_fd)
+                child_fd = os.open(
+                    entry.relative_path.name,
+                    _DIRECTORY_FLAGS,
+                    dir_fd=parent_fd,
+                )
+                child = os.fstat(child_fd)
+                destination_identities[entry.relative_path] = (
+                    child.st_dev,
+                    child.st_ino,
+                )
             finally:
+                if child_fd >= 0:
+                    os.close(child_fd)
                 for descriptor in reversed(opened):
                     os.close(descriptor)
         for entry in files:
             checkpoint()
-            _copy_file_at(source_fd, destination_fd, entry, checkpoint)
+            destination_identities[entry.relative_path] = _copy_file_at(
+                source_fd,
+                destination_fd,
+                entry,
+                checkpoint,
+                source_identities,
+                destination_identities,
+            )
         for entry in reversed(directories):
             parent_fd, opened = _open_relative_parent(
-                destination_fd, entry.relative_path
+                destination_fd,
+                entry.relative_path,
+                destination_identities,
             )
             child_fd = -1
             try:
@@ -634,6 +712,14 @@ def copy_pack_tree_snapshot(
     expected_content = _entries_digest(selected, include_identity=False)
     if destination_scan.content_digest != expected_content:
         raise PackTreePolicyError("Pack migration destination verification failed")
+    for entry in destination_scan.entries:
+        if destination_identities.get(entry.relative_path) != (
+            entry.device,
+            entry.inode,
+        ):
+            raise PackTreePolicyError(
+                f"Pack migration destination entry was replaced: {entry.relative_path}"
+            )
     return PackTreeCopyResult(
         destination_scan,
         len(files),

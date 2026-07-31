@@ -312,6 +312,32 @@ minecraft_server:
             pack_migration.discard_pack_migration_plan(plan)
         self.assertEqual(plan.state, "discarded")
 
+    def test_publication_lock_release_failure_retains_plan_diagnostic(self) -> None:
+        plan = self.plan()
+        self.make_ready(plan)
+        original = pack_migration._release_plan_locks
+        with patch.object(
+            pack_migration,
+            "_release_plan_locks",
+            side_effect=pack_migration.PackMigrationCleanupError("unlock failed"),
+        ):
+            with self.assertRaisesRegex(
+                pack_migration.PackMigrationCleanupError, "unlock failed"
+            ):
+                pack_migration.apply_pack_copy_migration_at(plan)
+        self.assertTrue((plan.transaction_root / "plan.json").is_file())
+        self.assertEqual(
+            [path.name for path in plan.transaction_root.iterdir()], ["plan.json"]
+        )
+        self.assertTrue(packctl.project_lock_is_active("pack:demo"))
+        with patch.object(
+            pack_migration,
+            "_release_plan_locks",
+            side_effect=original,
+        ):
+            pack_migration.apply_pack_copy_migration_at(plan)
+        self.assertEqual(plan.state, "applied")
+
     def test_transaction_parent_symlink_replacement_cannot_escape(self) -> None:
         outside = self.root / "outside"
         outside.mkdir()

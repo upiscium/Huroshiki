@@ -131,6 +131,7 @@ def search_modrinth(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--request-id", required=True)
     parser.add_argument("provider", choices=("modrinth",))
     subcommands = parser.add_subparsers(dest="action", required=True)
     resolve = subcommands.add_parser("resolve")
@@ -145,6 +146,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if (
+        not args.request_id
+        or len(args.request_id) > 128
+        or any(ord(character) < 33 or ord(character) > 126 for character in args.request_id)
+    ):
+        print("Invalid provider request ID", file=sys.stderr)
+        return 2
     try:
         if args.action == "resolve":
             result = resolve_modrinth(args.selector)
@@ -158,7 +166,13 @@ def main(argv: list[str] | None = None) -> int:
     except LookupError as error:
         print(str(error), file=sys.stderr)
         return 1
-    print(json.dumps(result, ensure_ascii=True, separators=(",", ":")))
+    print(
+        json.dumps(
+            {"request_id": args.request_id, "result": result},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    )
     return 0
 
 
