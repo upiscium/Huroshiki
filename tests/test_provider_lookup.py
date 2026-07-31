@@ -94,14 +94,27 @@ class ProviderLookupCoreTest(unittest.TestCase):
         values.update(overrides)
         return core.ResolverProcessResult(**values)
 
+    @classmethod
+    def responder(cls, payload: object, **overrides):
+        def respond(command, **_kwargs):
+            request_id = command[command.index("--request-id") + 1]
+            return cls.process(
+                {"request_id": request_id, "result": payload},
+                **overrides,
+            )
+
+        return respond
+
     def test_actual_helper_process_protocol_is_consumed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             scripts = Path(directory)
             helper = scripts / "provider_lookup.py"
             helper.write_text(
-                "import json\n"
-                "print(json.dumps({'provider':'modrinth','project_id':'canonical',"
-                "'slug':'slug','title':'Title'}))\n",
+                "import json, sys\n"
+                "request_id = sys.argv[sys.argv.index('--request-id') + 1]\n"
+                "result = {'provider':'modrinth','project_id':'canonical',"
+                "'slug':'slug','title':'Title'}\n"
+                "print(json.dumps({'request_id': request_id, 'result': result}))\n",
                 encoding="utf-8",
             )
             with patch.object(core, "SCRIPTS", scripts), patch.object(
@@ -132,7 +145,7 @@ class ProviderLookupCoreTest(unittest.TestCase):
             ],
         }
         with patch.object(
-            core, "run_resolver_process", return_value=self.process(payload)
+            core, "run_resolver_process", side_effect=self.responder(payload)
         ) as runner:
             projects = core.search_provider_projects(
                 "modrinth", "same", minecraft="1.21.1", loader="neoforge"
@@ -144,7 +157,7 @@ class ProviderLookupCoreTest(unittest.TestCase):
 
         payload["results"][1]["project_id"] = "one"
         with patch.object(
-            core, "run_resolver_process", return_value=self.process(payload)
+            core, "run_resolver_process", side_effect=self.responder(payload)
         ):
             with self.assertRaisesRegex(core.HuroshikiError, "duplicate project ID"):
                 core.search_provider_projects(
@@ -169,28 +182,45 @@ class ProviderLookupCoreTest(unittest.TestCase):
             with self.subTest(message=message), patch.object(
                 core,
                 "run_resolver_process",
-                return_value=self.process(valid, **overrides),
+                side_effect=self.responder(valid, **overrides),
             ):
                 with self.assertRaisesRegex(core.HuroshikiError, message):
                     core.resolve_project_selector("modrinth", "one")
 
-        invalid_results = (
-            "not json",
-            json.dumps({"provider": "modrinth", "slug": "one", "title": "One"}),
-            json.dumps(
-                {
-                    "provider": "modrinth",
-                    "project_id": "one",
-                    "slug": "one",
-                    "title": "bad\nvalue",
-                }
+        with patch.object(
+            core,
+            "run_resolver_process",
+            return_value=core.ResolverProcessResult(0, "not json", "", False, False),
+        ):
+            with self.assertRaises(core.HuroshikiError):
+                core.resolve_project_selector("modrinth", "one")
+        for envelope, message in (
+            ({"request_id": "wrong", "result": valid}, "mismatched request ID"),
+            (
+                {"request_id": "wrong", "result": valid, "extra": True},
+                "invalid response envelope",
             ),
-        )
-        for stdout in invalid_results:
-            with self.subTest(stdout=stdout), patch.object(
+        ):
+            with self.subTest(message=message), patch.object(
                 core,
                 "run_resolver_process",
-                return_value=core.ResolverProcessResult(0, stdout, "", False, False),
+                return_value=self.process(envelope),
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, message):
+                    core.resolve_project_selector("modrinth", "one")
+        for invalid in (
+            {"provider": "modrinth", "slug": "one", "title": "One"},
+            {
+                "provider": "modrinth",
+                "project_id": "one",
+                "slug": "one",
+                "title": "bad\nvalue",
+            },
+        ):
+            with self.subTest(invalid=invalid), patch.object(
+                core,
+                "run_resolver_process",
+                side_effect=self.responder(invalid),
             ):
                 with self.assertRaises(core.HuroshikiError):
                     core.resolve_project_selector("modrinth", "one")
@@ -205,7 +235,7 @@ class ProviderLookupCoreTest(unittest.TestCase):
             "title": "One",
         }
         with patch.object(
-            core, "run_resolver_process", return_value=self.process(valid)
+            core, "run_resolver_process", side_effect=self.responder(valid)
         ) as runner:
             core.resolve_project_selector(
                 "modrinth", "one", cancel_event=cancel, deadline=deadline

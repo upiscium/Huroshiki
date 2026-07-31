@@ -38,6 +38,7 @@ class UrlArtifact:
     url: str
     sha256: str
     loaders: tuple[str, ...]
+    minecraft_versions: tuple[str, ...] = ()
 
 
 URL_USER_AGENT = "huroshiki/1 self-hosted-mod-fetcher"
@@ -408,6 +409,96 @@ def parse_jar_identity(
     return mod_id, name, version, tuple(item[3] for item in identities)
 
 
+def parse_jar_minecraft_versions(path: Path) -> tuple[str, ...]:
+    versions: set[str] = set()
+    try:
+        with zipfile.ZipFile(path) as jar:
+            entries = {info.filename: info for info in jar.infolist()}
+            if "fabric.mod.json" in entries:
+                try:
+                    data = json.loads(
+                        _read_metadata_entry(jar, entries["fabric.mod.json"]).decode("utf-8")
+                    )
+                except (UnicodeError, json.JSONDecodeError):
+                    data = None
+                depends = data.get("depends", {}) if isinstance(data, dict) else {}
+                minecraft = depends.get("minecraft") if isinstance(depends, dict) else None
+                if isinstance(minecraft, str):
+                    versions.add(minecraft.strip())
+                elif isinstance(minecraft, list):
+                    versions.update(str(item).strip() for item in minecraft if str(item).strip())
+            if "quilt.mod.json" in entries:
+                try:
+                    data = json.loads(
+                        _read_metadata_entry(jar, entries["quilt.mod.json"]).decode("utf-8")
+                    )
+                except (UnicodeError, json.JSONDecodeError):
+                    data = None
+                quilt_loader = data.get("quilt_loader", {}) if isinstance(data, dict) else {}
+                dependencies = (
+                    quilt_loader.get("depends", [])
+                    if isinstance(quilt_loader, dict)
+                    else []
+                )
+                if isinstance(dependencies, list):
+                    for dependency in dependencies:
+                        if (
+                            isinstance(dependency, dict)
+                            and dependency.get("id") == "minecraft"
+                        ):
+                            value = dependency.get("versions")
+                            if isinstance(value, str) and value.strip():
+                                versions.add(value.strip())
+                            elif isinstance(value, list):
+                                versions.update(
+                                    str(item).strip()
+                                    for item in value
+                                    if str(item).strip()
+                                )
+            if "META-INF/MANIFEST.MF" in entries:
+                try:
+                    manifest = _read_metadata_entry(
+                        jar, entries["META-INF/MANIFEST.MF"]
+                    ).decode("utf-8")
+                except UnicodeError:
+                    manifest = ""
+                for line in manifest.splitlines():
+                    key, separator, value = line.partition(":")
+                    if separator and key.lower() in {
+                        "minecraft-version",
+                        "minecraft-versions",
+                    }:
+                        versions.update(
+                            item.strip() for item in value.split(",") if item.strip()
+                        )
+            for name in ("META-INF/neoforge.mods.toml", "META-INF/mods.toml"):
+                if name not in entries:
+                    continue
+                try:
+                    data = tomllib.loads(
+                        _read_metadata_entry(jar, entries[name]).decode("utf-8")
+                    )
+                except (UnicodeError, tomllib.TOMLDecodeError):
+                    continue
+                dependencies = data.get("dependencies", {})
+                if not isinstance(dependencies, dict):
+                    continue
+                for records in dependencies.values():
+                    if not isinstance(records, list):
+                        continue
+                    for record in records:
+                        if (
+                            isinstance(record, dict)
+                            and str(record.get("modId", "")).lower() == "minecraft"
+                        ):
+                            value = str(record.get("versionRange", "")).strip()
+                            if value:
+                                versions.add(value)
+    except zipfile.BadZipFile as error:
+        raise HuroshikiError("The downloaded JAR is not a valid archive") from error
+    return tuple(sorted(versions))
+
+
 def url_log_paths(log_dir: Path) -> tuple[Path, Path, Path]:
     return (
         log_dir / "session.raw",
@@ -647,6 +738,7 @@ def download_url_artifact(
         mod_id, name, version, loaders = parse_jar_identity(
             temporary_path, target_loader
         )
+        minecraft_versions = parse_jar_minecraft_versions(temporary_path)
         check_cancel_deadline()
         if target_loader not in loaders:
             raise HuroshikiError(
@@ -665,6 +757,7 @@ def download_url_artifact(
             url=url,
             sha256=digest.hexdigest(),
             loaders=loaders,
+            minecraft_versions=minecraft_versions,
         )
     finally:
         if temporary_path is not None:
@@ -735,6 +828,13 @@ def write_url_metadata(
     download["hash-format"] = "sha256"
     download["hash"] = artifact.sha256
     document["download"] = download
+    huroshiki = tomlkit.table()
+    huroshiki["project-id"] = artifact.mod_id
+    if artifact.version:
+        huroshiki["version"] = artifact.version
+    huroshiki["loaders"] = list(artifact.loaders)
+    huroshiki["minecraft-versions"] = list(artifact.minecraft_versions)
+    document["huroshiki"] = huroshiki
     temporary = path.with_name(f".{path.name}.huroshiki-url-{uuid4().hex}")
     temporary.write_text(tomlkit.dumps(document), encoding="utf-8")
     temporary.replace(path)

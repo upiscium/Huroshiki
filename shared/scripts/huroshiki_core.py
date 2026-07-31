@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from typing import Callable, Iterable, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Iterable, Literal, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
@@ -29,6 +29,22 @@ from uuid import uuid4
 import tomlkit
 
 import packctl
+from pack_migration_roots import (
+    PackRootRecord,
+    identify_pack_metadata_by_slug,
+    read_pack_root_manifest,
+    record_pack_root,
+    remove_pack_root,
+    write_pack_root_manifest,
+)
+from provider_identity import parse_provider_metadata
+
+if TYPE_CHECKING:
+    from pack_migration_resolution import (
+        PackMigrationProgress,
+        PackMigrationResolutionPlan,
+    )
+    from pack_migration_roots import PackMigrationRootSelection
 from content_operations import (
     CONTENT_EDITOR_MAX_BYTES,
     ContentBrowseResult,
@@ -1375,6 +1391,7 @@ class PackTransaction:
     source: Path
     baseline: dict[Path, str]
     baseline_contents: dict[Path, bytes] = field(default_factory=dict)
+    root_manifest_baseline: tuple[PackRootRecord, ...] = field(default_factory=tuple)
     real_source_baseline: dict[Path, str] = field(default_factory=dict)
     pack_config_baseline: dict[str, str] = field(default_factory=dict)
     template_config_baseline: dict[str, str] = field(default_factory=dict)
@@ -1476,6 +1493,12 @@ class PackTransaction:
                     baseline_contents=metadata_content_snapshot(
                         tx_source,
                         **checkpoint_arguments,
+                    ),
+                    root_manifest_baseline=(
+                        read_pack_root_manifest(tx_source)
+                        if (tx_source / ".huroshiki-roots.json").is_file()
+                        and not (tx_source / ".huroshiki-roots.json").is_symlink()
+                        else ()
                     ),
                     real_source_baseline=verified_baseline,
                     pack_config_baseline=verified_config,
@@ -2006,7 +2029,26 @@ class PackTransaction:
             path = safe_child(self.source, relative_path)
             if not path.is_file() or not path.name.endswith(".pw.toml"):
                 raise HuroshikiError(f"Unknown metadata file: {relative_path}")
+            manifest = self.source / ".huroshiki-roots.json"
+            original = path.read_bytes()
+            root_identity: tuple[str, str] | None = None
+            if manifest.is_file() and not manifest.is_symlink():
+                mod = read_mod(self.source, relative_path)
+                identity = f"{canonical_provider(mod.provider)}:{mod.project_id}"
+                if any(
+                    root.canonical_identity == identity
+                    for root in read_pack_root_manifest(self.source)
+                ):
+                    root_identity = canonical_provider(mod.provider), mod.project_id
             packctl.set_side_file(path, side)
+            if root_identity is not None:
+                try:
+                    record_pack_root(
+                        self.source, root_identity[0], root_identity[1], side
+                    )
+                except BaseException:
+                    path.write_bytes(original)
+                    raise
 
     def unstage(self, relative_path: Path) -> None:
         """Remove one selected metadata change from the transaction.
@@ -2035,6 +2077,33 @@ class PackTransaction:
                     f"Unknown staged metadata file: {relative_path}"
                 )
 
+            current_mod = read_mod(self.source, relative_path)
+            current_identity = (
+                f"{canonical_provider(current_mod.provider)}:{current_mod.project_id}"
+            )
+            current_contents = path.read_bytes()
+            manifest = self.source / ".huroshiki-roots.json"
+            original_roots: tuple[PackRootRecord, ...] | None = None
+            updated_roots: tuple[PackRootRecord, ...] | None = None
+            if manifest.is_file() and not manifest.is_symlink():
+                original_roots = read_pack_root_manifest(self.source)
+                roots = {root.canonical_identity: root for root in original_roots}
+                roots.pop(current_identity, None)
+                original = self.baseline_contents.get(relative_path)
+                if original is not None:
+                    restored = parse_provider_metadata(relative_path, original)
+                    baseline_roots = {
+                        root.canonical_identity: root
+                        for root in self.root_manifest_baseline
+                    }
+                    if restored.canonical_identity in baseline_roots:
+                        baseline_root = baseline_roots[restored.canonical_identity]
+                        roots[restored.canonical_identity] = PackRootRecord(
+                            restored.provider,
+                            restored.project_id,
+                            baseline_root.side,
+                        )
+                updated_roots = tuple(roots.values())
             if relative_path in self.baseline_contents:
                 temporary = path.with_name(
                     f".{path.name}.huroshiki-unstage-{uuid4().hex}"
@@ -2050,6 +2119,15 @@ class PackTransaction:
                     except OSError:
                         break
                     current_parent = current_parent.parent
+            if updated_roots is not None:
+                try:
+                    write_pack_root_manifest(self.source, updated_roots)
+                except BaseException:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(current_contents)
+                    assert original_roots is not None
+                    write_pack_root_manifest(self.source, original_roots)
+                    raise
 
             remaining_batches: list[TransactionBatch] = []
             for batch in self.batches:
@@ -2187,6 +2265,10 @@ class PackTransaction:
         for slug in sorted(selected):
             self.ensure_active()
             ensure_safe_pack_source(self.source)
+            removed_identity: str | None = None
+            manifest = self.source / ".huroshiki-roots.json"
+            if manifest.is_file() and not manifest.is_symlink():
+                removed_identity = identify_pack_metadata_by_slug(self.source, slug)
             _run_noninteractive_packwiz(
                 ["packwiz", "remove", slug],
                 cwd=self.source,
@@ -2194,6 +2276,8 @@ class PackTransaction:
                 deadline=operation_deadline,
                 label=f"Packwiz remove {slug}",
             )
+            if removed_identity is not None:
+                remove_pack_root(self.source, removed_identity)
             ensure_safe_pack_source(self.source)
         return 0
 
@@ -2680,13 +2764,20 @@ def _run_provider_lookup(
     cancel_event: threading.Event | None,
     deadline: float | None,
 ) -> object:
+    request_id = uuid4().hex
     effective_deadline = (
         deadline
         if deadline is not None
         else time.monotonic() + PROVIDER_LOOKUP_TIMEOUT_SECONDS
     )
     result = run_resolver_process(
-        [sys.executable, str(SCRIPTS / "provider_lookup.py"), *arguments],
+        [
+            sys.executable,
+            str(SCRIPTS / "provider_lookup.py"),
+            "--request-id",
+            request_id,
+            *arguments,
+        ],
         cwd=ROOT,
         cancel_event=cancel_event,
         deadline=effective_deadline,
@@ -2704,9 +2795,14 @@ def _run_provider_lookup(
             concise_process_error(result).replace("Packwiz", "Provider lookup")
         )
     try:
-        return json.loads(result.stdout)
+        envelope = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise HuroshikiError("Provider lookup returned invalid JSON") from error
+    if not isinstance(envelope, dict) or set(envelope) != {"request_id", "result"}:
+        raise HuroshikiError("Provider lookup returned an invalid response envelope")
+    if envelope["request_id"] != request_id:
+        raise HuroshikiError("Provider lookup returned a mismatched request ID")
+    return envelope["result"]
 
 
 def resolve_project_selector(
@@ -3109,6 +3205,43 @@ def discard_pack_migration_plan(
     deadline: float | None = None,
 ) -> None:
     _discard_pack_migration_plan(plan, deadline=deadline)
+
+
+def resolve_pack_migration_plan(
+    plan: PackMigrationPlan,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[["PackMigrationProgress"], None] | None = None,
+) -> "PackMigrationResolutionPlan":
+    from pack_migration_resolution import resolve_pack_migration_plan_at
+
+    return resolve_pack_migration_plan_at(
+        plan,
+        repository_root=ROOT,
+        state_root=STATE_ROOT,
+        cancel_event=cancel_event,
+        deadline=deadline,
+        progress=progress,
+    )
+
+
+def commit_pack_migration_root_selection(
+    plan: PackMigrationPlan,
+    selections: tuple["PackMigrationRootSelection", ...],
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> tuple["PackRootRecord", ...]:
+    from pack_migration_resolution import commit_pack_migration_root_selection_at
+
+    return commit_pack_migration_root_selection_at(
+        plan,
+        selections,
+        repository_root=ROOT,
+        cancel_event=cancel_event,
+        deadline=deadline,
+    )
 
 
 def normalize_template_target(target: str) -> str:
@@ -6107,6 +6240,14 @@ def merge_metadata_closure(
         if not path.exists() or path.read_bytes() != updated:
             path.write_bytes(updated)
             changed.append(relative_path)
+    root_manifest = staged_source / ".huroshiki-roots.json"
+    if root_manifest.is_file() and not root_manifest.is_symlink():
+        record_pack_root(
+            staged_source,
+            closure.root_identity[0],
+            closure.root_identity[1],
+            side,
+        )
     return tuple(changed)
 
 

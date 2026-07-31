@@ -2265,9 +2265,13 @@ def init_packwiz_project(
     )
     create_layout(root)
     (source / ".packwizignore").write_text(
-        "*.log\n*.gitkeep\n/crash-reports/\n/logs/\n/saves/\n/screenshots/\n/world/\n",
+        "*.log\n*.gitkeep\n/.huroshiki-roots.json\n/crash-reports/\n/logs/\n"
+        "/saves/\n/screenshots/\n/world/\n",
         encoding="utf-8",
     )
+    from pack_migration_roots import write_pack_root_manifest
+
+    write_pack_root_manifest(source, ())
 
 
 def _new_pack(

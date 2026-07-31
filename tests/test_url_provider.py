@@ -512,6 +512,19 @@ loader_version: 21.1.234
 
         self.assertEqual((mod_id, version, loaders), ("private_mod", "1.0.0", ("fabric",)))
 
+    def test_jar_inspection_extracts_declared_minecraft_versions(self) -> None:
+        path = self.root / "minecraft-version.jar"
+        with zipfile.ZipFile(path, "w") as jar:
+            jar.writestr(
+                "fabric.mod.json",
+                '{"id":"demo","name":"Demo","version":"1",'
+                '"depends":{"minecraft":["1.21.1","1.21.4"]}}',
+            )
+        self.assertEqual(
+            url_artifacts.parse_jar_minecraft_versions(path),
+            ("1.21.1", "1.21.4"),
+        )
+
     def test_jar_identity_rejects_oversized_recognized_metadata(self) -> None:
         path = self.root / "metadata-bomb.jar"
         with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as jar:

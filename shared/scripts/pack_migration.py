@@ -10,12 +10,13 @@ import stat
 import threading
 import time
 import tomllib
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Protocol
 from uuid import uuid4
 
 import yaml
 
 import packctl
+from url_artifacts import DEFAULT_URL_MAX_JAR_SIZE_BYTES
 from overlay_policy import scan_content_overlays
 from pack_tree_policy import (
     PackMigrationTreeEntry,
@@ -40,6 +41,10 @@ _CONFIG_MAX_BYTES = 2 * 1024 * 1024
 
 class PackMigrationError(RuntimeError):
     pass
+
+
+class PackMigrationResolutionDiagnostic(Protocol):
+    def diagnostic_summary(self) -> dict[str, object]: ...
 
 
 class PackMigrationCancelled(PackMigrationError):
@@ -124,6 +129,8 @@ class PackMigrationSourceSnapshot:
     content_tree_digest: str
     distribution_config_digest: str | None
     provider_metadata_digest: str
+    url_max_jar_size_bytes: int
+    url_allow_private_networks: bool
     total_files: int
     total_directories: int
     total_bytes: int
@@ -136,6 +143,7 @@ class PackMigrationSourceSnapshot:
 class PackMigrationValidationToken:
     plan_identity: int
     staging_content_digest: str
+    staging_snapshot_digest: str
     target_snapshot: PackMigrationSourceSnapshot
 
 
@@ -293,6 +301,8 @@ def _snapshot_digest_payload(
     content_tree_digest: str,
     distribution_config_digest: str | None,
     provider_metadata_digest: str,
+    url_max_jar_size_bytes: int,
+    url_allow_private_networks: bool,
     validation_errors: tuple[str, ...],
 ) -> str:
     payload = {
@@ -305,6 +315,8 @@ def _snapshot_digest_payload(
         "content_tree": content_tree_digest,
         "distribution": distribution_config_digest,
         "providers": provider_metadata_digest,
+        "url_max_jar_size_bytes": url_max_jar_size_bytes,
+        "url_allow_private_networks": url_allow_private_networks,
         "validation_errors": list(validation_errors),
     }
     return hashlib.sha256(
@@ -387,9 +399,25 @@ def snapshot_pack_migration_source_at(
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+        raw_url_limit = effective.get(
+            "url_max_jar_size_bytes", DEFAULT_URL_MAX_JAR_SIZE_BYTES
+        )
+        if (
+            isinstance(raw_url_limit, bool)
+            or not isinstance(raw_url_limit, int)
+            or raw_url_limit <= 0
+        ):
+            raise PackMigrationError("url_max_jar_size_bytes must be a positive integer")
+        url_max_jar_size_bytes = raw_url_limit
+        raw_private = effective.get("url_allow_private_networks", False)
+        if not isinstance(raw_private, bool):
+            raise PackMigrationError("url_allow_private_networks must be a boolean")
+        url_allow_private_networks = raw_private
     except (packctl.ConfigError, PackMigrationError, TypeError, ValueError) as error:
         validation_errors.append(str(error))
         distribution_config_digest = None
+        url_max_jar_size_bytes = DEFAULT_URL_MAX_JAR_SIZE_BYTES
+        url_allow_private_networks = False
     try:
         _pack_versions_from_bytes(
             _read_scanned_file(scan, Path("source/pack.toml")),
@@ -431,6 +459,8 @@ def snapshot_pack_migration_source_at(
         content_tree_digest=content_tree_digest,
         distribution_config_digest=distribution_config_digest,
         provider_metadata_digest=provider_metadata_digest,
+        url_max_jar_size_bytes=url_max_jar_size_bytes,
+        url_allow_private_networks=url_allow_private_networks,
         validation_errors=immutable_errors,
     )
     checkpoint()
@@ -447,6 +477,8 @@ def snapshot_pack_migration_source_at(
         content_tree_digest,
         distribution_config_digest,
         provider_metadata_digest,
+        url_max_jar_size_bytes,
+        url_allow_private_networks,
         sum(entry.kind == "file" for entry in scan.entries),
         sum(entry.kind == "directory" for entry in scan.entries) - 1,
         sum(entry.size for entry in scan.entries if entry.kind == "file"),
@@ -512,10 +544,20 @@ class PackMigrationPlan:
         self._target_parent_identity = target_parent_identity
         self._source_copy_identity: tuple[int, int] | None = None
         self._source_copy_content_digest: str | None = None
+        self._source_copy_snapshot_digest: str | None = None
         self._staging_identity: tuple[int, int] | None = None
+        self._staging_snapshot_digest: str | None = None
         self._validation_token: PackMigrationValidationToken | None = None
         self._publication_committed = False
+        self._publication_state: Literal[
+            "not-published", "published", "uncertain"
+        ] = "not-published"
         self._published_identity: tuple[int, int] | None = None
+        self.resolution: PackMigrationResolutionDiagnostic | None = None
+        self._resolver_work_root: Path | None = None
+        self._resolver_work_identity: tuple[int, int] | None = None
+        self._resolved_staging_digest: str | None = None
+        self._provenance_committed = False
         self._lock = threading.RLock()
 
     @property
@@ -638,7 +680,7 @@ def _source_versions(snapshot: PackMigrationSourceSnapshot) -> tuple[str, str, s
 def _write_plan_file(plan: PackMigrationPlan, repository_root: Path) -> None:
     transaction_relative = plan.transaction_root.relative_to(repository_root)
     payload = {
-        "schema": 1,
+        "schema": 2 if plan.resolution is not None else 1,
         "source": plan.source_key,
         "target": {
             "id": plan.target.target_id,
@@ -675,6 +717,12 @@ def _write_plan_file(plan: PackMigrationPlan, repository_root: Path) -> None:
             }
             for warning in plan.warnings
         ],
+        "resolution": (
+            plan.resolution.diagnostic_summary()
+            if plan.resolution is not None
+            else None
+        ),
+        "cleanup_incomplete": plan.cleanup_error is not None,
     }
     contents = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
     transaction_fd = os.open(plan.transaction_root, _DIRECTORY_FLAGS)
@@ -772,7 +820,12 @@ def _make_transaction_root(
         os.close(parent_fd)
 
 
-def _cleanup_transaction(plan: PackMigrationPlan, deadline: float) -> None:
+def _cleanup_transaction(
+    plan: PackMigrationPlan,
+    deadline: float,
+    *,
+    preserve_diagnostic: bool = False,
+) -> None:
     try:
         os.stat(plan.transaction_root, follow_symlinks=False)
     except FileNotFoundError:
@@ -798,7 +851,11 @@ def _cleanup_transaction(plan: PackMigrationPlan, deadline: float) -> None:
             raise PackMigrationCleanupError(
                 "Pack migration transaction root was replaced"
             )
-        _remove_directory_contents(root_fd, checkpoint)
+        _remove_directory_contents(
+            root_fd,
+            checkpoint,
+            preserve={"plan.json"} if preserve_diagnostic else frozenset(),
+        )
         bound = os.stat(
             plan.transaction_root.name,
             dir_fd=parent_fd,
@@ -808,6 +865,8 @@ def _cleanup_transaction(plan: PackMigrationPlan, deadline: float) -> None:
             raise PackMigrationCleanupError(
                 "Pack migration transaction root changed during cleanup"
             )
+        if preserve_diagnostic:
+            return
         os.close(root_fd)
         root_fd = -1
         os.rmdir(plan.transaction_root.name, dir_fd=parent_fd)
@@ -825,12 +884,16 @@ def _cleanup_transaction(plan: PackMigrationPlan, deadline: float) -> None:
 def _remove_directory_contents(
     directory_fd: int,
     checkpoint: Callable[[], None],
+    *,
+    preserve: set[str] | frozenset[str] = frozenset(),
 ) -> None:
     checkpoint()
     with os.scandir(directory_fd) as iterator:
         names = sorted(entry.name for entry in iterator)
     for name in names:
         checkpoint()
+        if name in preserve:
+            continue
         metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if stat.S_ISREG(metadata.st_mode):
             os.unlink(name, dir_fd=directory_fd)
@@ -951,6 +1014,7 @@ def plan_pack_copy_migration_at(
         )
         plan._source_copy_identity = detached.scan.root_identity
         plan._source_copy_content_digest = detached.scan.content_digest
+        plan._source_copy_snapshot_digest = detached.scan.snapshot_digest
         staged = copy_pack_tree_snapshot(
             detached.scan,
             staging,
@@ -959,6 +1023,7 @@ def plan_pack_copy_migration_at(
             destination_parent_identity=plan._transaction_identity,
         )
         plan._staging_identity = staged.scan.root_identity
+        plan._staging_snapshot_digest = staged.scan.snapshot_digest
         old_minecraft, old_loader, old_loader_version = _source_versions(current)
         try:
             committed = _yaml_mapping(
@@ -1046,7 +1111,12 @@ def _issue_pack_migration_validation_token(
     )
     if snapshot.validation_errors:
         raise PackMigrationError("Validated target staging is not a valid Pack")
-    return PackMigrationValidationToken(id(plan), scan.content_digest, snapshot)
+    return PackMigrationValidationToken(
+        id(plan),
+        scan.content_digest,
+        scan.snapshot_digest,
+        snapshot,
+    )
 
 
 def _mark_pack_migration_plan_ready(
@@ -1072,10 +1142,18 @@ def _release_plan_locks(plan: PackMigrationPlan) -> None:
 
 
 def _finish_committed_publication(plan: PackMigrationPlan, deadline: float) -> None:
-    _cleanup_transaction(plan, deadline)
+    _cleanup_transaction(plan, deadline, preserve_diagnostic=True)
     _release_plan_locks(plan)
-    plan.cleanup_error = None
     plan._state = "applied"
+    try:
+        _cleanup_transaction(
+            plan,
+            time.monotonic() + PACK_MIGRATION_CLEANUP_TIMEOUT_SECONDS,
+        )
+    except BaseException as error:
+        plan.cleanup_error = error
+        return
+    plan.cleanup_error = None
 
 
 def _matches_validated_target(
@@ -1151,6 +1229,8 @@ def apply_pack_copy_migration_at(
         )
         if detached_scan.content_digest != plan._source_copy_content_digest:
             raise PackMigrationStale("Detached source snapshot changed after planning")
+        if detached_scan.snapshot_digest != plan._source_copy_snapshot_digest:
+            raise PackMigrationStale("Detached source snapshot identity changed after planning")
         current_source = snapshot_pack_migration_source_at(
             plan.source_key,
             plan.source_root,
@@ -1166,6 +1246,8 @@ def apply_pack_copy_migration_at(
         )
         if staged_scan.content_digest != token.staging_content_digest:
             raise PackMigrationStale("Target staging changed after validation")
+        if staged_scan.snapshot_digest != token.staging_snapshot_digest:
+            raise PackMigrationStale("Target staging identity changed after validation")
         if not _target_missing(plan.target_root, plan._target_parent_identity):
             raise PackMigrationPublicationError("Target Pack appeared before publication")
         plan._state = "applying"
@@ -1188,6 +1270,7 @@ def apply_pack_copy_migration_at(
                     "Target Pack parent was replaced before publication"
                 )
             try:
+                plan._publication_state = "uncertain"
                 packctl.renameat2(
                     transaction_fd,
                     plan.target_staging_root.name,
@@ -1223,9 +1306,12 @@ def apply_pack_copy_migration_at(
                     else (staging_metadata.st_dev, staging_metadata.st_ino)
                 )
                 if target_identity != expected_identity or staging_identity is not None:
+                    if target_identity is None and staging_identity == expected_identity:
+                        plan._publication_state = "not-published"
                     raise PackMigrationPublicationError(
                         "Pack migration publication result is ambiguous or raced"
                     ) from rename_error
+                plan._publication_state = "published"
             published_metadata = os.stat(
                 plan.target_root.name,
                 dir_fd=target_parent_fd,
@@ -1236,6 +1322,7 @@ def apply_pack_copy_migration_at(
                     "Published target identity does not match validated staging"
                 )
             plan._publication_committed = True
+            plan._publication_state = "published"
             plan._published_identity = expected_identity
         except BaseException:
             plan._state = "failed"
@@ -1276,21 +1363,37 @@ def discard_pack_migration_plan(
         else time.monotonic() + PACK_MIGRATION_CLEANUP_TIMEOUT_SECONDS
     )
     with plan._lock:
-        if plan._publication_committed or plan.state in {"applied", "applying"}:
+        if (
+            plan._publication_state != "not-published"
+            or plan._publication_committed
+            or plan.state in {"applied", "applying"}
+        ):
             raise PackMigrationError("A published Pack migration cannot be discarded")
         if plan.state == "discarded":
             return
         plan._state = "discarding"
         try:
-            _cleanup_transaction(plan, effective_deadline)
+            _cleanup_transaction(
+                plan,
+                effective_deadline,
+                preserve_diagnostic=True,
+            )
             _release_plan_locks(plan)
         except BaseException as error:
             plan.cleanup_error = error
             plan._state = "failed"
             _record_plan_diagnostic(plan)
             raise
-        plan.cleanup_error = None
         plan._state = "discarded"
+        try:
+            _cleanup_transaction(
+                plan,
+                time.monotonic() + PACK_MIGRATION_CLEANUP_TIMEOUT_SECONDS,
+            )
+        except BaseException as error:
+            plan.cleanup_error = error
+            return
+        plan.cleanup_error = None
 
 
 __all__ = [
