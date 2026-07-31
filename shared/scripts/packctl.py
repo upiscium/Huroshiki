@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Iterable, Literal
 import unicodedata
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
@@ -56,7 +56,13 @@ from process_runner import (
     run_bounded_process,
 )
 import project_locks
-from project_locks import ProjectLockMetadata, process_start_identity
+from project_locks import (
+    ProjectLockBusy,
+    ProjectLockMetadata,
+    ProjectLockSet,
+    ProjectLockSetError,
+    process_start_identity,
+)
 from url_artifacts import DEFAULT_URL_MAX_JAR_SIZE_BYTES
 
 ROOT = resolve_root(import_root_argument(sys.argv[1:]))
@@ -967,6 +973,50 @@ _inspect_lock_path = project_locks.inspect_lock_path
 class ProjectLock(project_locks.ProjectLock):
     def __init__(self, project_key: str, operation: str) -> None:
         super().__init__(project_key, operation, project_lock_path(project_key))
+
+
+def acquire_project_locks(
+    project_keys: Iterable[str],
+    *,
+    deadline: float,
+    cancel_event: threading.Event | None,
+    operation: str = "multi-project transaction",
+) -> ProjectLockSet:
+    keys = tuple(sorted(set(project_keys)))
+    if not keys:
+        raise ConfigError("At least one project lock is required")
+    locks = tuple(ProjectLock(key, operation) for key in keys)
+    lock_set = ProjectLockSet(locks)
+    try:
+        for lock in locks:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ConfigError("Project lock acquisition was cancelled")
+                if time.monotonic() >= deadline:
+                    raise ConfigError("Project lock acquisition deadline exceeded")
+                try:
+                    lock.acquire()
+                    break
+                except ProjectLockBusy:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ConfigError(
+                            f"Project lock acquisition deadline exceeded: {lock.project_key}"
+                        )
+                    if cancel_event is not None:
+                        cancel_event.wait(min(0.02, remaining))
+                    else:
+                        time.sleep(min(0.02, remaining))
+        return lock_set
+    except BaseException as error:
+        try:
+            lock_set.release()
+        except BaseException as release_error:
+            raise ProjectLockSetError(
+                f"{error}; acquired lock rollback failed: {release_error}",
+                lock_set,
+            ) from error
+        raise
 
 
 def active_project_lock(project_key: str) -> ProjectLockMetadata | None:
@@ -4396,8 +4446,44 @@ def _project_key_from_state_name(name: str) -> str | None:
 
 
 def _transaction_active(path: Path) -> bool:
+    projects: set[str] = set()
     project = _project_key_from_state_name(path.name)
-    return project is not None and project_lock_is_active(project)
+    if project is not None:
+        projects.add(project)
+    directory_fd = plan_fd = -1
+    try:
+        directory_fd = os.open(
+            path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        plan_fd = os.open(
+            "plan.json",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+        metadata = os.fstat(plan_fd)
+        if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
+            contents = os.read(plan_fd, metadata.st_size + 1)
+            value = json.loads(contents.decode("utf-8"))
+            if isinstance(value, dict):
+                source = value.get("source")
+                target = value.get("target")
+                target_id = target.get("id") if isinstance(target, dict) else None
+                for candidate in (source, f"pack:{target_id}" if target_id else None):
+                    if not isinstance(candidate, str):
+                        continue
+                    kind, separator, project_id = candidate.partition(":")
+                    if separator and kind in {"pack", "template"}:
+                        validate_project_id(project_id)
+                        projects.add(candidate)
+    except (ConfigError, OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    finally:
+        if plan_fd >= 0:
+            os.close(plan_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+    return any(project_lock_is_active(candidate) for candidate in projects)
 
 
 def classify_state() -> list[StateItem]:

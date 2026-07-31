@@ -6,9 +6,19 @@ import fcntl
 import json
 import os
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Iterable
 
 from packctl_errors import ConfigError
+
+
+class ProjectLockBusy(ConfigError):
+    pass
+
+
+class ProjectLockSetError(ConfigError):
+    def __init__(self, message: str, lock_set: "ProjectLockSet") -> None:
+        super().__init__(message)
+        self.lock_set = lock_set
 
 
 @dataclass(frozen=True)
@@ -82,7 +92,7 @@ class ProjectLock:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
                 owner = read_lock_metadata(handle)
-                raise ConfigError(
+                raise ProjectLockBusy(
                     f"Project is locked: {self.project_key} ({format_lock_owner(owner)})"
                 ) from error
             metadata = ProjectLockMetadata(
@@ -110,11 +120,16 @@ class ProjectLock:
         handle = getattr(self, "_handle", None)
         if handle is None:
             return
-        self._handle = None
         try:
             fcntl.flock(handle, fcntl.LOCK_UN)
-        finally:
-            handle.close()
+        except BaseException:
+            raise
+        self._handle = None
+        handle.close()
+
+    @property
+    def owned(self) -> bool:
+        return self._handle is not None
 
     def __enter__(self) -> ProjectLock:
         return self.acquire()
@@ -127,6 +142,38 @@ class ProjectLock:
             self.release()
         except (OSError, ValueError):
             pass
+
+
+class ProjectLockSet:
+    """Canonical collection that retains failed release ownership for retry."""
+
+    def __init__(self, locks: Iterable[ProjectLock]) -> None:
+        self.locks = tuple(locks)
+        self.release_errors: dict[str, BaseException] = {}
+
+    @property
+    def owned_keys(self) -> tuple[str, ...]:
+        return tuple(lock.project_key for lock in self.locks if lock.owned)
+
+    @property
+    def owned(self) -> bool:
+        return bool(self.owned_keys)
+
+    def release(self) -> None:
+        errors: dict[str, BaseException] = {}
+        for lock in reversed(self.locks):
+            if not lock.owned:
+                continue
+            try:
+                lock.release()
+            except BaseException as error:
+                errors[lock.project_key] = error
+        self.release_errors = errors
+        if errors:
+            detail = "; ".join(f"{key}: {error}" for key, error in errors.items())
+            raise ProjectLockSetError(
+                f"Could not release all project locks: {detail}", self
+            )
 
 
 def inspect_lock_path(path: Path) -> tuple[bool, ProjectLockMetadata | None]:

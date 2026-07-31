@@ -150,6 +150,15 @@ from portable_paths import (
     portable_relative_path,
     portable_relative_path_key,
 )
+from pack_migration import (
+    PackMigrationPlan,
+    PackMigrationSourceSnapshot,
+    PackMigrationTarget,
+    apply_pack_copy_migration_at as _apply_pack_copy_migration_at,
+    discard_pack_migration_plan as _discard_pack_migration_plan,
+    plan_pack_copy_migration_at,
+    snapshot_pack_migration_source_at,
+)
 
 ROOT = packctl.ROOT
 PACKS = packctl.PACKS
@@ -3036,6 +3045,70 @@ def discard_content_plan(
     deadline: float | None = None,
 ) -> None:
     _discard_content_plan(plan, deadline=deadline)
+
+
+def snapshot_pack_migration_source(
+    project_key_value: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> PackMigrationSourceSnapshot:
+    kind, project_id = split_project_key(project_key_value)
+    if kind != "pack":
+        raise HuroshikiError("Pack migration is available only for packs")
+    return snapshot_pack_migration_source_at(
+        project_key_value,
+        packctl.get_pack_root(project_id),
+        ROOT,
+        cancel_event=cancel_event,
+        deadline=deadline,
+    )
+
+
+def plan_pack_copy_migration(
+    source_key: str,
+    target: PackMigrationTarget,
+    *,
+    expected_snapshot: PackMigrationSourceSnapshot,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> PackMigrationPlan:
+    kind, source_id = split_project_key(source_key)
+    if kind != "pack":
+        raise HuroshikiError("Pack migration is available only for packs")
+    return plan_pack_copy_migration_at(
+        source_key,
+        packctl.get_pack_root(source_id),
+        packctl.get_pack_root(target.target_id, must_exist=False),
+        TRANSACTION_ROOT,
+        target,
+        expected_snapshot=expected_snapshot,
+        repository_root=ROOT,
+        state_root=STATE_ROOT,
+        cancel_event=cancel_event,
+        deadline=deadline,
+    )
+
+
+def apply_pack_copy_migration(
+    plan: PackMigrationPlan,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> PackMigrationSourceSnapshot:
+    return _apply_pack_copy_migration_at(
+        plan,
+        cancel_event=cancel_event,
+        deadline=deadline,
+    )
+
+
+def discard_pack_migration_plan(
+    plan: PackMigrationPlan,
+    *,
+    deadline: float | None = None,
+) -> None:
+    _discard_pack_migration_plan(plan, deadline=deadline)
 
 
 def normalize_template_target(target: str) -> str:
