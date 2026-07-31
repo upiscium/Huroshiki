@@ -48,6 +48,7 @@ from content_operations import (
     ContentImportSourceSnapshot,
     ContentImportSummary,
     ContentMove,
+    ContentPathInfo,
     ContentOperation,
     ContentOperationCancelled,
     ContentOperationDeadlineExceeded,
@@ -70,6 +71,7 @@ from content_operations import (
     plan_content_import_at,
     plan_content_changes_at,
     read_content_file_at,
+    resolve_content_path_info_at,
 )
 from process_runner import (
     BoundedProcessResult,
@@ -2833,7 +2835,11 @@ def _pack_content_root(project_key_value: str) -> Path:
             "Content management is currently available only for packs"
         )
     root = project_root(project_key_value)
-    if not root.is_dir():
+    try:
+        root_mode = root.lstat().st_mode
+    except FileNotFoundError:
+        root_mode = 0
+    if not stat.S_ISDIR(root_mode):
         raise HuroshikiError(f"Missing project directory: {root}")
     return root
 
@@ -2941,6 +2947,29 @@ def load_content_text_document(
         relative_path,
         expected_snapshot=expected_snapshot,
         max_bytes=max_bytes,
+        cancel_event=cancel_event,
+        deadline=deadline,
+    )
+
+
+def resolve_content_path_info(
+    project_key_value: str,
+    side: str,
+    relative_path: str | Path,
+    *,
+    expected_snapshot: ContentSnapshot,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> ContentPathInfo:
+    content_checkpoint(cancel_event, deadline)
+    root = _pack_content_root(project_key_value)
+    return resolve_content_path_info_at(
+        project_key_value,
+        root,
+        ROOT,
+        side,
+        relative_path,
+        expected_snapshot=expected_snapshot,
         cancel_event=cancel_event,
         deadline=deadline,
     )

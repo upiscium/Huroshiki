@@ -182,6 +182,20 @@ IMPORT_SUMMARY = core.ContentImportSummary(
     Path("resourcepacks/demo.bin"),
     "file",
 )
+PATH_INFO = core.ContentPathInfo(
+    "pack:demo",
+    "common",
+    Path("config/demo.txt"),
+    Path("packs/demo/content/common/config/demo.txt"),
+    Path("/repo/packs/demo/content/common/config/demo.txt"),
+    "file",
+    5,
+    0o644,
+    False,
+    "a" * 64,
+    "c" * 64,
+    (),
+)
 
 
 class _Discard:
@@ -292,6 +306,13 @@ class ContentTuiTest(unittest.IsolatedAsyncioTestCase):
             )
             stack.enter_context(patch.object(huroshiki.core, "project_actions", return_value=()))
             stack.enter_context(patch.object(huroshiki.core, "load_content_browser", return_value=BROWSE))
+            stack.enter_context(
+                patch.object(
+                    huroshiki.core,
+                    "resolve_content_path_info",
+                    return_value=PATH_INFO,
+                )
+            )
             stack.enter_context(patch.object(huroshiki.core, "ContentChangePlan", _Plan))
             yield
 
@@ -360,6 +381,171 @@ class ContentTuiTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(started.wait(1))
                 await pilot.press("escape")
                 await pilot.pause()
+                self.assertIs(app.screen, screen)
+                self.assertTrue(observed_cancel.is_set())
+                release.set()
+                await pilot.pause(0.15)
+                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+
+    async def test_path_binding_opens_modal_off_loop_and_copies_both_paths(self) -> None:
+        captured: dict[str, object] = {}
+
+        def resolve(project_key, side, relative_path, **kwargs):
+            captured.update(
+                project_key=project_key,
+                side=side,
+                relative_path=relative_path,
+                thread=threading.current_thread().name,
+                **kwargs,
+            )
+            return PATH_INFO
+
+        with self.patches(), patch.object(
+            huroshiki.core,
+            "resolve_content_path_info",
+            side_effect=resolve,
+        ):
+            screen = huroshiki.ContentScreen("pack:demo")
+            app = _ContentApp(screen)
+            with patch.object(app, "copy_to_clipboard") as copy:
+                async with app.run_test() as pilot:
+                    await pilot.pause(0.15)
+                    await pilot.press("o")
+                    await pilot.pause(0.15)
+                    self.assertIsInstance(app.screen, huroshiki.ContentPathInfoModal)
+                    self.assertIs(captured["expected_snapshot"], SNAPSHOT)
+                    self.assertTrue(str(captured["thread"]).startswith("huroshiki-content-path-"))
+                    message = str(app.screen.query_one("#content-path-info", Static).content)
+                    for expected in (
+                        "Project: pack:demo",
+                        "Side: common",
+                        "Relative: config/demo.txt",
+                        "Repository path: packs/demo/content/common/config/demo.txt",
+                        "Absolute path: /repo/packs/demo/content/common/config/demo.txt",
+                        "Kind: file",
+                        "Bytes: 5",
+                        "Mode: 0644",
+                        "Executable: no",
+                        f"Digest: {'a' * 64}",
+                        f"Snapshot: {'c' * 64}",
+                        "Validation: valid",
+                    ):
+                        self.assertIn(expected, message)
+                    await pilot.press("a")
+                    copy.assert_called_with(str(PATH_INFO.absolute_path))
+                    await pilot.press("r")
+                    copy.assert_called_with(str(PATH_INFO.repository_relative_path))
+                    await pilot.press("escape")
+                    self.assertIs(app.screen, screen)
+            self.assertIn("o: path", screen.help_text)
+
+    async def test_path_modal_reports_clipboard_failure_without_closing(self) -> None:
+        with self.patches():
+            modal = huroshiki.ContentPathInfoModal(PATH_INFO)
+            app = _ContentApp(modal)
+            with patch.object(
+                app,
+                "copy_to_clipboard",
+                side_effect=RuntimeError("unsupported"),
+            ), patch.object(app, "notify") as notify:
+                async with app.run_test() as pilot:
+                    await pilot.press("a")
+                    await pilot.pause()
+                    self.assertIs(app.screen, modal)
+                    self.assertEqual(
+                        str(modal.query_one("#content-path-copy-status", Static).content),
+                        "Copy failed",
+                    )
+                    notify.assert_called_with("Copy failed", severity="error")
+
+    async def test_path_modal_displays_directory_and_validation_errors(self) -> None:
+        directory = core.ContentPathInfo(
+            "pack:demo",
+            "server",
+            Path("empty"),
+            Path("packs/demo/content/server/empty"),
+            Path("/repo/packs/demo/content/server/empty"),
+            "directory",
+            0,
+            0o755,
+            True,
+            None,
+            "c" * 64,
+            ("validation warning",),
+        )
+        with self.patches():
+            modal = huroshiki.ContentPathInfoModal(directory)
+            app = _ContentApp(modal)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                message = str(modal.query_one("#content-path-info", Static).content)
+                self.assertIn("Kind: directory", message)
+                self.assertIn("Digest: -", message)
+                self.assertIn("Validation: validation warning", message)
+                await pilot.press("escape")
+
+    async def test_path_stale_error_and_stale_completion_do_not_open_modal(self) -> None:
+        with self.patches(), patch.object(
+            huroshiki.core,
+            "resolve_content_path_info",
+            side_effect=core.ContentPlanStale("stale"),
+        ):
+            screen = huroshiki.ContentScreen("pack:demo")
+            app = _ContentApp(screen)
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                await pilot.press("o")
+                await pilot.pause(0.15)
+                self.assertIs(app.screen, screen)
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def delayed(*_args, **_kwargs):
+            started.set()
+            release.wait(2)
+            return PATH_INFO
+
+        with self.patches(), patch.object(
+            huroshiki.core,
+            "resolve_content_path_info",
+            side_effect=delayed,
+        ):
+            screen = huroshiki.ContentScreen("pack:demo")
+            app = _ContentApp(screen)
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                await pilot.press("o")
+                self.assertTrue(started.wait(1))
+                screen.view_generation += 1
+                release.set()
+                await pilot.pause(0.15)
+                self.assertIs(app.screen, screen)
+
+    async def test_path_resolution_escape_defers_navigation_and_cancels_worker(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        observed_cancel: threading.Event | None = None
+
+        def delayed(*_args, cancel_event, **_kwargs):
+            nonlocal observed_cancel
+            observed_cancel = cancel_event
+            started.set()
+            release.wait(2)
+            raise core.ContentOperationCancelled("cancelled")
+
+        with self.patches(), patch.object(
+            huroshiki.core,
+            "resolve_content_path_info",
+            side_effect=delayed,
+        ):
+            screen = huroshiki.ContentScreen("pack:demo")
+            app = _ContentApp(screen)
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                await pilot.press("o")
+                self.assertTrue(started.wait(1))
+                await pilot.press("escape")
                 self.assertIs(app.screen, screen)
                 self.assertTrue(observed_cancel.is_set())
                 release.set()
@@ -946,6 +1132,44 @@ class ContentCreateModelTest(unittest.TestCase):
             self.assertIsInstance(operation, core.ContentCreateFile)
             self.assertEqual(key, (side, Path(f"{prefix}/demo.js")))
             self.assertEqual(operation.mode, 0o644)
+        typescript, key = huroshiki.content_create_operation(
+            {
+                "kind": "startup",
+                "side": "common",
+                "path": "typed",
+                "extension": ".ts",
+                "mode": "0644",
+                "text": "",
+            }
+        )
+        self.assertIsInstance(typescript, core.ContentCreateFile)
+        self.assertEqual(key, ("common", Path("kubejs/startup_scripts/typed.ts")))
+        explicit_typescript, key = huroshiki.content_create_operation(
+            {
+                "kind": "client",
+                "side": "client",
+                "path": "existing.ts",
+                "extension": ".js",
+                "mode": "0644",
+                "text": "",
+            }
+        )
+        self.assertIsInstance(explicit_typescript, core.ContentCreateFile)
+        self.assertEqual(key, ("client", Path("kubejs/client_scripts/existing.ts")))
+        for kind, path in (
+            ("assets", "example/textures/item.png"),
+            ("data", "example/recipes/item.json"),
+        ):
+            _, key = huroshiki.content_create_operation(
+                {
+                    "kind": kind,
+                    "side": "common",
+                    "path": path,
+                    "mode": "0644",
+                    "text": "",
+                }
+            )
+            self.assertEqual(key, ("common", Path("kubejs") / kind / path))
         directory, _ = huroshiki.content_create_operation(
             {"kind": "directory", "side": "common", "path": "config/empty", "mode": "0755", "text": ""}
         )

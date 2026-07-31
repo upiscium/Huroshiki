@@ -146,6 +146,7 @@ DataTable {
 
 ConfirmModal,
 MessageModal,
+ContentPathInfoModal,
 PublicPackUrlEditModal,
 NewPackModal,
 CreateFromTemplateModal,

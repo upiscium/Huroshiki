@@ -600,6 +600,62 @@ class MessageModal(ModalScreen[None]):
         self.dismiss(None)
 
 
+class ContentPathInfoModal(ModalScreen[None]):
+    BINDINGS = [
+        Binding("a", "copy_absolute", "Copy absolute"),
+        Binding("r", "copy_repository", "Copy repository path"),
+        Binding("enter", "close", "Close"),
+        Binding("escape", "close", "Close"),
+    ]
+
+    def __init__(self, info: core.ContentPathInfo) -> None:
+        super().__init__()
+        self.info = info
+
+    def compose(self) -> ComposeResult:
+        validation = "valid" if not self.info.errors else "\n".join(self.info.errors)
+        lines = (
+            f"Project: {self.info.project_key}",
+            f"Side: {self.info.side}",
+            f"Relative: {self.info.relative_path}",
+            f"Repository path: {self.info.repository_relative_path}",
+            f"Absolute path: {self.info.absolute_path}",
+            f"Kind: {self.info.kind}",
+            f"Bytes: {self.info.size}",
+            f"Mode: {self.info.mode:04o}",
+            f"Executable: {'yes' if self.info.executable else 'no'}",
+            f"Digest: {self.info.digest or '-'}",
+            f"Snapshot: {self.info.snapshot_digest}",
+            f"Validation: {validation}",
+        )
+        with Container(id="modal-dialog", classes="wide-dialog"):
+            yield Static("Content path information", classes="modal-title")
+            yield Static("\n".join(lines), id="content-path-info", markup=False)
+            yield Static("", id="content-path-copy-status", markup=False)
+            yield Static(
+                "a: copy absolute    r: copy repository path    Enter / Esc: close",
+                classes="modal-help",
+            )
+
+    def _copy(self, value: str, label: str) -> None:
+        try:
+            self.app.copy_to_clipboard(value)
+        except BaseException:
+            self.query_one("#content-path-copy-status", Static).update("Copy failed")
+            self.app.notify("Copy failed", severity="error")
+            return
+        self.query_one("#content-path-copy-status", Static).update(f"Copied {label}")
+
+    def action_copy_absolute(self) -> None:
+        self._copy(str(self.info.absolute_path), "absolute path")
+
+    def action_copy_repository(self) -> None:
+        self._copy(str(self.info.repository_relative_path), "repository path")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class PublicPackUrlEditModal(ModalScreen[str | None]):
     BINDINGS = [
         Binding("ctrl+enter", "submit", "Review"),
@@ -2016,18 +2072,27 @@ def content_create_operation(
     path = values["path"].strip()
     mode = _parse_content_mode(values["mode"])
     presets = {
-        "startup": ("common", "kubejs/startup_scripts"),
-        "server": ("server", "kubejs/server_scripts"),
-        "client": ("client", "kubejs/client_scripts"),
+        "startup": ("common", "kubejs/startup_scripts", True),
+        "server": ("server", "kubejs/server_scripts", True),
+        "client": ("client", "kubejs/client_scripts", True),
+        "assets": ("common", "kubejs/assets", False),
+        "data": ("common", "kubejs/data", False),
     }
     if kind in presets:
-        default_side, prefix = presets[kind]
+        default_side, prefix, script = presets[kind]
         if not side:
             side = default_side
-        if "/" not in path:
+        if not path.lower().startswith("kubejs/"):
             path = f"{prefix}/{path}"
-        if not path.lower().endswith(".js"):
-            path += ".js"
+        if script and not path.lower().endswith((".js", ".ts")):
+            extension = values.get("extension", ".js").strip().lower()
+            if not extension.startswith("."):
+                extension = f".{extension}"
+            if extension not in {".js", ".ts"}:
+                raise core.ContentOperationError(
+                    "KubeJS script extension must be .js or .ts"
+                )
+            path += extension
         operation: core.ContentOperation = core.ContentCreateFile(
             side,
             Path(path),
@@ -2045,7 +2110,7 @@ def content_create_operation(
         operation = core.ContentCreateDirectory(side, Path(path), mode)
     else:
         raise core.ContentOperationError(
-            "Content kind must be file, directory, startup, server, or client"
+            "Content kind must be file, directory, startup, server, client, assets, or data"
         )
     return operation, (side, Path(path))
 
@@ -2059,6 +2124,7 @@ class ContentCreateModal(ModalScreen[dict[str, str] | None]):
         "content-create-kind",
         "content-create-side",
         "content-create-path",
+        "content-create-extension",
         "content-create-mode",
     )
 
@@ -2072,19 +2138,21 @@ class ContentCreateModal(ModalScreen[dict[str, str] | None]):
             yield Static("Kind / preset")
             yield Input(
                 value="file",
-                placeholder="file / directory / startup / server / client",
+                placeholder="file / directory / startup / server / client / assets / data",
                 id="content-create-kind",
             )
             yield Static("Side")
             yield Input(value="common", id="content-create-side")
             yield Static("Relative path or preset file name")
             yield Input(placeholder="config/example.toml", id="content-create-path")
+            yield Static("KubeJS script extension")
+            yield Input(value=".js", placeholder=".js / .ts", id="content-create-extension")
             yield Static("Mode")
             yield Input(value="0644", id="content-create-mode")
             yield Static("Initial UTF-8 text")
             yield TextArea("", id="content-create-text")
             yield Static(
-                "Presets create .js files under kubejs startup/server/client scripts. "
+                "Presets cover kubejs startup/server/client scripts plus assets/data. "
                 "Parents are never created implicitly. Ctrl+Enter: preview  Esc: cancel",
                 classes="modal-help",
             )
@@ -2099,6 +2167,8 @@ class ContentCreateModal(ModalScreen[dict[str, str] | None]):
             "startup": "common",
             "server": "server",
             "client": "client",
+            "assets": "common",
+            "data": "common",
         }.get(kind)
         side = self.query_one("#content-create-side", Input)
         if default_side is not None and side.value.strip().lower() == self._preset_side:
@@ -2124,6 +2194,9 @@ class ContentCreateModal(ModalScreen[dict[str, str] | None]):
             "kind": self.query_one("#content-create-kind", Input).value.strip(),
             "side": self.query_one("#content-create-side", Input).value.strip(),
             "path": self.query_one("#content-create-path", Input).value.strip(),
+            "extension": self.query_one(
+                "#content-create-extension", Input
+            ).value.strip(),
             "mode": self.query_one("#content-create-mode", Input).value.strip(),
             "text": self.query_one("#content-create-text", TextArea).text,
         }
@@ -2282,7 +2355,7 @@ class ContentScreen(ProjectChildScreen, FilterListScreen):
     filter_input_id = "content-search"
     filter_table_id = "content-table"
     help_text = (
-        "Tab: focus  Enter/e: edit  c: create  i: import  d: delete  m: move  s: side  "
+        "Tab: focus  Enter/e: edit  c: create  i: import  d: delete  m: move  o: path  s: side  "
         "r: reload  q: clear filter  p/Esc: project"
     )
     SIDES = ("all", "common", "client", "server")
@@ -2300,6 +2373,10 @@ class ContentScreen(ProjectChildScreen, FilterListScreen):
         self.worker_kind: str | None = None
         self.worker_timer: Timer | None = None
         self.pending_destination: Callable[[], None] | None = None
+        self.view_generation = 0
+        self.path_request: tuple[
+            core.ContentBrowseResult, tuple[str, Path], int
+        ] | None = None
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -2338,6 +2415,7 @@ class ContentScreen(ProjectChildScreen, FilterListScreen):
         return True
 
     def start_browser_load(self) -> None:
+        self.view_generation += 1
         if self._start_worker(
             "browser",
             lambda cancel, deadline: core.load_content_browser(
@@ -2358,6 +2436,9 @@ class ContentScreen(ProjectChildScreen, FilterListScreen):
         kind = self.worker_kind
         self.worker = None
         self.worker_kind = None
+        path_request = self.path_request if kind == "path" else None
+        if kind == "path":
+            self.path_request = None
         try:
             result = self.app.finish_content_worker(self.project_key, worker)
         except BaseException as error:
@@ -2367,7 +2448,19 @@ class ContentScreen(ProjectChildScreen, FilterListScreen):
         else:
             if kind == "browser" and isinstance(result, core.ContentBrowseResult):
                 self.result = result
+                self.view_generation += 1
                 self.reload_rows()
+            elif kind == "path" and isinstance(result, core.ContentPathInfo):
+                current = self.current_entry()
+                if (
+                    path_request is not None
+                    and self.result is path_request[0]
+                    and self.view_generation == path_request[2]
+                    and current is not None
+                    and (current.side, current.relative_path) == path_request[1]
+                    and self.pending_destination is None
+                ):
+                    self.app.push_screen(ContentPathInfoModal(result))
             elif kind == "plan" and isinstance(result, core.ContentChangePlan):
                 self.app.register_content_plan(self.project_key, result)
                 if self.pending_destination is not None:
@@ -2474,6 +2567,7 @@ class ContentScreen(ProjectChildScreen, FilterListScreen):
 
     @on(Input.Changed, "#content-search")
     def filter_changed(self, _event: Input.Changed) -> None:
+        self.view_generation += 1
         self.reload_rows()
 
     @on(DataTable.RowHighlighted, "#content-table")
@@ -2519,6 +2613,31 @@ class ContentScreen(ProjectChildScreen, FilterListScreen):
                 self.result.snapshot,
             )
         )
+
+    def show_path_info(self) -> None:
+        entry = self.current_entry()
+        browse = self.result
+        if entry is None or browse is None:
+            self.app.notify("No Content entry is selected", severity="warning")
+            return
+        key = (entry.side, entry.relative_path)
+        self.path_request = (browse, key, self.view_generation)
+        if self._start_worker(
+            "path",
+            lambda cancel, deadline: core.resolve_content_path_info(
+                self.project_key,
+                entry.side,
+                entry.relative_path,
+                expected_snapshot=browse.snapshot,
+                cancel_event=cancel,
+                deadline=deadline,
+            ),
+        ):
+            self.query_one("#content-status", Static).update(
+                "Resolving Content path information..."
+            )
+        else:
+            self.path_request = None
 
     def create_entry(self, values: dict[str, str] | None) -> None:
         if values is None or self.result is None:
@@ -2698,7 +2817,10 @@ class ContentScreen(ProjectChildScreen, FilterListScreen):
             self.request_delete()
         elif key == "m":
             self.move_current()
+        elif key == "o":
+            self.show_path_info()
         elif key == "s":
+            self.view_generation += 1
             self.side_filter = self.SIDES[(self.SIDES.index(self.side_filter) + 1) % len(self.SIDES)]
             self.reload_rows()
         elif key == "r":

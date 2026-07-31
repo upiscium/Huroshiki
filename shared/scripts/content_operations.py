@@ -23,6 +23,7 @@ from overlay_policy import (
     create_overlay_directory,
     delete_overlay_entry,
     inspect_overlay_file,
+    inspect_overlay_entry,
     scan_import_source,
     move_overlay_entry,
     normalize_overlay_relative_path,
@@ -113,6 +114,22 @@ class ContentSnapshot:
     content_identity: PathIdentity
     entries: tuple[ContentSnapshotEntry, ...]
     digest: str
+
+
+@dataclass(frozen=True)
+class ContentPathInfo:
+    project_key: str
+    side: Literal["common", "client", "server"]
+    relative_path: Path
+    repository_relative_path: Path
+    absolute_path: Path
+    kind: Literal["file", "directory", "invalid"]
+    size: int
+    mode: int
+    executable: bool
+    digest: str | None
+    snapshot_digest: str
+    errors: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -662,6 +679,130 @@ def load_content_browser_at(
                 "Content changed while loading the browser; reload Content"
             )
     return ContentBrowseResult(entries, after, analyze_content_conflicts(after))
+
+
+def resolve_content_path_info_at(
+    project_key: str,
+    project_root: Path,
+    repository_root: Path,
+    side: str,
+    relative_path: str | Path,
+    *,
+    expected_snapshot: ContentSnapshot,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> ContentPathInfo:
+    effective_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + CONTENT_OPERATION_TIMEOUT_SECONDS
+    )
+    checkpoint = lambda: _checkpoint(cancel_event, effective_deadline)
+    checkpoint()
+    normalized_side = _normalize_side(side)
+    relative = _normalize_path(relative_path)
+    if expected_snapshot.project_key != project_key:
+        raise ContentPlanStale("Content snapshot belongs to another project")
+    current = content_snapshot_at(project_key, project_root, checkpoint=checkpoint)
+    if not _snapshots_match(current, expected_snapshot):
+        raise ContentPlanStale("Content changed after the browser snapshot; reload Content")
+    expected_entry = next(
+        (
+            entry
+            for entry in expected_snapshot.entries
+            if entry.side == normalized_side and entry.relative_path == relative
+        ),
+        None,
+    )
+    if expected_entry is None:
+        raise ContentOperationError(
+            f"Content entry is not present in the browser snapshot: {normalized_side}/{relative}"
+        )
+    try:
+        inspected = inspect_overlay_entry(
+            project_root / "content",
+            normalized_side,
+            relative,
+            checkpoint=checkpoint,
+        )
+        digest = None
+        if inspected.kind == "file":
+            file = inspect_overlay_file(
+                project_root / "content",
+                normalized_side,
+                relative,
+                checkpoint=checkpoint,
+            )
+            digest = file.digest
+            inspected_values = (
+                file.mode,
+                file.size,
+                file.device,
+                file.inode,
+            )
+        else:
+            inspected_values = (
+                inspected.mode,
+                inspected.size,
+                inspected.device,
+                inspected.inode,
+            )
+    except (OverlayPolicyError, OSError) as error:
+        raise ContentPlanStale(
+            f"Content entry changed while resolving path information: {error}"
+        ) from error
+    expected_values = (
+        expected_entry.mode,
+        expected_entry.size,
+        expected_entry.device,
+        expected_entry.inode,
+    )
+    if expected_entry.kind == "invalid":
+        inspected_values = (
+            inspected.mode,
+            expected_entry.size,
+            inspected.device,
+            inspected.inode,
+        )
+    if (
+        inspected.kind != expected_entry.kind
+        or inspected_values != expected_values
+        or digest != expected_entry.digest
+    ):
+        raise ContentPlanStale(
+            "Content entry changed while resolving path information; reload Content"
+        )
+    after = content_snapshot_at(project_key, project_root, checkpoint=checkpoint)
+    if not _snapshots_match(after, expected_snapshot) or not _snapshots_match(
+        after, current
+    ):
+        raise ContentPlanStale("Content changed while resolving path information")
+    checkpoint()
+    repository_root = Path(os.path.abspath(repository_root))
+    project_root = Path(os.path.abspath(project_root))
+    try:
+        project_relative = project_root.relative_to(repository_root)
+    except ValueError as error:
+        raise ContentOperationError(
+            "Content project root is outside the managed repository"
+        ) from error
+    repository_relative = (
+        project_relative / "content" / normalized_side / relative
+    )
+    return ContentPathInfo(
+        project_key,
+        normalized_side,
+        relative,
+        repository_relative,
+        repository_root / repository_relative,
+        expected_entry.kind,
+        expected_entry.size,
+        expected_entry.mode,
+        bool(expected_entry.mode & 0o111),
+        expected_entry.digest,
+        expected_snapshot.digest,
+        expected_entry.errors,
+    )
 
 
 def detect_content_newline_policy(

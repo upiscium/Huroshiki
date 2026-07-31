@@ -17,6 +17,8 @@
   recursive browser scans remain cancellable. Binary editing remains unsupported.
 - Added bounded local file and directory import for Pack Content, including immutable source
   inspection, overwrite policies, conflict summaries, and transactional preview/apply.
+- Added read-only Pack Content path details and clipboard actions with snapshot-based stale-entry
+  protection, plus TypeScript and assets/data support for KubeJS creation presets.
 
 ### Reliability and Transaction Safety
 
