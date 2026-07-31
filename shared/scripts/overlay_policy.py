@@ -66,9 +66,49 @@ class OverlayScan:
     issues: tuple[OverlayIssue, ...]
 
 
+@dataclass(frozen=True)
+class LocalImportEntry:
+    relative_path: Path
+    kind: Literal["file", "directory", "invalid"]
+    size: int
+    mode: int
+    device: int
+    inode: int
+    mtime_ns: int
+    ctime_ns: int
+    digest: str | None
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LocalImportScan:
+    root: Path
+    kind: Literal["file", "directory", "invalid"]
+    entries: tuple[LocalImportEntry, ...]
+
+
+def _invalidate_local_import_entry(
+    entry: LocalImportEntry,
+    message: str,
+) -> LocalImportEntry:
+    return LocalImportEntry(
+        entry.relative_path,
+        "invalid",
+        entry.size,
+        entry.mode,
+        entry.device,
+        entry.inode,
+        entry.mtime_ns,
+        entry.ctime_ns,
+        entry.digest,
+        entry.errors + (message,),
+    )
+
+
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _RENAME_NOREPLACE = 1
 _RENAME_EXCHANGE = 2
+_STREAM_CHUNK_SIZE = 1024 * 1024
 
 
 @dataclass
@@ -378,6 +418,31 @@ def create_overlay_directory(
             raise OverlayPolicyError(
                 f"Overlay entry already exists: {target}/{relative}"
             ) from error
+
+
+def set_overlay_directory_mode(
+    content_root: Path,
+    target: str,
+    relative_path: str | Path,
+    mode: int,
+) -> None:
+    relative = normalize_overlay_relative_path(relative_path)
+    with _open_overlay_parent(content_root, target, relative, create=False) as parent:
+        directory_fd = _open_directory(relative.name, parent.fd)
+        try:
+            opened = os.fstat(directory_fd)
+            os.fchmod(directory_fd, mode)
+            current = os.stat(
+                relative.name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+                raise OverlayPolicyError(
+                    f"Overlay directory changed while setting mode: {target}/{relative}"
+                )
+        finally:
+            os.close(directory_fd)
 
 
 def write_overlay_bytes(
@@ -1573,3 +1638,412 @@ def copy_content_tree(
             os.close(source_parent_fd)
         os.close(destination_fd)
         os.close(destination_parent_fd)
+
+
+def _inspect_local_import_file(
+    file_fd: int,
+    relative_path: Path,
+    listed: os.stat_result,
+    checkpoint: Callable[[], None] | None,
+) -> LocalImportEntry:
+    opened = os.fstat(file_fd)
+    errors: list[str] = []
+    if not stat.S_ISREG(opened.st_mode):
+        return LocalImportEntry(
+            relative_path, "invalid", 0, stat.S_IMODE(opened.st_mode),
+            opened.st_dev, opened.st_ino, opened.st_mtime_ns, opened.st_ctime_ns,
+            None, ("special filesystem entry is not allowed",),
+        )
+    if (opened.st_dev, opened.st_ino) != (listed.st_dev, listed.st_ino):
+        errors.append("source entry changed while opening")
+    if opened.st_nlink != 1:
+        errors.append("hard-linked source files are not allowed")
+    digest = hashlib.sha256()
+    while True:
+        if checkpoint is not None:
+            checkpoint()
+        chunk = os.read(file_fd, _STREAM_CHUNK_SIZE)
+        if not chunk:
+            break
+        digest.update(chunk)
+    after = os.fstat(file_fd)
+    if (
+        (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino)
+        or opened.st_size != after.st_size
+        or opened.st_mtime_ns != after.st_mtime_ns
+        or opened.st_ctime_ns != after.st_ctime_ns
+    ):
+        errors.append("source file changed while inspecting")
+    return LocalImportEntry(
+        relative_path,
+        "file" if not errors else "invalid",
+        opened.st_size,
+        stat.S_IMODE(opened.st_mode),
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_mtime_ns,
+        opened.st_ctime_ns,
+        digest.hexdigest(),
+        tuple(errors),
+    )
+
+
+def _inspect_local_import_directory(
+    directory_fd: int,
+    relative_path: Path,
+    entries: list[LocalImportEntry],
+    checkpoint: Callable[[], None] | None,
+) -> None:
+    if checkpoint is not None:
+        checkpoint()
+    opened = os.fstat(directory_fd)
+    entries.append(
+        LocalImportEntry(
+            relative_path, "directory", 0, stat.S_IMODE(opened.st_mode),
+            opened.st_dev, opened.st_ino, opened.st_mtime_ns, opened.st_ctime_ns,
+            None,
+        )
+    )
+    try:
+        with os.scandir(directory_fd) as iterator:
+            children = sorted(iterator, key=lambda child: child.name)
+    except OSError as error:
+        entries[-1] = LocalImportEntry(
+            relative_path, "invalid", 0, stat.S_IMODE(opened.st_mode),
+            opened.st_dev, opened.st_ino, opened.st_mtime_ns, opened.st_ctime_ns,
+            None, (f"cannot list source directory: {error}",),
+        )
+        return
+    for child in children:
+        if checkpoint is not None:
+            checkpoint()
+        relative = Path(child.name) if relative_path == Path(".") else relative_path / child.name
+        try:
+            metadata = child.stat(follow_symlinks=False)
+        except OSError as error:
+            entries.append(
+                LocalImportEntry(relative, "invalid", 0, 0, 0, 0, 0, 0, None,
+                                 (f"cannot inspect source entry: {error}",))
+            )
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
+            entries.append(
+                LocalImportEntry(
+                    relative, "invalid", 0, stat.S_IMODE(metadata.st_mode),
+                    metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns,
+                    metadata.st_ctime_ns, None, ("symlink is not allowed",),
+                )
+            )
+        elif stat.S_ISDIR(metadata.st_mode):
+            try:
+                child_fd = _open_directory(child.name, directory_fd)
+            except OSError as error:
+                entries.append(
+                    LocalImportEntry(
+                        relative, "invalid", 0, stat.S_IMODE(metadata.st_mode),
+                        metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns,
+                        metadata.st_ctime_ns, None,
+                        (f"cannot open source directory: {error}",),
+                    )
+                )
+                continue
+            try:
+                current = os.fstat(child_fd)
+                if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+                    entries.append(
+                        LocalImportEntry(
+                            relative, "invalid", 0, stat.S_IMODE(current.st_mode),
+                            current.st_dev, current.st_ino, current.st_mtime_ns,
+                            current.st_ctime_ns, None,
+                            ("source directory changed while opening",),
+                        )
+                    )
+                else:
+                    entry_index = len(entries)
+                    _inspect_local_import_directory(child_fd, relative, entries, checkpoint)
+                    try:
+                        bound = os.stat(
+                            child.name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError:
+                        bound = None
+                    if bound is None or (bound.st_dev, bound.st_ino) != (
+                        current.st_dev,
+                        current.st_ino,
+                    ):
+                        entries[entry_index] = _invalidate_local_import_entry(
+                            entries[entry_index],
+                            "source directory changed while inspecting",
+                        )
+            finally:
+                os.close(child_fd)
+        elif stat.S_ISREG(metadata.st_mode):
+            try:
+                file_fd = os.open(
+                    child.name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                    dir_fd=directory_fd,
+                )
+            except OSError as error:
+                entries.append(
+                    LocalImportEntry(
+                        relative, "invalid", metadata.st_size,
+                        stat.S_IMODE(metadata.st_mode), metadata.st_dev,
+                        metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns,
+                        None, (f"cannot open source file: {error}",),
+                    )
+                )
+                continue
+            try:
+                inspected = _inspect_local_import_file(
+                    file_fd, relative, metadata, checkpoint
+                )
+                try:
+                    bound = os.stat(
+                        child.name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    bound = None
+                if bound is None or (bound.st_dev, bound.st_ino) != (
+                    inspected.device,
+                    inspected.inode,
+                ):
+                    inspected = _invalidate_local_import_entry(
+                        inspected, "source file changed while inspecting"
+                    )
+                entries.append(inspected)
+            finally:
+                os.close(file_fd)
+        else:
+            entries.append(
+                LocalImportEntry(
+                    relative, "invalid", 0, stat.S_IMODE(metadata.st_mode),
+                    metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns,
+                    metadata.st_ctime_ns, None,
+                    ("special filesystem entry is not allowed",),
+                )
+            )
+    current = os.fstat(directory_fd)
+    if (
+        (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        or opened.st_mtime_ns != current.st_mtime_ns
+        or opened.st_ctime_ns != current.st_ctime_ns
+    ):
+        index = next(
+            index for index, entry in enumerate(entries)
+            if entry.relative_path == relative_path
+        )
+        entry = entries[index]
+        entries[index] = LocalImportEntry(
+            entry.relative_path, "invalid", entry.size, entry.mode, entry.device,
+            entry.inode, entry.mtime_ns, entry.ctime_ns, entry.digest,
+            entry.errors + ("source directory changed while inspecting",),
+        )
+
+
+def scan_import_source(
+    source: Path,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> LocalImportScan:
+    if checkpoint is not None:
+        checkpoint()
+    parent_fd = os.open(source.parent, _DIRECTORY_FLAGS)
+    source_fd = -1
+    try:
+        listed = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISLNK(listed.st_mode):
+            entry = LocalImportEntry(
+                Path("."), "invalid", 0, stat.S_IMODE(listed.st_mode),
+                listed.st_dev, listed.st_ino, listed.st_mtime_ns, listed.st_ctime_ns,
+                None, ("symlink is not allowed",),
+            )
+            return LocalImportScan(source, "invalid", (entry,))
+        if stat.S_ISDIR(listed.st_mode):
+            source_fd = _open_directory(source.name, parent_fd)
+            entries: list[LocalImportEntry] = []
+            _inspect_local_import_directory(source_fd, Path("."), entries, checkpoint)
+            try:
+                bound = os.stat(
+                    source.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                bound = None
+            opened = os.fstat(source_fd)
+            if bound is None or (bound.st_dev, bound.st_ino) != (
+                opened.st_dev,
+                opened.st_ino,
+            ):
+                entries[0] = _invalidate_local_import_entry(
+                    entries[0], "source root changed while inspecting"
+                )
+            kind: Literal["file", "directory", "invalid"] = (
+                "invalid" if entries[0].kind == "invalid" else "directory"
+            )
+            return LocalImportScan(source, kind, tuple(entries))
+        if not stat.S_ISREG(listed.st_mode):
+            entry = LocalImportEntry(
+                Path("."), "invalid", 0, stat.S_IMODE(listed.st_mode),
+                listed.st_dev, listed.st_ino, listed.st_mtime_ns, listed.st_ctime_ns,
+                None, ("special filesystem entry is not allowed",),
+            )
+            return LocalImportScan(source, "invalid", (entry,))
+        source_fd = os.open(
+            source.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+            dir_fd=parent_fd,
+        )
+        entry = _inspect_local_import_file(source_fd, Path("."), listed, checkpoint)
+        try:
+            bound = os.stat(
+                source.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            bound = None
+        if bound is None or (bound.st_dev, bound.st_ino) != (
+            entry.device,
+            entry.inode,
+        ):
+            entry = _invalidate_local_import_entry(
+                entry, "source root changed while inspecting"
+            )
+        return LocalImportScan(source, "file" if entry.kind == "file" else "invalid", (entry,))
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        os.close(parent_fd)
+
+
+def _open_import_relative_parent(root_fd: int, relative: Path) -> tuple[int, list[int]]:
+    current = root_fd
+    opened: list[int] = []
+    for part in relative.parts[:-1]:
+        child = _open_directory(part, current)
+        opened.append(child)
+        current = child
+    return current, opened
+
+
+def copy_import_source(
+    expected: LocalImportScan,
+    destination: Path,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> None:
+    if checkpoint is not None:
+        checkpoint()
+    if any(entry.kind == "invalid" or entry.errors for entry in expected.entries):
+        raise OverlayPolicyError("Unsafe local import source cannot be copied")
+    current = scan_import_source(expected.root, checkpoint=checkpoint)
+    if current != expected:
+        raise OverlayPolicyError("Local import source changed after inspection")
+    if destination.exists():
+        raise OverlayPolicyError(f"Import staging destination already exists: {destination}")
+
+    if expected.kind == "directory":
+        destination.mkdir(mode=0o700)
+        directory_modes = [(destination, expected.entries[0].mode)]
+        source_root_fd = os.open(expected.root, _DIRECTORY_FLAGS)
+        try:
+            for entry in expected.entries[1:]:
+                if checkpoint is not None:
+                    checkpoint()
+                target = destination / entry.relative_path
+                if entry.kind == "directory":
+                    target.mkdir(mode=0o700)
+                    directory_modes.append((target, entry.mode))
+                    continue
+                parent_fd, opened = _open_import_relative_parent(
+                    source_root_fd, entry.relative_path
+                )
+                try:
+                    source_fd = os.open(
+                        entry.relative_path.name,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                        dir_fd=parent_fd,
+                    )
+                    try:
+                        _copy_verified_import_file(source_fd, target, entry, checkpoint)
+                    finally:
+                        os.close(source_fd)
+                finally:
+                    for descriptor in reversed(opened):
+                        os.close(descriptor)
+            for directory, mode in reversed(directory_modes):
+                directory.chmod(mode)
+        finally:
+            os.close(source_root_fd)
+    else:
+        source_fd = os.open(
+            expected.root,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+        )
+        try:
+            _copy_verified_import_file(source_fd, destination, expected.entries[0], checkpoint)
+        finally:
+            os.close(source_fd)
+    after = scan_import_source(expected.root, checkpoint=checkpoint)
+    if after != expected:
+        raise OverlayPolicyError("Local import source changed while copying")
+
+
+def _copy_verified_import_file(
+    source_fd: int,
+    destination: Path,
+    expected: LocalImportEntry,
+    checkpoint: Callable[[], None] | None,
+) -> None:
+    opened = os.fstat(source_fd)
+    identity = (opened.st_dev, opened.st_ino)
+    if (
+        identity != (expected.device, expected.inode)
+        or opened.st_size != expected.size
+        or opened.st_mtime_ns != expected.mtime_ns
+        or opened.st_ctime_ns != expected.ctime_ns
+        or opened.st_nlink != 1
+    ):
+        raise OverlayPolicyError(f"Local import source changed: {expected.relative_path}")
+    digest = hashlib.sha256()
+    output_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        expected.mode,
+    )
+    try:
+        while True:
+            if checkpoint is not None:
+                checkpoint()
+            chunk = os.read(source_fd, _STREAM_CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                if checkpoint is not None:
+                    checkpoint()
+                written = os.write(output_fd, view)
+                if written == 0:
+                    raise OSError(errno.EIO, "short local import write")
+                view = view[written:]
+        os.fchmod(output_fd, expected.mode)
+        after = os.fstat(source_fd)
+        if (
+            identity != (after.st_dev, after.st_ino)
+            or opened.st_size != after.st_size
+            or opened.st_mtime_ns != after.st_mtime_ns
+            or opened.st_ctime_ns != after.st_ctime_ns
+            or digest.hexdigest() != expected.digest
+        ):
+            raise OverlayPolicyError(
+                f"Local import source changed while copying: {expected.relative_path}"
+            )
+    finally:
+        os.close(output_fd)

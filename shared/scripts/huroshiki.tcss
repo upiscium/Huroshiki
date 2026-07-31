@@ -149,9 +149,10 @@ MessageModal,
 PublicPackUrlEditModal,
 NewPackModal,
 CreateFromTemplateModal,
-NewTemplateModal,
-ContentCreateModal,
-ContentMoveModal {
+    NewTemplateModal,
+    ContentCreateModal,
+    ContentImportModal,
+    ContentMoveModal {
     align: center middle;
     background: $background 60%;
 }
@@ -173,7 +174,8 @@ ContentMoveModal {
     width: 78;
 }
 
-#modal-dialog Input {
+#modal-dialog Input,
+#modal-dialog Select {
     margin: 0 0 1 0;
 }
 

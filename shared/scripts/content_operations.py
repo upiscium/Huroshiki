@@ -13,16 +13,21 @@ from typing import Callable, Literal, TypeAlias
 
 import packctl
 from overlay_policy import (
+    LocalImportEntry,
+    LocalImportScan,
     OVERLAY_TARGETS,
     OverlayPolicyError,
+    copy_import_source,
     copy_content_tree,
     create_overlay_directory,
     delete_overlay_entry,
     inspect_overlay_file,
+    scan_import_source,
     move_overlay_entry,
     normalize_overlay_relative_path,
     read_overlay_bytes,
     scan_content_overlays,
+    set_overlay_directory_mode,
     write_overlay_bytes,
 )
 from portable_paths import PortablePathError, portable_relative_path_key
@@ -133,7 +138,7 @@ class ContentTextDocument:
 class ContentCreateFile:
     side: str
     relative_path: Path
-    contents: bytes
+    contents: bytes | LocalImportScan
     mode: int = 0o644
 
 
@@ -141,9 +146,71 @@ class ContentCreateFile:
 class ContentReplaceFile:
     side: str
     relative_path: Path
-    contents: bytes
+    contents: bytes | LocalImportScan
     expected_digest: str | None = None
     mode: int | None = None
+
+
+@dataclass(frozen=True)
+class ContentImportSourceEntry:
+    relative_path: Path
+    kind: Literal["file", "directory", "invalid"]
+    mode: int
+    executable: bool
+    size: int
+    digest: str | None
+    device: int
+    inode: int
+    mtime_ns: int
+    ctime_ns: int
+    portable_key: str | None
+    validation_errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ContentImportSourceSnapshot:
+    submitted_path: Path
+    source_path: Path
+    source_kind: Literal["file", "directory", "invalid"]
+    entries: tuple[ContentImportSourceEntry, ...]
+    digest: str
+    files: int
+    directories: int
+    total_bytes: int
+    validation_errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ContentImportRequest:
+    source: ContentImportSourceSnapshot
+    side: str
+    target_relative_path: Path
+    placement: Literal["file", "directory"]
+    overwrite_policy: Literal[
+        "reject",
+        "replace-files",
+        "merge-directories",
+        "merge-and-replace-files",
+    ] = "reject"
+
+
+@dataclass(frozen=True)
+class ContentImportSummary:
+    submitted_source_path: Path
+    source_path: Path
+    source_digest: str
+    files: int
+    directories: int
+    total_bytes: int
+    created: tuple[Path, ...]
+    updated: tuple[Path, ...]
+    unchanged: tuple[Path, ...]
+    rejected: tuple[str, ...]
+    conflicts: tuple[str, ...]
+    overwrite_policy: str
+    side: str
+    target_relative_path: Path
+    placement: str
 
 
 @dataclass(frozen=True)
@@ -726,7 +793,11 @@ def _normalize_operations(
             item: ContentOperation = ContentCreateFile(
                 _normalize_side(operation.side),
                 _normalize_path(operation.relative_path),
-                bytes(operation.contents),
+                (
+                    operation.contents
+                    if isinstance(operation.contents, LocalImportScan)
+                    else bytes(operation.contents)
+                ),
                 _validate_mode(operation.mode),
             )
             target = (item.side, portable_relative_path_key(item.relative_path))
@@ -734,7 +805,11 @@ def _normalize_operations(
             item = ContentReplaceFile(
                 _normalize_side(operation.side),
                 _normalize_path(operation.relative_path),
-                bytes(operation.contents),
+                (
+                    operation.contents
+                    if isinstance(operation.contents, LocalImportScan)
+                    else bytes(operation.contents)
+                ),
                 operation.expected_digest,
                 None if operation.mode is None else _validate_mode(operation.mode),
             )
@@ -799,26 +874,65 @@ def _apply_operation(
 ) -> None:
     try:
         if isinstance(operation, ContentCreateFile):
-            write_overlay_bytes(
-                staging,
-                operation.side,
-                operation.relative_path,
-                operation.contents,
-                mode=operation.mode,
-                create=True,
-                checkpoint=checkpoint,
-            )
+            if isinstance(operation.contents, LocalImportScan):
+                destination = staging / operation.side / operation.relative_path
+                copy_import_source(
+                    operation.contents,
+                    destination,
+                    checkpoint=checkpoint,
+                )
+                destination.chmod(operation.mode)
+            else:
+                write_overlay_bytes(
+                    staging,
+                    operation.side,
+                    operation.relative_path,
+                    operation.contents,
+                    mode=operation.mode,
+                    create=True,
+                    checkpoint=checkpoint,
+                )
         elif isinstance(operation, ContentReplaceFile):
-            write_overlay_bytes(
-                staging,
-                operation.side,
-                operation.relative_path,
-                operation.contents,
-                mode=operation.mode,
-                create=False,
-                expected_digest=operation.expected_digest,
-                checkpoint=checkpoint,
-            )
+            if isinstance(operation.contents, LocalImportScan):
+                current = inspect_overlay_file(
+                    staging,
+                    operation.side,
+                    operation.relative_path,
+                    checkpoint=checkpoint,
+                )
+                if (
+                    operation.expected_digest is not None
+                    and current.digest != operation.expected_digest
+                ):
+                    raise OverlayPolicyError(
+                        "Overlay file digest changed: "
+                        f"{operation.side}/{operation.relative_path}"
+                    )
+                delete_overlay_entry(
+                    staging,
+                    operation.side,
+                    operation.relative_path,
+                    directory=False,
+                )
+                destination = staging / operation.side / operation.relative_path
+                copy_import_source(
+                    operation.contents,
+                    destination,
+                    checkpoint=checkpoint,
+                )
+                if operation.mode is not None:
+                    destination.chmod(operation.mode)
+            else:
+                write_overlay_bytes(
+                    staging,
+                    operation.side,
+                    operation.relative_path,
+                    operation.contents,
+                    mode=operation.mode,
+                    create=False,
+                    expected_digest=operation.expected_digest,
+                    checkpoint=checkpoint,
+                )
         elif isinstance(operation, ContentDeleteFile):
             delete_overlay_entry(
                 staging,
@@ -831,7 +945,7 @@ def _apply_operation(
                 staging,
                 operation.side,
                 operation.relative_path,
-                mode=operation.mode,
+                mode=operation.mode | 0o700,
             )
         elif isinstance(operation, ContentDeleteDirectory):
             delete_overlay_entry(
@@ -847,6 +961,33 @@ def _apply_operation(
                 operation.source_path,
                 operation.destination_side,
                 operation.destination_path,
+            )
+    except (OverlayPolicyError, OSError) as error:
+        raise ContentOperationError(str(error)) from error
+
+
+def _finalize_created_directory_modes(
+    staging: Path,
+    operations: tuple[ContentOperation, ...],
+    checkpoint: Callable[[], None],
+) -> None:
+    directories = sorted(
+        (
+            operation
+            for operation in operations
+            if isinstance(operation, ContentCreateDirectory)
+        ),
+        key=lambda operation: len(operation.relative_path.parts),
+        reverse=True,
+    )
+    try:
+        for operation in directories:
+            checkpoint()
+            set_overlay_directory_mode(
+                staging,
+                operation.side,
+                operation.relative_path,
+                operation.mode,
             )
     except (OverlayPolicyError, OSError) as error:
         raise ContentOperationError(str(error)) from error
@@ -1071,6 +1212,7 @@ class ContentChangePlan:
         self.warnings = tuple(
             conflict for conflict in conflicts if conflict.severity == "warning"
         )
+        self.import_summary: ContentImportSummary | None = None
         self.state = state
         self.cleanup_error: BaseException | None = None
         self._project_lock = project_lock
@@ -1296,6 +1438,455 @@ def _write_plan_file(plan: ContentChangePlan) -> None:
     )
 
 
+def _import_snapshot_digest(entries: tuple[ContentImportSourceEntry, ...]) -> str:
+    payload = [
+        {
+            "path": entry.relative_path.as_posix(),
+            "kind": entry.kind,
+            "mode": entry.mode,
+            "size": entry.size,
+            "digest": entry.digest,
+            "device": entry.device,
+            "inode": entry.inode,
+            "mtime_ns": entry.mtime_ns,
+            "ctime_ns": entry.ctime_ns,
+            "portable": entry.portable_key,
+            "errors": list(entry.validation_errors),
+        }
+        for entry in entries
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _paths_overlap(source: Path, protected: Path, source_is_directory: bool) -> bool:
+    return (
+        source == protected
+        or protected in source.parents
+        or (source_is_directory and source in protected.parents)
+    )
+
+
+def inspect_content_import_source_at(
+    source_path: str | Path,
+    *,
+    repository_root: Path,
+    state_root: Path,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> ContentImportSourceSnapshot:
+    effective_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + CONTENT_OPERATION_TIMEOUT_SECONDS
+    )
+    checkpoint = lambda: _checkpoint(cancel_event, effective_deadline)
+    checkpoint()
+    expanded = Path(os.path.expanduser(os.fspath(source_path)))
+    if not expanded.is_absolute():
+        raise ContentOperationError(
+            "Content import source must be an absolute path (a leading '~' is expanded)"
+        )
+    try:
+        listed = expanded.lstat()
+    except FileNotFoundError as error:
+        raise ContentOperationError(f"Content import source does not exist: {expanded}") from error
+    except OSError as error:
+        raise ContentOperationError(f"Cannot inspect Content import source {expanded}: {error}") from error
+    if stat.S_ISLNK(listed.st_mode):
+        canonical = expanded
+    else:
+        try:
+            canonical = expanded.resolve(strict=True)
+        except OSError as error:
+            raise ContentOperationError(
+                f"Cannot resolve Content import source {expanded}: {error}"
+            ) from error
+    is_directory = stat.S_ISDIR(listed.st_mode)
+    for protected, label in (
+        (repository_root.resolve() / ".git", "repository metadata"),
+        (state_root.resolve(), "state root"),
+    ):
+        if _paths_overlap(canonical, protected, is_directory):
+            raise ContentOperationError(
+                f"Content import source overlaps the Huroshiki {label}: {canonical}"
+            )
+    repository = repository_root.resolve()
+    if canonical == repository or (is_directory and canonical in repository.parents):
+        raise ContentOperationError(
+            f"Content import source dangerously contains the Huroshiki repository: {canonical}"
+        )
+    try:
+        scan = scan_import_source(canonical, checkpoint=checkpoint)
+    except (OSError, OverlayPolicyError) as error:
+        raise ContentOperationError(
+            f"Cannot inspect Content import source {canonical}: {error}"
+        ) from error
+
+    entries: list[ContentImportSourceEntry] = []
+    portable_paths: dict[str, Path] = {}
+    aggregate_errors: list[str] = []
+    for raw in scan.entries:
+        checkpoint()
+        errors = list(raw.errors)
+        portable: str | None = None
+        if raw.relative_path != Path("."):
+            try:
+                normalize_overlay_relative_path(raw.relative_path)
+                portable = portable_relative_path_key(
+                    raw.relative_path, context="Content import source path"
+                )
+            except (OverlayPolicyError, PortablePathError) as error:
+                errors.append(str(error))
+            if portable is not None:
+                previous = portable_paths.get(portable)
+                if previous is not None and previous != raw.relative_path:
+                    message = (
+                        "portable source path collision: "
+                        f"{previous} and {raw.relative_path}"
+                    )
+                    errors.append(message)
+                    aggregate_errors.append(message)
+                else:
+                    portable_paths[portable] = raw.relative_path
+        entry = ContentImportSourceEntry(
+            raw.relative_path,
+            raw.kind if not errors else "invalid",
+            raw.mode,
+            bool(raw.mode & 0o111),
+            raw.size,
+            raw.digest,
+            raw.device,
+            raw.inode,
+            raw.mtime_ns,
+            raw.ctime_ns,
+            portable,
+            tuple(errors),
+        )
+        entries.append(entry)
+        aggregate_errors.extend(
+            f"{raw.relative_path}: {message}" for message in errors
+        )
+    immutable_entries = tuple(entries)
+    source_kind = scan.kind
+    return ContentImportSourceSnapshot(
+        expanded,
+        canonical,
+        source_kind,
+        immutable_entries,
+        _import_snapshot_digest(immutable_entries),
+        sum(entry.kind == "file" for entry in immutable_entries),
+        sum(entry.kind == "directory" for entry in immutable_entries),
+        sum(entry.size for entry in immutable_entries if entry.kind == "file"),
+        tuple(aggregate_errors),
+    )
+
+
+def _local_scan(snapshot: ContentImportSourceSnapshot) -> LocalImportScan:
+    return LocalImportScan(
+        snapshot.source_path,
+        snapshot.source_kind,
+        tuple(
+            LocalImportEntry(
+                entry.relative_path,
+                entry.kind,
+                entry.size,
+                entry.mode,
+                entry.device,
+                entry.inode,
+                entry.mtime_ns,
+                entry.ctime_ns,
+                entry.digest,
+                entry.validation_errors,
+            )
+            for entry in snapshot.entries
+        ),
+    )
+
+
+def plan_content_import_at(
+    project_key: str,
+    project_root: Path,
+    transaction_parent: Path,
+    request: ContentImportRequest,
+    *,
+    expected_snapshot: ContentSnapshot,
+    repository_root: Path,
+    state_root: Path,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> ContentChangePlan:
+    effective_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + CONTENT_OPERATION_TIMEOUT_SECONDS
+    )
+    checkpoint = lambda: _checkpoint(cancel_event, effective_deadline)
+    checkpoint()
+    snapshot = request.source
+    if snapshot.digest != _import_snapshot_digest(snapshot.entries):
+        raise ContentOperationError("Content import source snapshot digest is invalid")
+    side = _normalize_side(request.side)
+    target_root = _normalize_path(request.target_relative_path)
+    if request.placement not in {"file", "directory"}:
+        raise ContentOperationError("Content import placement must be file or directory")
+    if snapshot.source_kind != "invalid" and (snapshot.source_kind, request.placement) not in {
+        ("file", "file"),
+        ("directory", "directory"),
+    }:
+        raise ContentOperationError(
+            "File sources require file placement and directory sources require directory placement"
+        )
+    policies = {
+        "reject", "replace-files", "merge-directories",
+        "merge-and-replace-files",
+    }
+    if request.overwrite_policy not in policies:
+        raise ContentOperationError(f"Unsupported Content import overwrite policy: {request.overwrite_policy}")
+    if snapshot.validation_errors or snapshot.source_kind == "invalid":
+        plan = plan_content_changes_at(
+            project_key,
+            project_root,
+            transaction_parent,
+            (),
+            expected_snapshot=expected_snapshot,
+            deadline=effective_deadline,
+            cancel_event=cancel_event,
+        )
+        plan.import_summary = ContentImportSummary(
+            snapshot.submitted_path,
+            snapshot.source_path,
+            snapshot.digest,
+            snapshot.files,
+            snapshot.directories,
+            snapshot.total_bytes,
+            (),
+            (),
+            (),
+            snapshot.validation_errors,
+            snapshot.validation_errors,
+            request.overwrite_policy,
+            side,
+            target_root,
+            request.placement,
+        )
+        plan.state = "failed"
+        _write_plan_file(plan)
+        return plan
+    canonical_source = snapshot.source_path
+    for protected, label in (
+        (repository_root.resolve() / ".git", "repository metadata"),
+        (state_root.resolve(), "state root"),
+        ((project_root / "content").resolve(), "live Content tree"),
+    ):
+        if _paths_overlap(canonical_source, protected, snapshot.source_kind == "directory"):
+            raise ContentOperationError(
+                f"Content import source overlaps the Huroshiki {label}: {canonical_source}"
+            )
+    repository = repository_root.resolve()
+    if canonical_source == repository or (
+        snapshot.source_kind == "directory" and canonical_source in repository.parents
+    ):
+        raise ContentOperationError(
+            f"Content import source dangerously contains the Huroshiki repository: {canonical_source}"
+        )
+
+    plan = plan_content_changes_at(
+        project_key,
+        project_root,
+        transaction_parent,
+        (),
+        expected_snapshot=expected_snapshot,
+        deadline=effective_deadline,
+        cancel_event=cancel_event,
+    )
+    private_source = plan.transaction_root / "import-source"
+    try:
+        try:
+            copy_import_source(
+                _local_scan(snapshot), private_source, checkpoint=checkpoint
+            )
+        except OverlayPolicyError as error:
+            raise ContentOperationError(str(error)) from error
+        baseline_by_portable = {
+            entry.portable_identity: entry for entry in plan.baseline_snapshot.entries
+        }
+        operations: list[ContentOperation] = []
+        created: list[Path] = []
+        updated: list[Path] = []
+        unchanged: list[Path] = []
+        conflicts: list[str] = []
+
+        required_parents = [
+            parent for parent in reversed(target_root.parents) if parent != Path(".")
+        ]
+        for parent in required_parents:
+            portable = portable_relative_path_key(parent, context="Content import target")
+            existing_parent = baseline_by_portable.get((side, portable))
+            if existing_parent is None:
+                operations.append(ContentCreateDirectory(side, parent, 0o755))
+                created.append(parent)
+            elif existing_parent.kind != "directory":
+                conflicts.append(
+                    f"target parent is not a directory: {side}/{parent}"
+                )
+
+        mapped: list[tuple[ContentImportSourceEntry, Path]] = []
+        if snapshot.source_kind == "file":
+            mapped.append((snapshot.entries[0], target_root))
+        else:
+            mapped.append((snapshot.entries[0], target_root))
+            mapped.extend(
+                (entry, target_root / entry.relative_path)
+                for entry in snapshot.entries[1:]
+            )
+        mapped.sort(key=lambda item: (len(item[1].parts), item[1].as_posix()))
+        for source_entry, target in mapped:
+            checkpoint()
+            target = _normalize_path(target)
+            portable = portable_relative_path_key(target, context="Content import target")
+            existing = baseline_by_portable.get((side, portable))
+            if existing is not None and existing.relative_path != target:
+                conflicts.append(
+                    f"portable target collision: {target} and {existing.relative_path}"
+                )
+                continue
+            if source_entry.kind == "directory":
+                if existing is None:
+                    operations.append(ContentCreateDirectory(side, target, source_entry.mode))
+                    created.append(target)
+                elif existing.kind != "directory":
+                    conflicts.append(f"file/directory type collision at {side}/{target}")
+                elif request.overwrite_policy in {"reject", "replace-files"}:
+                    conflicts.append(f"target directory already exists: {side}/{target}")
+                else:
+                    unchanged.append(target)
+                continue
+            if existing is not None and existing.kind != "file":
+                conflicts.append(f"file/directory type collision at {side}/{target}")
+                continue
+            source_file = private_source if snapshot.source_kind == "file" else private_source / source_entry.relative_path
+            source_scan = scan_import_source(source_file, checkpoint=checkpoint)
+            if existing is None:
+                operations.append(
+                    ContentCreateFile(side, target, source_scan, source_entry.mode)
+                )
+                created.append(target)
+            elif request.overwrite_policy in {"replace-files", "merge-and-replace-files"}:
+                if (
+                    existing.digest == source_entry.digest
+                    and existing.mode == source_entry.mode
+                ):
+                    unchanged.append(target)
+                else:
+                    operations.append(
+                        ContentReplaceFile(
+                            side, target, source_scan, existing.digest or "", source_entry.mode
+                        )
+                    )
+                    updated.append(target)
+            else:
+                conflicts.append(f"target file already exists: {side}/{target}")
+
+        normalized = _normalize_operations(tuple(operations) if not conflicts else ())
+        for operation in normalized:
+            checkpoint()
+            _apply_operation(plan.staging_content, operation, checkpoint)
+        _finalize_created_directory_modes(
+            plan.staging_content,
+            normalized,
+            checkpoint,
+        )
+        staging_scan = scan_content_overlays(
+            plan.staging_content,
+            checkpoint=checkpoint,
+        )
+        if staging_scan.issues:
+            details = "; ".join(
+                f"{issue.relative_path}: {issue.message}"
+                for issue in staging_scan.issues
+            )
+            raise ContentOperationError(
+                f"Staged Content overlay is invalid: {details}"
+            )
+        result = content_snapshot_at(
+            project_key,
+            plan.transaction_root,
+            content_root=plan.staging_content,
+            checkpoint=checkpoint,
+        )
+        plan.operations = normalized
+        plan.result_snapshot = result
+        plan.changes = _changes(plan.baseline_snapshot, result, normalized)
+        plan.conflicts = _conflicts(result)
+        plan.warnings = tuple(
+            conflict for conflict in plan.conflicts if conflict.severity == "warning"
+        )
+        reported_conflicts = tuple(conflicts) + tuple(
+            conflict.message for conflict in plan.conflicts
+        )
+        summary = ContentImportSummary(
+            snapshot.submitted_path,
+            snapshot.source_path,
+            snapshot.digest,
+            snapshot.files,
+            snapshot.directories,
+            snapshot.total_bytes,
+            tuple(created),
+            tuple(updated),
+            tuple(unchanged),
+            snapshot.validation_errors + tuple(conflicts),
+            reported_conflicts,
+            request.overwrite_policy,
+            side,
+            target_root,
+            request.placement,
+        )
+        plan.import_summary = summary
+        plan.state = (
+            "failed"
+            if conflicts
+            or any(conflict.severity == "error" for conflict in plan.conflicts)
+            else "ready"
+        )
+        _write_plan_file(plan)
+        return plan
+    except BaseException as error:
+        discard = plan.begin_discard(
+            deadline=time.monotonic() + CONTENT_DISCARD_TIMEOUT_SECONDS
+        )
+        discard.run()
+        try:
+            discard.raise_for_error()
+        except BaseException as cleanup_error:
+            retained_error = (
+                f"{error}; Content import cleanup failed: {cleanup_error}"
+            )
+            plan.cleanup_error = cleanup_error
+            plan.state = "failed"
+            plan.import_summary = ContentImportSummary(
+                snapshot.submitted_path,
+                snapshot.source_path,
+                snapshot.digest,
+                snapshot.files,
+                snapshot.directories,
+                snapshot.total_bytes,
+                (),
+                (),
+                (),
+                (retained_error,),
+                (retained_error,),
+                request.overwrite_policy,
+                side,
+                target_root,
+                request.placement,
+            )
+            _write_plan_file(plan)
+            return plan
+        raise
+
+
 def plan_content_changes_at(
     project_key: str,
     project_root: Path,
@@ -1368,6 +1959,7 @@ def plan_content_changes_at(
         for operation in normalized:
             checkpoint()
             _apply_operation(staging, operation, checkpoint)
+        _finalize_created_directory_modes(staging, normalized, checkpoint)
         checkpoint()
         staging_scan = scan_content_overlays(staging, checkpoint=checkpoint)
         if staging_scan.issues:
