@@ -20,6 +20,14 @@
 - Added read-only Pack Content path details and clipboard actions with snapshot-based stale-entry
   protection, plus TypeScript and assets/data support for KubeJS creation presets.
 
+### Provider Search
+
+- Added CurseForge project search and strict numeric/project-URL resolution through the isolated
+  provider helper. Install results carry canonical numeric project IDs with title, author, and
+  description; labels and slugs are never reused as identity. Requests require
+  `HUROSHIKI_CURSEFORGE_API_KEY`, keep it in the API header, enforce Minecraft/loader filters,
+  bounded responses and redirects, and retain the shared cancellation/deadline process lifecycle.
+
 ### Reliability and Transaction Safety
 
 - Added the core snapshot and transaction foundation for copy-based Pack migration. It safely scans

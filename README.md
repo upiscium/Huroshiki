@@ -97,16 +97,19 @@ use canonical provider/project identity, preserve existing locations, union side
 version/download/update disagreements plus portable metadata-path or JAR-filename collisions. URL
 roots continue to use bounded downloads and do not acquire an implicit Packwiz dependency closure.
 Modrinth IDs, slugs, and project URLs are resolved through the Modrinth API before Packwiz runs.
-CurseForge automation requires a numeric project ID; an interactive result without an explicit
-project/addon ID fails closed rather than guessing from its display name.
-Modrinth identity and search requests run through the isolated `provider_lookup.py` helper, so the
+CurseForge accepts numeric project IDs and strict CurseForge project URLs; name searches return
+explicit candidates and never infer identity from a display label or ambiguous slug. Set
+`HUROSHIKI_CURSEFORGE_API_KEY` in the Huroshiki environment to enable CurseForge search and URL
+resolution. The key is sent only in the CurseForge API request header.
+Provider identity and search requests run through the isolated `provider_lookup.py` helper, so the
 same cancellation, absolute deadline, and orphan-process checks used for Packwiz also bound DNS,
-connection, TLS, and response waits. CurseForge provider search is not available; use its numeric ID.
-The Install screen searches Modrinth through that provider API and displays each canonical project
+connection, TLS, and response waits. The Install screen searches Modrinth and CurseForge through
+that provider API and displays each canonical project
 ID before selection. It then gives the selected ID to the noninteractive closure resolver; Packwiz
 menu labels are never interpreted as identities. Bare Modrinth input is always a search query,
 including a single word; use `mr:<ID-or-slug>` or a Modrinth project URL for exact lookup.
-CurseForge Install accepts numeric IDs only.
+Bare CurseForge input is also a search query; use `cf:<numeric-ID>`, a numeric ID while CurseForge
+is selected, or a CurseForge project URL for exact lookup.
 Noninteractive Modrinth and CurseForge closure resolvers run in isolated process groups: cancellation
 or their monotonic deadline stops the whole group with SIGTERM and then SIGKILL after a bounded grace
 period. URL roots keep their existing interruptible download cancellation and network timeouts; the

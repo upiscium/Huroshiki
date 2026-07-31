@@ -811,11 +811,17 @@ class ProviderSearchOperation:
         query: str,
         minecraft: str,
         loader: str,
+        deadline: float | None = None,
     ) -> None:
         self.provider = provider
         self.query = query
         self.minecraft = minecraft
         self.loader = loader
+        self.deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + PROVIDER_LOOKUP_TIMEOUT_SECONDS
+        )
         self.cancel_event = threading.Event()
         self.done = threading.Event()
         self.cancelled = False
@@ -830,6 +836,7 @@ class ProviderSearchOperation:
                 minecraft=self.minecraft,
                 loader=self.loader,
                 cancel_event=self.cancel_event,
+                deadline=self.deadline,
             )
         except Exception as error:
             self.error = str(error)
@@ -2719,26 +2726,6 @@ def normalize_add_selector(provider: str, query: str) -> tuple[str, str]:
     return normalized_provider, selector
 
 
-def _curseforge_project_reference(selector: str) -> tuple[str, str | None]:
-    value = selector.strip()
-    if value.lower().startswith("cf:"):
-        value = value[3:].strip()
-    if value.isdecimal():
-        return value, value
-    parsed = urlparse(value)
-    if parsed.scheme or parsed.netloc:
-        if parsed.scheme != "https" or parsed.hostname not in {
-            "curseforge.com",
-            "www.curseforge.com",
-        }:
-            raise HuroshikiError(f"Invalid CurseForge project URL: {selector!r}")
-        parts = [unquote(part).strip() for part in parsed.path.split("/") if part]
-        if len(parts) != 3 or parts[:2] != ["minecraft", "mc-mods"] or not parts[2]:
-            raise HuroshikiError(f"Invalid CurseForge project URL: {selector!r}")
-        return parts[2], None
-    return value, None
-
-
 PROVIDER_LOOKUP_TIMEOUT_SECONDS = 30
 
 
@@ -2756,6 +2743,35 @@ def _provider_protocol_text(
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise HuroshikiError(f"Provider lookup returned control characters in {key}")
     return value
+
+
+def _provider_protocol_mapping(
+    record: object,
+    *,
+    fields: set[str],
+    context: str,
+) -> dict[str, object]:
+    if not isinstance(record, dict) or set(record) != fields:
+        raise HuroshikiError(f"Provider lookup returned an invalid {context}")
+    return record
+
+
+def _provider_protocol_project_id(provider: str, record: object) -> str:
+    project_id = _provider_protocol_text(record, "project_id")
+    if provider == "curseforge":
+        try:
+            return canonical_curseforge_project_id(project_id)
+        except HuroshikiError as error:
+            raise HuroshikiError(
+                "Provider lookup returned an invalid CurseForge project ID"
+            ) from error
+    return project_id
+
+
+def canonical_curseforge_project_id(value: str) -> str:
+    if not value.isdecimal() or len(value) > 20 or int(value) <= 0:
+        raise HuroshikiError("CurseForge project ID must be a positive decimal value")
+    return str(int(value))
 
 
 def _run_provider_lookup(
@@ -2815,15 +2831,28 @@ def resolve_project_selector(
     if cancel_event is not None and cancel_event.is_set():
         raise HuroshikiError("Provider lookup was cancelled")
     normalized_provider, normalized_selector = normalize_add_selector(provider, selector)
-    if normalized_provider == "modrinth":
+    if normalized_provider == "curseforge" and normalized_selector.isdecimal():
+        project_id = canonical_curseforge_project_id(normalized_selector)
+        return ResolvedSelector(
+            normalized_provider,
+            selector,
+            project_id,
+            project_id,
+        )
+    if normalized_provider in {"modrinth", "curseforge"}:
         record = _run_provider_lookup(
-            ["modrinth", "resolve", normalized_selector],
+            [normalized_provider, "resolve", normalized_selector],
             cancel_event=cancel_event,
             deadline=deadline,
         )
-        if not isinstance(record, dict) or record.get("provider") != "modrinth":
+        record = _provider_protocol_mapping(
+            record,
+            fields={"provider", "project_id", "slug", "title"},
+            context="resolved project",
+        )
+        if record.get("provider") != normalized_provider:
             raise HuroshikiError("Provider lookup returned an invalid provider")
-        project_id = _provider_protocol_text(record, "project_id")
+        project_id = _provider_protocol_project_id(normalized_provider, record)
         title = _provider_protocol_text(record, "title")
         _provider_protocol_text(record, "slug")
         return ResolvedSelector(
@@ -2832,9 +2861,6 @@ def resolve_project_selector(
             project_id,
             title,
         )
-    if normalized_provider == "curseforge":
-        label, project_id = _curseforge_project_reference(normalized_selector)
-        return ResolvedSelector(normalized_provider, selector, project_id, label)
     return ResolvedSelector(normalized_provider, selector, None, normalized_selector)
 
 
@@ -2849,17 +2875,13 @@ def search_provider_projects(
     deadline: float | None = None,
 ) -> tuple[ProviderProject, ...]:
     normalized_provider = canonical_provider(provider)
-    if normalized_provider == "curseforge":
-        raise HuroshikiError(
-            "CurseForge search is unavailable; enter a numeric project ID."
-        )
-    if normalized_provider != "modrinth":
+    if normalized_provider not in {"modrinth", "curseforge"}:
         raise HuroshikiError(f"Provider search is unavailable for {provider}")
     if not 1 <= limit <= 50:
         raise HuroshikiError("Provider search limit must be between 1 and 50")
     record = _run_provider_lookup(
         [
-            "modrinth",
+            normalized_provider,
             "search",
             query,
             "--minecraft",
@@ -2872,7 +2894,12 @@ def search_provider_projects(
         cancel_event=cancel_event,
         deadline=deadline,
     )
-    if not isinstance(record, dict) or record.get("provider") != "modrinth":
+    record = _provider_protocol_mapping(
+        record,
+        fields={"provider", "results"},
+        context="search response",
+    )
+    if record.get("provider") != normalized_provider:
         raise HuroshikiError("Provider lookup returned an invalid provider")
     raw_results = record.get("results")
     if not isinstance(raw_results, list) or len(raw_results) > limit:
@@ -2880,9 +2907,20 @@ def search_provider_projects(
     projects: list[ProviderProject] = []
     identities: set[str] = set()
     for item in raw_results:
+        item = _provider_protocol_mapping(
+            item,
+            fields={
+                "project_id",
+                "slug",
+                "title",
+                "description",
+                "author",
+            },
+            context="search result",
+        )
         project = ProviderProject(
-            "modrinth",
-            _provider_protocol_text(item, "project_id"),
+            normalized_provider,
+            _provider_protocol_project_id(normalized_provider, item),
             _provider_protocol_text(item, "slug"),
             _provider_protocol_text(item, "title"),
             _provider_protocol_text(item, "description", required=False),

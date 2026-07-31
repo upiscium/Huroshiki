@@ -4881,7 +4881,9 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         }
         placeholders = {
             "modrinth": "Search; use mr:<ID-or-slug> or a Modrinth URL for exact lookup",
-            "curseforge": "Numeric CurseForge project ID",
+            "curseforge": (
+                "Search; use cf:<numeric-ID> or a CurseForge project URL for exact lookup"
+            ),
             "url": "Public URL of the self-hosted MOD JAR",
         }
         self.query_one("#provider-label", Static).update(
@@ -5063,38 +5065,41 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             self.app.notify(str(error), severity="error")
             return
 
-        if normalized_provider == "curseforge" and not normalized_query.isdecimal():
-            message = (
-                "CurseForge search is unavailable. "
-                "Enter a numeric CurseForge project ID."
-            )
-            self.set_status(message)
-            self.app.notify(message, severity="warning")
-            return
+        exact_curseforge_selector = normalized_provider == "curseforge" and (
+            normalized_query.isdecimal() or "curseforge.com/" in lowered_query
+        )
 
         event.input.disabled = True
-        if normalized_provider == "modrinth" and not exact_modrinth_selector:
+        if normalized_provider in {"modrinth", "curseforge"} and not (
+            exact_modrinth_selector or exact_curseforge_selector
+        ):
             minecraft, loader, _ = core.packctl.project_versions(
                 self.transaction().source
             )
             operation = core.ProviderSearchOperation(
-                provider="modrinth",
+                provider=normalized_provider,
                 query=normalized_query,
                 minecraft=minecraft,
                 loader=loader,
             )
             self.operation = operation
             self.state = "searching"
-            self.set_status("Searching Modrinth...")
+            provider_label = (
+                "CurseForge" if normalized_provider == "curseforge" else "Modrinth"
+            )
+            self.set_status(f"Searching {provider_label}...")
             target = self._run_search
         else:
-            canonical_id = (
-                normalized_query if normalized_provider == "curseforge" else None
-            )
             try:
+                canonical_id = (
+                    core.canonical_curseforge_project_id(normalized_query)
+                    if normalized_provider == "curseforge"
+                    and normalized_query.isdecimal()
+                    else None
+                )
                 self._start_resolved_operation(
                     provider=normalized_provider,
-                    selector=normalized_query,
+                    selector=canonical_id or normalized_query,
                     canonical_project_id=canonical_id,
                 )
             except Exception as error:
@@ -5227,7 +5232,10 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             )
             self.query_one("#search-results-table", DataTable).focus()
         else:
-            self.set_status("Modrinth returned no matching projects")
+            provider_label = (
+                "CurseForge" if operation.provider == "curseforge" else "Modrinth"
+            )
+            self.set_status(f"{provider_label} returned no matching projects")
             search.focus()
 
     def _run_operation(
