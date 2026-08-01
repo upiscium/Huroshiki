@@ -531,24 +531,40 @@ class AddTransactionTest(unittest.TestCase):
                 )
             self.assertEqual(closure.root_identity, ("curseforge", "12345"))
 
-        for selector in (
-            "search terms",
-            "https://www.curseforge.com/minecraft/mc-mods/example",
-        ):
-            with self.subTest(selector=selector), patch.object(
-                core.subprocess, "run"
-            ) as run:
-                with self.assertRaisesRegex(
-                    core.HuroshikiError, "Canonical project ID is unavailable"
-                ):
-                    core.resolve_mod_closure(
-                        provider="curseforge",
-                        selector=selector,
-                        minecraft="1.21.1",
-                        loader="neoforge",
-                        loader_version="21.1.234",
-                    )
-                run.assert_not_called()
+        lookup_result = {
+            "provider": "curseforge",
+            "project_id": "12345",
+            "slug": "example",
+            "title": "Example",
+        }
+        with patch.object(
+            core, "_run_provider_lookup", return_value=lookup_result
+        ), patch.object(core.subprocess, "run", side_effect=run):
+            closure = core.resolve_mod_closure(
+                provider="curseforge",
+                selector="https://www.curseforge.com/minecraft/mc-mods/example",
+                minecraft="1.21.1",
+                loader="neoforge",
+                loader_version="21.1.234",
+            )
+        self.assertEqual(closure.root_identity, ("curseforge", "12345"))
+
+        with patch.object(
+            core,
+            "_run_provider_lookup",
+            side_effect=core.HuroshikiError(
+                "CurseForge resolve requires a numeric project ID or project URL"
+            ),
+        ), patch.object(core.subprocess, "run") as process:
+            with self.assertRaisesRegex(core.HuroshikiError, "numeric project ID"):
+                core.resolve_mod_closure(
+                    provider="curseforge",
+                    selector="search terms",
+                    minecraft="1.21.1",
+                    loader="neoforge",
+                    loader_version="21.1.234",
+                )
+            process.assert_not_called()
 
     def test_resolved_add_failure_restores_existing_staged_changes(self) -> None:
         transaction = core.PackTransaction.create(self.key)

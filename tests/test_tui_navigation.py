@@ -1034,7 +1034,49 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.2)
                 self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
 
-    async def test_curseforge_name_search_is_rejected_before_worker(self) -> None:
+    async def test_curseforge_name_search_keeps_canonical_project_id(self) -> None:
+        projects = (
+            core.ProviderProject(
+                "curseforge",
+                "328085",
+                "create",
+                "Create",
+                "Aesthetic Technology",
+                "simibubi",
+            ),
+        )
+        transaction = _InstallTransaction()
+        with self.patches(), patch.object(
+            huroshiki.core.packctl,
+            "project_versions",
+            return_value=("1.21.1", "neoforge", "21.1.0"),
+        ), patch.object(
+            huroshiki.core, "search_provider_projects", return_value=projects
+        ) as search:
+            screen = huroshiki.InstallScreen("pack:demo")
+            screen.provider = "curseforge"
+            app = _NavigationApp(screen)
+            app.transactions["pack:demo"] = transaction
+            async with app.run_test() as pilot:
+                field = screen.query_one("#mod-search", Input)
+                field.value = "Create"
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+                self.assertEqual(screen.state, "showing_results")
+                self.assertEqual(screen.search_results[0].provider, "curseforge")
+                self.assertEqual(screen.search_results[0].project_id, "328085")
+                self.assertIn("simibubi", screen.search_results[0].subtitle)
+                self.assertIn("Aesthetic Technology", screen.search_results[0].subtitle)
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+        self.assertEqual(search.call_args.args[:2], ("curseforge", "Create"))
+        self.assertEqual(transaction.resolved_calls[0]["provider"], "curseforge")
+        self.assertEqual(transaction.resolved_calls[0]["selector"], "328085")
+        self.assertEqual(
+            transaction.resolved_calls[0]["canonical_project_id"], "328085"
+        )
+
+    async def test_numeric_curseforge_id_bypasses_name_search(self) -> None:
         transaction = _InstallTransaction()
         with self.patches(), patch.object(
             huroshiki.core, "search_provider_projects"
@@ -1045,11 +1087,14 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
             app.transactions["pack:demo"] = transaction
             async with app.run_test() as pilot:
                 field = screen.query_one("#mod-search", Input)
-                field.value = "Create"
+                field.value = "000328085"
                 await pilot.press("enter")
-                await pilot.pause()
-                self.assertIn("numeric CurseForge", str(screen.query_one("#packwiz-status").render()))
+                await pilot.pause(0.2)
         search.assert_not_called()
+        self.assertEqual(transaction.resolved_calls[0]["selector"], "328085")
+        self.assertEqual(
+            transaction.resolved_calls[0]["canonical_project_id"], "328085"
+        )
 
 
 if __name__ == "__main__":
