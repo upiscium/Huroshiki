@@ -553,11 +553,20 @@ class PackMigrationPlan:
             "not-published", "published", "uncertain"
         ] = "not-published"
         self._published_identity: tuple[int, int] | None = None
+        self.operation_id = uuid4().hex
         self.resolution: PackMigrationResolutionDiagnostic | None = None
         self._resolver_work_root: Path | None = None
         self._resolver_work_identity: tuple[int, int] | None = None
         self._resolved_staging_digest: str | None = None
         self._provenance_committed = False
+        self._resolution_attempt = 0
+        self._resolution_input_digest: str | None = None
+        self._active_resolution_request: object | None = None
+        self._previous_resolution: PackMigrationResolutionDiagnostic | None = None
+        self._explicit_removed_roots: tuple[str, ...] = ()
+        self._explicit_replaced_roots: tuple[tuple[str, str], ...] = ()
+        self._conflict_removed_roots: tuple[object, ...] = ()
+        self._conflict_replaced_roots: tuple[object, ...] = ()
         self._lock = threading.RLock()
 
     @property
@@ -680,7 +689,12 @@ def _source_versions(snapshot: PackMigrationSourceSnapshot) -> tuple[str, str, s
 def _write_plan_file(plan: PackMigrationPlan, repository_root: Path) -> None:
     transaction_relative = plan.transaction_root.relative_to(repository_root)
     payload = {
-        "schema": 2 if plan.resolution is not None else 1,
+        "schema": (
+            3
+            if plan._resolution_attempt > 0
+            else 2 if plan.resolution is not None else 1
+        ),
+        "operation_id": plan.operation_id,
         "source": plan.source_key,
         "target": {
             "id": plan.target.target_id,
@@ -721,6 +735,19 @@ def _write_plan_file(plan: PackMigrationPlan, repository_root: Path) -> None:
             plan.resolution.diagnostic_summary()
             if plan.resolution is not None
             else None
+        ),
+        "resolution_attempt": plan._resolution_attempt,
+        "explicit_resolutions": {
+            "removed": list(plan._explicit_removed_roots),
+            "replaced": [
+                {"from": old, "to": new}
+                for old, new in plan._explicit_replaced_roots
+            ],
+        },
+        "remaining_unresolved": (
+            len(getattr(plan.resolution, "unresolved_roots", ()))
+            if plan.resolution is not None
+            else 0
         ),
         "cleanup_incomplete": plan.cleanup_error is not None,
     }

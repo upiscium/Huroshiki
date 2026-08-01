@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import stat
@@ -143,6 +143,8 @@ class PackMigrationProgress:
         "building-closure",
         "refreshing",
         "validating-target",
+        "validating-resolutions",
+        "applying-resolutions",
         "classifying",
         "committing",
         "cleaning-up",
@@ -229,8 +231,10 @@ def _create_workspace(plan: PackMigrationPlan) -> Path:
         opened = os.fstat(transaction_fd)
         if (opened.st_dev, opened.st_ino) != plan._transaction_identity:
             raise PackMigrationStale("Pack migration transaction root was replaced")
-        os.mkdir("resolver-work", 0o700, dir_fd=transaction_fd)
-        workspace_fd = os.open("resolver-work", _DIRECTORY_FLAGS, dir_fd=transaction_fd)
+        attempt = int(getattr(plan, "_resolution_attempt", 0))
+        name = f"resolver-work-attempt-{attempt:04d}"
+        os.mkdir(name, 0o700, dir_fd=transaction_fd)
+        workspace_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=transaction_fd)
         try:
             workspace = os.fstat(workspace_fd)
             plan._resolver_work_identity = (workspace.st_dev, workspace.st_ino)
@@ -238,7 +242,7 @@ def _create_workspace(plan: PackMigrationPlan) -> Path:
             os.close(workspace_fd)
     finally:
         os.close(transaction_fd)
-    plan._resolver_work_root = plan.transaction_root / "resolver-work"
+    plan._resolver_work_root = plan.transaction_root / name
     return plan._resolver_work_root
 
 
@@ -948,8 +952,9 @@ def commit_pack_migration_root_selection_at(
         return tuple(sorted(records, key=lambda record: record.canonical_identity))
 
 
-def resolve_pack_migration_plan_at(
+def _resolve_effective_root_set(
     plan: PackMigrationPlan,
+    roots: tuple[PackMigrationRoot, ...] | None = None,
     *,
     repository_root: Path,
     state_root: Path,
@@ -965,7 +970,8 @@ def resolve_pack_migration_plan_at(
     )
     checkpoint = lambda: _checkpoint(cancel_event, effective_deadline)
     with plan._lock:
-        if plan.state != "staged":
+        conflict_retry = roots is not None and getattr(plan, "_active_resolution_request", None) is not None
+        if plan.state != "staged" and not (conflict_retry and plan.state == "resolving"):
             raise PackMigrationResolutionError(
                 f"Pack migration resolution requires staged state, not {plan.state}"
             )
@@ -974,6 +980,8 @@ def resolve_pack_migration_plan_at(
             f"pack:{plan.target.target_id}",
         }:
             raise PackMigrationResolutionError("Pack migration locks are not fully owned")
+        if not hasattr(plan, "_resolution_attempt"):
+            plan._resolution_attempt = 0
         plan._state = "resolving"
         _progress(progress, PackMigrationProgress("validating", 0, 1, None, "Validating plan"))
         resolver_workspace_fd = -1
@@ -1018,13 +1026,17 @@ def resolve_pack_migration_plan_at(
             ):
                 raise PackMigrationStale("Detached Packwiz source was replaced")
             try:
-                roots = extract_pack_migration_roots(
+                original_roots = extract_pack_migration_roots(
                     detached_source,
                     expected_identity=detached_source_scan.root_identity,
                     expected_snapshot_digest=detached_source_scan.snapshot_digest,
                     checkpoint=checkpoint,
                 )
             except PackMigrationRootManifestMissing:
+                original_roots = None
+            if roots is None and original_roots is not None:
+                roots = original_roots
+            if original_roots is None:
                 candidates = extract_pack_migration_root_candidates(
                     detached_source,
                     expected_identity=detached_source_scan.root_identity,
@@ -1069,6 +1081,7 @@ def resolve_pack_migration_plan_at(
                 plan._state = "resolution-required"
                 _record_plan_diagnostic(plan)
                 return result
+            roots = tuple(roots)
             workspace = _create_workspace(plan)
             resolver_workspace_fd = os.open(workspace, _DIRECTORY_FLAGS)
             opened_workspace = os.fstat(resolver_workspace_fd)
@@ -1287,7 +1300,9 @@ def resolve_pack_migration_plan_at(
                     "Built resolved root closures",
                 ),
             )
-            source_roots = {root.canonical_identity for root in roots}
+            source_roots = {
+                root.canonical_identity for root in (original_roots or roots)
+            }
             before = _metadata_entries(detached_source, source_roots, checkpoint)
             if unresolved:
                 _validate_detached_snapshot(plan, checkpoint)
@@ -1423,6 +1438,220 @@ def resolve_pack_migration_plan_at(
                 os.close(resolver_workspace_fd)
 
 
+def resolve_pack_migration_plan_at(
+    plan: PackMigrationPlan,
+    *,
+    repository_root: Path,
+    state_root: Path,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[[PackMigrationProgress], None] | None = None,
+) -> PackMigrationResolutionPlan:
+    """Run the initial, provenance-aware migration resolution."""
+    return _resolve_effective_root_set(
+        plan,
+        None,
+        repository_root=repository_root,
+        state_root=state_root,
+        cancel_event=cancel_event,
+        deadline=deadline,
+        progress=progress,
+    )
+
+
+def resolve_pack_migration_conflicts_at(
+    plan: PackMigrationPlan,
+    request: "PackMigrationResolutionRequest",
+    *,
+    repository_root: Path,
+    state_root: Path,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[[PackMigrationProgress], None] | None = None,
+) -> "PackMigrationConflictResolutionResult":
+    """Apply a pure conflict choice by resolving its effective roots afresh."""
+    from pack_migration_conflicts import (
+        PackMigrationConflictResolutionError,
+        PackMigrationConflictResolutionResult,
+        validate_resolution_request,
+    )
+
+    # Validation is deliberately the first operation under the plan lock.  In
+    # particular, it must not emit progress or inspect a path before rejecting
+    # a stale/user-forged request.
+    with plan._lock:
+        validated = validate_resolution_request(plan, request)
+        effective_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + PACK_MIGRATION_TIMEOUT_SECONDS
+        )
+        checkpoint = lambda: _checkpoint(cancel_event, effective_deadline)
+        _progress(
+            progress,
+            PackMigrationProgress(
+                "validating-resolutions",
+                0,
+                1,
+                None,
+                "Validating resolutions",
+            ),
+        )
+        try:
+            checkpoint()
+            import huroshiki_core as core
+
+            for replacement in validated.replaced_roots:
+                if replacement.replacement_root.provider != "modrinth":
+                    continue
+                try:
+                    selector = core.resolve_project_selector(
+                        "modrinth",
+                        replacement.replacement_root.project_id,
+                        cancel_event=cancel_event,
+                        deadline=effective_deadline,
+                    )
+                except Exception as error:
+                    if _operation_failure(error):
+                        raise
+                    # Missing or incompatible projects remain user-level
+                    # unresolved outcomes in the fresh resolver attempt.
+                    continue
+                if (
+                    selector.canonical_project_id
+                    != replacement.replacement_root.project_id
+                ):
+                    raise PackMigrationConflictResolutionError(
+                        "Modrinth replacement must use its canonical project ID"
+                    )
+        except PackMigrationConflictResolutionError:
+            raise
+        except BaseException as error:
+            plan._state = "failed"
+            plan.cleanup_error = error
+            _record_plan_diagnostic(plan)
+            raise
+        previous = plan.resolution
+        plan._active_resolution_request = request
+        plan._previous_resolution = previous
+        plan._resolution_input_digest = request.resolution_snapshot_digest
+        plan._resolution_attempt = int(getattr(plan, "_resolution_attempt", 0)) + 1
+        plan._state = "resolving"
+        try:
+            checkpoint()
+            if _identity(plan.transaction_root) != plan._transaction_identity:
+                raise PackMigrationStale("Pack migration transaction root was replaced")
+            _validate_detached_snapshot(plan, checkpoint)
+            _validate_live_source(plan, repository_root, cancel_event, effective_deadline)
+            staging = scan_pack_migration_source(plan.target_staging_root, checkpoint=checkpoint)
+            if (
+                staging.snapshot_digest != plan._staging_snapshot_digest
+                or staging.root_identity != plan._staging_identity
+            ):
+                raise PackMigrationStale("Target staging changed before conflict resolution")
+            _progress(
+                progress,
+                PackMigrationProgress(
+                    "applying-resolutions",
+                    0,
+                    len(validated.effective_roots),
+                    None,
+                    "Applying resolutions",
+                ),
+            )
+            result = _resolve_effective_root_set(
+                plan,
+                tuple(validated.effective_roots),
+                repository_root=repository_root,
+                state_root=state_root,
+                cancel_event=cancel_event,
+                deadline=effective_deadline,
+                progress=progress,
+            )
+            cumulative_removed = tuple(
+                {
+                    item.source_root.canonical_identity: item
+                    for item in (
+                        plan._conflict_removed_roots + validated.removed_roots
+                    )
+                }.values()
+            )
+            cumulative_replaced = tuple(
+                {
+                    item.old_identity: item
+                    for item in (
+                        plan._conflict_replaced_roots + validated.replaced_roots
+                    )
+                }.values()
+            )
+            replacement_changes = tuple(
+                (item.old_identity, item.new_identity)
+                for item in cumulative_replaced
+            )
+            result = replace(
+                result,
+                identity_changes=tuple(
+                    dict.fromkeys(result.identity_changes + replacement_changes)
+                ),
+            )
+            plan.resolution = result
+            plan._state = result.state
+            explicit_identities = {
+                item.source_root.canonical_identity
+                for item in cumulative_removed
+            } | {item.old_identity for item in cumulative_replaced}
+            removed_dependencies = tuple(
+                entry.canonical_identity
+                for entry in result.dependency_delta.removed
+                if entry.canonical_identity not in explicit_identities
+            )
+            dependencies_are_attributable = (
+                result.state == "resolved"
+                and len(cumulative_removed) == 1
+                and not cumulative_replaced
+            )
+            removed = tuple(
+                replace(
+                    item,
+                    removed_dependencies=(
+                        removed_dependencies
+                        if dependencies_are_attributable
+                        else item.removed_dependencies
+                    ),
+                )
+                for item in cumulative_removed
+            )
+            plan._conflict_removed_roots = removed
+            plan._conflict_replaced_roots = cumulative_replaced
+            plan._explicit_removed_roots = tuple(
+                dict.fromkeys(
+                    item.source_root.canonical_identity for item in removed
+                )
+            )
+            plan._explicit_replaced_roots = tuple(
+                dict.fromkeys(
+                    (item.old_identity, item.new_identity)
+                    for item in cumulative_replaced
+                )
+            )
+            _record_plan_diagnostic(plan)
+            return PackMigrationConflictResolutionResult(
+                resolution_plan=result,
+                removed_roots=removed,
+                replaced_roots=cumulative_replaced,
+                remaining_unresolved=result.unresolved_roots,
+                attempt_number=plan._resolution_attempt,
+                state=result.state,
+            )
+        except BaseException as error:
+            plan._state = "failed"
+            plan.cleanup_error = error
+            _record_plan_diagnostic(plan)
+            raise
+        finally:
+            plan._active_resolution_request = None
+
+
 __all__ = [
     "PackMigrationDependencyDelta",
     "PackMigrationDependencyEntry",
@@ -1434,4 +1663,5 @@ __all__ = [
     "commit_pack_migration_root_selection_at",
     "initialize_target_packwiz_source",
     "resolve_pack_migration_plan_at",
+    "resolve_pack_migration_conflicts_at",
 ]
