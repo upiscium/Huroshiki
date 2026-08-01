@@ -183,6 +183,15 @@ from pack_migration import (
     prepare_pack_migration_publication as _prepare_pack_migration_publication,
     retry_pack_migration_cleanup as _retry_pack_migration_cleanup,
 )
+from pack_publish import (
+    PackPublishCancelled,
+    PackPublishDeadlineExceeded,
+    PackPublishError,
+    PackPublishManifest,
+    PublishFileEntry,
+    PublishWarning,
+    plan_pack_publish_manifest,
+)
 
 ROOT = packctl.ROOT
 PACKS = packctl.PACKS
