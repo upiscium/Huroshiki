@@ -141,7 +141,9 @@ minecraft_server:
             .replace("21.1.1", "21.4.1"),
             encoding="utf-8",
         )
-        target_scan = scan_pack_migration_source(plan.target_staging_root, checkpoint=lambda: None)
+        target_scan = scan_pack_migration_source(
+            plan.target_staging_root / "source", checkpoint=lambda: None
+        )
         resolution = PackMigrationResolutionPlan(
             plan.source_snapshot.snapshot_digest,
             plan.target,

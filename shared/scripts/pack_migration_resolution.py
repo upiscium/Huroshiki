@@ -1407,7 +1407,7 @@ def _resolve_effective_root_set(
             installed_scan = _exchange_target_source(
                 plan, workspace, resolver_scan, checkpoint
             )
-            plan._resolved_staging_digest = installed_scan.snapshot_digest
+            plan._resolved_source_snapshot_digest = installed_scan.snapshot_digest
             result = PackMigrationResolutionPlan(
                 plan.source_snapshot.snapshot_digest,
                 plan.target,

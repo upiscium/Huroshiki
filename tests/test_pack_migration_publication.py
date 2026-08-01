@@ -7,8 +7,10 @@ import time
 from unittest.mock import patch
 
 import pack_migration
+import pack_migration_resolution
 import packctl
 from tests import test_pack_migration_core as migration_fixture
+from tests import test_pack_migration_resolution as resolution_fixture
 
 
 class PackMigrationPublicationTest(unittest.TestCase):
@@ -125,7 +127,7 @@ class PackMigrationPublicationTest(unittest.TestCase):
         pack_migration.discard_pack_migration_plan(second)
 
     def test_source_detached_staging_and_lock_staleness_are_rejected(self) -> None:
-        cases = ("source", "detached", "staging")
+        cases = ("source", "detached", "resolved-source")
         for changed in cases:
             with self.subTest(changed=changed):
                 plan, resolution = self.resolved_input()
@@ -134,7 +136,7 @@ class PackMigrationPublicationTest(unittest.TestCase):
                 elif changed == "detached":
                     path = plan.source_snapshot_root / "pack.yaml"
                 else:
-                    path = plan.target_staging_root / "pack.yaml"
+                    path = plan.target_staging_root / "source" / "pack.toml"
                 original = path.read_bytes()
                 path.write_bytes(original + b"\n# changed\n")
                 with self.assertRaises(pack_migration.PackMigrationError):
@@ -260,6 +262,95 @@ class PackMigrationPublicationTest(unittest.TestCase):
         self.assertTrue(plan.transaction_root.is_dir())
         self.assertTrue(packctl.project_lock_is_active("pack:demo"))
         pack_migration.discard_pack_migration_plan(plan)
+
+
+class PackMigrationResolverPublicationIntegrationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = resolution_fixture.PackMigrationResolutionTest(
+            methodName="runTest"
+        )
+        self.fixture.setUp()
+
+    def tearDown(self) -> None:
+        self.fixture.tearDown()
+
+    def test_real_resolver_result_prepares_and_publishes(self) -> None:
+        plan = self.fixture.plan()
+        source_before = pack_migration.snapshot_pack_migration_source_at(
+            "pack:demo", self.fixture.pack, self.fixture.root
+        ).snapshot_digest
+        with patch.object(
+            packctl,
+            "init_packwiz_project",
+            side_effect=self.fixture.fake_init,
+        ), patch.object(
+            resolution_fixture.core,
+            "resolve_mod_closure",
+            side_effect=self.fixture.fake_closure,
+        ), patch.object(
+            resolution_fixture.core,
+            "resolve_project_selector",
+            side_effect=self.fixture.fake_selector,
+        ), patch.object(packctl, "run_packwiz"):
+            resolved = pack_migration_resolution.resolve_pack_migration_plan_at(
+                plan,
+                repository_root=self.fixture.root,
+                state_root=self.fixture.state,
+            )
+
+        self.assertEqual(resolved.state, "resolved")
+        assert resolved.target_source_snapshot is not None
+        self.assertEqual(
+            resolved.target_source_snapshot.root,
+            plan.target_staging_root / "source",
+        )
+        (plan.target_staging_root / "pack.yaml").write_text(
+            """id: next
+display_name: Next
+enabled: true
+distribution:
+  rsync_target: host:/packs/next
+minecraft_server:
+  ssh_host: minecraft
+  stack_dir: /stacks/next
+  service: next
+""",
+            encoding="utf-8",
+        )
+        publication = pack_migration.prepare_pack_migration_publication(
+            plan,
+            resolved,
+            acknowledged_warning_codes=tuple(
+                warning.code
+                for warning in plan.warnings
+                if warning.acknowledgement_required
+            ),
+        )
+        whole_staging = pack_migration.scan_pack_migration_source(
+            plan.target_staging_root, checkpoint=lambda: None
+        )
+        self.assertEqual(
+            publication._token.staging_snapshot_digest,
+            whole_staging.snapshot_digest,
+        )
+        self.assertEqual(
+            publication._token.staging_content_digest,
+            whole_staging.content_digest,
+        )
+        self.assertNotEqual(
+            publication._token.staging_snapshot_digest,
+            resolved.target_source_snapshot.snapshot_digest,
+        )
+        published = pack_migration.apply_pack_copy_migration_at(publication)
+
+        self.assertEqual(published.project_key, "pack:next")
+        self.assertEqual(plan.state, "applied")
+        self.assertEqual(
+            pack_migration.snapshot_pack_migration_source_at(
+                "pack:demo", self.fixture.pack, self.fixture.root
+            ).snapshot_digest,
+            source_before,
+        )
 
 
 if __name__ == "__main__":

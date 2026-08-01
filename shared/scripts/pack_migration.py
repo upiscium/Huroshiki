@@ -569,6 +569,7 @@ class PackMigrationPlan:
         self._source_copy_snapshot_digest: str | None = None
         self._staging_identity: tuple[int, int] | None = None
         self._staging_snapshot_digest: str | None = None
+        self._resolved_source_snapshot_digest: str | None = None
         self._validation_token: _PackMigrationValidationToken | None = None
         self._acknowledged_warning_codes: tuple[str, ...] = ()
         self._publication_committed = False
@@ -1276,10 +1277,22 @@ def prepare_pack_migration_publication(
         if len(normalized_acknowledgements) != len(supplied) or normalized_acknowledgements != required:
             raise PackMigrationPublicationError("Warning acknowledgement set is incomplete or unknown")
         checkpoint()
-        staging = scan_pack_migration_source(plan.target_staging_root, checkpoint=checkpoint)
+        resolved_source = scan_pack_migration_source(
+            plan.target_staging_root / "source", checkpoint=checkpoint
+        )
         expected = resolution_plan.target_source_snapshot
-        if expected is None or staging.root_identity != expected.root_identity or staging.snapshot_digest != expected.snapshot_digest or staging.content_digest != expected.content_digest:
-            raise PackMigrationStale("Formal target staging does not match resolved output")
+        if (
+            expected is None
+            or resolved_source.root_identity != expected.root_identity
+            or resolved_source.snapshot_digest != expected.snapshot_digest
+            or resolved_source.content_digest != expected.content_digest
+        ):
+            raise PackMigrationStale(
+                "Formal target staging source does not match resolved output"
+            )
+        staging = scan_pack_migration_source(
+            plan.target_staging_root, checkpoint=checkpoint
+        )
         _validate = snapshot_pack_migration_source_at(
             f"pack:{plan.target.target_id}", plan.target_staging_root,
             plan.target_root.parent.parent, cancel_event=cancel_event, deadline=effective_deadline,
@@ -1317,6 +1330,8 @@ def prepare_pack_migration_publication(
             _validate,
         )
         plan._validation_token = token
+        plan._resolved_source_snapshot_digest = resolved_source.snapshot_digest
+        plan._resolved_staging_digest = staging.snapshot_digest
         plan._state = "ready"
         plan._acknowledged_warning_codes = tuple(sorted(required))
         report(PackMigrationProgress("ready", 1, 1, None, "Migration ready for publication"))
