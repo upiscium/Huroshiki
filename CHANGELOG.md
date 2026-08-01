@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0-rc.2 - 2026-08-01
+
 ### Content Management
 
 - Added the snapshot-based Content overlay core used to safely plan and atomically publish
@@ -32,8 +34,8 @@
 
 - Added the core snapshot and transaction foundation for copy-based Pack migration. It safely scans
   and streams a detached source copy, holds source and target locks in canonical order, records a
-  staged migration plan without rewriting target versions, and provides an internally gated atomic
-  no-replace publication primitive for later resolver integration.
+  staged migration plan without rewriting target versions, and provides the internally gated
+  publication foundation used by target resolution.
 - Added target resolution for staged Pack migrations. Explicit root provenance is committed with the
   Packwiz source, target projects are initialized from scratch, provider roots and complete dependency
   closures are rebuilt for the target Minecraft/loader tuple, and URL roots fail closed when loader or
@@ -49,7 +51,16 @@
 - Added explicit Remove and Replace resolution for unresolved Pack migration roots. Requests cover the
   complete unresolved snapshot, reject stale or non-canonical choices before resolver work, and rebuild
   every effective root closure in a fresh attempt workspace. Incomplete attempts preserve formal staging;
-  complete attempts stop at `resolved` after verified source exchange and still cannot publish the Pack.
+  complete attempts stop at `resolved` after verified source exchange and do not independently authorize
+  publication.
+- Completed the copy-migration publication path from a resolved resolution plan. It issues an opaque,
+  digest-bound handoff tied to the plan identity, resolution attempt, fixed source snapshot, resolved
+  source, whole target staging tree, and exact warning acknowledgements. Planning safely derives target
+  `pack.yaml` from the detached source snapshot, replaces the Pack ID and display name, and does not
+  inherit `distribution` or `minecraft_server` operational settings. Publication uses
+  `renameat2(RENAME_NOREPLACE)` for atomic no-clobber installation, then revalidates the published
+  semantic snapshot. Cleanup failure retains the published target and lock ownership for bounded retry;
+  publication does not modify the source Pack.
 - Install checkpoint preparation now runs inside the add-operation worker and shares cancellation
   plus one operation-wide absolute deadline across copy, resolution, URL download, merge, rollback,
   interactive PTY polling, cleanup, and navigation. Checkpoints, resolver trees, and failed staged
