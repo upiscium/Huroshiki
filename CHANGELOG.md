@@ -46,6 +46,10 @@
   the fixed detached source and committed atomically with the Packwiz ignore rule; no dependency is
   implicitly promoted to a root. Legacy URL metadata requires an explicit canonical ID and is refreshed
   before the provenance source exchange.
+- Added explicit Remove and Replace resolution for unresolved Pack migration roots. Requests cover the
+  complete unresolved snapshot, reject stale or non-canonical choices before resolver work, and rebuild
+  every effective root closure in a fresh attempt workspace. Incomplete attempts preserve formal staging;
+  complete attempts stop at `resolved` after verified source exchange and still cannot publish the Pack.
 - Install checkpoint preparation now runs inside the add-operation worker and shares cancellation
   plus one operation-wide absolute deadline across copy, resolution, URL download, merge, rollback,
   interactive PTY polling, cleanup, and navigation. Checkpoints, resolver trees, and failed staged

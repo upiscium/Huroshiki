@@ -40,6 +40,10 @@ from pack_migration_roots import (
 from provider_identity import parse_provider_metadata
 
 if TYPE_CHECKING:
+    from pack_migration_conflicts import (
+        PackMigrationConflictResolutionResult,
+        PackMigrationResolutionRequest,
+    )
     from pack_migration_resolution import (
         PackMigrationProgress,
         PackMigrationResolutionPlan,
@@ -3279,6 +3283,27 @@ def commit_pack_migration_root_selection(
         repository_root=ROOT,
         cancel_event=cancel_event,
         deadline=deadline,
+    )
+
+
+def resolve_pack_migration_conflicts(
+    plan: PackMigrationPlan,
+    request: "PackMigrationResolutionRequest",
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[["PackMigrationProgress"], None] | None = None,
+) -> "PackMigrationConflictResolutionResult":
+    from pack_migration_resolution import resolve_pack_migration_conflicts_at
+
+    return resolve_pack_migration_conflicts_at(
+        plan,
+        request,
+        repository_root=ROOT,
+        state_root=STATE_ROOT,
+        cancel_event=cancel_event,
+        deadline=deadline,
+        progress=progress,
     )
 
 
