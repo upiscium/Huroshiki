@@ -145,9 +145,13 @@ class PackMigrationProgress:
         "validating-target",
         "validating-resolutions",
         "applying-resolutions",
+        "validating-publication",
+        "ready",
+        "publishing",
+        "verifying",
+        "cleaning-up",
         "classifying",
         "committing",
-        "cleaning-up",
     ]
     completed: int
     total: int
@@ -183,6 +187,7 @@ class PackMigrationResolutionPlan:
     target_source_snapshot: PackTreeScan | None
     state: Literal["resolved", "resolution-required"]
     provenance_required: bool = False
+    resolution_attempt: int = 0
 
     def diagnostic_summary(self) -> dict[str, object]:
         delta = self.dependency_delta
@@ -195,6 +200,7 @@ class PackMigrationResolutionPlan:
             "identity_changes": len(self.identity_changes),
             "path_collisions": len(self.path_collisions),
             "filename_collisions": len(self.filename_collisions),
+            "resolution_attempt": self.resolution_attempt,
             "dependency_delta": {
                 "added": len(delta.added),
                 "removed": len(delta.removed),
@@ -1076,6 +1082,7 @@ def _resolve_effective_root_set(
                     None,
                     "resolution-required",
                     True,
+                    int(getattr(plan, "_resolution_attempt", 0)),
                 )
                 plan.resolution = result
                 plan._state = "resolution-required"
@@ -1422,8 +1429,10 @@ def _resolve_effective_root_set(
                 (),
                 tuple(url_compatibility),
                 installed_scan,
-                "resolved",
-            )
+                    "resolved",
+                    False,
+                    int(getattr(plan, "_resolution_attempt", 0)),
+                )
             plan.resolution = result
             plan._state = "resolved"
             _record_plan_diagnostic(plan)

@@ -37,6 +37,7 @@ PACK_MIGRATION_INCLUDE = (
 )
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _CONFIG_MAX_BYTES = 2 * 1024 * 1024
+_PUBLICATION_SECRET = object()
 
 
 class PackMigrationError(RuntimeError):
@@ -140,11 +141,32 @@ class PackMigrationSourceSnapshot:
 
 
 @dataclass(frozen=True)
-class PackMigrationValidationToken:
+class _PackMigrationValidationToken:
     plan_identity: int
+    resolution_attempt: int
+    source_snapshot_digest: str
     staging_content_digest: str
     staging_snapshot_digest: str
+    staging_identity: tuple[int, int]
+    resolution_digest: str
+    acknowledged_warning_digest: str
     target_snapshot: PackMigrationSourceSnapshot
+
+
+class PackMigrationPublicationPlan:
+    """Opaque, digest-bound handoff from resolution to publication.
+
+    The constructor is intentionally private-by-convention; callers obtain one
+    only from ``prepare_pack_migration_publication``.
+    """
+
+    __slots__ = ("_plan", "_token")
+
+    def __init__(self, plan: "PackMigrationPlan", token: _PackMigrationValidationToken, *, _secret: object) -> None:
+        if _secret is not _PUBLICATION_SECRET:
+            raise TypeError("Pack migration publication handoffs are issued by the resolver")
+        self._plan = plan
+        self._token = token
 
 
 def _checkpoint(
@@ -547,7 +569,8 @@ class PackMigrationPlan:
         self._source_copy_snapshot_digest: str | None = None
         self._staging_identity: tuple[int, int] | None = None
         self._staging_snapshot_digest: str | None = None
-        self._validation_token: PackMigrationValidationToken | None = None
+        self._validation_token: _PackMigrationValidationToken | None = None
+        self._acknowledged_warning_codes: tuple[str, ...] = ()
         self._publication_committed = False
         self._publication_state: Literal[
             "not-published", "published", "uncertain"
@@ -711,6 +734,11 @@ def _write_plan_file(plan: PackMigrationPlan, repository_root: Path) -> None:
             else None
         ),
         "publication_committed": plan._publication_committed,
+        "publication_state": plan._publication_state,
+        "source_snapshot_digest": plan.source_snapshot.snapshot_digest,
+        "formal_staging_digest": plan._resolved_staging_digest or plan._staging_snapshot_digest,
+        "target_id": plan.target.target_id,
+        "acknowledged_warning_codes": list(plan._acknowledged_warning_codes),
         "owned_locks": list(plan._lock_set.owned_keys),
         "copied": {
             "files": plan.copied_files,
@@ -1115,47 +1143,256 @@ def plan_pack_copy_migration_at(
         ) from error
 
 
-def _issue_pack_migration_validation_token(
+def _publication_digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
+
+def _required_warning_digest(warnings: tuple[PackMigrationWarning, ...]) -> str:
+    return _publication_digest(
+        [
+            {
+                "code": warning.code,
+                "message": warning.message,
+                "path": warning.relative_path.as_posix()
+                if warning.relative_path is not None
+                else None,
+                "acknowledgement_required": warning.acknowledgement_required,
+                "identifier": _warning_identifier(warning),
+            }
+            for warning in warnings
+            if warning.acknowledgement_required
+        ]
+    )
+
+
+def _resolution_digest(resolution: object) -> str:
+    target = getattr(resolution, "target", None)
+    snapshot = getattr(resolution, "target_source_snapshot", None)
+    return _publication_digest(
+        {
+            "source": getattr(resolution, "source_snapshot_digest", None),
+            "state": getattr(resolution, "state", None),
+            "attempt": getattr(resolution, "resolution_attempt", None),
+            "target": {
+                "id": getattr(target, "target_id", None),
+                "minecraft": getattr(target, "minecraft_version", None),
+                "loader": getattr(target, "loader", None),
+                "loader_version": getattr(target, "loader_version", None),
+            },
+            "staging": getattr(snapshot, "snapshot_digest", None),
+            "resolved": [
+                getattr(item, "target_identity", None)
+                for item in getattr(resolution, "resolved_roots", ())
+            ],
+            "unresolved": [
+                getattr(item, "reason_code", None)
+                for item in getattr(resolution, "unresolved_roots", ())
+            ],
+            "collisions": [
+                getattr(resolution, name, ())
+                for name in ("path_collisions", "filename_collisions")
+            ],
+        }
+    )
+
+
+def _warning_identifier(warning: PackMigrationWarning) -> str:
+    return _publication_digest(
+        {
+            "code": warning.code,
+            "message": warning.message,
+            "path": warning.relative_path.as_posix() if warning.relative_path else None,
+        }
+    )
+
+
+def prepare_pack_migration_publication(
     plan: PackMigrationPlan,
+    resolution_plan: object,
     *,
-    repository_root: Path,
+    acknowledged_warning_codes: tuple[str, ...] = (),
+    acknowledged_warnings: tuple[str, ...] | None = None,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
-) -> PackMigrationValidationToken:
-    """Internal handoff for a future resolver and publication tests."""
-    if plan.state != "staged":
-        raise PackMigrationError("Only a staged Pack migration can be validated")
-    scan = scan_pack_migration_source(
-        plan.target_staging_root,
-        checkpoint=lambda: _checkpoint(cancel_event, deadline),
-    )
-    snapshot = snapshot_pack_migration_source_at(
-        f"pack:{plan.target.target_id}",
-        plan.target_staging_root,
-        repository_root,
+    progress: Callable[[object], None] | None = None,
+) -> PackMigrationPublicationPlan:
+    """Validate a resolved migration and create its opaque publication handoff."""
+    effective_deadline = deadline if deadline is not None else time.monotonic() + PACK_MIGRATION_TIMEOUT_SECONDS
+    checkpoint = lambda: _checkpoint(cancel_event, effective_deadline)
+
+    def report(value: object) -> None:
+        if progress is None:
+            return
+        try:
+            progress(value)
+        except Exception:
+            pass
+
+    checkpoint()
+    with plan._lock:
+        from pack_migration_resolution import PackMigrationProgress
+        report(PackMigrationProgress(
+                "validating-publication", 0, 1, None,
+                "Validating migration publication",
+            ))
+        from pack_migration_resolution import PackMigrationResolutionPlan
+        if plan.state != "resolved" or plan.resolution is not resolution_plan or not isinstance(resolution_plan, PackMigrationResolutionPlan):
+            raise PackMigrationPublicationError("Pack migration resolution is not the current resolved result")
+        if resolution_plan.state != "resolved" or resolution_plan.unresolved_roots or resolution_plan.provenance_required:
+            raise PackMigrationPublicationError("Pack migration resolution is incomplete")
+        if resolution_plan.path_collisions or resolution_plan.filename_collisions:
+            raise PackMigrationPublicationError("Pack migration resolution retains path or filename collisions")
+        if resolution_plan.source_snapshot_digest != plan.source_snapshot.snapshot_digest:
+            raise PackMigrationStale("Pack migration resolution source snapshot is stale")
+        if resolution_plan.target != plan.target:
+            raise PackMigrationPublicationError("Pack migration resolution target does not match plan")
+        if getattr(resolution_plan, "resolution_attempt", plan._resolution_attempt) != plan._resolution_attempt:
+            raise PackMigrationStale("Pack migration resolution attempt is stale")
+        required_warnings = tuple(
+            warning for warning in plan.warnings if warning.acknowledgement_required
+        )
+        required = {warning.code for warning in required_warnings}
+        identifiers = {
+            identifier
+            for warning in required_warnings
+            for identifier in (warning.code, _warning_identifier(warning))
+        }
+        if acknowledged_warnings is not None:
+            if acknowledged_warning_codes:
+                raise PackMigrationPublicationError("Warning acknowledgements were supplied twice")
+            acknowledged_warning_codes = acknowledged_warnings
+        supplied = tuple(acknowledged_warning_codes)
+        if any(not isinstance(code, str) or not code.strip() for code in supplied):
+            raise PackMigrationPublicationError("Warning acknowledgement codes must be non-empty strings")
+        if len(set(supplied)) != len(supplied) or not set(supplied).issubset(identifiers):
+            raise PackMigrationPublicationError("Warning acknowledgement set is incomplete or unknown")
+        normalized_acknowledgements = {
+            warning.code
+            for warning in required_warnings
+            if warning.code in supplied or _warning_identifier(warning) in supplied
+        }
+        if len(normalized_acknowledgements) != len(supplied) or normalized_acknowledgements != required:
+            raise PackMigrationPublicationError("Warning acknowledgement set is incomplete or unknown")
+        checkpoint()
+        staging = scan_pack_migration_source(plan.target_staging_root, checkpoint=checkpoint)
+        expected = resolution_plan.target_source_snapshot
+        if expected is None or staging.root_identity != expected.root_identity or staging.snapshot_digest != expected.snapshot_digest or staging.content_digest != expected.content_digest:
+            raise PackMigrationStale("Formal target staging does not match resolved output")
+        _validate = snapshot_pack_migration_source_at(
+            f"pack:{plan.target.target_id}", plan.target_staging_root,
+            plan.target_root.parent.parent, cancel_event=cancel_event, deadline=effective_deadline,
+        )
+        if not _matches_validated_target(
+            _validate,
+            _PackMigrationValidationToken(
+                id(plan),
+                plan._resolution_attempt,
+                plan.source_snapshot.snapshot_digest,
+                staging.content_digest,
+                staging.snapshot_digest,
+                staging.root_identity,
+                _resolution_digest(resolution_plan),
+                _required_warning_digest(plan.warnings),
+                _validate,
+            ),
+        ):
+            raise PackMigrationStale("Formal target staging semantic validation failed")
+        current_source = snapshot_pack_migration_source_at(plan.source_key, plan.source_root, plan.source_root.parent.parent, cancel_event=cancel_event, deadline=effective_deadline)
+        if not _same_snapshot(current_source, plan.source_snapshot):
+            raise PackMigrationStale("Source Pack changed before publication")
+        detached = scan_pack_migration_source(plan.source_snapshot_root, checkpoint=checkpoint)
+        if detached.snapshot_digest != plan._source_copy_snapshot_digest or detached.root_identity != plan._source_copy_identity:
+            raise PackMigrationStale("Detached source snapshot changed before publication")
+        if not _target_missing(plan.target_root, plan._target_parent_identity):
+            raise PackMigrationPublicationError("Target Pack appeared before publication")
+        if set(plan._lock_set.owned_keys) != {plan.source_key, f"pack:{plan.target.target_id}"}:
+            raise PackMigrationPublicationError("Pack migration locks are not fully owned")
+        token = _PackMigrationValidationToken(
+            id(plan), plan._resolution_attempt, plan.source_snapshot.snapshot_digest,
+            staging.content_digest, staging.snapshot_digest, staging.root_identity,
+            _resolution_digest(resolution_plan),
+            _required_warning_digest(plan.warnings),
+            _validate,
+        )
+        plan._validation_token = token
+        plan._state = "ready"
+        plan._acknowledged_warning_codes = tuple(sorted(required))
+        report(PackMigrationProgress("ready", 1, 1, None, "Migration ready for publication"))
+        _record_plan_diagnostic(plan)
+        return PackMigrationPublicationPlan(plan, token, _secret=_PUBLICATION_SECRET)
+
+
+def apply_pack_migration_publication(
+    publication: PackMigrationPublicationPlan,
+    *, cancel_event: threading.Event | None = None, deadline: float | None = None,
+    progress: Callable[[object], None] | None = None,
+) -> PackMigrationSourceSnapshot:
+    if not isinstance(publication, PackMigrationPublicationPlan):
+        raise PackMigrationPublicationError("Invalid Pack migration publication handoff")
+    plan = publication._plan
+    token = publication._token
+    if plan._validation_token is not token:
+        raise PackMigrationPublicationError("Pack migration publication handoff was replayed or replaced")
+    result = apply_pack_copy_migration_at(publication, cancel_event=cancel_event, deadline=deadline, progress=progress)
+    return result
+
+
+def retry_pack_migration_cleanup(
+    publication: PackMigrationPublicationPlan,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[[object], None] | None = None,
+) -> PackMigrationSourceSnapshot:
+    """Retry only cleanup after a committed publication uncertainty."""
+    if not isinstance(publication, PackMigrationPublicationPlan):
+        raise PackMigrationPublicationError("Invalid Pack migration publication handoff")
+    plan = publication._plan
+    if not plan._publication_committed or plan.cleanup_error is None:
+        raise PackMigrationPublicationError("Migration has no committed cleanup requiring retry")
+    return _retry_committed_publication(
+        publication,
         cancel_event=cancel_event,
         deadline=deadline,
-    )
-    if snapshot.validation_errors:
-        raise PackMigrationError("Validated target staging is not a valid Pack")
-    return PackMigrationValidationToken(
-        id(plan),
-        scan.content_digest,
-        scan.snapshot_digest,
-        snapshot,
+        progress=progress,
     )
 
 
-def _mark_pack_migration_plan_ready(
-    plan: PackMigrationPlan,
+def _retry_committed_publication(
+    publication: PackMigrationPublicationPlan,
     *,
-    validation_token: PackMigrationValidationToken,
-) -> None:
-    with plan._lock:
-        if plan.state != "staged" or validation_token.plan_identity != id(plan):
-            raise PackMigrationError("Invalid Pack migration validation token")
-        plan._validation_token = validation_token
-        plan._state = "ready"
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[[object], None] | None = None,
+) -> PackMigrationSourceSnapshot:
+    plan = publication._plan
+    if plan._validation_token is not publication._token:
+        raise PackMigrationPublicationError("Pack migration publication handoff was replayed or replaced")
+    if not plan._publication_committed or plan.cleanup_error is None:
+        raise PackMigrationPublicationError("Migration has no committed cleanup requiring retry")
+    effective_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + PACK_MIGRATION_TIMEOUT_SECONDS
+    )
+    _checkpoint(cancel_event, effective_deadline)
+    return _apply_pack_copy_migration_raw(
+        plan,
+        cancel_event=cancel_event,
+        deadline=deadline,
+        progress=progress,
+    )
+
+
+def _report_publication_progress(progress: Callable[[object], None] | None, value: object) -> None:
+    if progress is None:
+        return
+    try:
+        progress(value)
+    except Exception:
+        pass
 
 
 def _release_plan_locks(plan: PackMigrationPlan) -> None:
@@ -1168,24 +1405,67 @@ def _release_plan_locks(plan: PackMigrationPlan) -> None:
         ) from error
 
 
-def _finish_committed_publication(plan: PackMigrationPlan, deadline: float) -> None:
-    _cleanup_transaction(plan, deadline, preserve_diagnostic=True)
-    _release_plan_locks(plan)
-    plan._state = "applied"
+def _retain_cleanup_diagnostic(plan: PackMigrationPlan) -> None:
+    """Retain a bounded diagnostic tree without following an old path."""
     try:
-        _cleanup_transaction(
-            plan,
-            time.monotonic() + PACK_MIGRATION_CLEANUP_TIMEOUT_SECONDS,
+        if plan.transaction_root.exists() and _identity(plan.transaction_root) == plan._transaction_identity:
+            _record_plan_diagnostic(plan)
+            return
+    except BaseException:
+        pass
+    try:
+        transaction_root, identity = _make_transaction_root(
+            plan.transaction_root.parent, prefix="pack-publication-recovery-"
         )
+        plan.transaction_root = transaction_root
+        plan._transaction_identity = identity
+        _record_plan_diagnostic(plan)
+    except BaseException:
+        pass
+
+
+def _finish_committed_publication(plan: PackMigrationPlan, deadline: float) -> None:
+    # Keep both locks until the transaction tree is completely gone.  A
+    # post-commit cleanup failure must never make the published target or its
+    # ownership look disposable.
+    try:
+        _cleanup_transaction(plan, deadline, preserve_diagnostic=True)
+        if time.monotonic() >= deadline:
+            raise PackMigrationCleanupError("Pack migration cleanup deadline exceeded")
+        transaction_fd = os.open(plan.transaction_root, _DIRECTORY_FLAGS)
+        try:
+            opened = os.fstat(transaction_fd)
+            if (opened.st_dev, opened.st_ino) != plan._transaction_identity:
+                raise PackMigrationCleanupError("Pack migration transaction root changed during cleanup")
+            os.unlink("plan.json", dir_fd=transaction_fd)
+            os.fsync(transaction_fd)
+        finally:
+            os.close(transaction_fd)
+        parent_fd = os.open(plan.transaction_root.parent, _DIRECTORY_FLAGS)
+        try:
+            os.rmdir(plan.transaction_root.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
     except BaseException as error:
         plan.cleanup_error = error
-        return
+        plan._state = "failed"
+        _retain_cleanup_diagnostic(plan)
+        raise
+    try:
+        _release_plan_locks(plan)
+    except BaseException as error:
+        plan.cleanup_error = error
+        plan._state = "failed"
+        _retain_cleanup_diagnostic(plan)
+        raise
+    plan._state = "applied"
     plan.cleanup_error = None
 
 
 def _matches_validated_target(
     snapshot: PackMigrationSourceSnapshot,
-    token: PackMigrationValidationToken,
+    token: _PackMigrationValidationToken,
 ) -> bool:
     return (
         not snapshot.validation_errors
@@ -1200,10 +1480,48 @@ def _matches_validated_target(
 
 
 def apply_pack_copy_migration_at(
+    publication: PackMigrationPublicationPlan,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[[object], None] | None = None,
+) -> PackMigrationSourceSnapshot:
+    """Publish only an issued, one-shot migration publication handoff."""
+    if not isinstance(publication, PackMigrationPublicationPlan):
+        raise PackMigrationPublicationError("Pack migration publication requires a ready handoff")
+    plan = publication._plan
+    if plan._validation_token is not publication._token:
+        raise PackMigrationPublicationError("Pack migration publication handoff was replayed or replaced")
+    if plan.state == "applied":
+        raise PackMigrationPublicationError("Pack migration publication handoff was already consumed")
+    if plan._publication_committed:
+        raise PackMigrationPublicationError(
+            "Committed publication can only be retried through cleanup retry"
+        )
+    from pack_migration_resolution import PackMigrationProgress
+    _report_publication_progress(
+        progress,
+        PackMigrationProgress("publishing", 0, 1, None, "Publishing migration target"),
+    )
+    try:
+        result = _apply_pack_copy_migration_raw(
+            plan, cancel_event=cancel_event, deadline=deadline, progress=progress,
+        )
+    except BaseException as error:
+        if not plan._publication_committed:
+            plan._state = "failed"
+        plan.cleanup_error = error
+        _record_plan_diagnostic(plan)
+        raise
+    return result
+
+
+def _apply_pack_copy_migration_raw(
     plan: PackMigrationPlan,
     *,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
+    progress: Callable[[object], None] | None = None,
 ) -> PackMigrationSourceSnapshot:
     effective_deadline = (
         deadline
@@ -1214,19 +1532,33 @@ def apply_pack_copy_migration_at(
     with plan._lock:
         if plan._publication_committed:
             try:
+                retry_deadline = min(
+                    effective_deadline,
+                    time.monotonic() + PACK_MIGRATION_TIMEOUT_SECONDS,
+                )
+                checkpoint()
                 published = snapshot_pack_migration_source_at(
                     f"pack:{plan.target.target_id}",
                     plan.target_root,
                     plan.target_root.parent.parent,
                     cancel_event=cancel_event,
-                    deadline=effective_deadline,
+                    deadline=retry_deadline,
                 )
                 token = plan._validation_token
                 if token is None or not _matches_validated_target(published, token):
                     raise PackMigrationPublicationError(
                         "Published target changed before cleanup retry"
                     )
-                _finish_committed_publication(plan, effective_deadline)
+                from pack_migration_resolution import PackMigrationProgress
+                _report_publication_progress(
+                    progress,
+                    PackMigrationProgress("verifying", 1, 1, None, "Verified published target"),
+                )
+                _report_publication_progress(
+                    progress,
+                    PackMigrationProgress("cleaning-up", 0, 1, None, "Cleaning migration transaction"),
+                )
+                _finish_committed_publication(plan, min(retry_deadline, time.monotonic() + PACK_MIGRATION_CLEANUP_TIMEOUT_SECONDS))
                 return published
             except BaseException as error:
                 plan._state = "failed"
@@ -1238,6 +1570,15 @@ def apply_pack_copy_migration_at(
             raise PackMigrationError(
                 f"Pack migration plan cannot be applied from state {plan.state}"
             )
+        if token.resolution_attempt != int(getattr(plan, "_resolution_attempt", 0)):
+            raise PackMigrationStale("Pack migration publication attempt is stale")
+        if token.source_snapshot_digest != plan.source_snapshot.snapshot_digest:
+            raise PackMigrationStale("Pack migration publication source snapshot is stale")
+        if plan.resolution is not None and token.resolution_digest and token.resolution_digest != _resolution_digest(plan.resolution):
+            raise PackMigrationStale("Pack migration resolution changed after handoff")
+        required = {warning.code for warning in plan.warnings if warning.acknowledgement_required}
+        if token.acknowledged_warning_digest and token.acknowledged_warning_digest != _required_warning_digest(plan.warnings):
+            raise PackMigrationPublicationError("Pack migration warning acknowledgement is stale")
         if set(plan._lock_set.owned_keys) != {
             plan.source_key,
             f"pack:{plan.target.target_id}",
@@ -1275,12 +1616,15 @@ def apply_pack_copy_migration_at(
             raise PackMigrationStale("Target staging changed after validation")
         if staged_scan.snapshot_digest != token.staging_snapshot_digest:
             raise PackMigrationStale("Target staging identity changed after validation")
+        if staged_scan.root_identity != token.staging_identity:
+            raise PackMigrationStale("Target staging directory was replaced after validation")
         if not _target_missing(plan.target_root, plan._target_parent_identity):
             raise PackMigrationPublicationError("Target Pack appeared before publication")
         plan._state = "applying"
         transaction_fd = os.open(plan.transaction_root, _DIRECTORY_FLAGS)
         target_parent_fd = os.open(plan.target_root.parent, _DIRECTORY_FLAGS)
         expected_identity = plan._staging_identity
+        publication_outcome_deadline: float | None = None
         try:
             opened_transaction = os.fstat(transaction_fd)
             opened_target_parent = os.fstat(target_parent_fd)
@@ -1297,6 +1641,11 @@ def apply_pack_copy_migration_at(
                     "Target Pack parent was replaced before publication"
                 )
             try:
+                # This is the last caller-controlled checkpoint.  Once the
+                # syscall starts, cancellation cannot leave publication
+                # ownership or its result undetermined.
+                checkpoint()
+                publication_outcome_deadline = time.monotonic() + PACK_MIGRATION_TIMEOUT_SECONDS
                 plan._publication_state = "uncertain"
                 packctl.renameat2(
                     transaction_fd,
@@ -1358,19 +1707,30 @@ def apply_pack_copy_migration_at(
         finally:
             os.close(target_parent_fd)
             os.close(transaction_fd)
-        published = snapshot_pack_migration_source_at(
-            f"pack:{plan.target.target_id}",
-            plan.target_root,
-            plan.target_root.parent.parent,
-            cancel_event=cancel_event,
-            deadline=effective_deadline,
-        )
-        if not _matches_validated_target(published, token):
-            plan._state = "failed"
-            _record_plan_diagnostic(plan)
-            raise PackMigrationPublicationError("Published target snapshot verification failed")
+        outcome_deadline = publication_outcome_deadline or time.monotonic() + PACK_MIGRATION_TIMEOUT_SECONDS
         try:
-            _finish_committed_publication(plan, effective_deadline)
+            published = snapshot_pack_migration_source_at(
+                f"pack:{plan.target.target_id}",
+                plan.target_root,
+                plan.target_root.parent.parent,
+                cancel_event=None,
+                deadline=outcome_deadline,
+            )
+            if not _matches_validated_target(published, token):
+                raise PackMigrationPublicationError("Published target snapshot verification failed")
+            from pack_migration_resolution import PackMigrationProgress
+            _report_publication_progress(
+                progress,
+                PackMigrationProgress("verifying", 1, 1, None, "Verified published target"),
+            )
+            _report_publication_progress(
+                progress,
+                PackMigrationProgress("cleaning-up", 0, 1, None, "Cleaning migration transaction"),
+            )
+            _finish_committed_publication(
+                plan,
+                min(outcome_deadline, time.monotonic() + PACK_MIGRATION_CLEANUP_TIMEOUT_SECONDS),
+            )
         except BaseException as error:
             plan.cleanup_error = error
             plan._state = "failed"
@@ -1426,12 +1786,16 @@ def discard_pack_migration_plan(
 __all__ = [
     "PackMigrationChange",
     "PackMigrationPlan",
+    "PackMigrationPublicationPlan",
     "PackMigrationSourceSnapshot",
     "PackMigrationTarget",
     "PackMigrationTreeEntry",
     "PackMigrationWarning",
     "apply_pack_copy_migration_at",
+    "apply_pack_migration_publication",
     "discard_pack_migration_plan",
     "plan_pack_copy_migration_at",
+    "prepare_pack_migration_publication",
+    "retry_pack_migration_cleanup",
     "snapshot_pack_migration_source_at",
 ]

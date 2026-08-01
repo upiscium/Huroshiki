@@ -172,12 +172,16 @@ from portable_paths import (
 )
 from pack_migration import (
     PackMigrationPlan,
+    PackMigrationPublicationPlan,
     PackMigrationSourceSnapshot,
     PackMigrationTarget,
     apply_pack_copy_migration_at as _apply_pack_copy_migration_at,
+    apply_pack_migration_publication as _apply_pack_migration_publication,
     discard_pack_migration_plan as _discard_pack_migration_plan,
     plan_pack_copy_migration_at,
     snapshot_pack_migration_source_at,
+    prepare_pack_migration_publication as _prepare_pack_migration_publication,
+    retry_pack_migration_cleanup as _retry_pack_migration_cleanup,
 )
 
 ROOT = packctl.ROOT
@@ -3229,15 +3233,63 @@ def plan_pack_copy_migration(
 
 
 def apply_pack_copy_migration(
-    plan: PackMigrationPlan,
+    publication: PackMigrationPublicationPlan,
     *,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
 ) -> PackMigrationSourceSnapshot:
     return _apply_pack_copy_migration_at(
-        plan,
+        publication,
         cancel_event=cancel_event,
         deadline=deadline,
+    )
+
+
+def prepare_pack_migration_publication(
+    plan: PackMigrationPlan,
+    resolution_plan: object,
+    *,
+    acknowledged_warning_codes: tuple[str, ...] = (),
+    acknowledged_warnings: tuple[str, ...] | None = None,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[[object], None] | None = None,
+) -> PackMigrationPublicationPlan:
+    return _prepare_pack_migration_publication(
+        plan,
+        resolution_plan,
+        acknowledged_warning_codes=acknowledged_warning_codes,
+        acknowledged_warnings=acknowledged_warnings,
+        cancel_event=cancel_event,
+        deadline=deadline,
+        progress=progress,
+    )
+
+
+def apply_pack_migration_publication(
+    publication: PackMigrationPublicationPlan,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[[object], None] | None = None,
+) -> PackMigrationSourceSnapshot:
+    return _apply_pack_migration_publication(
+        publication, cancel_event=cancel_event, deadline=deadline, progress=progress
+    )
+
+
+def retry_pack_migration_cleanup(
+    publication: PackMigrationPublicationPlan,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[[object], None] | None = None,
+) -> PackMigrationSourceSnapshot:
+    return _retry_pack_migration_cleanup(
+        publication,
+        cancel_event=cancel_event,
+        deadline=deadline,
+        progress=progress,
     )
 
 

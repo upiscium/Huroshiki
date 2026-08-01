@@ -213,7 +213,7 @@ class PackMigrationConflictTest(unittest.TestCase):
         self.assertEqual(result.attempt_number, 1)
         self.assertEqual(result.removed_roots[0].source_root.canonical_identity, "modrinth:root-project")
         self.assertTrue((plan.transaction_root / "resolver-work-attempt-0001").is_dir())
-        with self.assertRaisesRegex(pack_migration.PackMigrationError, "cannot be applied"):
+        with self.assertRaisesRegex(pack_migration.PackMigrationError, "publication requires"):
             pack_migration.apply_pack_copy_migration_at(plan)
         pack_migration.discard_pack_migration_plan(plan)
 

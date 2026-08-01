@@ -13,6 +13,9 @@ from unittest.mock import patch
 import huroshiki_core as core
 import pack_migration
 import packctl
+from pack_migration_resolution import PackMigrationResolutionPlan
+from pack_migration_resolution import PackMigrationDependencyDelta
+from pack_tree_policy import scan_pack_migration_source
 
 
 PACK_TOML = '''name = "Demo"
@@ -138,11 +141,21 @@ minecraft_server:
             .replace("21.1.1", "21.4.1"),
             encoding="utf-8",
         )
-        token = pack_migration._issue_pack_migration_validation_token(
-            plan, repository_root=self.root
+        target_scan = scan_pack_migration_source(plan.target_staging_root, checkpoint=lambda: None)
+        resolution = PackMigrationResolutionPlan(
+            plan.source_snapshot.snapshot_digest,
+            plan.target,
+            (), (), (), (), PackMigrationDependencyDelta(), (), (), (), (), (), (),
+            target_scan, "resolved", False, 0,
         )
-        pack_migration._mark_pack_migration_plan_ready(
-            plan, validation_token=token
+        plan.resolution = resolution
+        plan._state = "resolved"
+        plan._public_test_handoff = pack_migration.prepare_pack_migration_publication(
+            plan,
+            resolution,
+            acknowledged_warning_codes=tuple(
+                warning.code for warning in plan.warnings if warning.acknowledgement_required
+            ),
         )
 
     def test_snapshot_has_semantic_digests_and_no_absolute_path_dependency(self) -> None:
@@ -183,7 +196,7 @@ minecraft_server:
             with self.assertRaises(AttributeError):
                 plan.state = "ready"  # type: ignore[misc]
             plan._state = "ready"
-            with self.assertRaisesRegex(pack_migration.PackMigrationError, "cannot be applied"):
+            with self.assertRaisesRegex(pack_migration.PackMigrationError, "publication requires"):
                 pack_migration.apply_pack_copy_migration_at(plan)
         finally:
             plan._state = "staged"
@@ -192,7 +205,7 @@ minecraft_server:
     def test_apply_atomically_publishes_validated_target(self) -> None:
         plan = self.plan()
         self.make_ready(plan)
-        published = pack_migration.apply_pack_copy_migration_at(plan)
+        published = pack_migration.apply_pack_copy_migration_at(plan._public_test_handoff)
         self.assertEqual(plan.state, "applied")
         self.assertEqual(published.project_key, "pack:next")
         self.assertTrue((self.packs / "next" / "source" / "pack.toml").is_file())
@@ -215,7 +228,7 @@ minecraft_server:
                         "changed", encoding="utf-8"
                     )
                 with self.assertRaises(pack_migration.PackMigrationStale):
-                    pack_migration.apply_pack_copy_migration_at(plan)
+                    pack_migration.apply_pack_copy_migration_at(plan._public_test_handoff)
                 self.assertFalse((self.packs / "next").exists())
                 if changed == "source":
                     text = (self.pack / "pack.yaml").read_text()
@@ -232,7 +245,7 @@ minecraft_server:
             with self.assertRaisesRegex(
                 pack_migration.PackMigrationPublicationError, "appeared"
             ):
-                pack_migration.apply_pack_copy_migration_at(plan)
+                pack_migration.apply_pack_copy_migration_at(plan._public_test_handoff)
         finally:
             (self.packs / "next").rmdir()
             pack_migration.discard_pack_migration_plan(plan)
@@ -247,7 +260,7 @@ minecraft_server:
             raise OSError("uncertain syscall result")
 
         with patch.object(packctl, "renameat2", side_effect=publish_then_raise):
-            published = pack_migration.apply_pack_copy_migration_at(plan)
+            published = pack_migration.apply_pack_copy_migration_at(plan._public_test_handoff)
         self.assertEqual(published.project_key, "pack:next")
         self.assertEqual(plan.state, "applied")
 
@@ -256,7 +269,7 @@ minecraft_server:
         self.make_ready(plan)
         with patch.object(packctl, "renameat2", side_effect=OSError("rename failed")):
             with self.assertRaises(pack_migration.PackMigrationPublicationError):
-                pack_migration.apply_pack_copy_migration_at(plan)
+                pack_migration.apply_pack_copy_migration_at(plan._public_test_handoff)
         self.assertEqual(plan.state, "failed")
         self.assertTrue(plan.transaction_root.is_dir())
         self.assertTrue(packctl.project_lock_is_active("pack:demo"))
@@ -281,13 +294,13 @@ minecraft_server:
             side_effect=fail_published_snapshot,
         ):
             with self.assertRaises(pack_migration.PackMigrationStale):
-                pack_migration.apply_pack_copy_migration_at(plan)
+                pack_migration.apply_pack_copy_migration_at(plan._public_test_handoff)
         self.assertTrue(plan._publication_committed)
         self.assertTrue((self.packs / "next").is_dir())
         self.assertTrue(packctl.project_lock_is_active("pack:demo"))
         with self.assertRaisesRegex(pack_migration.PackMigrationError, "cannot be discarded"):
             pack_migration.discard_pack_migration_plan(plan)
-        published = pack_migration.apply_pack_copy_migration_at(plan)
+        published = pack_migration.retry_pack_migration_cleanup(plan._public_test_handoff)
         self.assertEqual(published.project_key, "pack:next")
         self.assertEqual(plan.state, "applied")
 
@@ -324,7 +337,7 @@ minecraft_server:
             with self.assertRaisesRegex(
                 pack_migration.PackMigrationCleanupError, "unlock failed"
             ):
-                pack_migration.apply_pack_copy_migration_at(plan)
+                pack_migration.apply_pack_copy_migration_at(plan._public_test_handoff)
         self.assertTrue((plan.transaction_root / "plan.json").is_file())
         self.assertEqual(
             [path.name for path in plan.transaction_root.iterdir()], ["plan.json"]
@@ -335,7 +348,7 @@ minecraft_server:
             "_release_plan_locks",
             side_effect=original,
         ):
-            pack_migration.apply_pack_copy_migration_at(plan)
+            pack_migration.retry_pack_migration_cleanup(plan._public_test_handoff)
         self.assertEqual(plan.state, "applied")
 
     def test_transaction_parent_symlink_replacement_cannot_escape(self) -> None:
