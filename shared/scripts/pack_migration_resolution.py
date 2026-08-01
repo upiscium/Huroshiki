@@ -18,6 +18,7 @@ from pack_migration import (
     PackMigrationStale,
     _identity,
     _record_plan_diagnostic,
+    _retire_resolution_pending_warnings,
     _same_snapshot,
     snapshot_pack_migration_source_at,
 )
@@ -145,9 +146,13 @@ class PackMigrationProgress:
         "validating-target",
         "validating-resolutions",
         "applying-resolutions",
+        "validating-publication",
+        "ready",
+        "publishing",
+        "verifying",
+        "cleaning-up",
         "classifying",
         "committing",
-        "cleaning-up",
     ]
     completed: int
     total: int
@@ -183,6 +188,7 @@ class PackMigrationResolutionPlan:
     target_source_snapshot: PackTreeScan | None
     state: Literal["resolved", "resolution-required"]
     provenance_required: bool = False
+    resolution_attempt: int = 0
 
     def diagnostic_summary(self) -> dict[str, object]:
         delta = self.dependency_delta
@@ -195,6 +201,7 @@ class PackMigrationResolutionPlan:
             "identity_changes": len(self.identity_changes),
             "path_collisions": len(self.path_collisions),
             "filename_collisions": len(self.filename_collisions),
+            "resolution_attempt": self.resolution_attempt,
             "dependency_delta": {
                 "added": len(delta.added),
                 "removed": len(delta.removed),
@@ -1076,6 +1083,7 @@ def _resolve_effective_root_set(
                     None,
                     "resolution-required",
                     True,
+                    int(getattr(plan, "_resolution_attempt", 0)),
                 )
                 plan.resolution = result
                 plan._state = "resolution-required"
@@ -1400,7 +1408,7 @@ def _resolve_effective_root_set(
             installed_scan = _exchange_target_source(
                 plan, workspace, resolver_scan, checkpoint
             )
-            plan._resolved_staging_digest = installed_scan.snapshot_digest
+            plan._resolved_source_snapshot_digest = installed_scan.snapshot_digest
             result = PackMigrationResolutionPlan(
                 plan.source_snapshot.snapshot_digest,
                 plan.target,
@@ -1422,10 +1430,13 @@ def _resolve_effective_root_set(
                 (),
                 tuple(url_compatibility),
                 installed_scan,
-                "resolved",
-            )
+                    "resolved",
+                    False,
+                    int(getattr(plan, "_resolution_attempt", 0)),
+                )
             plan.resolution = result
             plan._state = "resolved"
+            _retire_resolution_pending_warnings(plan)
             _record_plan_diagnostic(plan)
             return result
         except BaseException as error:
@@ -1596,6 +1607,8 @@ def resolve_pack_migration_conflicts_at(
             )
             plan.resolution = result
             plan._state = result.state
+            if result.state == "resolved":
+                _retire_resolution_pending_warnings(plan)
             explicit_identities = {
                 item.source_root.canonical_identity
                 for item in cumulative_removed

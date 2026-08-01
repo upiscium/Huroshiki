@@ -1384,47 +1384,49 @@ def _prospective_text(config: dict[str, Any], key: str, context: str) -> str:
 
 def _validate_prospective_deployment(config: dict[str, Any], context: str) -> None:
     errors: list[str] = []
-    try:
-        distribution = require_mapping(config, "distribution", context)
-    except ConfigError as error:
-        errors.append(str(error))
-    else:
+    if "distribution" in config:
         try:
-            target = distribution.get("rsync_target")
-            if not isinstance(target, str) or not target:
-                raise ConfigError(
-                    f"{context}.distribution.rsync_target must be a non-empty string"
-                )
-            validate_rsync_target(target)
-            public_url = distribution.get("public_pack_url")
-            if public_url is not None:
-                if not isinstance(public_url, str):
-                    raise ConfigError(
-                        f"{context}.distribution.public_pack_url must be a string"
-                    )
-                validate_public_pack_url(public_url)
-        except (ConfigError, ValueError) as error:
+            distribution = require_mapping(config, "distribution", context)
+        except ConfigError as error:
             errors.append(str(error))
-    try:
-        server = require_mapping(config, "minecraft_server", context)
-    except ConfigError as error:
-        errors.append(str(error))
-    else:
-        validators = {
-            "ssh_host": validate_ssh_target,
-            "stack_dir": validate_remote_stack_dir,
-            "service": validate_compose_service,
-        }
-        for field, validator in validators.items():
+        else:
             try:
-                raw_value = server.get(field)
-                if not isinstance(raw_value, str) or not raw_value.strip():
+                target = distribution.get("rsync_target")
+                if not isinstance(target, str) or not target:
                     raise ConfigError(
-                        f"{context}.minecraft_server.{field} must be a non-empty string"
+                        f"{context}.distribution.rsync_target must be a non-empty string"
                     )
-                validator(raw_value)
-            except ConfigError as error:
+                validate_rsync_target(target)
+                public_url = distribution.get("public_pack_url")
+                if public_url is not None:
+                    if not isinstance(public_url, str):
+                        raise ConfigError(
+                            f"{context}.distribution.public_pack_url must be a string"
+                        )
+                    validate_public_pack_url(public_url)
+            except (ConfigError, ValueError) as error:
                 errors.append(str(error))
+    if "minecraft_server" in config:
+        try:
+            server = require_mapping(config, "minecraft_server", context)
+        except ConfigError as error:
+            errors.append(str(error))
+        else:
+            validators = {
+                "ssh_host": validate_ssh_target,
+                "stack_dir": validate_remote_stack_dir,
+                "service": validate_compose_service,
+            }
+            for field, validator in validators.items():
+                try:
+                    raw_value = server.get(field)
+                    if not isinstance(raw_value, str) or not raw_value.strip():
+                        raise ConfigError(
+                            f"{context}.minecraft_server.{field} must be a non-empty string"
+                        )
+                    validator(raw_value)
+                except ConfigError as error:
+                    errors.append(str(error))
     if errors:
         raise ConfigError("; ".join(errors))
 

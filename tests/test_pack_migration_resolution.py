@@ -135,7 +135,7 @@ class PackMigrationResolutionTest(unittest.TestCase):
         self.assertEqual(diagnostic["schema"], 2)
         self.assertEqual(diagnostic["state"], "resolved")
         self.assertNotIn(str(self.root), json.dumps(diagnostic))
-        with self.assertRaisesRegex(pack_migration.PackMigrationError, "cannot be applied"):
+        with self.assertRaisesRegex(pack_migration.PackMigrationError, "publication requires"):
             pack_migration.apply_pack_copy_migration_at(plan)
         pack_migration.discard_pack_migration_plan(plan)
 
@@ -194,7 +194,7 @@ class PackMigrationResolutionTest(unittest.TestCase):
             (plan.target_staging_root / "source" / "pack.toml").read_bytes(), before
         )
         self.assertEqual(result.unresolved_roots[0].reason_code, "no-compatible-file")
-        with self.assertRaisesRegex(pack_migration.PackMigrationError, "cannot be applied"):
+        with self.assertRaisesRegex(pack_migration.PackMigrationError, "publication requires"):
             pack_migration.apply_pack_copy_migration_at(plan)
         pack_migration.discard_pack_migration_plan(plan)
 
