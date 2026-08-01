@@ -90,6 +90,7 @@
             test -f ${huroshiki}/lib/huroshiki/template_import.py
             test -f ${huroshiki}/lib/huroshiki/template_merge.py
             test -f ${huroshiki}/lib/huroshiki/deploy_support.py
+            test -f ${huroshiki}/lib/huroshiki/pack_publish.py
             test -f ${huroshiki}/lib/huroshiki/url_artifacts.py
             test -f ${huroshiki}/lib/huroshiki/project_locks.py
             test -f ${huroshiki}/lib/huroshiki/pack_migration.py
