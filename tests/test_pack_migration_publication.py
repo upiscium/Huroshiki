@@ -173,8 +173,13 @@ class PackMigrationPublicationTest(unittest.TestCase):
     def test_warning_details_become_stale_after_ready(self) -> None:
         plan = self.fixture.plan()
         self.fixture.make_ready(plan)
+        changed_code = next(
+            warning.code
+            for warning in plan.warnings
+            if warning.acknowledgement_required
+        )
         plan.warnings = tuple(
-            warning if warning.code != "resolver-pending" else type(warning)(
+            warning if warning.code != changed_code else type(warning)(
                 warning.code, warning.message + " changed", warning.relative_path,
                 warning.acknowledgement_required,
             )
@@ -275,10 +280,14 @@ class PackMigrationResolverPublicationIntegrationTest(unittest.TestCase):
         self.fixture.tearDown()
 
     def test_real_resolver_result_prepares_and_publishes(self) -> None:
-        plan = self.fixture.plan()
-        source_before = pack_migration.snapshot_pack_migration_source_at(
-            "pack:demo", self.fixture.pack, self.fixture.root
-        ).snapshot_digest
+        snapshot = resolution_fixture.core.snapshot_pack_migration_source("pack:demo")
+        source_before = snapshot.snapshot_digest
+        source_pack_yaml_before = (self.fixture.pack / "pack.yaml").read_bytes()
+        plan = resolution_fixture.core.plan_pack_copy_migration(
+            "pack:demo",
+            self.fixture.target(),
+            expected_snapshot=snapshot,
+        )
         with patch.object(
             packctl,
             "init_packwiz_project",
@@ -292,32 +301,29 @@ class PackMigrationResolverPublicationIntegrationTest(unittest.TestCase):
             "resolve_project_selector",
             side_effect=self.fixture.fake_selector,
         ), patch.object(packctl, "run_packwiz"):
-            resolved = pack_migration_resolution.resolve_pack_migration_plan_at(
-                plan,
-                repository_root=self.fixture.root,
-                state_root=self.fixture.state,
-            )
+            resolved = resolution_fixture.core.resolve_pack_migration_plan(plan)
 
         self.assertEqual(resolved.state, "resolved")
+        self.assertFalse(
+            {"resolver-pending", "url-provider-compatibility-pending"}
+            & {warning.code for warning in plan.warnings}
+        )
         assert resolved.target_source_snapshot is not None
         self.assertEqual(
             resolved.target_source_snapshot.root,
             plan.target_staging_root / "source",
         )
-        (plan.target_staging_root / "pack.yaml").write_text(
-            """id: next
-display_name: Next
-enabled: true
-distribution:
-  rsync_target: host:/packs/next
-minecraft_server:
-  ssh_host: minecraft
-  stack_dir: /stacks/next
-  service: next
-""",
-            encoding="utf-8",
+        target_config = (plan.target_staging_root / "pack.yaml").read_text(
+            encoding="utf-8"
         )
-        publication = pack_migration.prepare_pack_migration_publication(
+        self.assertIn("id: next", target_config)
+        self.assertIn("display_name: Next", target_config)
+        self.assertIn("enabled: true", target_config)
+        self.assertIn("url_max_jar_size_bytes: 123456", target_config)
+        self.assertNotIn("rsync_target:", target_config)
+        self.assertNotIn("public_pack_url:", target_config)
+        self.assertNotIn("minecraft_server:", target_config)
+        publication = resolution_fixture.core.prepare_pack_migration_publication(
             plan,
             resolved,
             acknowledged_warning_codes=tuple(
@@ -341,15 +347,31 @@ minecraft_server:
             publication._token.staging_snapshot_digest,
             resolved.target_source_snapshot.snapshot_digest,
         )
-        published = pack_migration.apply_pack_copy_migration_at(publication)
+        published = resolution_fixture.core.apply_pack_migration_publication(publication)
 
         self.assertEqual(published.project_key, "pack:next")
+        self.assertFalse(published.validation_errors)
         self.assertEqual(plan.state, "applied")
         self.assertEqual(
-            pack_migration.snapshot_pack_migration_source_at(
-                "pack:demo", self.fixture.pack, self.fixture.root
+            packctl.project_versions(self.fixture.packs / "next" / "source"),
+            ("1.21.4", "fabric", "0.16.0"),
+        )
+        published_config = (self.fixture.packs / "next" / "pack.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("id: next", published_config)
+        self.assertIn("display_name: Next", published_config)
+        self.assertNotIn("rsync_target:", published_config)
+        self.assertNotIn("public_pack_url:", published_config)
+        self.assertNotIn("minecraft_server:", published_config)
+        self.assertEqual(
+            resolution_fixture.core.snapshot_pack_migration_source(
+                "pack:demo"
             ).snapshot_digest,
             source_before,
+        )
+        self.assertEqual(
+            (self.fixture.pack / "pack.yaml").read_bytes(), source_pack_yaml_before
         )
 
 

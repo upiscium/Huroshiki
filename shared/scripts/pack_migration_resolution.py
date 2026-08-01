@@ -18,6 +18,7 @@ from pack_migration import (
     PackMigrationStale,
     _identity,
     _record_plan_diagnostic,
+    _retire_resolution_pending_warnings,
     _same_snapshot,
     snapshot_pack_migration_source_at,
 )
@@ -1435,6 +1436,7 @@ def _resolve_effective_root_set(
                 )
             plan.resolution = result
             plan._state = "resolved"
+            _retire_resolution_pending_warnings(plan)
             _record_plan_diagnostic(plan)
             return result
         except BaseException as error:
@@ -1605,6 +1607,8 @@ def resolve_pack_migration_conflicts_at(
             )
             plan.resolution = result
             plan._state = result.state
+            if result.state == "resolved":
+                _retire_resolution_pending_warnings(plan)
             explicit_identities = {
                 item.source_root.canonical_identity
                 for item in cumulative_removed

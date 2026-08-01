@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -685,21 +686,37 @@ def _warnings_and_skips(
         for entry in snapshot.entries
     ):
         warnings.append(
-            PackMigrationWarning(
-                "url-provider-compatibility-pending",
-                "Provider and URL compatibility will be checked by a later resolver",
-                Path("source"),
-                True,
-            )
+        PackMigrationWarning(
+            "url-provider-compatibility-pending",
+            "Provider and URL compatibility will be checked by a later resolver",
+            Path("source"),
+        )
         )
     warnings.append(
         PackMigrationWarning(
             "resolver-pending",
-            "MOD resolution and target Packwiz initialization are not implemented yet",
-            acknowledgement_required=True,
+            "MOD resolution and target Packwiz initialization are pending",
         )
     )
     return tuple(warnings), skipped
+
+
+def _retire_resolution_pending_warnings(plan: PackMigrationPlan) -> None:
+    pending_codes = {
+        "resolver-pending",
+        "url-provider-compatibility-pending",
+    }
+    retired_messages = {
+        warning.message for warning in plan.warnings if warning.code in pending_codes
+    }
+    plan.warnings = tuple(
+        warning for warning in plan.warnings if warning.code not in pending_codes
+    )
+    plan.changes = tuple(
+        change
+        for change in plan.changes
+        if not (change.category == "warning" and change.detail in retired_messages)
+    )
 
 
 def _source_versions(snapshot: PackMigrationSourceSnapshot) -> tuple[str, str, str]:
@@ -979,6 +996,215 @@ def _remove_directory_contents(
         os.rmdir(name, dir_fd=directory_fd)
 
 
+def _same_config_snapshot(
+    left: packctl.ConfigFileSnapshot,
+    right: packctl.ConfigFileSnapshot,
+) -> bool:
+    return (
+        left.exists == right.exists
+        and left.mode == right.mode
+        and left.device == right.device
+        and left.inode == right.inode
+        and left.bytes == right.bytes
+        and left.digest == right.digest
+    )
+
+
+def _write_target_config_bytes(
+    descriptor: int,
+    contents: bytes,
+    checkpoint: Callable[[], None],
+) -> None:
+    view = memoryview(contents)
+    while view:
+        checkpoint()
+        written = os.write(descriptor, view[: 64 * 1024])
+        if written == 0:
+            raise OSError("short target Pack configuration write")
+        view = view[written:]
+
+
+def _stage_pack_migration_target_config(
+    plan: PackMigrationPlan,
+    source_scan: PackTreeScan,
+    *,
+    checkpoint: Callable[[], None],
+) -> tuple[PackTreeScan, tuple[PackMigrationChange, ...]]:
+    """Transform and atomically stage target ``pack.yaml`` from a fixed scan."""
+
+    checkpoint()
+    source_contents = _read_scanned_file(source_scan, Path("pack.yaml"))
+    source_config = _yaml_mapping(source_contents, "pack.yaml")
+    target_config = deepcopy(source_config)
+    source_id = source_config.get("id")
+    source_display_name = source_config.get("display_name", source_id)
+    target_config["id"] = plan.target.target_id
+    target_config["display_name"] = plan.target.display_name
+
+    cleared: list[PackMigrationChange] = []
+    distribution = target_config.get("distribution")
+    if isinstance(distribution, dict):
+        for key in ("rsync_target", "public_pack_url"):
+            if key in distribution:
+                del distribution[key]
+                cleared.append(
+                    PackMigrationChange(
+                        "target-config", None, f"Cleared distribution.{key}"
+                    )
+                )
+        # The complete section is operational in the current Pack schema. Drop
+        # it even if a source accepted an additional committed field, rather
+        # than carrying a future destination setting into the copied Pack.
+        del target_config["distribution"]
+    if "minecraft_server" in target_config:
+        del target_config["minecraft_server"]
+        cleared.append(
+            PackMigrationChange(
+                "target-config", None, "Cleared minecraft_server configuration"
+            )
+        )
+
+    try:
+        packctl.prospective_pack_config(plan.target.target_id, target_config, {})
+    except (packctl.ConfigError, TypeError, ValueError) as error:
+        raise PackMigrationError(f"Target Pack configuration is invalid: {error}") from error
+    serialized = yaml.safe_dump(
+        target_config,
+        sort_keys=False,
+        allow_unicode=True,
+    ).encode("utf-8")
+
+    current_scan = scan_pack_migration_source(
+        plan.target_staging_root,
+        checkpoint=checkpoint,
+    )
+    if (
+        current_scan.root_identity != plan._staging_identity
+        or current_scan.snapshot_digest != plan._staging_snapshot_digest
+    ):
+        raise PackMigrationStale("Target staging changed before configuration staging")
+    source_entry = _entry_map(source_scan).get(Path("pack.yaml"))
+    staging_entry = _entry_map(current_scan).get(Path("pack.yaml"))
+    if (
+        source_entry is None
+        or staging_entry is None
+        or source_entry.kind != "file"
+        or staging_entry.kind != "file"
+        or source_entry.digest != staging_entry.digest
+        or source_entry.mode != staging_entry.mode
+    ):
+        raise PackMigrationStale("Staged Pack configuration does not match fixed source")
+
+    temporary_name: str | None = None
+    staged_snapshot: packctl.ConfigFileSnapshot | None = None
+    expected_snapshot: packctl.ConfigFileSnapshot | None = None
+    try:
+        with packctl.open_config_directory(plan.target_staging_root) as directory:
+            if (directory.device, directory.inode) != plan._staging_identity:
+                raise PackMigrationStale("Target staging root was replaced")
+            checkpoint()
+            expected_snapshot = packctl.read_config_snapshot(directory, "pack.yaml")
+            if (
+                not expected_snapshot.exists
+                or expected_snapshot.device != staging_entry.device
+                or expected_snapshot.inode != staging_entry.inode
+                or expected_snapshot.mode != staging_entry.mode
+                or expected_snapshot.digest != staging_entry.digest
+                or expected_snapshot.bytes != source_contents
+            ):
+                raise PackMigrationStale("Staged Pack configuration changed before replacement")
+            mode = expected_snapshot.mode if expected_snapshot.mode is not None else 0o600
+            descriptor, temporary_name = packctl.create_config_temp(
+                directory,
+                "pack.yaml",
+                mode,
+            )
+            try:
+                _write_target_config_bytes(descriptor, serialized, checkpoint)
+                os.fchmod(descriptor, mode)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            checkpoint()
+            staged_snapshot = packctl.read_config_snapshot(directory, temporary_name)
+            if (
+                not staged_snapshot.exists
+                or staged_snapshot.mode != mode
+                or staged_snapshot.bytes != serialized
+                or staged_snapshot.digest != hashlib.sha256(serialized).hexdigest()
+            ):
+                raise PackMigrationStale("Temporary target Pack configuration changed")
+            packctl.check_config_directory_identity(directory)
+            current_config = packctl.read_config_snapshot(directory, "pack.yaml")
+            if not _same_config_snapshot(current_config, expected_snapshot):
+                raise PackMigrationStale("Staged Pack configuration changed before replacement")
+            checkpoint()
+            packctl.renameat2(
+                directory.fd,
+                temporary_name,
+                directory.fd,
+                "pack.yaml",
+                packctl.RENAME_EXCHANGE,
+            )
+            packctl.check_config_directory_identity(directory)
+            published = packctl.read_config_snapshot(directory, "pack.yaml")
+            exchanged = packctl.read_config_snapshot(directory, temporary_name)
+            if not _same_config_snapshot(published, staged_snapshot):
+                raise PackMigrationStale("Target Pack configuration replacement changed")
+            if not _same_config_snapshot(exchanged, expected_snapshot):
+                raise PackMigrationStale("Original Pack configuration exchange changed")
+            os.fsync(directory.fd)
+            checkpoint()
+            os.unlink(temporary_name, dir_fd=directory.fd)
+            temporary_name = None
+            os.fsync(directory.fd)
+            packctl.check_config_directory_identity(directory)
+    except packctl.ConfigError as error:
+        raise PackMigrationStale("Target Pack configuration path changed") from error
+    finally:
+        if temporary_name is not None:
+            try:
+                with packctl.open_config_directory(plan.target_staging_root) as directory:
+                    temporary = packctl.read_config_snapshot(directory, temporary_name)
+                    known_identities = {
+                        (snapshot.device, snapshot.inode)
+                        for snapshot in (staged_snapshot, expected_snapshot)
+                        if snapshot is not None and snapshot.exists
+                    }
+                    if temporary.exists and (temporary.device, temporary.inode) in known_identities:
+                        os.unlink(temporary_name, dir_fd=directory.fd)
+                        os.fsync(directory.fd)
+            except BaseException:
+                pass
+
+    checkpoint()
+    result = scan_pack_migration_source(plan.target_staging_root, checkpoint=checkpoint)
+    if result.root_identity != plan._staging_identity:
+        raise PackMigrationStale("Target staging root changed after configuration staging")
+    result_entry = _entry_map(result).get(Path("pack.yaml"))
+    if (
+        result_entry is None
+        or result_entry.kind != "file"
+        or result_entry.errors
+        or result_entry.digest != hashlib.sha256(serialized).hexdigest()
+        or _read_scanned_file(result, Path("pack.yaml")) != serialized
+    ):
+        raise PackMigrationStale("Target Pack configuration verification failed")
+    if any(entry.kind == "invalid" or entry.errors for entry in result.entries):
+        raise PackMigrationError("Target staging contains unsafe entries")
+    return result, (
+        PackMigrationChange(
+            "target-config", None, f"Pack ID: {source_id} -> {plan.target.target_id}"
+        ),
+        PackMigrationChange(
+            "target-config",
+            None,
+            f"Display name: {source_display_name} -> {plan.target.display_name}",
+        ),
+        *cleared,
+    )
+
+
 def plan_pack_copy_migration_at(
     source_key: str,
     source_root: Path,
@@ -1080,15 +1306,14 @@ def plan_pack_copy_migration_at(
         )
         plan._staging_identity = staged.scan.root_identity
         plan._staging_snapshot_digest = staged.scan.snapshot_digest
+        staged_config, target_config_changes = _stage_pack_migration_target_config(
+            plan,
+            detached.scan,
+            checkpoint=checkpoint,
+        )
+        plan._staging_identity = staged_config.root_identity
+        plan._staging_snapshot_digest = staged_config.snapshot_digest
         old_minecraft, old_loader, old_loader_version = _source_versions(current)
-        try:
-            committed = _yaml_mapping(
-                _read_scanned_file(current._tree_scan, Path("pack.yaml")),
-                "pack.yaml",
-            )
-            old_display = str(committed.get("display_name", source_id))
-        except PackMigrationError:
-            old_display = source_id
         changes = [
             PackMigrationChange("copy", entry.relative_path, "Copy unchanged")
             for entry in current.entries[1:]
@@ -1101,9 +1326,8 @@ def plan_pack_copy_migration_at(
             PackMigrationChange("skip", path, "Excluded from migration staging")
             for path in skipped
         )
+        changes.extend(target_config_changes)
         for detail in (
-            f"Pack ID: {source_id} -> {target.target_id}",
-            f"Display name: {old_display} -> {target.display_name}",
             f"Minecraft: {old_minecraft} -> {target.minecraft_version}",
             f"Loader: {old_loader} -> {target.loader}",
             f"Loader version: {old_loader_version} -> {target.loader_version}",
