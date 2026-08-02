@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import os
+import json
 import hashlib
 import shutil
 from pathlib import Path
@@ -13,6 +14,7 @@ from unittest.mock import patch
 
 import pack_publish
 import packctl
+from portable_paths import portable_relative_path_key
 
 
 class PackPublishManifestTest(unittest.TestCase):
@@ -85,6 +87,17 @@ class PackPublishManifestTest(unittest.TestCase):
         document["index"]["hash"] = hashlib.sha256(index).hexdigest()
         pack_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
+    def write_explicit_index(self, records: list[tuple[str, str | None]]) -> None:
+        """Write exact Packwiz index records, including records for invalid paths."""
+        output = ['hash-format = "sha256"\n']
+        for relative, digest_path in records:
+            digest = hashlib.sha256(
+                (self.pack / "source" / (digest_path or relative)).read_bytes()
+            ).hexdigest()
+            output.append(f"\n[[files]]\nfile = {json.dumps(relative)}\nhash = \"{digest}\"\n")
+        (self.pack / "source" / "index.toml").write_text("".join(output), encoding="utf-8")
+        self.update_pack_index_hash()
+
     def manifest_entries(self, manifest: object) -> dict[str, pack_publish.PublishFileEntry]:
         return {entry.relative_path.as_posix(): entry for entry in manifest.files}
 
@@ -102,6 +115,8 @@ class PackPublishManifestTest(unittest.TestCase):
         first = pack_publish.plan_pack_publish_manifest("demo")
         second = pack_publish.plan_pack_publish_manifest("demo")
         paths = {str(entry.relative_path) for entry in first.files}
+        portable_keys = [portable_relative_path_key(entry.relative_path) for entry in first.files]
+        self.assertEqual(len(portable_keys), len(set(portable_keys)))
         self.assertIn("pack.toml", paths)
         self.assertIn("config.txt", paths)
         self.assertIn("server.cfg", paths)
@@ -146,6 +161,40 @@ class PackPublishManifestTest(unittest.TestCase):
         self.assertNotIn("mods/server.pw.toml", self.generated_index_records(client))
         self.assertNotIn("mods/client.pw.toml", self.manifest_entries(server))
         self.assertNotIn("mods/client.pw.toml", self.generated_index_records(server))
+
+    def test_content_root_is_not_a_publication_plan(self) -> None:
+        (self.pack / "content" / "root.txt").write_bytes(b"root files are not overlays")
+        with self.assertRaises(pack_publish.PackPublishError):
+            pack_publish.plan_pack_publish_manifest("demo")
+
+    def test_only_common_and_selected_side_content_are_planned(self) -> None:
+        (self.pack / "content" / "client" / "client.cfg").write_bytes(b"client")
+        manifest = pack_publish.plan_pack_publish_manifest("demo", target_side="server")
+        paths = {str(entry.relative_path) for entry in manifest.files}
+        self.assertIn("config.txt", paths)
+        self.assertIn("server.cfg", paths)
+        self.assertNotIn("client.cfg", paths)
+
+    def test_missing_content_root_is_an_empty_overlay_set(self) -> None:
+        shutil.rmtree(self.pack / "content")
+        manifest = pack_publish.plan_pack_publish_manifest("demo")
+        self.assertFalse(
+            any(entry.source_kind == "content" for entry in manifest.files)
+        )
+
+    def test_only_common_content_directory_is_supported(self) -> None:
+        shutil.rmtree(self.pack / "content" / "client")
+        shutil.rmtree(self.pack / "content" / "server")
+        manifest = pack_publish.plan_pack_publish_manifest("demo")
+        self.assertIn("config.txt", self.manifest_entries(manifest))
+
+    def test_only_selected_side_content_directory_is_supported(self) -> None:
+        shutil.rmtree(self.pack / "content")
+        selected = self.pack / "content" / "server"
+        selected.mkdir(parents=True)
+        (selected / "server-only.cfg").write_bytes(b"server")
+        manifest = pack_publish.plan_pack_publish_manifest("demo")
+        self.assertIn("server-only.cfg", self.manifest_entries(manifest))
 
     def test_common_and_side_duplicate_destination_fails(self) -> None:
         (self.pack / "content" / "common" / "same.txt").write_bytes(b"common")
@@ -294,6 +343,128 @@ class PackPublishManifestTest(unittest.TestCase):
         (owned / "server.pw.toml").write_text("not metadata")
         with self.assertRaises(pack_publish.PackPublishError):
             pack_publish.plan_pack_publish_manifest("demo")
+
+    def test_content_root_and_overlay_roots_must_be_directories(self) -> None:
+        for relative in (Path("content"), Path("content/common"), Path("content/client"), Path("content/server")):
+            with self.subTest(relative=relative):
+                content = self.pack / "content"
+                if content.is_dir() and not content.is_symlink():
+                    shutil.rmtree(content)
+                elif content.exists() or content.is_symlink():
+                    content.unlink()
+                content.mkdir()
+                for root in ("common", "client", "server"):
+                    (content / root).mkdir()
+                target = self.pack / relative
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                elif target.exists():
+                    target.unlink()
+                target.write_bytes(b"not a directory")
+                with self.assertRaises(pack_publish.PackPublishError):
+                    pack_publish.plan_pack_publish_manifest("demo")
+
+    def test_symlink_at_content_root_or_overlay_root_is_rejected(self) -> None:
+        for relative in (Path("content"), Path("content/common"), Path("content/client"), Path("content/server")):
+            with self.subTest(relative=relative):
+                content = self.pack / "content"
+                if content.is_dir() and not content.is_symlink():
+                    shutil.rmtree(content)
+                elif content.exists() or content.is_symlink():
+                    content.unlink()
+                content.mkdir()
+                for root in ("common", "client", "server"):
+                    (content / root).mkdir()
+                target = self.pack / relative
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                elif target.exists() or target.is_symlink():
+                    target.unlink()
+                target.symlink_to(self.root, target_is_directory=True)
+                with self.assertRaises(pack_publish.PackPublishError):
+                    pack_publish.plan_pack_publish_manifest("demo")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO test requires POSIX")
+    def test_special_entry_at_content_root_or_overlay_root_is_rejected(self) -> None:
+        for relative in (Path("content"), Path("content/common"), Path("content/client"), Path("content/server")):
+            with self.subTest(relative=relative):
+                content = self.pack / "content"
+                if content.is_dir() and not content.is_symlink():
+                    shutil.rmtree(content)
+                elif content.exists() or content.is_symlink():
+                    content.unlink()
+                content.mkdir()
+                for root in ("common", "client", "server"):
+                    (content / root).mkdir()
+                target = self.pack / relative
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                elif target.exists() or target.is_symlink():
+                    target.unlink()
+                os.mkfifo(target)
+                with self.assertRaises(pack_publish.PackPublishError):
+                    pack_publish.plan_pack_publish_manifest("demo")
+
+    def test_unsupported_content_child_is_rejected(self) -> None:
+        unsupported = self.pack / "content" / "unsupported"
+        unsupported.mkdir()
+        (unsupported / "file.txt").write_bytes(b"unsupported")
+        with self.assertRaises(pack_publish.PackPublishError):
+            pack_publish.plan_pack_publish_manifest("demo")
+
+    def test_index_descriptor_namespace_collisions_are_rejected(self) -> None:
+        for relative in (
+            "pack.toml",
+            "index.toml",
+            "PACK.TOML",
+            "INDEX.TOML",
+            "ｐａｃｋ．ｔｏｍｌ",
+            "ｉｎｄｅｘ．ｔｏｍｌ",
+        ):
+            with self.subTest(relative=relative):
+                source_path = self.pack / "source" / relative
+                created = not source_path.exists()
+                if not source_path.exists():
+                    source_path.write_bytes(b"descriptor collision")
+                try:
+                    self.write_explicit_index(
+                        [("README.md", None), (relative, "README.md")]
+                    )
+                    expected = (
+                        "portable path collision"
+                        if relative in {"PACK.TOML", "INDEX.TOML"}
+                        else "generated descriptor"
+                    )
+                    with self.assertRaisesRegex(
+                        pack_publish.PackPublishError, expected
+                    ):
+                        pack_publish.plan_pack_publish_manifest("demo")
+                finally:
+                    if created:
+                        source_path.unlink()
+
+    def test_index_descriptor_unicode_normalization_collision_is_rejected(self) -> None:
+        decomposed = "cafe\u0301.txt"
+        composed = "caf\u00e9.txt"
+        (self.pack / "source" / composed).write_bytes(b"composed")
+        (self.pack / "source" / decomposed).write_bytes(b"decomposed")
+        self.write_explicit_index([(composed, None), (decomposed, None)])
+        with self.assertRaises(pack_publish.PackPublishError):
+            pack_publish.plan_pack_publish_manifest("demo")
+
+    def test_indexed_file_at_selected_metadata_jar_destination_is_rejected(self) -> None:
+        jar = self.pack / "source" / "mods" / "server.jar"
+        jar.write_bytes(b"ordinary indexed jar")
+        self.write_index()
+        with self.assertRaises(pack_publish.PackPublishError):
+            pack_publish.plan_pack_publish_manifest("demo")
+
+    def test_non_normalized_index_paths_are_rejected(self) -> None:
+        for relative in ("./README.md", "mods//server.pw.toml", "mods/./server.pw.toml"):
+            with self.subTest(relative=relative):
+                self.write_explicit_index([(relative, "README.md")])
+                with self.assertRaises(pack_publish.PackPublishError):
+                    pack_publish.plan_pack_publish_manifest("demo")
 
     def test_content_collision_with_packwiz_jar_destination_is_rejected(self) -> None:
         mods = self.pack / "content" / "server" / "mods"

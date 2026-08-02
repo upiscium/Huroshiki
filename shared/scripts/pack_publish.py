@@ -12,6 +12,7 @@ import threading
 import time
 import tomllib
 from typing import Callable, Literal
+import unicodedata
 
 import tomlkit
 import yaml
@@ -226,11 +227,13 @@ def _content_files(scan: PackTreeScan, target_side: str) -> list[tuple[Path, obj
     """Validate overlay shape/policy solely from the fixed tree scan."""
     entries = _entry_map(scan)
     root = entries.get(Path("content"))
-    if root is None or root.kind != "directory":
+    if root is None:
+        return []
+    if root.kind != "directory":
         raise PackPublishError("content must be an ordinary directory")
     for target in ("common", "client", "server"):
         item = entries.get(Path("content") / target)
-        if item is None or item.kind != "directory":
+        if item is not None and item.kind != "directory":
             raise PackPublishError(f"content/{target} must be an ordinary directory")
     selected: list[tuple[Path, object]] = []
     for path, item in sorted(entries.items(), key=lambda pair: pair[0].as_posix()):
@@ -285,6 +288,32 @@ def _generated_entry(
         "generated",
         contents,
     )
+
+
+def _portable_output_map(
+    files: list[PublishFileEntry],
+) -> dict[str, PurePosixPath]:
+    result: dict[str, PurePosixPath] = {}
+    for entry in files:
+        path = entry.relative_path
+        if not path.parts or path.is_absolute() or path.as_posix() != str(path):
+            raise PackPublishError(f"publication path is not normalized: {path}")
+        try:
+            key = portable_relative_path_key(path)
+        except PortablePathError as error:
+            raise PackPublishError(f"invalid publication path: {path}") from error
+        previous = result.get(key)
+        if previous is not None:
+            raise PackPublishError(
+                f"publication path collision: {previous} and {path}"
+            )
+        result[key] = path
+    return result
+
+
+def _collides_with_generated_descriptor(path: Path) -> bool:
+    compatibility_name = unicodedata.normalize("NFKC", path.as_posix()).casefold()
+    return compatibility_name in {"pack.toml", "index.toml"}
 
 
 def _variant_index_bytes(
@@ -354,15 +383,26 @@ def _packwiz_files(root_fd: int, scan: PackTreeScan, side: str, *, cancel_event:
             raise PackPublishError("index.toml contains an invalid file record")
         if set(record) - {"file", "hash", "metafile"}:
             raise PackPublishError("index.toml contains unsupported file record fields")
-        path = Path(record["file"])
-        if path.is_absolute() or not path.parts or ".." in path.parts:
+        raw_path = record["file"]
+        posix_path = PurePosixPath(raw_path)
+        if (
+            posix_path.is_absolute()
+            or not posix_path.parts
+            or ".." in posix_path.parts
+            or posix_path.as_posix() != raw_path
+        ):
             raise PackPublishError("index.toml contains an unsafe path")
+        path = Path(*posix_path.parts)
         try:
             indexed_key = portable_relative_path_key(path)
         except PortablePathError as error:
             raise PackPublishError(f"index.toml contains an invalid path: {path}") from error
         if indexed_key in indexed_paths:
             raise PackPublishError(f"index.toml contains a duplicate path: {path}")
+        if _collides_with_generated_descriptor(path):
+            raise PackPublishError(
+                f"index.toml file record collides with generated descriptor: {path}"
+            )
         indexed_paths.add(indexed_key)
         found = _file_entry(scan, Path("source") / path, PurePosixPath(path.as_posix()), "packwiz")
         if found.sha256 != record["hash"]:
@@ -432,6 +472,16 @@ def _packwiz_files(root_fd: int, scan: PackTreeScan, side: str, *, cancel_event:
         _checkpoint(cancel_event, deadline)
         if not metafile or path in selected_metadata:
             selected_records.append((path, digest, metafile))
+    selected_source_keys = {
+        portable_relative_path_key(path) for path, _, _ in selected_records
+    } | {
+        portable_relative_path_key(Path("pack.toml")),
+        portable_relative_path_key(Path("index.toml")),
+    }
+    if selected_source_keys & jar_destinations:
+        raise PackPublishError(
+            "selected Packwiz file collides with metadata JAR destination"
+        )
     generated_index = _variant_index_bytes(
         selected_records,
         lambda: _checkpoint(cancel_event, deadline),
@@ -536,9 +586,8 @@ def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", can
             pack_files, tuple_value, jar_destinations = _packwiz_files(root_fd, scan, target_side, cancel_event=cancel_event, deadline=deadline)
             _progress(progress, "validating-content")
             content_files = _content_files(scan, target_side)
-            portable = {portable_relative_path_key(entry.relative_path): entry.relative_path for entry in pack_files}
             files = list(pack_files)
-            destinations: set[str] = set()
+            portable = _portable_output_map(files)
             for overlay_path, overlay in content_files:
                 _checkpoint(cancel_event, deadline)
                 relative = Path(*overlay_path.parts[2:])
@@ -547,9 +596,9 @@ def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", can
                     key = portable_relative_path_key(destination)
                 except PortablePathError as error:
                     raise PackPublishError(f"invalid content destination: {destination}") from error
-                if key in portable or key in jar_destinations or key in destinations:
+                if key in portable or key in jar_destinations:
                     raise PackPublishError(f"content destination collision: {destination}")
-                destinations.add(key)
+                portable[key] = destination
                 item = entries.get(overlay_path)
                 _read_bound(
                     root_fd,
@@ -562,6 +611,7 @@ def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", can
                 )
                 files.append(PublishFileEntry(destination, item.size, item.digest, stat.S_IMODE(item.mode), "content"))
             files.sort(key=lambda entry: entry.relative_path.as_posix())
+            _portable_output_map(files)
             _progress(progress, "building-manifest")
             total_bytes = 0
             for entry in files:
