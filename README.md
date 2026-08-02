@@ -25,7 +25,7 @@ packctl --version
 ```
 
 After the release follow-up publishes the reviewed tag, the exact release candidate can be run with
-`nix run github:upiscium/Huroshiki/v0.2.0-rc.3 -- --help`. That tag is not created by the release
+`nix run github:upiscium/Huroshiki/v0.2.0-rc.4 -- --help`. That tag is not created by the release
 preparation PR.
 
 The managed repository is selected by `--root PATH`, then `HUROSHIKI_ROOT`, then the current
@@ -114,6 +114,9 @@ accepted directly; otherwise the pinned Packwiz Installer materializes both arti
 transaction state, verifies each declared hash, and requires equal computed SHA-256 or the same
 complete target-loader MOD ID/version set. Names, slugs, and filenames alone are never evidence. Explicit
 root pairs, URL artifacts, mismatched versions/loaders, and unverifiable artifacts remain conflicts.
+Legacy Packs without `.huroshiki-roots.json` may safely retain existing metadata when an incoming
+verified equivalent is known to be a transitive dependency; sides are unioned and no root manifest
+is inferred or created. Ambiguous collisions with an incoming explicit root remain rejected.
 Noninteractive Modrinth and CurseForge closure resolvers run in isolated process groups: cancellation
 or their monotonic deadline stops the whole group with SIGTERM and then SIGKILL after a bounded grace
 period. URL roots keep their existing interruptible download cancellation and network timeouts; the

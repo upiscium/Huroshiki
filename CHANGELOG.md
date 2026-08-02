@@ -2,12 +2,20 @@
 
 ## Unreleased
 
+## 0.2.0-rc.4 - 2026-08-02
+
 ### Dependency Equivalence
 
-- Fixed verified cross-provider transitive dependency collisions in legacy Packs without a root
-  provenance manifest. Existing unknown metadata is preserved with side union only, while a shared
-  three-state provenance policy rejects ambiguous root replacement before artifact materialization
-  and leaves legacy Packs without an inferred roots manifest.
+- Fixed the `v0.2.0-rc.3` regression that rejected verified cross-provider transitive dependency
+  collisions in legacy Packs without `.huroshiki-roots.json`. Provenance is now separated into
+  `explicit`, `dependency`, and `unknown`; `existing unknown + incoming dependency` preserves the
+  existing metadata, unions sides, omits the duplicate incoming metadata/JAR, and does not infer or
+  create a root manifest. Ambiguous collisions with an incoming explicit root still fail closed
+  before materialization.
+- Kept artifact/JAR equivalence verification mandatory through strict declared SHA-256, verified
+  materialized SHA-256, or an exact target-loader MOD ID/version set. Canonical candidate provenance
+  and existing-state now participate in the evidence binding with metadata, target context, and
+  artifact evidence. The shared policy applies to Add, Profiles, Template Import, and Update.
 
 ## 0.2.0-rc.3 - 2026-08-02
 
