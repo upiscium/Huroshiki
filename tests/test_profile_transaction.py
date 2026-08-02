@@ -8,6 +8,11 @@ from unittest.mock import patch
 
 import huroshiki_core as core
 import packctl
+from pack_migration_roots import PackRootRecord, write_pack_root_manifest
+
+
+SHA256 = "0" * 64
+BAD_SHA256 = "1" * 64
 
 
 def metadata(provider: str, project_id: str, side: str = "both") -> str:
@@ -19,6 +24,10 @@ def metadata(provider: str, project_id: str, side: str = "both") -> str:
     return f'''name = "MOD {project_id}"
 filename = "{project_id}.jar"
 side = "{side}"
+ [download]
+url = "https://cdn.example/{project_id}.jar"
+hash-format = "sha256"
+hash = "{SHA256}"
 {update}'''
 
 
@@ -248,6 +257,88 @@ class ProfileTransactionTest(unittest.TestCase):
             core.apply_profiles(self.key, profile, ["base"])
         install.assert_called_once()
         self.assertIn('side = "both"', target.read_text(encoding="utf-8"))
+
+    def test_cross_provider_dependency_collision_merges_with_side_union(self) -> None:
+        mods = self.source / "mods"
+        existing_root = mods / "existing-root.pw.toml"
+        dependency = mods / "shared.pw.toml"
+        existing_root.write_text(metadata("modrinth", "existing-root"), encoding="utf-8")
+        dependency.write_text(metadata("modrinth", "shared"), encoding="utf-8")
+        write_pack_root_manifest(
+            self.source,
+            (PackRootRecord("modrinth", "existing-root", "client"),),
+        )
+        incoming = core.ResolvedModClosure(
+            ("curseforge", "101"),
+            (
+                core.ResolvedMetadata(
+                    ("curseforge", "101"),
+                    Path("mods/incoming-root.pw.toml"),
+                    "incoming-root.jar",
+                    metadata("curseforge", "101").encode(),
+                    "curseforge",
+                    "101",
+                ),
+                core.ResolvedMetadata(
+                    ("curseforge", "202"),
+                    Path("mods/shared.pw.toml"),
+                    "shared.jar",
+                    metadata("curseforge", "202", "server").replace(
+                        'filename = "202.jar"', 'filename = "shared.jar"'
+                    ).encode(),
+                    "curseforge",
+                    "202",
+                ),
+            ),
+        )
+        with patch.object(core, "resolve_mod_closure", return_value=incoming), patch.object(
+            core, "run_resolver_process", side_effect=self.refresh_success
+        ):
+            core.apply_profiles(
+                self.key,
+                self.profiles(
+                    {"source": "curseforge", "project": 101, "side": "server"}
+                ),
+                ["base"],
+            )
+        self.assertEqual(len(list(mods.glob("*.pw.toml"))), 3)
+        self.assertIn('side = "both"', dependency.read_text(encoding="utf-8"))
+        roots = {(item.provider, item.project_id) for item in core.read_pack_root_manifest(self.source)}
+        self.assertEqual(roots, {("modrinth", "existing-root"), ("curseforge", "101")})
+
+    def test_cross_provider_non_equivalent_dependency_collision_fails_closed(self) -> None:
+        mods = self.source / "mods"
+        dependency = mods / "shared.pw.toml"
+        dependency.write_text(metadata("modrinth", "shared"), encoding="utf-8")
+        write_pack_root_manifest(
+            self.source,
+            (PackRootRecord("modrinth", "existing-root", "client"),),
+        )
+        incoming = core.ResolvedModClosure(
+            ("curseforge", "101"),
+            (
+                core.ResolvedMetadata(
+                    ("curseforge", "101"), Path("mods/incoming-root.pw.toml"),
+                    "incoming-root.jar", metadata("curseforge", "101").encode(),
+                    "curseforge", "101",
+                ),
+                core.ResolvedMetadata(
+                    ("curseforge", "202"), Path("mods/shared.pw.toml"),
+                    "shared.jar", metadata("curseforge", "202").replace(
+                        f'hash = "{SHA256}"', f'hash = "{BAD_SHA256}"'
+                    ).encode(), "curseforge", "202",
+                ),
+            ),
+        )
+        before = self.snapshot()
+        with patch.object(core, "resolve_mod_closure", return_value=incoming):
+            with self.assertRaises(core.HuroshikiError):
+                core.apply_profiles(
+                    self.key,
+                    self.profiles({"source": "curseforge", "project": 101, "side": "server"}),
+                    ["base"],
+                )
+        self.assertEqual(self.snapshot(), before)
 
     def test_multiple_profiles_keep_order_and_roll_back_together(self) -> None:
         original = self.snapshot()

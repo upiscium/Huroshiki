@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import huroshiki_core as core
 import packctl
+from dependency_equivalence import MaterializedArtifact, SemanticJarIdentity
 from url_artifacts import UrlArtifact
 
 
@@ -42,17 +43,43 @@ def metadata(
     )
 
 
+def closure_metadata(
+    provider: str,
+    project_id: str,
+    filename: str,
+    *,
+    side: str = "both",
+    version: str = "1.0",
+    download_hash: str | None = "a" * 64,
+) -> str:
+    provider_table = "modrinth" if provider == "modrinth" else "curseforge"
+    project_key = "mod-id" if provider == "modrinth" else "project-id"
+    download = "[download]\n"
+    if download_hash is not None:
+        download += f'hash-format = "sha256"\nhash = "{download_hash}"\n'
+    return (
+        f'name = "{project_id}"\nfilename = "{filename}"\nside = "{side}"\n'
+        f"{download}[update.{provider_table}]\n{project_key} = "
+        f'"{project_id}"\nversion = "{version}"\n'
+    )
+
+
 class TemplateResolverMergeTest(unittest.TestCase):
     @staticmethod
-    def run_fake_resolver(command, *, cwd, cancel_event, deadline):
+    def run_fake_resolver(
+        command, *, cwd, cancel_event, deadline, result_callback=None
+    ):
         result = core.subprocess.run(command, cwd=cwd, check=False)
-        return core.ResolverProcessResult(
+        resolved = core.ResolverProcessResult(
             result.returncode,
             result.stdout or "",
             result.stderr or "",
             False,
             False,
         )
+        if result_callback is not None:
+            result_callback(resolved)
+        return resolved
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -416,6 +443,156 @@ class TemplateResolverMergeTest(unittest.TestCase):
             ):
                 self.create(conflict_resolutions=resolution)
         create.assert_not_called()
+
+    def test_cross_provider_transitive_dependency_collision_is_deterministic(self) -> None:
+        self.write_template(
+            "  - name: Modrinth Root\n    provider: modrinth\n"
+            "    project_id: root-m\n    side: client\n"
+            "  - name: CurseForge Root\n    provider: curseforge\n"
+            "    project_id: '42'\n    side: server\n"
+        )
+
+        def fake_run(command, *, cwd=None, **kwargs):
+            if command[-1] == "refresh":
+                return subprocess.CompletedProcess(command, 0, "", "")
+            source = Path(cwd)
+            if command[-1] == "root-m":
+                root = closure_metadata("modrinth", "root-m", "root-m.jar")
+                dependency = closure_metadata("modrinth", "dep-m", "shared.jar")
+            else:
+                root = closure_metadata("curseforge", "42", "root-c.jar")
+                dependency = closure_metadata("curseforge", "99", "shared.jar")
+            root_path = "root-m.pw.toml" if command[-1] == "root-m" else "root-c.pw.toml"
+            (source / "mods" / root_path).write_text(root, encoding="utf-8")
+            (source / "mods" / "shared.pw.toml").write_text(
+                dependency, encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            patch.object(core, "create_project", side_effect=self.fake_create),
+            patch.object(core.subprocess, "run", side_effect=fake_run),
+        ):
+            report = self.create()
+
+        self.assertEqual(report.installed, ("Modrinth Root", "CurseForge Root"))
+        self.assertEqual(
+            {(item.actual_provider, item.actual_project_id) for item in report.retained},
+            {("modrinth", "root-m"), ("curseforge", "42")},
+        )
+        mods = self.packs / "generated" / "source" / "mods"
+        self.assertTrue((mods / "root-m.pw.toml").is_file())
+        self.assertTrue((mods / "root-c.pw.toml").is_file())
+        self.assertEqual(packctl.read_toml(mods / "shared.pw.toml")["side"], "both")
+        self.assertEqual(
+            packctl.read_toml(mods / "shared.pw.toml")["update"]["modrinth"]["mod-id"],
+            "dep-m",
+        )
+
+    def test_explicit_root_collision_is_not_auto_collapsed(self) -> None:
+        self.write_template(
+            "  - name: Modrinth Root\n    provider: modrinth\n"
+            "    project_id: root-m\n    side: client\n"
+            "  - name: CurseForge Root\n    provider: curseforge\n"
+            "    project_id: '42'\n    side: server\n"
+        )
+
+        def fake_run(command, *, cwd=None, **kwargs):
+            if command[-1] == "root-m":
+                provider, project = "modrinth", "root-m"
+            else:
+                provider, project = "curseforge", "42"
+            (Path(cwd) / "mods" / "root.pw.toml").write_text(
+                closure_metadata(provider, project, "same.jar"), encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            patch.object(core, "create_project", side_effect=self.fake_create),
+            patch.object(core.subprocess, "run", side_effect=fake_run),
+        ):
+            report = self.create()
+
+        self.assertEqual(report.installed, ("Modrinth Root",))
+        self.assertEqual(len(report.failed), 1)
+        self.assertIn("explicit roots", report.failed[0].reason)
+        self.assertEqual(
+            [(item.actual_provider, item.actual_project_id) for item in report.retained],
+            [("modrinth", "root-m")],
+        )
+
+    def test_cross_provider_dependency_hash_or_semantic_mismatch_fails_closed(self) -> None:
+        for mismatch in ("hash", "semantic"):
+            with self.subTest(mismatch=mismatch):
+                self.write_template(
+                    "  - name: Modrinth Root\n    provider: modrinth\n"
+                    "    project_id: root-m\n    side: client\n"
+                    "  - name: CurseForge Root\n    provider: curseforge\n"
+                    "    project_id: '42'\n    side: server\n"
+                )
+
+                def fake_run(command, *, cwd=None, **kwargs):
+                    if command[-1] == "refresh":
+                        return subprocess.CompletedProcess(command, 0, "", "")
+                    source = Path(cwd)
+                    if command[-1] == "root-m":
+                        root = closure_metadata("modrinth", "root-m", "root-m.jar")
+                        dependency = closure_metadata(
+                            "modrinth", "dep-m", "shared.jar",
+                            version="1.0",
+                            download_hash=("a" * 64 if mismatch == "hash" else None),
+                        )
+                    else:
+                        root = closure_metadata("curseforge", "42", "root-c.jar")
+                        dependency = closure_metadata(
+                            "curseforge", "99", "shared.jar",
+                            version=("1.0" if mismatch == "hash" else "2.0"),
+                            download_hash=("b" * 64 if mismatch == "hash" else None),
+                        )
+                    root_path = "root-m.pw.toml" if command[-1] == "root-m" else "root-c.pw.toml"
+                    (source / "mods" / root_path).write_text(root, encoding="utf-8")
+                    (source / "mods" / "shared.pw.toml").write_text(
+                        dependency, encoding="utf-8"
+                    )
+                    return subprocess.CompletedProcess(command, 0, "", "")
+
+                def materialize(candidate, context, **kwargs):
+                    version = "1.0" if candidate.provider_identity == "modrinth:dep-m" else "2.0"
+                    return MaterializedArtifact(
+                        "a" * 64 if candidate.provider_identity == "modrinth:dep-m" else "b" * 64,
+                        SemanticJarIdentity((("shared", version),), context.target_loader),
+                    )
+
+                patches = [
+                    patch.object(core, "create_project", side_effect=self.fake_create),
+                    patch.object(core.subprocess, "run", side_effect=fake_run),
+                ]
+                if mismatch == "semantic":
+                    patches.append(
+                        patch.object(
+                            core, "materialize_provider_artifact", side_effect=materialize
+                        )
+                    )
+                else:
+                    patches.append(
+                        patch.object(
+                            core,
+                            "materialize_provider_artifact",
+                            side_effect=materialize,
+                        )
+                    )
+                for item in patches:
+                    item.start()
+                try:
+                    report = self.create()
+                finally:
+                    for item in reversed(patches):
+                        item.stop()
+
+                self.assertEqual(report.installed, ("Modrinth Root",))
+                self.assertEqual(len(report.failed), 1)
+                self.assertIn("equivalent", report.failed[0].reason)
+                (self.packs / "generated").rename(self.packs / f"generated-{mismatch}")
 
     def test_portable_path_and_filename_collisions_and_windows_names_fail(self) -> None:
         cases = (

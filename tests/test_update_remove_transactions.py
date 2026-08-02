@@ -100,18 +100,23 @@ class TransactionTestCase(unittest.TestCase):
         return subprocess.CompletedProcess(command, returncode)
 
     @staticmethod
-    def run_fake_resolver(command, *, cwd, cancel_event, deadline):
+    def run_fake_resolver(
+        command, *, cwd, cancel_event, deadline, result_callback=None
+    ):
         try:
             result = core.subprocess.run(command, cwd=cwd, check=False)
         except subprocess.TimeoutExpired:
             return core.ResolverProcessResult(-15, "", "", False, True)
-        return core.ResolverProcessResult(
+        resolved = core.ResolverProcessResult(
             result.returncode,
             result.stdout or "",
             result.stderr or "",
             False,
             False,
         )
+        if result_callback is not None:
+            result_callback(resolved)
+        return resolved
 
 
 class UpdatePreparationOperationTest(unittest.TestCase):
@@ -246,6 +251,164 @@ class UpdatePreparationOperationTest(unittest.TestCase):
 
 
 class UpdateTransactionTest(TransactionTestCase):
+    @staticmethod
+    def provider_metadata(
+        provider: str,
+        project: str,
+        *,
+        version: str = "v2",
+        filename: str = "shared.jar",
+        side: str = "both",
+        digest: str = "a" * 64,
+    ) -> str:
+        update = (
+            f'[update.modrinth]\nmod-id = "{project}"\nversion = "{version}"\n'
+            if provider == "modrinth"
+            else f"[update.curseforge]\nproject-id = {project}\nfile-id = 1\n"
+        )
+        return (
+            f'name = "{project}"\nfilename = "{filename}"\nside = "{side}"\n'
+            f'[download]\nhash-format = "sha256"\nhash = "{digest}"\n'
+            f'url = "https://example.invalid/{project}.jar"\n{update}'
+        )
+
+    def test_verified_cross_provider_dependency_collision_collapses_in_update(self) -> None:
+        self.source.joinpath("pack.toml").write_text(
+            '[versions]\nminecraft = "1.21.1"\nfabric = "0.16.0"\n', encoding="utf-8"
+        )
+        first = self.source / "mods/first.pw.toml"
+        second = self.source / "mods/second.pw.toml"
+        first.write_text(self.provider_metadata("modrinth", "first", filename="first.jar", digest="1" * 64).replace('version = "v2"', 'version = "v1"'), encoding="utf-8")
+        second.write_text(self.provider_metadata("curseforge", "2", filename="second.jar", digest="2" * 64).replace("file-id = 1", "file-id = 0"), encoding="utf-8")
+        core.write_pack_root_manifest(self.source, ())
+
+        def resolve(command, *, cwd, **_):
+            if command[-1] == "refresh":
+                return core.ResolverProcessResult(0, "", "", False, False)
+            slug = command[-1]
+            provider, project = ("modrinth", "first") if slug == "first" else ("curseforge", "2")
+            root_file = "first.jar" if slug == "first" else "second.jar"
+            root = self.provider_metadata(provider, project, filename=root_file, digest=("1" if slug == "first" else "2") * 64)
+            dependency_provider, dependency_id = (("modrinth", "shared") if slug == "first" else ("curseforge", "123"))
+            dependency = self.provider_metadata(dependency_provider, dependency_id, side=("client" if slug == "first" else "server"))
+            (cwd / "mods").mkdir(exist_ok=True)
+            (cwd / "mods" / f"{slug}.pw.toml").write_text(root, encoding="utf-8")
+            (cwd / "mods" / f"shared-{slug}.pw.toml").write_text(
+                dependency, encoding="utf-8"
+            )
+            return core.ResolverProcessResult(0, "", "", False, False)
+
+        transaction = core.PackTransaction.create(self.key)
+        def materialize(candidate, *_args, **_kwargs):
+            from dependency_equivalence import MaterializedArtifact
+            return MaterializedArtifact("e" * 64 if "modrinth" in candidate.provider_identity else "f" * 64)
+
+        with patch.object(core, "run_resolver_process", side_effect=resolve), patch.object(
+            core, "materialize_provider_artifact", side_effect=materialize
+        ):
+            candidates = transaction.prepare_updates()
+            self.assertEqual(2, len([item for item in candidates if item.available]))
+            transaction.select_updates(item.root for item in candidates if item.available)
+            transaction.apply(refresh=False)
+
+        shared_files = [
+            path
+            for path in self.source.rglob("*.pw.toml")
+            if 'filename = "shared.jar"' in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual(len(shared_files), 1)
+        shared = shared_files[0]
+        self.assertIn('side = "both"', shared.read_text(encoding="utf-8"))
+        transaction.discard()
+
+    def test_non_equivalent_cross_provider_dependency_collision_fails_closed(self) -> None:
+        self.source.joinpath("pack.toml").write_text(
+            '[versions]\nminecraft = "1.21.1"\nfabric = "0.16.0"\n', encoding="utf-8"
+        )
+        self.write_mod("first")
+        self.write_mod("second")
+        core.write_pack_root_manifest(self.source, ())
+
+        def resolve(command, *, cwd, **_):
+            if command[-1] == "refresh":
+                return core.ResolverProcessResult(0, "", "", False, False)
+            slug = command[-1]
+            root = self.provider_metadata("modrinth", slug, filename=f"{slug}.jar", digest="1" * 64)
+            provider, project, digest = ("modrinth", "shared", "3" * 64) if slug == "first" else ("curseforge", "123", "4" * 64)
+            (cwd / "mods").mkdir(exist_ok=True)
+            (cwd / "mods" / f"{slug}.pw.toml").write_text(root, encoding="utf-8")
+            (cwd / "mods" / f"shared-{slug}.pw.toml").write_text(
+                self.provider_metadata(provider, project, digest=digest),
+                encoding="utf-8",
+            )
+            return core.ResolverProcessResult(0, "", "", False, False)
+
+        transaction = core.PackTransaction.create(self.key)
+        def materialize(candidate, *_args, **_kwargs):
+            from dependency_equivalence import MaterializedArtifact
+            return MaterializedArtifact("e" * 64 if "modrinth" in candidate.provider_identity else "f" * 64)
+
+        with patch.object(core, "run_resolver_process", side_effect=resolve), patch.object(
+            core, "materialize_provider_artifact", side_effect=materialize
+        ):
+            candidates = transaction.prepare_updates()
+            self.assertEqual(2, len([item for item in candidates if item.available]))
+            with self.assertRaisesRegex(core.HuroshikiError, "could not be verified as equivalent"):
+                transaction.select_updates(item.root for item in candidates if item.available)
+        self.assertFalse((self.source / "mods/shared.pw.toml").exists())
+        transaction.discard()
+
+    def test_update_collapses_against_unchanged_installed_dependency(self) -> None:
+        self.source.joinpath("pack.toml").write_text(
+            '[versions]\nminecraft = "1.21.1"\nfabric = "0.16.0"\n',
+            encoding="utf-8",
+        )
+        self.write_mod("first")
+        installed = self.source / "mods/shared-curseforge.pw.toml"
+        installed.write_text(
+            self.provider_metadata(
+                "curseforge", "123", side="server", digest="a" * 64
+            ),
+            encoding="utf-8",
+        )
+        core.write_pack_root_manifest(
+            self.source, (core.PackRootRecord("modrinth", "first", "both"),)
+        )
+
+        def resolve(command, *, cwd, **_):
+            if command[-1] == "refresh":
+                return core.ResolverProcessResult(0, "", "", False, False)
+            (cwd / "mods/first.pw.toml").write_text(
+                self.provider_metadata(
+                    "modrinth", "first", filename="first.jar", digest="1" * 64
+                ),
+                encoding="utf-8",
+            )
+            (cwd / "mods/shared-modrinth.pw.toml").write_text(
+                self.provider_metadata(
+                    "modrinth", "shared", side="client", digest="a" * 64
+                ),
+                encoding="utf-8",
+            )
+            return core.ResolverProcessResult(0, "", "", False, False)
+
+        transaction = core.PackTransaction.create(self.key)
+        with patch.object(core, "run_resolver_process", side_effect=resolve):
+            candidates = transaction.prepare_updates()
+            transaction.select_updates(
+                item.root for item in candidates if item.available
+            )
+            transaction.apply(refresh=False)
+
+        shared_files = [
+            path
+            for path in self.source.rglob("*.pw.toml")
+            if 'filename = "shared.jar"' in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual(shared_files, [installed])
+        self.assertIn('side = "both"', installed.read_text(encoding="utf-8"))
+        transaction.discard()
+
     def test_copy_checkpoint_removes_partial_destination(self) -> None:
         destination = self.root / "copy"
         calls = 0
@@ -1490,11 +1653,14 @@ class RemoveTransactionTest(TransactionTestCase):
         deadline = time.monotonic() + 30
         calls: list[tuple[threading.Event | None, float | None]] = []
 
-        def run(command, *, cwd, cancel_event, deadline):
+        def run(command, *, cwd, cancel_event, deadline, result_callback=None):
             calls.append((cancel_event, deadline))
             if command[:2] == ["packwiz", "remove"]:
                 (cwd / "mods" / f"{command[2]}.pw.toml").unlink()
-            return core.ResolverProcessResult(0, "", "", False, False)
+            result = core.ResolverProcessResult(0, "", "", False, False)
+            if result_callback is not None:
+                result_callback(result)
+            return result
 
         with patch.object(core, "run_resolver_process", side_effect=run):
             self.assertEqual(

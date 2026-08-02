@@ -102,15 +102,20 @@ class AddTransactionTest(unittest.TestCase):
         return subprocess.CompletedProcess(command, returncode)
 
     @staticmethod
-    def run_fake_resolver(command, *, cwd, cancel_event, deadline):
+    def run_fake_resolver(
+        command, *, cwd, cancel_event, deadline, result_callback=None
+    ):
         result = core.subprocess.run(command, cwd=cwd, check=False)
-        return core.ResolverProcessResult(
+        resolved = core.ResolverProcessResult(
             result.returncode,
             result.stdout or "",
             result.stderr or "",
             False,
             False,
         )
+        if result_callback is not None:
+            result_callback(resolved)
+        return resolved
 
     @staticmethod
     def provider_lookup(arguments, **_):
@@ -632,6 +637,139 @@ class AddTransactionTest(unittest.TestCase):
             self.assertIsNone(transaction._operation)
         finally:
             transaction.discard()
+
+    def test_verified_cross_provider_dependency_collapses_and_unions_side(self) -> None:
+        digest = "a" * 64
+        existing_contents = (
+            metadata("Shared", "200", "server")
+            .replace("update.modrinth", "update.curseforge")
+            .replace('mod-id = "200"', "project-id = 200")
+            .replace('hash = "00"', f'hash = "{digest}"')
+            .replace('filename = "200.jar"', 'filename = "shared.jar"')
+        )
+        existing_path = self.source / "mods/shared.pw.toml"
+        existing_path.write_text(existing_contents, encoding="utf-8")
+        core.write_pack_root_manifest(self.source, ())
+        root = self.closure("root").metadata[0]
+        incoming_contents = (
+            metadata("Shared", "shared", "both")
+            .replace('hash = "00"', f'hash = "{digest}"')
+            .replace('filename = "shared.jar"', 'filename = "shared.jar"')
+        ).encode()
+        incoming = core.ResolvedMetadata(
+            ("modrinth", "shared"),
+            Path("mods/shared.pw.toml"),
+            "shared.jar",
+            incoming_contents,
+            "modrinth",
+            "shared",
+        )
+        closure = core.ResolvedModClosure(("modrinth", "root"), (root, incoming))
+
+        changed = core.merge_metadata_closure(
+            self.source, closure, requested_side="client"
+        )
+
+        self.assertIn(Path("mods/shared.pw.toml"), changed)
+        retained = core.read_mod(self.source, Path("mods/shared.pw.toml"))
+        self.assertEqual(
+            (core.canonical_provider(retained.provider), retained.project_id),
+            ("curseforge", "200"),
+        )
+        self.assertEqual(retained.side, "both")
+        self.assertEqual(len(list(self.source.rglob("shared.pw.toml"))), 1)
+
+    def test_equivalent_dependencies_inside_one_closure_collapse(self) -> None:
+        digest = "c" * 64
+        root = self.closure("root").metadata[0]
+        modrinth_contents = metadata("Shared", "shared", "client").replace(
+            'hash = "00"', f'hash = "{digest}"'
+        ).encode()
+        curseforge_contents = (
+            metadata("Shared", "200", "server")
+            .replace("update.modrinth", "update.curseforge")
+            .replace('mod-id = "200"', "project-id = 200")
+            .replace('hash = "00"', f'hash = "{digest}"')
+            .replace('filename = "200.jar"', 'filename = "shared.jar"')
+            .encode()
+        )
+        closure = core.ResolvedModClosure(
+            ("modrinth", "root"),
+            (
+                root,
+                core.ResolvedMetadata(
+                    ("curseforge", "200"),
+                    Path("mods/shared.pw.toml"),
+                    "shared.jar",
+                    curseforge_contents,
+                    "curseforge",
+                    "200",
+                ),
+                core.ResolvedMetadata(
+                    ("modrinth", "shared"),
+                    Path("mods/shared.pw.toml"),
+                    "shared.jar",
+                    modrinth_contents,
+                    "modrinth",
+                    "shared",
+                ),
+            ),
+        )
+
+        core.merge_metadata_closure(self.source, closure, requested_side="client")
+
+        retained = core.read_mod(self.source, Path("mods/shared.pw.toml"))
+        self.assertEqual(
+            (core.canonical_provider(retained.provider), retained.project_id),
+            ("modrinth", "shared"),
+        )
+        self.assertFalse(
+            any(
+                path.name == "200.pw.toml"
+                for path in self.source.rglob("*.pw.toml")
+            )
+        )
+
+    def test_incoming_explicit_root_replaces_equivalent_existing_dependency(self) -> None:
+        digest = "b" * 64
+        existing = (
+            metadata("Shared", "200", "server")
+            .replace("update.modrinth", "update.curseforge")
+            .replace('mod-id = "200"', "project-id = 200")
+            .replace('hash = "00"', f'hash = "{digest}"')
+            .replace('filename = "200.jar"', 'filename = "shared.jar"')
+        )
+        (self.source / "mods/old.pw.toml").write_text(existing, encoding="utf-8")
+        core.write_pack_root_manifest(self.source, ())
+        incoming_contents = (
+            metadata("Shared", "shared", "client")
+            .replace('hash = "00"', f'hash = "{digest}"')
+            .replace('filename = "shared.jar"', 'filename = "shared.jar"')
+        ).encode()
+        incoming = core.ResolvedMetadata(
+            ("modrinth", "shared"),
+            Path("mods/new.pw.toml"),
+            "shared.jar",
+            incoming_contents,
+            "modrinth",
+            "shared",
+        )
+
+        core.merge_metadata_closure(
+            self.source,
+            core.ResolvedModClosure(("modrinth", "shared"), (incoming,)),
+            requested_side="client",
+        )
+
+        self.assertFalse((self.source / "mods/old.pw.toml").exists())
+        retained = core.read_mod(self.source, Path("mods/new.pw.toml"))
+        self.assertEqual(
+            (core.canonical_provider(retained.provider), retained.project_id),
+            ("modrinth", "shared"),
+        )
+        self.assertEqual(retained.side, "both")
+        roots = core.read_pack_root_manifest(self.source)
+        self.assertEqual([(item.provider, item.project_id) for item in roots], [("modrinth", "shared")])
 
     def test_curseforge_probe_rejects_mismatch_provider_and_multiple_metadata(self) -> None:
         cases = (

@@ -10,6 +10,10 @@
   noninteractive CLI, profile, and template selectors require positive numeric CurseForge IDs and
   reject names, slugs, and URLs. This supersedes the earlier direct CurseForge API credential
   requirement; no such credential is required.
+- Added verified cross-provider dependency equivalence. Modrinth and CurseForge dependencies that
+  collide by metadata path or JAR filename collapse only when artifact SHA-256 or the complete
+  target-loader MOD ID/version identity proves equivalence. Sides are unioned, explicit roots are
+  never automatically collapsed, and unverifiable or version-mismatched artifacts still fail closed.
 
 ## 0.2.0-rc.2 - 2026-08-01
 
@@ -35,9 +39,9 @@
 
 - Added CurseForge project search and strict numeric/project-URL resolution through the isolated
   provider helper. Install results carry canonical numeric project IDs with title, author, and
-  description; labels and slugs are never reused as identity. Requests required a locally
-  configured CurseForge credential, enforced Minecraft/loader filters, bounded responses and
-  redirects, and retained the shared cancellation/deadline process lifecycle.
+  description; labels and slugs are never reused as identity. Requests require
+  `HUROSHIKI_CURSEFORGE_API_KEY`, keep it in the API header, enforce Minecraft/loader filters,
+  bounded responses and redirects, and retain the shared cancellation/deadline process lifecycle.
 
 ### Reliability and Transaction Safety
 

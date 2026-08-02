@@ -537,6 +537,7 @@ def download_url_artifact(
     *,
     total_timeout_seconds: float = DEFAULT_URL_TOTAL_TIMEOUT_SECONDS,
     allow_private_networks: bool = False,
+    retained_path: Path | None = None,
 ) -> UrlArtifact:
     validate_public_url(url)
     if (
@@ -749,7 +750,7 @@ def download_url_artifact(
             f"Resolved {name} ({mod_id}) version={version or 'unknown'} "
             f"loaders={','.join(loaders)}",
         )
-        return UrlArtifact(
+        artifact = UrlArtifact(
             name=name,
             mod_id=mod_id,
             version=version,
@@ -759,6 +760,11 @@ def download_url_artifact(
             loaders=loaders,
             minecraft_versions=minecraft_versions,
         )
+        if retained_path is not None:
+            retained_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.replace(retained_path)
+            temporary_path = None
+        return artifact
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)

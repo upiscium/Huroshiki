@@ -331,7 +331,7 @@ class _PreparedUpdateTransaction(_UpdateTransaction):
             )
         ]
 
-    def select_updates(self, selected: set[Path]) -> None:
+    def select_updates(self, selected: set[Path], **_) -> None:
         self.selected = set(selected)
 
     def apply(self, *, cancel_event=None, deadline=None) -> None:
@@ -343,6 +343,8 @@ class _NavigationApp(App[None]):
 
     def __init__(self, screen) -> None:
         super().__init__()
+        self.update_apply_workers = {}
+        self._shutting_down = False
         self.initial_screen = screen
         self.transactions: dict[str, object] = {}
 
@@ -443,7 +445,7 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause()
                     self.assertIsInstance(app.screen, huroshiki.ConfirmModal)
                     await pilot.press("enter")
-                    await pilot.pause()
+                    await pilot.pause(0.15)
 
         self.assertEqual(transaction.apply_controls, transaction.prepare_controls)
         self.assertEqual(transaction.selected, {Path("mods/first.pw.toml")})

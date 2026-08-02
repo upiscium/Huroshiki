@@ -17,6 +17,7 @@ from uuid import uuid4
 import yaml
 
 import packctl
+from process_runner import BoundedProcessResult, stop_process_group
 from url_artifacts import DEFAULT_URL_MAX_JAR_SIZE_BYTES
 from overlay_policy import scan_content_overlays
 from pack_tree_policy import (
@@ -592,7 +593,31 @@ class PackMigrationPlan:
         self._explicit_replaced_roots: tuple[tuple[str, str], ...] = ()
         self._conflict_removed_roots: tuple[object, ...] = ()
         self._conflict_replaced_roots: tuple[object, ...] = ()
+        self._resolver_process_results: list[BoundedProcessResult] = []
         self._lock = threading.RLock()
+
+    def _record_resolver_process_result(self, result: BoundedProcessResult) -> None:
+        if result.termination_incomplete:
+            self._resolver_process_results.append(result)
+
+    def _retry_resolver_process_cleanup(self, deadline: float) -> None:
+        remaining: list[BoundedProcessResult] = []
+        for result in self._resolver_process_results:
+            if result.process_group is None:
+                remaining.append(result)
+                continue
+            cleanup = stop_process_group(
+                result.process_group,
+                parent=result.parent_process,
+                cleanup_deadline=deadline,
+            )
+            if not (cleanup.group_drained and cleanup.parent_reaped):
+                remaining.append(result)
+        self._resolver_process_results = remaining
+        if remaining:
+            raise PackMigrationCleanupError(
+                "Pack migration resolver process-group cleanup was incomplete"
+            )
 
     @property
     def state(self) -> str:
@@ -1999,6 +2024,7 @@ def discard_pack_migration_plan(
             return
         plan._state = "discarding"
         try:
+            plan._retry_resolver_process_cleanup(effective_deadline)
             _cleanup_transaction(
                 plan,
                 effective_deadline,

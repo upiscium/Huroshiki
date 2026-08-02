@@ -44,15 +44,20 @@ class TemplateCreationTest(unittest.TestCase):
         self.runner_patch.stop()
 
     @staticmethod
-    def run_fake_resolver(command, *, cwd, cancel_event, deadline):
+    def run_fake_resolver(
+        command, *, cwd, cancel_event, deadline, result_callback=None
+    ):
         result = core.subprocess.run(command, cwd=cwd, check=False)
-        return core.ResolverProcessResult(
+        resolved = core.ResolverProcessResult(
             result.returncode,
             result.stdout or "",
             result.stderr or "",
             False,
             False,
         )
+        if result_callback is not None:
+            result_callback(resolved)
+        return resolved
 
     def test_report_optional_collections_default_to_empty(self) -> None:
         report = core.TemplateCreationReport("pack:generated", ("base",))

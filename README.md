@@ -107,6 +107,12 @@ URL for exact lookup.
 Packwiz and provider resolver work use isolated process groups, so the same cancellation, absolute
 deadline, and orphan-process checks bound their work. Packwiz menu labels are never interpreted as
 identities.
+When Modrinth and CurseForge resolve the same transitive dependency to a colliding metadata path or
+JAR filename, Huroshiki collapses it only after verified equivalence. Equal declared SHA-256 is
+accepted directly; otherwise the pinned Packwiz Installer materializes both artifacts in isolated
+transaction state, verifies each declared hash, and requires equal computed SHA-256 or the same
+complete target-loader MOD ID/version set. Names, slugs, and filenames are never evidence. Explicit
+root pairs, URL artifacts, mismatched versions/loaders, and unverifiable artifacts remain conflicts.
 Noninteractive Modrinth and CurseForge closure resolvers run in isolated process groups: cancellation
 or their monotonic deadline stops the whole group with SIGTERM and then SIGKILL after a bounded grace
 period. URL roots keep their existing interruptible download cancellation and network timeouts; the
