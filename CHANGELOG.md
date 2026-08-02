@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Dependency Equivalence
+
+- Fixed verified cross-provider transitive dependency collisions in legacy Packs without a root
+  provenance manifest. Existing unknown metadata is preserved with side union only, while a shared
+  three-state provenance policy rejects ambiguous root replacement before artifact materialization
+  and leaves legacy Packs without an inferred roots manifest.
+
 ## 0.2.0-rc.3 - 2026-08-02
 
 ### Provider Search

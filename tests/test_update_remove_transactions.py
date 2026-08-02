@@ -371,10 +371,6 @@ class UpdateTransactionTest(TransactionTestCase):
             ),
             encoding="utf-8",
         )
-        core.write_pack_root_manifest(
-            self.source, (core.PackRootRecord("modrinth", "first", "both"),)
-        )
-
         def resolve(command, *, cwd, **_):
             if command[-1] == "refresh":
                 return core.ResolverProcessResult(0, "", "", False, False)
@@ -407,7 +403,50 @@ class UpdateTransactionTest(TransactionTestCase):
         ]
         self.assertEqual(shared_files, [installed])
         self.assertIn('side = "both"', installed.read_text(encoding="utf-8"))
+        self.assertFalse((self.source / ".huroshiki-roots.json").exists())
         transaction.discard()
+
+    def test_manifest_dependency_update_is_not_promoted_to_explicit_root(self) -> None:
+        self.source.joinpath("pack.toml").write_text(
+            '[versions]\nminecraft = "1.21.1"\nfabric = "0.16.0"\n',
+            encoding="utf-8",
+        )
+        explicit_path = Path("mods/explicit.pw.toml")
+        dependency_path = Path("mods/dependency.pw.toml")
+        explicit_contents = self.provider_metadata(
+            "curseforge", "123", filename="shared.jar", digest="a" * 64
+        ).encode()
+        dependency_before = self.provider_metadata(
+            "modrinth", "dependency", filename="dependency.jar", digest="a" * 64
+        ).encode()
+        dependency_after = self.provider_metadata(
+            "modrinth", "dependency", filename="shared.jar", digest="a" * 64
+        ).encode()
+        (self.source / explicit_path).write_bytes(explicit_contents)
+        (self.source / dependency_path).write_bytes(dependency_before)
+        core.write_pack_root_manifest(
+            self.source, (core.PackRootRecord("curseforge", "123", "both"),)
+        )
+        candidate = core.UpdateCandidate(
+            "dependency",
+            dependency_path,
+            "dependency",
+            "Dependency",
+            "modrinth",
+            "v1",
+            "v2",
+            "available",
+            (core.UpdateChange(dependency_path, dependency_before, dependency_after),),
+        )
+
+        with patch.object(core, "materialize_provider_artifact") as materialize:
+            changes = core._merge_update_closures((candidate,), source=self.source)
+
+        materialize.assert_not_called()
+        self.assertEqual(
+            changes,
+            (core.UpdateChange(dependency_path, dependency_before, None),),
+        )
 
     def test_copy_checkpoint_removes_partial_destination(self) -> None:
         destination = self.root / "copy"

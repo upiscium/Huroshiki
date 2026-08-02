@@ -263,11 +263,8 @@ class ProfileTransactionTest(unittest.TestCase):
         existing_root = mods / "existing-root.pw.toml"
         dependency = mods / "shared.pw.toml"
         existing_root.write_text(metadata("modrinth", "existing-root"), encoding="utf-8")
-        dependency.write_text(metadata("modrinth", "shared"), encoding="utf-8")
-        write_pack_root_manifest(
-            self.source,
-            (PackRootRecord("modrinth", "existing-root", "client"),),
-        )
+        dependency_contents = metadata("modrinth", "shared")
+        dependency.write_text(dependency_contents, encoding="utf-8")
         incoming = core.ResolvedModClosure(
             ("curseforge", "101"),
             (
@@ -302,9 +299,11 @@ class ProfileTransactionTest(unittest.TestCase):
                 ["base"],
             )
         self.assertEqual(len(list(mods.glob("*.pw.toml"))), 3)
-        self.assertIn('side = "both"', dependency.read_text(encoding="utf-8"))
-        roots = {(item.provider, item.project_id) for item in core.read_pack_root_manifest(self.source)}
-        self.assertEqual(roots, {("modrinth", "existing-root"), ("curseforge", "101")})
+        self.assertEqual(
+            dependency.read_text(encoding="utf-8"),
+            dependency_contents.replace('side = "client"', 'side = "both"'),
+        )
+        self.assertFalse((self.source / ".huroshiki-roots.json").exists())
 
     def test_cross_provider_non_equivalent_dependency_collision_fails_closed(self) -> None:
         mods = self.source / "mods"

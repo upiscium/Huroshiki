@@ -543,13 +543,10 @@ class TemplateImportCoreTest(unittest.TestCase):
         (mods / "existing-root.pw.toml").write_bytes(
             metadata("Existing Root", "existing-root", "existing-root.jar", provider="modrinth")
         )
-        (mods / "shared.pw.toml").write_bytes(
-            metadata("Shared", "202", "shared.jar", provider="curseforge", side="client")
+        shared_contents = metadata(
+            "Shared", "202", "shared.jar", provider="curseforge", side="client"
         )
-        write_pack_root_manifest(
-            self.source,
-            (PackRootRecord("modrinth", "existing-root", "client"),),
-        )
+        (mods / "shared.pw.toml").write_bytes(shared_contents)
         self.template.joinpath("template.yaml").write_text(
             "id: base\ndisplay_name: Base\nenabled: true\n"
             "minecraft: 1.21.1\nloader: neoforge\nreference_loader_version: 21.1.0\nmods:\n"
@@ -577,9 +574,13 @@ class TemplateImportCoreTest(unittest.TestCase):
             operation.run()
         self.assertIsNone(operation.error)
         self.assertEqual(len(list(operation.transaction.source.glob("mods/*.pw.toml"))), 3)
-        self.assertIn('side = "both"', (operation.transaction.source / "mods/shared.pw.toml").read_text())
-        roots = {(item.provider, item.project_id) for item in core.read_pack_root_manifest(operation.transaction.source)}
-        self.assertEqual(roots, {("modrinth", "existing-root"), ("modrinth", "root")})
+        self.assertEqual(
+            (operation.transaction.source / "mods/shared.pw.toml").read_bytes(),
+            shared_contents.replace(b'side = "client"', b'side = "both"'),
+        )
+        self.assertFalse(
+            (operation.transaction.source / ".huroshiki-roots.json").exists()
+        )
         operation.discard()
 
     def test_cross_provider_version_mismatch_fails_closed_without_preview(self) -> None:
