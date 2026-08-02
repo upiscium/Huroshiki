@@ -25,7 +25,7 @@ packctl --version
 ```
 
 After the release follow-up publishes the reviewed tag, the exact release candidate can be run with
-`nix run github:upiscium/Huroshiki/v0.2.0-rc.2 -- --help`. That tag is not created by the release
+`nix run github:upiscium/Huroshiki/v0.2.0-rc.3 -- --help`. That tag is not created by the release
 preparation PR.
 
 The managed repository is selected by `--root PATH`, then `HUROSHIKI_ROOT`, then the current
@@ -97,10 +97,11 @@ use canonical provider/project identity, preserve existing locations, union side
 version/download/update disagreements plus portable metadata-path or JAR-filename collisions. URL
 roots continue to use bounded downloads and do not acquire an implicit Packwiz dependency closure.
 Modrinth IDs, slugs, and project URLs are resolved through the Modrinth API before Packwiz runs.
-CurseForge uses Packwiz-native interactive search in the TUI. Results display labels only; Huroshiki
+CurseForge uses Packwiz-native interactive search in the TUI; Huroshiki does not directly search the
+CurseForge API, and a CurseForge API key is unnecessary. Results display labels only; Huroshiki
 verifies the selected root's positive numeric project ID with an isolated root-only probe, then
-resolves and merges its canonical complete dependency closure. `provider_lookup.py` is Modrinth-only
-and no direct CurseForge API credential is required. Noninteractive CLI, profile, and template
+resolves and merges its canonical complete dependency closure. `provider_lookup.py` is Modrinth-only.
+Noninteractive CLI, profile, and template
 selectors require positive numeric CurseForge IDs; names, slugs, and URLs fail closed. Bare Modrinth
 input is always a search query, including a single word; use `mr:<ID-or-slug>` or a Modrinth project
 URL for exact lookup.
@@ -108,10 +109,10 @@ Packwiz and provider resolver work use isolated process groups, so the same canc
 deadline, and orphan-process checks bound their work. Packwiz menu labels are never interpreted as
 identities.
 When Modrinth and CurseForge resolve the same transitive dependency to a colliding metadata path or
-JAR filename, Huroshiki collapses it only after verified equivalence. Equal declared SHA-256 is
+JAR filename, Huroshiki collapses it only after verified identity equivalence. Equal declared SHA-256 is
 accepted directly; otherwise the pinned Packwiz Installer materializes both artifacts in isolated
 transaction state, verifies each declared hash, and requires equal computed SHA-256 or the same
-complete target-loader MOD ID/version set. Names, slugs, and filenames are never evidence. Explicit
+complete target-loader MOD ID/version set. Names, slugs, and filenames alone are never evidence. Explicit
 root pairs, URL artifacts, mismatched versions/loaders, and unverifiable artifacts remain conflicts.
 Noninteractive Modrinth and CurseForge closure resolvers run in isolated process groups: cancellation
 or their monotonic deadline stops the whole group with SIGTERM and then SIGKILL after a bounded grace

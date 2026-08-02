@@ -2,18 +2,36 @@
 
 ## Unreleased
 
+## 0.2.0-rc.3 - 2026-08-02
+
 ### Provider Search
 
 - Changed TUI CurseForge Install to Packwiz-native interactive search: labels are display-only, the
   selected root's positive numeric project ID is verified with an isolated root-only probe, and the
-  canonical complete closure is then resolved and merged. `provider_lookup.py` is Modrinth-only;
-  noninteractive CLI, profile, and template selectors require positive numeric CurseForge IDs and
-  reject names, slugs, and URLs. This supersedes the earlier direct CurseForge API credential
-  requirement; no such credential is required.
+  canonical complete dependency closure is then re-resolved by numeric ID and merged.
+  `provider_lookup.py` is Modrinth-only, Huroshiki no longer searches the CurseForge API directly,
+  and no CurseForge API key is required. Noninteractive CLI, Profile, Template, and migration paths
+  require positive numeric CurseForge project IDs and reject names, slugs, and URLs.
+
+### Dependency Equivalence
+
 - Added verified cross-provider dependency equivalence. Modrinth and CurseForge dependencies that
-  collide by metadata path or JAR filename collapse only when artifact SHA-256 or the complete
-  target-loader MOD ID/version identity proves equivalence. Sides are unioned, explicit roots are
-  never automatically collapsed, and unverifiable or version-mismatched artifacts still fail closed.
+  collide by metadata path or JAR filename collapse only when declared SHA-256 values match, when
+  isolated materialization produces the same artifact SHA-256, or when the complete target-loader
+  MOD ID/version set matches exactly. The deterministic winner keeps one metadata/JAR record, sides
+  are unioned, and root provenance is preserved. Explicit-root pairs, URL-provider candidates,
+  version or loader mismatches, differing MOD ID sets, and unverifiable artifacts fail closed; names,
+  slugs, display labels, and filenames alone are never equivalence evidence.
+
+### Reliability and Transaction Safety
+
+- Pinned Packwiz Installer v0.5.14 for bounded provider-artifact materialization. Cancellation,
+  monotonic deadlines, process-group termination, server-thread cleanup, retained workspace
+  ownership, transaction locks, and bounded cleanup retry remain coordinated across Add, Profiles,
+  Template creation/import, Update, and migration resolution.
+- Moved TUI Update selection, dependency verification, and apply work off the Textual event loop.
+  Navigation and shutdown cancel and wait for the named non-daemon worker, retaining transaction and
+  lock ownership whenever cleanup integrity cannot be proven.
 
 ## 0.2.0-rc.2 - 2026-08-01
 
