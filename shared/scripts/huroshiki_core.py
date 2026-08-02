@@ -34,6 +34,7 @@ from dependency_equivalence import (
     EQUIVALENCE_POLICY_VERSION,
     EquivalenceContext,
     EquivalenceError,
+    Provenance,
     verify_equivalence,
 )
 from pack_migration_roots import (
@@ -5594,10 +5595,6 @@ def _merge_update_closures(
             left_identity, right_identity = collision
             if {left_identity[0], right_identity[0]} != {"modrinth", "curseforge"}:
                 break
-            if not manifest_exists:
-                raise HuroshikiError(
-                    "Cross-provider Update equivalence requires explicit root provenance"
-                )
             if context is None:
                 minecraft, loader, loader_version = packctl.project_versions(source)
                 context = EquivalenceContext(
@@ -5621,7 +5618,13 @@ def _merge_update_closures(
                 filename=left.filename,
                 contents=left.contents,
                 side=left_mod.side,
-                explicit_root=left_identity in explicit_roots,
+                provenance=_dependency_provenance(
+                    existing=left_identity in baseline_by_identity,
+                    explicit=left_identity in explicit_roots,
+                    provenance_known=(
+                        manifest_exists or left_identity not in baseline_by_identity
+                    ),
+                ),
                 existing=left_identity in baseline_by_identity,
             )
             right_candidate = _dependency_candidate(
@@ -5630,7 +5633,13 @@ def _merge_update_closures(
                 filename=right.filename,
                 contents=right.contents,
                 side=right_mod.side,
-                explicit_root=right_identity in explicit_roots,
+                provenance=_dependency_provenance(
+                    existing=right_identity in baseline_by_identity,
+                    explicit=right_identity in explicit_roots,
+                    provenance_known=(
+                        manifest_exists or right_identity not in baseline_by_identity
+                    ),
+                ),
                 existing=right_identity in baseline_by_identity,
             )
             evidence = _verify_dependency_collision(
@@ -6724,6 +6733,14 @@ def _equivalence_snapshot_digest(source: Path) -> str:
     return digest.hexdigest()
 
 
+def _dependency_provenance(
+    *, existing: bool, explicit: bool, provenance_known: bool = True
+) -> Provenance:
+    if existing and not provenance_known:
+        return "unknown"
+    return "explicit" if explicit else "dependency"
+
+
 def _dependency_candidate(
     *,
     identity: tuple[str, str],
@@ -6731,7 +6748,7 @@ def _dependency_candidate(
     filename: str,
     contents: bytes,
     side: str,
-    explicit_root: bool,
+    provenance: Provenance,
     existing: bool,
 ) -> DependencyCandidate:
     return DependencyCandidate(
@@ -6740,7 +6757,7 @@ def _dependency_candidate(
         filename,
         contents,
         side,
-        explicit_root,
+        provenance,
         existing,
     )
 
@@ -6876,7 +6893,10 @@ def merge_metadata_closure(
             filename=left_item.filename,
             contents=left_item.contents,
             side=side,
-            explicit_root=left_identity == closure.root_identity,
+            provenance=_dependency_provenance(
+                existing=False,
+                explicit=left_identity == closure.root_identity,
+            ),
             existing=False,
         )
         right_candidate = _dependency_candidate(
@@ -6885,7 +6905,10 @@ def merge_metadata_closure(
             filename=right_item.filename,
             contents=right_item.contents,
             side=side,
-            explicit_root=right_identity == closure.root_identity,
+            provenance=_dependency_provenance(
+                existing=False,
+                explicit=right_identity == closure.root_identity,
+            ),
             existing=False,
         )
         evidence = _verify_dependency_collision(
@@ -6964,10 +6987,6 @@ def merge_metadata_closure(
                     f"{collision_identity[0]}:{collision_identity[1]} vs "
                     f"{item.provider}:{item.project_id}"
                 )
-            if not manifest_exists:
-                raise HuroshikiError(
-                    "Cross-provider dependency equivalence requires explicit root provenance"
-                )
             collision_contents = safe_child(
                 staged_source, collision.relative_path
             ).read_bytes()
@@ -6977,7 +6996,11 @@ def merge_metadata_closure(
                 filename=collision.filename,
                 contents=collision_contents,
                 side=collision.side,
-                explicit_root=collision_identity in explicit_roots,
+                provenance=_dependency_provenance(
+                    existing=True,
+                    explicit=collision_identity in explicit_roots,
+                    provenance_known=manifest_exists,
+                ),
                 existing=True,
             )
             incoming_candidate = _dependency_candidate(
@@ -6986,7 +7009,10 @@ def merge_metadata_closure(
                 filename=item.filename,
                 contents=item.contents,
                 side=side,
-                explicit_root=item.identity == closure.root_identity,
+                provenance=_dependency_provenance(
+                    existing=False,
+                    explicit=item.identity == closure.root_identity,
+                ),
                 existing=False,
             )
             evidence = _verify_dependency_collision(
@@ -7296,7 +7322,10 @@ def _merge_resolved_template_roots(
                         filename=previous.filename,
                         contents=previous.contents,
                         side=previous_mod.side,
-                        explicit_root=owner in explicit_identities,
+                        provenance=_dependency_provenance(
+                            existing=True,
+                            explicit=owner in explicit_identities,
+                        ),
                         existing=True,
                     )
                     incoming_candidate = _dependency_candidate(
@@ -7305,12 +7334,15 @@ def _merge_resolved_template_roots(
                         filename=item.filename,
                         contents=item.contents,
                         side=entry.side,
-                        explicit_root=item.identity == root.root_identity,
+                        provenance=_dependency_provenance(
+                            existing=False,
+                            explicit=item.identity == root.root_identity,
+                        ),
                         existing=False,
                     )
                     if (
-                        existing_candidate.explicit_root
-                        and incoming_candidate.explicit_root
+                        existing_candidate.provenance == "explicit"
+                        and incoming_candidate.provenance == "explicit"
                     ):
                         reason = (
                             "metadata path collision between explicit roots; "

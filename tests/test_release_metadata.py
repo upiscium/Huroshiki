@@ -55,9 +55,13 @@ class ReleaseMetadataTest(unittest.TestCase):
 
         rc3_heading = f"## {VERSION} - 2026-08-02"
         self.assertTrue(
-            changelog.startswith(f"# Changelog\n\n## Unreleased\n\n{rc3_heading}\n"),
-            "Unreleased must remain empty before the rc.3 entry",
+            changelog.startswith("# Changelog\n\n## Unreleased\n"),
+            "Unreleased must remain the first changelog section",
         )
+        self.assertIn(rc3_heading, changelog)
+        unreleased = changelog.split(rc3_heading, 1)[0]
+        self.assertIn("legacy Packs without a root", unreleased)
+        self.assertIn("three-state provenance policy", unreleased)
         self.assertTrue(release_notes.startswith(f"# Huroshiki v{VERSION}\n"))
         self.assertIn("Release date: 2026-08-02", release_notes)
         self.assertIn("github:upiscium/Huroshiki/v0.2.0-rc.3", readme)

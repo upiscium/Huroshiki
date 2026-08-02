@@ -18,7 +18,8 @@ class EquivalenceError(ValueError):
 
 Provider = Literal["modrinth", "curseforge"]
 EvidenceKind = Literal["declared-sha256", "exact-sha256", "jar-mod-identity"]
-EQUIVALENCE_POLICY_VERSION = "1"
+Provenance = Literal["explicit", "dependency", "unknown"]
+EQUIVALENCE_POLICY_VERSION = "2"
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _UNRESOLVED = {
     "", "unknown", "unresolved", "latest", "recommended", "none", "null", "*", "?"
@@ -32,8 +33,14 @@ class DependencyCandidate:
     filename: str
     contents: bytes
     side: str
-    explicit_root: bool = False
+    provenance: Provenance = "dependency"
     existing: bool = False
+
+    def __post_init__(self) -> None:
+        if self.provenance not in {"explicit", "dependency", "unknown"}:
+            raise EquivalenceError(
+                "dependency provenance must be explicit, dependency, or unknown"
+            )
 
 
 @dataclass(frozen=True)
@@ -236,12 +243,32 @@ def context_digest(context: EquivalenceContext) -> str:
 
 
 def _winner(left: DependencyCandidate, right: DependencyCandidate) -> DependencyCandidate:
-    if left.explicit_root and right.explicit_root:
+    roles = {left.provenance, right.provenance}
+    if left.provenance == "explicit" and right.provenance == "explicit":
         raise EquivalenceError("two explicit roots cannot be merged")
+    if roles == {"explicit", "dependency"}:
+        return left if left.provenance == "explicit" else right
+    if roles == {"unknown", "dependency"}:
+        unknown = left if left.provenance == "unknown" else right
+        if not unknown.existing:
+            raise EquivalenceError("unknown provenance is valid only for existing metadata")
+        return unknown
+    if "unknown" in roles:
+        raise EquivalenceError(
+            "root provenance resolution is required before this cross-provider merge"
+        )
+    if left.provenance != "dependency" or right.provenance != "dependency":
+        raise EquivalenceError(
+            "cross-provider equivalence is not admissible for these provenance roles"
+        )
+
     def rank(candidate: DependencyCandidate) -> tuple[int, int, str]:
-        root_rank = 0 if candidate.explicit_root and candidate.existing else 1 if candidate.explicit_root else 2 if candidate.existing else 3
         provider = _identity(candidate)[0]
-        return root_rank, 0 if provider == "modrinth" else 1, _canonical_identity(candidate)
+        return (
+            0 if candidate.existing else 1,
+            0 if provider == "modrinth" else 1,
+            _canonical_identity(candidate),
+        )
     return min((left, right), key=rank)
 
 

@@ -649,7 +649,6 @@ class AddTransactionTest(unittest.TestCase):
         )
         existing_path = self.source / "mods/shared.pw.toml"
         existing_path.write_text(existing_contents, encoding="utf-8")
-        core.write_pack_root_manifest(self.source, ())
         root = self.closure("root").metadata[0]
         incoming_contents = (
             metadata("Shared", "shared", "both")
@@ -678,6 +677,205 @@ class AddTransactionTest(unittest.TestCase):
         )
         self.assertEqual(retained.side, "both")
         self.assertEqual(len(list(self.source.rglob("shared.pw.toml"))), 1)
+        self.assertEqual(
+            existing_path.read_text(encoding="utf-8"),
+            existing_contents.replace('side = "server"', 'side = "both"'),
+        )
+        self.assertFalse((self.source / ".huroshiki-roots.json").exists())
+
+    def test_legacy_unknown_cannot_replace_or_be_replaced_by_explicit_root(self) -> None:
+        digest = "d" * 64
+        existing_contents = (
+            metadata("Shared", "200", "server")
+            .replace("update.modrinth", "update.curseforge")
+            .replace('mod-id = "200"', "project-id = 200")
+            .replace('hash = "00"', f'hash = "{digest}"')
+            .replace('filename = "200.jar"', 'filename = "shared.jar"')
+        )
+        existing_path = self.source / "mods/legacy.pw.toml"
+        existing_path.write_text(existing_contents, encoding="utf-8")
+        incoming_contents = metadata("Shared", "shared", "client").replace(
+            'hash = "00"', f'hash = "{digest}"'
+        ).encode()
+        incoming = core.ResolvedMetadata(
+            ("modrinth", "shared"),
+            Path("mods/new.pw.toml"),
+            "shared.jar",
+            incoming_contents,
+            "modrinth",
+            "shared",
+        )
+
+        with patch.object(core, "materialize_provider_artifact") as materialize:
+            with self.assertRaisesRegex(core.HuroshikiError, "provenance resolution"):
+                core.merge_metadata_closure(
+                    self.source,
+                    core.ResolvedModClosure(("modrinth", "shared"), (incoming,)),
+                    requested_side="client",
+                )
+
+        materialize.assert_not_called()
+        self.assertEqual(existing_path.read_text(encoding="utf-8"), existing_contents)
+        self.assertFalse((self.source / "mods/new.pw.toml").exists())
+        self.assertFalse((self.source / ".huroshiki-roots.json").exists())
+
+    def test_legacy_unknown_dependency_exact_equivalence_preserves_either_provider(self) -> None:
+        from dependency_equivalence import MaterializedArtifact
+
+        def provider_metadata(
+            provider: str, project: str, *, digest: str, side: str
+        ) -> str:
+            contents = metadata("Shared", project, side).replace(
+                'hash = "00"', f'hash = "{digest}"'
+            ).replace(f'filename = "{project}.jar"', 'filename = "shared.jar"')
+            if provider == "curseforge":
+                contents = contents.replace(
+                    "update.modrinth", "update.curseforge"
+                ).replace(f'mod-id = "{project}"', f"project-id = {project}")
+            return contents
+
+        for existing_provider, existing_id, incoming_provider, incoming_id in (
+            ("modrinth", "shared", "curseforge", "200"),
+            ("curseforge", "200", "modrinth", "shared"),
+        ):
+            with self.subTest(existing_provider=existing_provider):
+                existing_contents = provider_metadata(
+                    existing_provider, existing_id, digest="1" * 64, side="server"
+                )
+                existing_path = self.source / "mods/shared.pw.toml"
+                existing_path.write_text(existing_contents, encoding="utf-8")
+                root = self.closure("root").metadata[0]
+                incoming_contents = provider_metadata(
+                    incoming_provider, incoming_id, digest="2" * 64, side="client"
+                ).encode()
+                incoming = core.ResolvedMetadata(
+                    (incoming_provider, incoming_id),
+                    Path("mods/incoming-shared.pw.toml"),
+                    "shared.jar",
+                    incoming_contents,
+                    incoming_provider,
+                    incoming_id,
+                )
+                closure = core.ResolvedModClosure(
+                    root.identity, (root, incoming)
+                )
+
+                with patch.object(
+                    core,
+                    "materialize_provider_artifact",
+                    return_value=MaterializedArtifact("f" * 64),
+                ) as materialize:
+                    core.merge_metadata_closure(
+                        self.source, closure, requested_side="client"
+                    )
+
+                self.assertEqual(materialize.call_count, 2)
+                retained = core.read_mod(self.source, Path("mods/shared.pw.toml"))
+                self.assertEqual(
+                    (core.canonical_provider(retained.provider), retained.project_id),
+                    (existing_provider, existing_id),
+                )
+                self.assertEqual(
+                    existing_path.read_text(encoding="utf-8"),
+                    existing_contents.replace('side = "server"', 'side = "both"'),
+                )
+                self.assertFalse((self.source / "mods/incoming-shared.pw.toml").exists())
+                self.assertFalse((self.source / ".huroshiki-roots.json").exists())
+                existing_path.unlink()
+
+    def test_legacy_unknown_dependency_semantic_equivalence_preserves_existing(self) -> None:
+        from dependency_equivalence import MaterializedArtifact, SemanticJarIdentity
+
+        existing_contents = (
+            metadata("Shared", "shared", "server")
+            .replace('hash-format = "sha256"', 'hash-format = "sha1"')
+            .replace('hash = "00"', 'hash = "' + "1" * 40 + '"')
+        )
+        existing_path = self.source / "mods/shared.pw.toml"
+        existing_path.write_text(existing_contents, encoding="utf-8")
+        root = self.closure("root").metadata[0]
+        incoming_contents = (
+            metadata("Shared", "200", "client")
+            .replace("update.modrinth", "update.curseforge")
+            .replace('mod-id = "200"', "project-id = 200")
+            .replace('filename = "200.jar"', 'filename = "shared.jar"')
+            .replace('hash-format = "sha256"', 'hash-format = "sha1"')
+            .replace('hash = "00"', 'hash = "' + "2" * 40 + '"')
+            .encode()
+        )
+        incoming = core.ResolvedMetadata(
+            ("curseforge", "200"), Path("mods/incoming.pw.toml"), "shared.jar",
+            incoming_contents, "curseforge", "200",
+        )
+        identity = SemanticJarIdentity((("shared", "1.0"),), "neoforge")
+
+        def materialize(candidate, *_args, **_kwargs):
+            digest = "1" * 64 if candidate.existing else "2" * 64
+            return MaterializedArtifact(digest, identity)
+
+        with patch.object(
+            core, "materialize_provider_artifact", side_effect=materialize
+        ):
+            core.merge_metadata_closure(
+                self.source,
+                core.ResolvedModClosure(root.identity, (root, incoming)),
+                requested_side="client",
+            )
+
+        self.assertEqual(
+            existing_path.read_text(encoding="utf-8"),
+            existing_contents.replace('side = "server"', 'side = "both"'),
+        )
+        self.assertFalse((self.source / "mods/incoming.pw.toml").exists())
+        self.assertFalse((self.source / ".huroshiki-roots.json").exists())
+
+    def test_legacy_unknown_non_equivalent_dependency_fails_as_equivalence(self) -> None:
+        from dependency_equivalence import MaterializedArtifact, SemanticJarIdentity
+
+        existing = self.source / "mods/shared.pw.toml"
+        existing.write_text(
+            metadata("Shared", "shared", "server")
+            .replace('hash-format = "sha256"', 'hash-format = "sha1"')
+            .replace('hash = "00"', 'hash = "' + "1" * 40 + '"'),
+            encoding="utf-8",
+        )
+        root = self.closure("root").metadata[0]
+        incoming_contents = (
+            metadata("Shared", "200", "client")
+            .replace("update.modrinth", "update.curseforge")
+            .replace('mod-id = "200"', "project-id = 200")
+            .replace('filename = "200.jar"', 'filename = "shared.jar"')
+            .replace('hash-format = "sha256"', 'hash-format = "sha1"')
+            .replace('hash = "00"', 'hash = "' + "2" * 40 + '"')
+            .encode()
+        )
+        incoming = core.ResolvedMetadata(
+            ("curseforge", "200"), Path("mods/incoming.pw.toml"), "shared.jar",
+            incoming_contents, "curseforge", "200",
+        )
+        before = core.tree_digest_snapshot(self.source)
+
+        def materialize(candidate, *_args, **_kwargs):
+            version = "1.0" if candidate.existing else "2.0"
+            digest = "1" * 64 if candidate.existing else "2" * 64
+            return MaterializedArtifact(
+                digest, SemanticJarIdentity((("shared", version),), "neoforge")
+            )
+
+        with patch.object(
+            core, "materialize_provider_artifact", side_effect=materialize
+        ):
+            with self.assertRaisesRegex(
+                core.HuroshikiError, "could not be verified as equivalent"
+            ):
+                core.merge_metadata_closure(
+                    self.source,
+                    core.ResolvedModClosure(root.identity, (root, incoming)),
+                    requested_side="client",
+                )
+
+        self.assertEqual(core.tree_digest_snapshot(self.source), before)
+        self.assertFalse((self.source / ".huroshiki-roots.json").exists())
 
     def test_equivalent_dependencies_inside_one_closure_collapse(self) -> None:
         digest = "c" * 64

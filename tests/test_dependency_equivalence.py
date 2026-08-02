@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import unittest
+from unittest.mock import Mock
 
 from dependency_equivalence import (
     DependencyCandidate,
@@ -18,8 +19,21 @@ from dependency_equivalence import (
 CTX = EquivalenceContext("1.21.1", "neoforge", "21.1.1", "source-digest", "110-v1")
 
 
-def candidate(identity: str, metadata: str = "name = 'x'", **flags: bool) -> DependencyCandidate:
-    return DependencyCandidate(identity, "mods/x.pw.toml", "x.jar", metadata.encode(), "both", **flags)
+def candidate(
+    identity: str,
+    metadata: str = "name = 'x'",
+    provenance: str = "dependency",
+    existing: bool = False,
+) -> DependencyCandidate:
+    return DependencyCandidate(
+        identity,
+        "mods/x.pw.toml",
+        "x.jar",
+        metadata.encode(),
+        "both",
+        provenance=provenance,
+        existing=existing,
+    )
 
 
 class DependencyEquivalenceTest(unittest.TestCase):
@@ -53,14 +67,48 @@ class DependencyEquivalenceTest(unittest.TestCase):
         wrong = SemanticJarIdentity((("mod", "1.0"),), "fabric")
         self.assertIsNone(verify_equivalence(left, right, CTX, lambda c, ctx: MaterializedArtifact(sha_left if c is left else sha_right, wrong)))
 
-    def test_winner_policy_and_explicit_root_conflict(self) -> None:
-        existing = candidate("curseforge:2", existing=True)
-        incoming = candidate("modrinth:z")
-        self.assertIs(select_winner(existing, incoming), existing)
-        existing_root = candidate("curseforge:2", existing=True, explicit_root=True)
-        incoming_root = candidate("modrinth:z", explicit_root=True)
+    def test_winner_policy_uses_provenance_and_canonical_identity(self) -> None:
+        explicit = candidate("curseforge:2", provenance="explicit", existing=True)
+        dependency = candidate("modrinth:z", provenance="dependency")
+        self.assertIs(select_winner(explicit, dependency), explicit)
+        self.assertIs(select_winner(dependency, explicit), explicit)
+
+        modrinth = candidate("modrinth:z", provenance="dependency", existing=True)
+        curseforge = candidate("curseforge:1", provenance="dependency")
+        self.assertIs(select_winner(modrinth, curseforge), modrinth)
+        self.assertIs(select_winner(curseforge, modrinth), modrinth)
+        existing_curseforge = candidate(
+            "curseforge:2", provenance="dependency", existing=True
+        )
+        incoming_modrinth = candidate("modrinth:a", provenance="dependency")
+        self.assertIs(
+            select_winner(existing_curseforge, incoming_modrinth),
+            existing_curseforge,
+        )
+        first = candidate("modrinth:a", provenance="dependency", existing=True)
+        second = candidate("modrinth:z", provenance="dependency")
+        self.assertIs(select_winner(second, first), first)
+
+        unknown = candidate("curseforge:2", provenance="unknown", existing=True)
+        self.assertIs(select_winner(unknown, dependency), unknown)
+
+    def test_rejected_provenance_pairs_fail_before_materialization(self) -> None:
+        rejected = (("explicit", "explicit"), ("unknown", "explicit"),
+                    ("explicit", "unknown"), ("unknown", "unknown"))
+        for left_role, right_role in rejected:
+            with self.subTest(left_role=left_role, right_role=right_role):
+                left = candidate("modrinth:x", provenance=left_role)
+                right = candidate("curseforge:1", provenance=right_role)
+                with self.assertRaises(EquivalenceError):
+                    select_winner(left, right)
+                materialize = Mock()
+                with self.assertRaises(EquivalenceError):
+                    verify_equivalence(left, right, CTX, materialize)
+                materialize.assert_not_called()
+
+    def test_invalid_provenance_is_rejected_at_construction(self) -> None:
         with self.assertRaises(EquivalenceError):
-            select_winner(existing_root, incoming_root)
+            candidate("modrinth:x", provenance="not-a-role")
 
     def test_semantic_identity_is_sorted_and_complete(self) -> None:
         with self.assertRaises(EquivalenceError):
