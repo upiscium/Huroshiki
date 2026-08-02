@@ -1,7 +1,7 @@
 """Network-free, snapshot-bound publication manifest planning."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -13,6 +13,7 @@ import time
 import tomllib
 from typing import Callable, Literal
 
+import tomlkit
 import yaml
 
 import packctl
@@ -47,6 +48,18 @@ class PublishFileEntry:
     sha256: str
     mode: int
     source_kind: Literal["packwiz", "content", "generated"]
+    contents: bytes | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.source_kind == "generated":
+            if self.contents is None:
+                raise ValueError("generated publication files must retain their contents")
+            if self.size != len(self.contents):
+                raise ValueError("generated publication file size does not match contents")
+            if self.sha256 != hashlib.sha256(self.contents).hexdigest():
+                raise ValueError("generated publication file digest does not match contents")
+        elif self.contents is not None:
+            raise ValueError("source-backed publication files must not retain duplicate contents")
 
 
 @dataclass(frozen=True)
@@ -68,6 +81,7 @@ _D_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _F_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 _CHUNK = 1024 * 1024
 _MAX_DESCRIPTOR = 64 * 1024 * 1024
+_MAX_INDEX_RECORDS = 100_000
 _MAX_TOTAL_BYTES = sys.maxsize
 _IGNORED_ROOTS = frozenset(
     {
@@ -203,48 +217,9 @@ def _config(root_fd: int, entries: dict[Path, object], pack_id: str, *, cancel_e
     local_entry = entries.get(Path("pack.local.yaml"))
     local = {} if local_entry is None else _yaml_bytes(_read_bound(root_fd, Path("pack.local.yaml"), local_entry, directories=directories, cancel_event=cancel_event, deadline=deadline, max_bytes=_MAX_DESCRIPTOR), "pack.local.yaml")
     try:
-        packctl.validate_local_config("pack", Path("pack.local.yaml"), local)
+        return packctl.prospective_pack_config(pack_id, committed, local)
     except packctl.ConfigError as error:
         raise PackPublishError(str(error)) from error
-    if committed.get("id") != pack_id or "url_allow_private_networks" in committed:
-        raise PackPublishError("pack.yaml identity or machine-local setting is invalid")
-    config = packctl.merge(committed, local)
-    if not isinstance(config.get("enabled"), bool) or not isinstance(config.get("display_name"), str) or not str(config["display_name"]).strip():
-        raise PackPublishError("pack.yaml enabled/display_name is invalid")
-    minecraft = config.get("minecraft")
-    if not isinstance(minecraft, dict):
-        raise PackPublishError("pack.yaml minecraft must be a mapping")
-    for key in ("version", "loader", "loader_version"):
-        if not isinstance(minecraft.get(key), str) or not minecraft[key].strip():
-            raise PackPublishError(f"pack.yaml minecraft.{key} is required")
-    if str(minecraft["loader"]).strip().lower() not in packctl.LOADER_FLAGS:
-        raise PackPublishError("pack.yaml minecraft.loader is unsupported")
-    distribution = config.get("distribution")
-    if distribution is not None and not isinstance(distribution, dict):
-        raise PackPublishError("pack.yaml distribution must be a mapping")
-    try:
-        packctl.validate_url_policy(config, "pack.yaml")
-    except packctl.ConfigError as error:
-        raise PackPublishError(str(error)) from error
-    if isinstance(distribution, dict):
-        unknown = set(distribution) - {"rsync_target", "public_pack_url"}
-        if unknown:
-            raise PackPublishError("pack.yaml distribution contains unsupported fields")
-        if "rsync_target" in distribution:
-            if not isinstance(distribution["rsync_target"], str):
-                raise PackPublishError("distribution.rsync_target must be a string")
-            try:
-                packctl.validate_rsync_target(distribution["rsync_target"])
-            except (packctl.ConfigError, ValueError) as error:
-                raise PackPublishError(str(error)) from error
-        if "public_pack_url" in distribution:
-            if not isinstance(distribution["public_pack_url"], str):
-                raise PackPublishError("distribution.public_pack_url must be a string")
-            try:
-                packctl.validate_public_pack_url(distribution["public_pack_url"])
-            except packctl.ConfigError as error:
-                raise PackPublishError(str(error)) from error
-    return config
 
 
 def _content_files(scan: PackTreeScan, target_side: str) -> list[tuple[Path, object]]:
@@ -290,6 +265,51 @@ def _file_entry(scan: PackTreeScan, relative: Path, output: PurePosixPath, kind:
     return PublishFileEntry(output, item.size, item.digest, stat.S_IMODE(item.mode), kind)
 
 
+def _generated_entry(
+    scan: PackTreeScan,
+    source_relative: Path,
+    output: PurePosixPath,
+    contents: bytes,
+) -> PublishFileEntry:
+    item = next(
+        (entry for entry in scan.entries if entry.relative_path == source_relative),
+        None,
+    )
+    if item is None or item.kind != "file":
+        raise PackPublishError(f"unsafe or missing publication file: {source_relative}")
+    return PublishFileEntry(
+        output,
+        len(contents),
+        hashlib.sha256(contents).hexdigest(),
+        stat.S_IMODE(item.mode),
+        "generated",
+        contents,
+    )
+
+
+def _variant_index_bytes(
+    records: list[tuple[Path, str, bool]],
+    checkpoint: Callable[[], None],
+) -> bytes:
+    checkpoint()
+    ordered = sorted(records, key=lambda item: item[0].as_posix())
+    checkpoint()
+    result = bytearray(b'hash-format = "sha256"\n')
+    for path, digest, metafile in ordered:
+        checkpoint()
+        record = (
+            "\n[[files]]\n"
+            f"file = {json.dumps(path.as_posix(), ensure_ascii=False)}\n"
+        ).encode("utf-8")
+        if metafile:
+            record += b"metafile = true\n"
+        record += f'hash = "{digest}"\n'.encode("ascii")
+        if len(result) > _MAX_DESCRIPTOR - len(record):
+            raise PackPublishError("generated index.toml is too large")
+        result.extend(record)
+    return bytes(result)
+
+
 def _packwiz_files(root_fd: int, scan: PackTreeScan, side: str, *, cancel_event: threading.Event | None, deadline: float | None) -> tuple[list[PublishFileEntry], tuple[str, str, str], frozenset[str]]:
     entries = _entry_map(scan)
     directories = _directory_map(entries)
@@ -298,25 +318,42 @@ def _packwiz_files(root_fd: int, scan: PackTreeScan, side: str, *, cancel_event:
         if item is None or item.kind != "file":
             raise PackPublishError(f"source/{name} is required")
         return _read_bound(root_fd, Path("source") / name, item, directories=directories, cancel_event=cancel_event, deadline=deadline, max_bytes=_MAX_DESCRIPTOR)
+    pack_bytes = read("pack.toml")
+    index_bytes = read("index.toml")
     try:
-        pack = tomllib.loads(read("pack.toml").decode("utf-8"))
-        index = tomllib.loads(read("index.toml").decode("utf-8"))
+        pack = tomllib.loads(pack_bytes.decode("utf-8"))
+        index = tomllib.loads(index_bytes.decode("utf-8"))
     except (UnicodeError, tomllib.TOMLDecodeError) as error:
         raise PackPublishError(f"invalid Packwiz TOML: {error}") from error
     versions = pack.get("versions")
-    if not isinstance(versions, dict) or not isinstance(versions.get("minecraft"), str):
+    if not isinstance(versions, dict) or not isinstance(versions.get("minecraft"), str) or not versions["minecraft"].strip():
         raise PackPublishError("pack.toml versions tuple is invalid")
     loaders = [name for name in packctl.LOADER_FLAGS if name in versions]
-    if len(loaders) != 1 or not isinstance(versions[loaders[0]], str):
+    if len(loaders) != 1 or not isinstance(versions[loaders[0]], str) or not versions[loaders[0]].strip():
         raise PackPublishError("pack.toml must define exactly one loader version")
-    tuple_value = (versions["minecraft"], loaders[0], versions[loaders[0]])
-    if index.get("hash-format") != "sha256" or not isinstance(index.get("files", []), list):
+    tuple_value = (versions["minecraft"].strip(), loaders[0], versions[loaders[0]].strip())
+    pack_index = pack.get("index")
+    if (
+        not isinstance(pack_index, dict)
+        or pack_index.get("file") != "index.toml"
+        or pack_index.get("hash-format") != "sha256"
+        or not isinstance(pack_index.get("hash"), str)
+        or pack_index["hash"] != hashlib.sha256(index_bytes).hexdigest()
+    ):
+        raise PackPublishError("pack.toml index descriptor is invalid or stale")
+    index_records = index.get("files", [])
+    if index.get("hash-format") != "sha256" or not isinstance(index_records, list):
         raise PackPublishError("index.toml structure is invalid")
-    indexed_metadata: dict[Path, str] = {}
+    if len(index_records) > _MAX_INDEX_RECORDS:
+        raise PackPublishError("index.toml contains too many file records")
+    indexed_records: dict[Path, tuple[str, bool]] = {}
     indexed_paths: set[str] = set()
-    for record in index.get("files", []):
+    for record in index_records:
+        _checkpoint(cancel_event, deadline)
         if not isinstance(record, dict) or not isinstance(record.get("file"), str) or not isinstance(record.get("hash"), str):
             raise PackPublishError("index.toml contains an invalid file record")
+        if set(record) - {"file", "hash", "metafile"}:
+            raise PackPublishError("index.toml contains unsupported file record fields")
         path = Path(record["file"])
         if path.is_absolute() or not path.parts or ".." in path.parts:
             raise PackPublishError("index.toml contains an unsafe path")
@@ -330,10 +367,15 @@ def _packwiz_files(root_fd: int, scan: PackTreeScan, side: str, *, cancel_event:
         found = _file_entry(scan, Path("source") / path, PurePosixPath(path.as_posix()), "packwiz")
         if found.sha256 != record["hash"]:
             raise PackPublishError(f"index hash mismatch: {path}")
+        metafile = record.get("metafile", False)
+        if not isinstance(metafile, bool):
+            raise PackPublishError(f"index metafile flag is invalid: {path}")
         if path.name.endswith(".pw.toml"):
-            if record.get("metafile") is not True:
+            if metafile is not True:
                 raise PackPublishError(f"index metadata record is not marked metafile: {path}")
-            indexed_metadata[path] = record["hash"]
+        elif metafile:
+            raise PackPublishError(f"index ordinary file is marked metafile: {path}")
+        indexed_records[path] = (record["hash"], metafile)
     metadata: list[tuple[Path, object]] = []
     identities: dict[str, Path] = {}
     paths: dict[str, Path] = {}
@@ -373,13 +415,61 @@ def _packwiz_files(root_fd: int, scan: PackTreeScan, side: str, *, cancel_event:
                 raise PackPublishError(
                     f"invalid metadata filename destination: {jar_destination}"
                 ) from error
-    if set(indexed_metadata) != metadata_paths:
-        missing = sorted(path.as_posix() for path in metadata_paths - set(indexed_metadata))
-        extra = sorted(path.as_posix() for path in set(indexed_metadata) - metadata_paths)
+    indexed_metadata = {
+        path for path, (_, metafile) in indexed_records.items() if metafile
+    }
+    if indexed_metadata != metadata_paths:
+        missing = sorted(path.as_posix() for path in metadata_paths - indexed_metadata)
+        extra = sorted(path.as_posix() for path in indexed_metadata - metadata_paths)
         raise PackPublishError(
             f"index metadata set does not match source metadata: missing={missing}, extra={extra}"
         )
-    files = [_file_entry(scan, Path("source") / name, PurePosixPath(name), "packwiz") for name in (Path("pack.toml"), Path("index.toml"))]
+    selected_metadata = {
+        relative for relative, parsed in metadata if parsed.side in (side, "both")
+    }
+    selected_records: list[tuple[Path, str, bool]] = []
+    for path, (digest, metafile) in indexed_records.items():
+        _checkpoint(cancel_event, deadline)
+        if not metafile or path in selected_metadata:
+            selected_records.append((path, digest, metafile))
+    generated_index = _variant_index_bytes(
+        selected_records,
+        lambda: _checkpoint(cancel_event, deadline),
+    )
+    generated_index_digest = hashlib.sha256(generated_index).hexdigest()
+    try:
+        pack_document = tomlkit.parse(pack_bytes.decode("utf-8"))
+        document_index = pack_document.get("index")
+        if not isinstance(document_index, dict):
+            raise PackPublishError("pack.toml index descriptor is invalid")
+        document_index["hash"] = generated_index_digest
+        generated_pack = tomlkit.dumps(pack_document).encode("utf-8")
+    except (UnicodeError, tomlkit.exceptions.ParseError) as error:
+        raise PackPublishError(f"invalid Packwiz TOML: {error}") from error
+    files = [
+        _generated_entry(
+            scan,
+            Path("source/pack.toml"),
+            PurePosixPath("pack.toml"),
+            generated_pack,
+        ),
+        _generated_entry(
+            scan,
+            Path("source/index.toml"),
+            PurePosixPath("index.toml"),
+            generated_index,
+        ),
+    ]
+    for path, _, metafile in selected_records:
+        if not metafile:
+            files.append(
+                _file_entry(
+                    scan,
+                    Path("source") / path,
+                    PurePosixPath(path.as_posix()),
+                    "packwiz",
+                )
+            )
     for relative, parsed in metadata:
         if parsed.side in (side, "both"):
             files.append(_file_entry(scan, Path("source") / relative, PurePosixPath(relative.as_posix()), "packwiz"))
@@ -441,14 +531,9 @@ def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", can
                 raise PackPublishError("Pack root changed while opening")
             entries = _entry_map(scan)
             _progress(progress, "validating-config")
-            config = _config(root_fd, entries, pack_id, cancel_event=cancel_event, deadline=deadline)
-            minecraft = config["minecraft"]
-            assert isinstance(minecraft, dict)
+            _config(root_fd, entries, pack_id, cancel_event=cancel_event, deadline=deadline)
             _progress(progress, "validating-packwiz")
             pack_files, tuple_value, jar_destinations = _packwiz_files(root_fd, scan, target_side, cancel_event=cancel_event, deadline=deadline)
-            expected_tuple = (str(minecraft["version"]), str(minecraft["loader"]).lower(), str(minecraft["loader_version"]))
-            if tuple_value != expected_tuple:
-                raise PackPublishError("Packwiz versions tuple does not match pack.yaml")
             _progress(progress, "validating-content")
             content_files = _content_files(scan, target_side)
             portable = {portable_relative_path_key(entry.relative_path): entry.relative_path for entry in pack_files}
@@ -483,7 +568,7 @@ def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", can
                 if entry.size < 0 or total_bytes > _MAX_TOTAL_BYTES - entry.size:
                     raise PackPublishError("publication manifest byte total overflow")
                 total_bytes += entry.size
-            result = PackPublishManifest(pack_id, target_side, _semantic_snapshot_digest(scan), expected_tuple[0], expected_tuple[1], expected_tuple[2], tuple(files), total_bytes, "", ())
+            result = PackPublishManifest(pack_id, target_side, _semantic_snapshot_digest(scan), tuple_value[0], tuple_value[1], tuple_value[2], tuple(files), total_bytes, "", ())
             result = PackPublishManifest(result.pack_id, result.target_side, result.source_snapshot_digest, result.minecraft_version, result.loader, result.loader_version, result.files, result.total_bytes, _manifest_digest(result), result.warnings)
             _checkpoint(cancel_event, deadline)
             try:
