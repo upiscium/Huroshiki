@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -8,6 +9,8 @@ from textual.app import App
 from textual.widgets import DataTable, Input
 
 import huroshiki
+import huroshiki_core as core
+from packwiz_parser import MenuItem, ParserEvent
 
 
 class _InstallTestApp(App[None]):
@@ -19,6 +22,22 @@ class _InstallTestApp(App[None]):
 
     def on_mount(self) -> None:
         self.push_screen(huroshiki.InstallScreen("pack:demo"))
+
+
+class _ActivePackwizOperation(core.PackwizAddOperation):
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.cancel_event = threading.Event()
+        self.termination_result = None
+        self.termination_incomplete = False
+        self.menu_cancelled = False
+
+    def cancel_menu(self) -> None:
+        self.menu_cancelled = True
+
+    def cancel(self, *, deadline=None) -> None:
+        self.cancel_event.set()
+        self.done.set()
 
 
 class InstallControlsTest(unittest.IsolatedAsyncioTestCase):
@@ -71,6 +90,51 @@ class InstallControlsTest(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(screen.search_results, [])
                 self.assertEqual(results.row_count, 0)
+
+    async def test_q_cancels_an_active_packwiz_menu(self) -> None:
+        with patch.object(
+            huroshiki.core,
+            "project_config",
+            return_value={"display_name": "Demo"},
+        ):
+            app = _InstallTestApp()
+            async with app.run_test() as pilot:
+                screen = app.screen
+                operation = _ActivePackwizOperation()
+                screen.operation = operation
+                screen.packwiz_menu_items = [MenuItem(7, "Create")]
+                screen.refresh_search_results()
+                results = screen.query_one("#search-results-table", DataTable)
+                results.focus()
+
+                await pilot.press("q")
+                await pilot.pause()
+
+                self.assertTrue(operation.menu_cancelled)
+                self.assertEqual(screen.packwiz_menu_items, [])
+                self.assertEqual(screen.state, "cancelling")
+
+    async def test_packwiz_progress_events_use_parser_messages(self) -> None:
+        with patch.object(
+            huroshiki.core,
+            "project_config",
+            return_value={"display_name": "Demo"},
+        ):
+            app = _InstallTestApp()
+            async with app.run_test():
+                screen = app.screen
+                screen.operation = _ActivePackwizOperation()
+
+                screen._handle_packwiz_event(ParserEvent("search_started", "Create"))
+                self.assertIn("Create", str(screen.query_one("#packwiz-status").render()))
+                screen._handle_packwiz_event(
+                    ParserEvent("identity_verified", "Verified CurseForge project ID 328085")
+                )
+                self.assertIn("328085", str(screen.query_one("#packwiz-status").render()))
+                screen._handle_packwiz_event(ParserEvent("diagnostic", "Packwiz warning"))
+                self.assertIn(
+                    "Packwiz warning", str(screen.query_one("#packwiz-status").render())
+                )
 
 
 if __name__ == "__main__":

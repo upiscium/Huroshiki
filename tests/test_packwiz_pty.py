@@ -100,6 +100,24 @@ class PackwizPtySessionTest(unittest.TestCase):
             self.assertEqual(result.returncode, -signal.SIGINT)
             self.assertTrue(result.raw_log.is_file())
 
+    def test_shared_cancel_event_prevents_prestart_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cancel_event = threading.Event()
+            cancel_event.set()
+            session = PackwizPtySession(
+                ["packwiz"],
+                cwd=root,
+                log_dir=root / "logs",
+                cancel_event=cancel_event,
+            )
+            with patch.object(packwiz_pty.subprocess, "Popen") as popen:
+                result = session.run()
+
+            popen.assert_not_called()
+            self.assertTrue(result.cancelled)
+            self.assertEqual(result.returncode, -signal.SIGINT)
+
     def test_cancel_escalates_and_drains_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

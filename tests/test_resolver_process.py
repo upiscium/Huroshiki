@@ -264,6 +264,45 @@ class ResolverProcessTest(unittest.TestCase):
         self.assertEqual(len(process_holder), 1)
         self.assertIsNotNone(process_holder[0].poll())
 
+    def test_exception_observer_receives_incomplete_cleanup_handles(self) -> None:
+        process = Mock(pid=12345, returncode=None)
+        process.poll.side_effect = KeyboardInterrupt
+        cleanup = runner.ProcessTerminationResult(False, False, True)
+        observed: list[runner.BoundedProcessResult] = []
+        with patch.object(runner.subprocess, "Popen", return_value=process), patch.object(
+            runner, "stop_process_group", return_value=cleanup
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.run_bounded_process(
+                    [sys.executable, "-c", "pass"],
+                    cwd=self.cwd,
+                    result_callback=observed.append,
+                )
+
+        self.assertEqual(len(observed), 1)
+        self.assertTrue(observed[0].termination_incomplete)
+        self.assertEqual(observed[0].process_group, 12345)
+        self.assertIs(observed[0].parent_process, process)
+
+    def test_exception_observer_runs_when_cleanup_itself_is_interrupted(self) -> None:
+        process = Mock(pid=12346, returncode=None)
+        process.poll.side_effect = RuntimeError("poll failed")
+        observed: list[runner.BoundedProcessResult] = []
+        with patch.object(runner.subprocess, "Popen", return_value=process), patch.object(
+            runner, "stop_process_group", side_effect=KeyboardInterrupt
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.run_bounded_process(
+                    [sys.executable, "-c", "pass"],
+                    cwd=self.cwd,
+                    result_callback=observed.append,
+                )
+
+        self.assertEqual(len(observed), 1)
+        self.assertTrue(observed[0].termination_incomplete)
+        self.assertEqual(observed[0].process_group, 12346)
+        self.assertIs(observed[0].parent_process, process)
+
     def test_cancel_stops_child_process_in_same_group(self) -> None:
         child_pid_file = self.cwd / "child.pid"
         cancel = threading.Event()

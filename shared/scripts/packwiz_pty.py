@@ -64,6 +64,7 @@ class PackwizPtySession:
         cwd: Path,
         log_dir: Path,
         on_event: EventCallback | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         self.command = command
         self.cwd = cwd
@@ -73,7 +74,7 @@ class PackwizPtySession:
         self.process: subprocess.Popen[bytes] | None = None
         self.master_fd: int | None = None
         self._write_lock = threading.Lock()
-        self._cancelled = threading.Event()
+        self._cancelled = cancel_event or threading.Event()
         self._termination_lock = threading.Lock()
         self._termination_result: ProcessTerminationResult | None = None
         self._cancel_deadline: float | None = None

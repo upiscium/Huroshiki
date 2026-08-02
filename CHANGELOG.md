@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Provider Search
+
+- Changed TUI CurseForge Install to Packwiz-native interactive search: labels are display-only, the
+  selected root's positive numeric project ID is verified with an isolated root-only probe, and the
+  canonical complete closure is then resolved and merged. `provider_lookup.py` is Modrinth-only;
+  noninteractive CLI, profile, and template selectors require positive numeric CurseForge IDs and
+  reject names, slugs, and URLs. This supersedes the earlier direct CurseForge API credential
+  requirement; no such credential is required.
+
 ## 0.2.0-rc.2 - 2026-08-01
 
 ### Content Management
@@ -26,9 +35,9 @@
 
 - Added CurseForge project search and strict numeric/project-URL resolution through the isolated
   provider helper. Install results carry canonical numeric project IDs with title, author, and
-  description; labels and slugs are never reused as identity. Requests require
-  `HUROSHIKI_CURSEFORGE_API_KEY`, keep it in the API header, enforce Minecraft/loader filters,
-  bounded responses and redirects, and retain the shared cancellation/deadline process lifecycle.
+  description; labels and slugs are never reused as identity. Requests required a locally
+  configured CurseForge credential, enforced Minecraft/loader filters, bounded responses and
+  redirects, and retained the shared cancellation/deadline process lifecycle.
 
 ### Reliability and Transaction Safety
 

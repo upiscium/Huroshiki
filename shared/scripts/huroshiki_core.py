@@ -821,6 +821,8 @@ class ProviderSearchOperation:
         loader: str,
         deadline: float | None = None,
     ) -> None:
+        if canonical_provider(provider) != "modrinth":
+            raise HuroshikiError("Provider API search is available only for Modrinth")
         self.provider = provider
         self.query = query
         self.minecraft = minecraft
@@ -1138,11 +1140,16 @@ class PackwizAddOperation(_AddOperationLifecycle):
     ) -> None:
         super().__init__(transaction, deadline=deadline)
         self.provider, self.query = normalize_add_selector(provider, query)
+        if self.provider == "curseforge" and self.query.isdecimal():
+            self.query = canonical_curseforge_project_id(self.query)
         self.client = client
         self.server = server
         self.on_event = on_event
         self.termination_result: ProcessTerminationResult | None = None
         self.termination_incomplete = False
+        self.resolver_process_result: BoundedProcessResult | None = None
+        self.resolver_termination_result: ProcessTerminationResult | None = None
+        self.resolver_termination_incomplete = False
         self.menu_items: dict[int, str] = {}
         self.selection: str | None = None
         operation_id = uuid4().hex
@@ -1158,6 +1165,7 @@ class PackwizAddOperation(_AddOperationLifecycle):
             transaction.root / f"retained-failed-add-source-{operation_id}"
         )
         self.resolver_source = self.resolver_root / "source"
+        self.closure_resolver_root = self.resolver_root / "closure"
         self.minecraft = ""
         self.loader = ""
         self.loader_version = ""
@@ -1212,12 +1220,19 @@ class PackwizAddOperation(_AddOperationLifecycle):
                         self.menu_items = {item.index: item.label for item in event.items}
                     if self.on_event is not None:
                         self.on_event(event)
+                    if self.provider == "curseforge" and event.kind == "confirmation":
+                        if self.session is None:
+                            raise HuroshikiError("Packwiz PTY session was not initialized")
+                        # The interactive pass is an identity probe. Dependencies are
+                        # resolved only after the selected root's numeric ID is verified.
+                        self.session.send_line("n")
 
                 self.session = PackwizPtySession(
                     build_add_command(self.provider, self.query),
                     cwd=self.resolver_source,
                     log_dir=self.log_dir,
                     on_event=record_event,
+                    cancel_event=self.cancel_event,
                 )
             self._checkpoint()
 
@@ -1261,7 +1276,7 @@ class PackwizAddOperation(_AddOperationLifecycle):
                 self.termination_incomplete = not (
                     self.termination_result.group_drained
                     and self.termination_result.parent_reaped
-                )
+                ) or getattr(self, "resolver_termination_incomplete", False)
             if result is None:
                 result = self._error_result(HuroshikiError("Add operation failed"))
         completed = self._complete(result)
@@ -1302,6 +1317,26 @@ class PackwizAddOperation(_AddOperationLifecycle):
             )
         )
         effective_deadline = self._request_cancel(deadline=deadline)
+        resolver_process = getattr(self, "resolver_process_result", None)
+        resolver_termination_incomplete = getattr(
+            self, "resolver_termination_incomplete", False
+        )
+        if (
+            retrying_cleanup
+            and resolver_termination_incomplete
+            and deadline is not None
+            and resolver_process is not None
+            and resolver_process.process_group is not None
+        ):
+            self.resolver_termination_result = stop_resolver_process_group(
+                resolver_process.process_group,
+                parent=resolver_process.parent_process,
+                cleanup_deadline=deadline,
+            )
+            self.resolver_termination_incomplete = not (
+                self.resolver_termination_result.group_drained
+                and self.resolver_termination_result.parent_reaped
+            )
         session = self.session
         if session is not None:
             cleanup_deadline = (
@@ -1314,10 +1349,19 @@ class PackwizAddOperation(_AddOperationLifecycle):
                 self.termination_incomplete = not (
                     self.termination_result.group_drained
                     and self.termination_result.parent_reaped
-                )
+                ) or getattr(self, "resolver_termination_incomplete", False)
+        elif not getattr(self, "resolver_termination_incomplete", False):
+            self.termination_incomplete = False
         if self.done.is_set():
             self.transaction._release_add_cleanup_ownership(self)
-        return self.termination_result
+        return self.termination_result or self.resolver_termination_result
+
+    def _record_resolver_process_result(self, result: BoundedProcessResult) -> None:
+        self.resolver_process_result = result
+        self.resolver_termination_incomplete = result.termination_incomplete
+        self.termination_incomplete = (
+            self.termination_incomplete or self.resolver_termination_incomplete
+        )
 
     def resize(self, width: int, height: int) -> None:
         if self.session is not None:
@@ -1690,9 +1734,13 @@ class PackTransaction:
         if not isinstance(operation, PackwizAddOperation):
             return False
         termination = operation.termination_result
-        return operation.termination_incomplete or (
+        return (
+            operation.termination_incomplete
+            or getattr(operation, "resolver_termination_incomplete", False)
+            or (
             termination is not None
             and not (termination.group_drained and termination.parent_reaped)
+            )
         )
 
     def _release_add_cleanup_ownership(
@@ -1861,27 +1909,67 @@ class PackTransaction:
                 )
 
             operation._checkpoint()
-            metadata = _read_resolver_metadata(operation.resolver_source)
+            ensure_safe_pack_source(operation.resolver_source)
+            probe_metadata = _read_resolver_metadata(operation.resolver_source)
             operation._checkpoint()
-            selected = operation.selection or operation.query
-            project_id = resolve_project_selector(
-                operation.provider,
-                selected,
-                cancel_event=operation.cancel_event,
-                deadline=operation.deadline,
-            ).canonical_project_id
-            operation._checkpoint()
-            if project_id is None:
-                raise HuroshikiError(
-                    "Selected Packwiz result has no canonical project ID; "
-                    "retry with an explicit provider project ID"
+            if operation.provider == "curseforge":
+                if len(probe_metadata) != 1:
+                    raise HuroshikiError(
+                        "CurseForge identity probe must produce exactly one root metadata file"
+                    )
+                probe_root = probe_metadata[0]
+                if probe_root.provider != "curseforge":
+                    raise HuroshikiError(
+                        "CurseForge identity probe produced non-CurseForge metadata"
+                    )
+                project_id = canonical_curseforge_project_id(probe_root.project_id)
+                if operation.query.isdecimal() and project_id != operation.query:
+                    raise HuroshikiError(
+                        "CurseForge identity probe returned a different project ID"
+                    )
+                if operation.on_event is not None:
+                    operation.on_event(
+                        ParserEvent(
+                            "identity_verified",
+                            f"Verified CurseForge project ID {project_id}",
+                        )
+                    )
+                operation._checkpoint()
+                closure = resolve_mod_closure(
+                    provider="curseforge",
+                    selector=project_id,
+                    canonical_project_id=project_id,
+                    minecraft=operation.minecraft,
+                    loader=operation.loader,
+                    loader_version=operation.loader_version,
+                    cancel_event=operation.cancel_event,
+                    deadline=operation.deadline,
+                    resolver_root=operation.closure_resolver_root,
+                    process_result_callback=operation._record_resolver_process_result,
                 )
-            root_identity = resolved_root_identity(
-                operation.provider, project_id, metadata
-            )
+                ensure_safe_pack_source(operation.closure_resolver_root / "source")
+            else:
+                selected = operation.selection or operation.query
+                project_id = resolve_project_selector(
+                    operation.provider,
+                    selected,
+                    cancel_event=operation.cancel_event,
+                    deadline=operation.deadline,
+                ).canonical_project_id
+                operation._checkpoint()
+                if project_id is None:
+                    raise HuroshikiError(
+                        "Selected Packwiz result has no canonical project ID; "
+                        "retry with an explicit provider project ID"
+                    )
+                root_identity = resolved_root_identity(
+                    operation.provider, project_id, probe_metadata
+                )
+                closure = ResolvedModClosure(root_identity, probe_metadata)
+            operation._checkpoint()
             changed = merge_metadata_closure(
                 self.source,
-                ResolvedModClosure(root_identity, metadata),
+                closure,
                 requested_side=side_from_flags(operation.client, operation.server),
             )
             operation._checkpoint()
@@ -2839,7 +2927,7 @@ def resolve_project_selector(
     if cancel_event is not None and cancel_event.is_set():
         raise HuroshikiError("Provider lookup was cancelled")
     normalized_provider, normalized_selector = normalize_add_selector(provider, selector)
-    if normalized_provider == "curseforge" and normalized_selector.isdecimal():
+    if normalized_provider == "curseforge":
         project_id = canonical_curseforge_project_id(normalized_selector)
         return ResolvedSelector(
             normalized_provider,
@@ -2847,7 +2935,7 @@ def resolve_project_selector(
             project_id,
             project_id,
         )
-    if normalized_provider in {"modrinth", "curseforge"}:
+    if normalized_provider == "modrinth":
         record = _run_provider_lookup(
             [normalized_provider, "resolve", normalized_selector],
             cancel_event=cancel_event,
@@ -2883,7 +2971,7 @@ def search_provider_projects(
     deadline: float | None = None,
 ) -> tuple[ProviderProject, ...]:
     normalized_provider = canonical_provider(provider)
-    if normalized_provider not in {"modrinth", "curseforge"}:
+    if normalized_provider != "modrinth":
         raise HuroshikiError(f"Provider search is unavailable for {provider}")
     if not 1 <= limit <= 50:
         raise HuroshikiError("Provider search limit must be between 1 and 50")
@@ -6120,6 +6208,7 @@ def resolve_mod_closure(
     resolver_root: Path | None = None,
     url_max_jar_size_bytes: int | None = None,
     url_allow_private_networks: bool = False,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> ResolvedModClosure:
     if cancel_event is not None and cancel_event.is_set():
         raise HuroshikiError("MOD resolution was cancelled")
@@ -6224,12 +6313,21 @@ def resolve_mod_closure(
                 deadline,
                 resolver_deadline,
             )
-        process = run_resolver_process(
-            command,
-            cwd=source,
-            cancel_event=cancel_event,
-            deadline=resolver_deadline,
-        )
+        if process_result_callback is None:
+            process = run_resolver_process(
+                command,
+                cwd=source,
+                cancel_event=cancel_event,
+                deadline=resolver_deadline,
+            )
+        else:
+            process = run_resolver_process(
+                command,
+                cwd=source,
+                cancel_event=cancel_event,
+                deadline=resolver_deadline,
+                result_callback=process_result_callback,
+            )
         if process.termination_incomplete:
             raise HuroshikiError(
                 "Packwiz resolver process termination was incomplete"
