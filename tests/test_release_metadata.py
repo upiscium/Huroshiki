@@ -16,7 +16,7 @@ SCRIPTS = ROOT / "shared" / "scripts"
 class ReleaseMetadataTest(unittest.TestCase):
     def test_runtime_version_source(self) -> None:
         self.assertRegex(VERSION, r"^[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$")
-        self.assertEqual(VERSION, "0.2.0-rc.3")
+        self.assertEqual(VERSION, "0.2.0-rc.4")
         self.assertEqual(
             (SCRIPTS / "VERSION").read_text(encoding="utf-8").strip(),
             VERSION,
@@ -53,31 +53,53 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertTrue(release_note_path.is_file())
         release_notes = release_note_path.read_text(encoding="utf-8")
 
-        rc3_heading = f"## {VERSION} - 2026-08-02"
+        rc4_heading = f"## {VERSION} - 2026-08-02"
         self.assertTrue(
-            changelog.startswith("# Changelog\n\n## Unreleased\n"),
-            "Unreleased must remain the first changelog section",
+            changelog.startswith(
+                f"# Changelog\n\n## Unreleased\n\n{rc4_heading}\n"
+            ),
+            "Unreleased must remain empty before the rc.4 entry",
         )
-        self.assertIn(rc3_heading, changelog)
-        unreleased = changelog.split(rc3_heading, 1)[0]
-        self.assertIn("legacy Packs without a root", unreleased)
-        self.assertIn("three-state provenance policy", unreleased)
+        rc4_changelog = changelog.split(rc4_heading, 1)[1].split(
+            "## 0.2.0-rc.3 -", 1
+        )[0]
         self.assertTrue(release_notes.startswith(f"# Huroshiki v{VERSION}\n"))
         self.assertIn("Release date: 2026-08-02", release_notes)
-        self.assertIn("github:upiscium/Huroshiki/v0.2.0-rc.3", readme)
+        self.assertIn("github:upiscium/Huroshiki/v0.2.0-rc.4", readme)
         self.assertIn(
-            "compare/v0.2.0-rc.2...v0.2.0-rc.3",
+            "compare/v0.2.0-rc.3...v0.2.0-rc.4",
             release_notes,
         )
 
-        rc3_changelog = changelog.split("## 0.2.0-rc.2 -", 1)[0]
-        self.assertIn("Packwiz-native", rc3_changelog)
-        self.assertIn("no CurseForge API key is required", rc3_changelog)
-        self.assertIn("dependency equivalence", rc3_changelog)
+        release_scope = f"{rc4_changelog}\n{release_notes}"
+        release_scope_words = " ".join(release_scope.split())
+        self.assertIn("legacy Packs without", release_scope_words)
+        for provenance in ("explicit", "dependency", "unknown"):
+            self.assertIn(provenance, release_scope_words)
+        self.assertIn("preserves the existing metadata", release_scope_words)
+        self.assertIn("does not infer or create a root manifest", release_scope_words)
+        self.assertIn("evidence binding", release_scope_words)
+        self.assertIn("unions sides", release_scope_words)
+        self.assertIn("incoming explicit root", release_scope_words)
+        self.assertIn("fails closed", release_scope_words)
+        for evidence in (
+            "strict declared SHA-256",
+            "verified materialized SHA-256",
+            "target-loader MOD ID/version set",
+        ):
+            self.assertIn(evidence, release_scope_words)
+        self.assertIn("## Known limitations", release_notes)
+        self.assertIn(
+            "No live network-backed CurseForge install or cross-provider artifact "
+            "collapse was executed as part of release verification.",
+            release_scope_words,
+        )
         self.assertIn("Packwiz-native CurseForge Install", release_notes)
         self.assertIn("no API key is required", release_notes)
-        self.assertIn("cross-provider dependency equivalence", release_notes)
-        excluded_release_scope = f"{rc3_changelog}\n{release_notes}".lower()
+        readme_words = " ".join(readme.split())
+        self.assertIn("CurseForge uses Packwiz-native interactive search", readme_words)
+        self.assertIn("CurseForge API key is unnecessary", readme_words)
+        excluded_release_scope = release_scope.lower()
         for excluded in (
             "#104",
             "#105",
@@ -86,8 +108,18 @@ class ReleaseMetadataTest(unittest.TestCase):
         ):
             self.assertNotIn(excluded, excluded_release_scope)
 
-        self.assertIn("## 0.2.0-rc.2 - 2026-08-01", changelog)
-        self.assertIn("## 0.2.0-rc.1 - 2026-07-30", changelog)
+        for historical in (
+            "## 0.2.0-rc.3 - 2026-08-02",
+            "## 0.2.0-rc.2 - 2026-08-01",
+            "## 0.2.0-rc.1 - 2026-07-30",
+        ):
+            self.assertIn(historical, changelog)
+        for historical_note in (
+            "v0.2.0-rc.1.md",
+            "v0.2.0-rc.2.md",
+            "v0.2.0-rc.3.md",
+        ):
+            self.assertTrue((ROOT / "docs" / "releases" / historical_note).is_file())
         rc2_changelog = changelog.split("## 0.2.0-rc.2 -", 1)[1].split(
             "## 0.2.0-rc.1 -", 1
         )[0]
