@@ -6,6 +6,8 @@ import hashlib
 import shutil
 from pathlib import Path
 import tempfile
+import tomlkit
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -25,12 +27,12 @@ class PackPublishManifestTest(unittest.TestCase):
         (self.pack / "content" / "server").mkdir(parents=True)
         (self.pack / "content" / "client").mkdir(parents=True)
         (self.pack / "pack.yaml").write_text(
-            "id: demo\ndisplay_name: Demo\nenabled: true\n"
-            "minecraft:\n  version: 1.21.1\n  loader: neoforge\n"
-            "  loader_version: 21.1.0\n", encoding="utf-8"
+            "id: demo\ndisplay_name: Demo\nenabled: true\n", encoding="utf-8"
         )
         (self.pack / "source" / "pack.toml").write_text(
             'name = "Demo"\nversion = "1"\npack-format = "packwiz:1.1.0"\n'
+            '[index]\nfile = "index.toml"\nhash-format = "sha256"\n'
+            'hash = "placeholder"\n'
             '[versions]\nminecraft = "1.21.1"\nneoforge = "21.1.0"\n', encoding="utf-8"
         )
         (self.pack / "source" / "index.toml").write_text(
@@ -44,6 +46,7 @@ class PackPublishManifestTest(unittest.TestCase):
             'filename = "client.jar"\nside = "client"\n'
             '[update.modrinth]\nmod-id = "client"\nversion = "v1"\n', encoding="utf-8"
         )
+        (self.pack / "source" / "README.md").write_bytes(b"ordinary indexed source")
         self.write_index()
         (self.pack / "content" / "common" / "config.txt").write_bytes(b"common")
         (self.pack / "content" / "server" / "server.cfg").write_bytes(b"server")
@@ -58,17 +61,42 @@ class PackPublishManifestTest(unittest.TestCase):
 
     def write_index(self) -> None:
         records = []
-        for metadata in sorted((self.pack / "source").rglob("*.pw.toml")):
+        indexed = sorted(
+            path for path in (self.pack / "source").rglob("*")
+            if path.is_file() and path.name != "pack.toml" and path.name != "index.toml"
+        )
+        for metadata in indexed:
             relative = metadata.relative_to(self.pack / "source").as_posix()
             digest = hashlib.sha256(metadata.read_bytes()).hexdigest()
             records.append(
                 f'[[files]]\nfile = "{relative}"\nmetafile = true\n'
                 f'hash = "{digest}"\n'
+                if metadata.name.endswith(".pw.toml")
+                else f'[[files]]\nfile = "{relative}"\nhash = "{digest}"\n'
             )
-        (self.pack / "source" / "index.toml").write_text(
-            'hash-format = "sha256"\n' + "".join(records),
-            encoding="utf-8",
-        )
+        index = ('hash-format = "sha256"\n' + "".join(records)).encode("utf-8")
+        (self.pack / "source" / "index.toml").write_bytes(index)
+        self.update_pack_index_hash()
+
+    def update_pack_index_hash(self) -> None:
+        pack_path = self.pack / "source" / "pack.toml"
+        index = (self.pack / "source" / "index.toml").read_bytes()
+        document = tomlkit.parse(pack_path.read_text(encoding="utf-8"))
+        document["index"]["hash"] = hashlib.sha256(index).hexdigest()
+        pack_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+
+    def manifest_entries(self, manifest: object) -> dict[str, pack_publish.PublishFileEntry]:
+        return {entry.relative_path.as_posix(): entry for entry in manifest.files}
+
+    def generated_contents(self, manifest: object, path: str) -> bytes:
+        entry = self.manifest_entries(manifest)[path]
+        self.assertEqual(entry.source_kind, "generated")
+        self.assertIsNotNone(entry.contents)
+        return entry.contents or b""
+
+    def generated_index_records(self, manifest: object) -> dict[str, dict[str, object]]:
+        index = tomllib.loads(self.generated_contents(manifest, "index.toml").decode("utf-8"))
+        return {record["file"]: record for record in index.get("files", [])}
 
     def test_server_manifest_is_side_aware_and_deterministic(self) -> None:
         first = pack_publish.plan_pack_publish_manifest("demo")
@@ -78,8 +106,29 @@ class PackPublishManifestTest(unittest.TestCase):
         self.assertIn("config.txt", paths)
         self.assertIn("server.cfg", paths)
         self.assertNotIn("mods/client.pw.toml", paths)
+        self.assertEqual(
+            (first.minecraft_version, first.loader, first.loader_version),
+            ("1.21.1", "neoforge", "21.1.0"),
+        )
         self.assertEqual(first.manifest_digest, second.manifest_digest)
         self.assertEqual(first.source_snapshot_digest, second.source_snapshot_digest)
+
+        records = self.generated_index_records(first)
+        entries = self.manifest_entries(first)
+        for path, record in records.items():
+            self.assertIn(path, entries)
+            self.assertEqual(record["hash"], entries[path].sha256)
+        for path, entry in entries.items():
+            if entry.source_kind == "packwiz" and path not in {"pack.toml", "index.toml"}:
+                self.assertIn(path, records)
+        self.assertIn("README.md", records)
+        self.assertEqual(records["README.md"].get("metafile", False), False)
+        pack = tomllib.loads(self.generated_contents(first, "pack.toml").decode("utf-8"))
+        index_bytes = self.generated_contents(first, "index.toml")
+        self.assertEqual(pack["index"]["hash"], hashlib.sha256(index_bytes).hexdigest())
+        self.assertEqual(first.files, second.files)
+        self.assertEqual(index_bytes, self.generated_contents(second, "index.toml"))
+        self.assertEqual(self.generated_contents(first, "pack.toml"), self.generated_contents(second, "pack.toml"))
 
     def test_client_selection_and_target_side_digest(self) -> None:
         client = pack_publish.plan_pack_publish_manifest("demo", target_side="client")
@@ -88,6 +137,15 @@ class PackPublishManifestTest(unittest.TestCase):
         self.assertIn("config.txt", paths)
         self.assertNotIn("server.cfg", paths)
         self.assertNotEqual(client.manifest_digest, server.manifest_digest)
+        for manifest in (client, server):
+            entries = self.manifest_entries(manifest)
+            records = self.generated_index_records(manifest)
+            self.assertIn("README.md", entries)
+            self.assertIn("README.md", records)
+        self.assertNotIn("mods/server.pw.toml", self.manifest_entries(client))
+        self.assertNotIn("mods/server.pw.toml", self.generated_index_records(client))
+        self.assertNotIn("mods/client.pw.toml", self.manifest_entries(server))
+        self.assertNotIn("mods/client.pw.toml", self.generated_index_records(server))
 
     def test_common_and_side_duplicate_destination_fails(self) -> None:
         (self.pack / "content" / "common" / "same.txt").write_bytes(b"common")
@@ -135,18 +193,60 @@ class PackPublishManifestTest(unittest.TestCase):
         with self.assertRaises(pack_publish.PackPublishError):
             pack_publish.plan_pack_publish_manifest("demo")
 
-    def test_packwiz_tuple_mismatch_is_rejected(self) -> None:
-        path = self.pack / "source" / "pack.toml"
-        path.write_text(path.read_text().replace('minecraft = "1.21.1"', 'minecraft = "1.20.1"'))
-        with self.assertRaises(pack_publish.PackPublishError):
-            pack_publish.plan_pack_publish_manifest("demo")
-
     def test_missing_and_invalid_index_are_rejected(self) -> None:
         index = self.pack / "source" / "index.toml"
         index.unlink()
         with self.assertRaises(pack_publish.PackPublishError):
             pack_publish.plan_pack_publish_manifest("demo")
         index.write_text('hash-format = "sha256"\nfiles = "invalid"\n')
+        self.update_pack_index_hash()
+        with self.assertRaises(pack_publish.PackPublishError):
+            pack_publish.plan_pack_publish_manifest("demo")
+
+    def test_empty_index_is_supported(self) -> None:
+        shutil.rmtree(self.pack / "source" / "mods")
+        (self.pack / "source" / "README.md").unlink()
+        (self.pack / "source" / "index.toml").write_text(
+            'hash-format = "sha256"\n', encoding="utf-8"
+        )
+        self.update_pack_index_hash()
+        manifest = pack_publish.plan_pack_publish_manifest("demo")
+        self.assertEqual(self.generated_index_records(manifest), {})
+        self.assertEqual(
+            {
+                path
+                for path, entry in self.manifest_entries(manifest).items()
+                if entry.source_kind in {"packwiz", "generated"}
+            },
+            {"pack.toml", "index.toml"},
+        )
+
+    def test_incomplete_or_stale_pack_index_descriptor_is_rejected(self) -> None:
+        path = self.pack / "source" / "pack.toml"
+        original = path.read_text(encoding="utf-8")
+        missing = original.replace(
+            '[index]\nfile = "index.toml"\nhash-format = "sha256"\n'
+            'hash = "'
+            + hashlib.sha256(
+                (self.pack / "source" / "index.toml").read_bytes()
+            ).hexdigest()
+            + '"\n',
+            "",
+        )
+        path.write_text(missing, encoding="utf-8")
+        with self.assertRaises(pack_publish.PackPublishError):
+            pack_publish.plan_pack_publish_manifest("demo")
+        path.write_text(original, encoding="utf-8")
+        path.write_text(original.replace('hash-format = "sha256"\n', ""), encoding="utf-8")
+        with self.assertRaises(pack_publish.PackPublishError):
+            pack_publish.plan_pack_publish_manifest("demo")
+        digest = hashlib.sha256(
+            (self.pack / "source" / "index.toml").read_bytes()
+        ).hexdigest()
+        path.write_text(
+            original.replace(f'hash = "{digest}"', 'hash = "' + "0" * 64 + '"'),
+            encoding="utf-8",
+        )
         with self.assertRaises(pack_publish.PackPublishError):
             pack_publish.plan_pack_publish_manifest("demo")
 
@@ -156,6 +256,7 @@ class PackPublishManifestTest(unittest.TestCase):
             'hash-format = "sha256"\n[[files]]\nfile = "mods/server.pw.toml"\n'
             'hash = "' + ("0" * 64) + '"\n'
         )
+        self.update_pack_index_hash()
         self.assertNotEqual(hashlib.sha256(metadata.read_bytes()).hexdigest(), "0" * 64)
         with self.assertRaises(pack_publish.PackPublishError):
             pack_publish.plan_pack_publish_manifest("demo")
