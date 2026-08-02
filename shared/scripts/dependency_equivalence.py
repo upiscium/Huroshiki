@@ -323,6 +323,16 @@ def verify_equivalence(
     evidence_payload = json.dumps(
         {
             "artifact_sha256": artifact_sha,
+            "candidates": {
+                "left": {
+                    "existing": canonical_left.existing,
+                    "provenance": canonical_left.provenance,
+                },
+                "right": {
+                    "existing": canonical_right.existing,
+                    "provenance": canonical_right.provenance,
+                },
+            },
             "semantic_identity": (
                 {
                     "loader": semantic.target_loader,

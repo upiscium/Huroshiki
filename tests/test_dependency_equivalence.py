@@ -106,6 +106,94 @@ class DependencyEquivalenceTest(unittest.TestCase):
                     verify_equivalence(left, right, CTX, materialize)
                 materialize.assert_not_called()
 
+    def test_binding_canonically_includes_candidate_policy_inputs(self) -> None:
+        digest = "b" * 64
+        metadata = (
+            '[download]\nhash-format = "sha256"\n'
+            f'hash = "{digest}"\nurl = "https://example.invalid/x.jar"\n'
+        )
+        unknown = candidate(
+            "modrinth:x", metadata, provenance="unknown", existing=True
+        )
+        explicit = candidate(
+            "modrinth:x", metadata, provenance="explicit", existing=True
+        )
+        dependency = candidate("curseforge:1", metadata, provenance="dependency")
+
+        unknown_evidence = verify_equivalence(unknown, dependency, CTX)
+        explicit_evidence = verify_equivalence(explicit, dependency, CTX)
+        swapped_evidence = verify_equivalence(dependency, unknown, CTX)
+        changed_existing_evidence = verify_equivalence(
+            candidate(
+                "modrinth:x", metadata, provenance="dependency", existing=True
+            ),
+            dependency,
+            CTX,
+        )
+        nonexisting_evidence = verify_equivalence(
+            candidate("modrinth:x", metadata, provenance="dependency"),
+            dependency,
+            CTX,
+        )
+        canonical_left_unknown = verify_equivalence(
+            candidate(
+                "curseforge:1", metadata, provenance="unknown", existing=True
+            ),
+            candidate("modrinth:x", metadata, provenance="dependency"),
+            CTX,
+        )
+        canonical_left_explicit = verify_equivalence(
+            candidate(
+                "curseforge:1", metadata, provenance="explicit", existing=True
+            ),
+            candidate("modrinth:x", metadata, provenance="dependency"),
+            CTX,
+        )
+        canonical_left_existing = verify_equivalence(
+            candidate(
+                "curseforge:1", metadata, provenance="dependency", existing=True
+            ),
+            candidate(
+                "modrinth:x", metadata, provenance="dependency", existing=True
+            ),
+            CTX,
+        )
+        canonical_left_nonexisting = verify_equivalence(
+            candidate("curseforge:1", metadata, provenance="dependency"),
+            candidate(
+                "modrinth:x", metadata, provenance="dependency", existing=True
+            ),
+            CTX,
+        )
+
+        assert unknown_evidence is not None
+        assert explicit_evidence is not None
+        assert swapped_evidence is not None
+        assert changed_existing_evidence is not None
+        assert nonexisting_evidence is not None
+        assert canonical_left_unknown is not None
+        assert canonical_left_explicit is not None
+        assert canonical_left_existing is not None
+        assert canonical_left_nonexisting is not None
+        self.assertNotEqual(
+            unknown_evidence.binding_digest, explicit_evidence.binding_digest
+        )
+        self.assertEqual(
+            unknown_evidence.binding_digest, swapped_evidence.binding_digest
+        )
+        self.assertNotEqual(
+            changed_existing_evidence.binding_digest,
+            nonexisting_evidence.binding_digest,
+        )
+        self.assertNotEqual(
+            canonical_left_unknown.binding_digest,
+            canonical_left_explicit.binding_digest,
+        )
+        self.assertNotEqual(
+            canonical_left_existing.binding_digest,
+            canonical_left_nonexisting.binding_digest,
+        )
+
     def test_invalid_provenance_is_rejected_at_construction(self) -> None:
         with self.assertRaises(EquivalenceError):
             candidate("modrinth:x", provenance="not-a-role")
