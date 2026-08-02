@@ -75,6 +75,49 @@ class PackMigrationResolutionTest(unittest.TestCase):
             "next", "Next", "1.21.4", "fabric", "0.16.0"
         )
 
+    @staticmethod
+    def provider_metadata(provider: str, project: str, *, filename: str, side: str, digest: str) -> core.ResolvedMetadata:
+        update = (
+            f'[update.modrinth]\nmod-id = "{project}"\nversion = "v2"\n'
+            if provider == "modrinth"
+            else f"[update.curseforge]\nproject-id = {project}\nfile-id = 1\n"
+        )
+        contents = (
+            f'name = "{project}"\nfilename = "{filename}"\nside = "{side}"\n'
+            f'[download]\nhash-format = "sha256"\nhash = "{digest}"\n'
+            f'url = "https://example.invalid/{project}.jar"\n{update}'
+        ).encode()
+        return core.ResolvedMetadata(
+            (provider, project), Path("mods") / f"{project}.pw.toml", filename,
+            contents, provider, project,
+        )
+
+    def _two_provider_roots(self) -> None:
+        (self.source / "mods/example.pw.toml").unlink(missing_ok=True)
+        first = self.provider_metadata("modrinth", "root-project", filename="root.jar", side="both", digest="1" * 64)
+        second = self.provider_metadata("curseforge", "123", filename="other.jar", side="both", digest="2" * 64)
+        (self.source / first.relative_path).write_bytes(first.contents)
+        (self.source / second.relative_path).write_bytes(second.contents)
+        write_pack_root_manifest(
+            self.source,
+            (PackRootRecord("modrinth", "root-project", "both"), PackRootRecord("curseforge", "123", "both")),
+        )
+
+    def _two_provider_closure(self, *, equivalent: bool) -> core.ResolvedModClosure:
+        provider = "modrinth" if self._current_root == "root-project" else "curseforge"
+        project = self._current_root
+        root = self.provider_metadata(
+            provider, project, filename="root.jar" if provider == "modrinth" else "other.jar",
+            side="both", digest="1" * 64 if provider == "modrinth" else "2" * 64,
+        )
+        shared = self.provider_metadata(
+            "modrinth" if provider == "modrinth" else "curseforge",
+            "shared" if provider == "modrinth" else "456",
+            filename="shared.jar", side="client" if provider == "modrinth" else "server",
+            digest="a" * 64 if equivalent else ("b" if provider == "modrinth" else "c") * 64,
+        )
+        return core.ResolvedModClosure((provider, project), (root, shared))
+
     def plan(self) -> pack_migration.PackMigrationPlan:
         snapshot = pack_migration.snapshot_pack_migration_source_at(
             "pack:demo", self.pack, self.root
@@ -137,6 +180,53 @@ class PackMigrationResolutionTest(unittest.TestCase):
         self.assertNotIn(str(self.root), json.dumps(diagnostic))
         with self.assertRaisesRegex(pack_migration.PackMigrationError, "publication requires"):
             pack_migration.apply_pack_copy_migration_at(plan)
+        pack_migration.discard_pack_migration_plan(plan)
+
+    def test_verified_cross_provider_dependencies_collapse_with_one_destination_and_roots_preserved(self) -> None:
+        self._two_provider_roots()
+        plan = self.plan()
+        equivalent = True
+
+        def closure(**kwargs: object) -> core.ResolvedModClosure:
+            self._current_root = str(kwargs["canonical_project_id"])
+            return self._two_provider_closure(equivalent=equivalent)
+
+        with patch.object(packctl, "init_packwiz_project", side_effect=self.fake_init), patch.object(
+            core, "resolve_mod_closure", side_effect=closure
+        ), patch.object(core, "resolve_project_selector", side_effect=self.fake_selector), patch.object(packctl, "run_packwiz"):
+            result = resolution.resolve_pack_migration_plan_at(plan, repository_root=self.root, state_root=self.state)
+
+        target = plan.target_staging_root / "source"
+        self.assertEqual(result.state, "resolved")
+        shared = [core.read_mod(target, path) for path in target.rglob("*.pw.toml") if path.is_file() and 'filename = "shared.jar"' in path.read_text()]
+        self.assertEqual(len(shared), 1)
+        self.assertEqual(shared[0].side, "both")
+        self.assertEqual(
+            [item.canonical_identity for item in read_pack_root_manifest(target)],
+            ["curseforge:123", "modrinth:root-project"],
+        )
+        pack_migration.discard_pack_migration_plan(plan)
+
+    def test_non_equivalent_cross_provider_dependency_collision_fails_closed(self) -> None:
+        self._two_provider_roots()
+        plan = self.plan()
+
+        def closure(**kwargs: object) -> core.ResolvedModClosure:
+            self._current_root = str(kwargs["canonical_project_id"])
+            return self._two_provider_closure(equivalent=False)
+
+        def materialize(candidate: object, *_: object, **__: object):
+            from dependency_equivalence import MaterializedArtifact
+            return MaterializedArtifact("e" * 64 if "modrinth" in getattr(candidate, "provider_identity", "") else "f" * 64)
+
+        with patch.object(packctl, "init_packwiz_project", side_effect=self.fake_init), patch.object(
+            core, "resolve_mod_closure", side_effect=closure
+        ), patch.object(core, "resolve_project_selector", side_effect=self.fake_selector), patch.object(
+            core, "materialize_provider_artifact", side_effect=materialize
+        ):
+            with self.assertRaisesRegex(core.HuroshikiError, "could not be verified as equivalent"):
+                resolution.resolve_pack_migration_plan_at(plan, repository_root=self.root, state_root=self.state)
+        self.assertEqual(plan.state, "failed")
         pack_migration.discard_pack_migration_plan(plan)
 
     def test_failed_handoff_rolls_staging_source_back(self) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import signal
@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Sequence
+from typing import Callable, Sequence
 
 
 PACKWIZ_PROCESS_TIMEOUT_SECONDS = 120
@@ -28,6 +28,10 @@ class BoundedProcessResult:
     timed_out: bool
     orphaned_descendants: bool = False
     termination_incomplete: bool = False
+    process_group: int | None = field(default=None, compare=False)
+    parent_process: subprocess.Popen[bytes] | None = field(
+        default=None, compare=False, repr=False
+    )
 
     @property
     def succeeded(self) -> bool:
@@ -156,6 +160,7 @@ def run_bounded_process(
     cwd: Path,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
+    result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> BoundedProcessResult:
     if cancel_event is not None and cancel_event.is_set():
         return BoundedProcessResult(-signal.SIGTERM, "", "", True, False)
@@ -200,11 +205,32 @@ def run_bounded_process(
                     break
                 time.sleep(PROCESS_POLL_SECONDS)
         except BaseException:
-            stop_process_group(
-                process.pid,
-                parent=process,
-                cleanup_deadline=_cleanup_deadline(include_reap=True),
-            )
+            cleanup: ProcessTerminationResult | None = None
+            try:
+                cleanup = stop_process_group(
+                    process.pid,
+                    parent=process,
+                    cleanup_deadline=_cleanup_deadline(include_reap=True),
+                )
+            finally:
+                if result_callback is not None:
+                    result_callback(
+                        BoundedProcessResult(
+                            process.returncode,
+                            "",
+                            "",
+                            cancelled,
+                            timed_out,
+                            termination_incomplete=(
+                                cleanup is None
+                                or not (
+                                    cleanup.group_drained and cleanup.parent_reaped
+                                )
+                            ),
+                            process_group=process.pid,
+                            parent_process=process,
+                        )
+                    )
             raise
         if not cancelled and not timed_out and live_process_group_members(process.pid):
             orphaned_descendants = True
@@ -217,7 +243,7 @@ def run_bounded_process(
         stderr_file.seek(0)
         stdout = stdout_file.read().decode("utf-8", errors="replace")
         stderr = stderr_file.read().decode("utf-8", errors="replace")
-    return BoundedProcessResult(
+    result = BoundedProcessResult(
         process.returncode,
         stdout,
         stderr,
@@ -225,7 +251,12 @@ def run_bounded_process(
         timed_out,
         orphaned_descendants,
         termination_incomplete,
+        process_group=process.pid,
+        parent_process=process,
     )
+    if result_callback is not None:
+        result_callback(result)
+    return result
 
 
 def concise_process_output(result: BoundedProcessResult) -> str:

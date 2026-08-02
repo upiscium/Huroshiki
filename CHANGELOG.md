@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Provider Search
+
+- Changed TUI CurseForge Install to Packwiz-native interactive search: labels are display-only, the
+  selected root's positive numeric project ID is verified with an isolated root-only probe, and the
+  canonical complete closure is then resolved and merged. `provider_lookup.py` is Modrinth-only;
+  noninteractive CLI, profile, and template selectors require positive numeric CurseForge IDs and
+  reject names, slugs, and URLs. This supersedes the earlier direct CurseForge API credential
+  requirement; no such credential is required.
+- Added verified cross-provider dependency equivalence. Modrinth and CurseForge dependencies that
+  collide by metadata path or JAR filename collapse only when artifact SHA-256 or the complete
+  target-loader MOD ID/version identity proves equivalence. Sides are unioned, explicit roots are
+  never automatically collapsed, and unverifiable or version-mismatched artifacts still fail closed.
+
 ## 0.2.0-rc.2 - 2026-08-01
 
 ### Content Management

@@ -15,6 +15,10 @@
       perSystem = system:
         let
           pkgs = import nixpkgs { inherit system; };
+          packwizInstaller = pkgs.fetchurl {
+            url = "https://github.com/packwiz/packwiz-installer/releases/download/v0.5.14/packwiz-installer.jar";
+            hash = "sha256-yfZGkI00DYR3OUipp9mLwdriUNNeEBbcbiuEWXYLVZg=";
+          };
           python = pkgs.python3.withPackages (ps: with ps; [
             pyyaml
             textual
@@ -43,10 +47,12 @@
               makeWrapper ${python}/bin/python "$out/bin/huroshiki" \
                 --add-flags "$out/lib/huroshiki/huroshiki.py" \
                 --set HUROSHIKI_DATA_DIR "$out/share/huroshiki" \
+                --set HUROSHIKI_PACKWIZ_INSTALLER_JAR ${packwizInstaller} \
                 --prefix PATH : ${pkgs.lib.makeBinPath runtimeInputs}
               makeWrapper ${python}/bin/python "$out/bin/packctl" \
                 --add-flags "$out/lib/huroshiki/packctl.py" \
                 --set HUROSHIKI_DATA_DIR "$out/share/huroshiki" \
+                --set HUROSHIKI_PACKWIZ_INSTALLER_JAR ${packwizInstaller} \
                 --prefix PATH : ${pkgs.lib.makeBinPath runtimeInputs}
               runHook postInstall
             '';
@@ -74,6 +80,8 @@
             test -f ${huroshiki}/lib/huroshiki/packwiz_pty.py
             test -f ${huroshiki}/lib/huroshiki/packwiz_parser.py
             test -f ${huroshiki}/lib/huroshiki/process_runner.py
+            test -f ${huroshiki}/lib/huroshiki/dependency_equivalence.py
+            test -f ${huroshiki}/lib/huroshiki/provider_artifacts.py
             test -f ${huroshiki}/lib/huroshiki/overlay_policy.py
             test -f ${huroshiki}/lib/huroshiki/content_operations.py
             test -f ${huroshiki}/lib/huroshiki/content_workers.py
@@ -124,7 +132,7 @@
             '';
           };
         in
-        { inherit pkgs python huroshiki smoke unitTests; };
+        { inherit pkgs python huroshiki smoke unitTests packwizInstaller; };
     in
     {
       packages = forAllSystems (system: {
@@ -154,7 +162,7 @@
       devShells = forAllSystems (
         system:
         let
-          inherit (perSystem system) pkgs python huroshiki;
+          inherit (perSystem system) pkgs python huroshiki packwizInstaller;
         in
         {
           default = pkgs.mkShell {
@@ -170,6 +178,7 @@
             ];
 
             shellHook = ''
+              export HUROSHIKI_PACKWIZ_INSTALLER_JAR=${packwizInstaller}
               echo "Minecraft modpack monorepo"
               echo "  packwiz: $(packwiz --version 2>/dev/null || echo available)"
               echo "  java:    $(java -version 2>&1 | head -n 1)"

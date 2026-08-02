@@ -63,6 +63,7 @@ except ModuleNotFoundError as error:
 
 import huroshiki_core as core
 from content_workers import ContentWorker
+from packwiz_parser import MenuItem, ParserEvent, visible_menu_items
 from template_import import (
     ActualIdentityConflict,
     CandidateNameConflict,
@@ -132,6 +133,10 @@ class HuroshikiApp(App[None]):
             ],
         ] = {}
         self._transaction_discard_timer: Timer | None = None
+        self.update_apply_workers: dict[
+            str, tuple[threading.Thread, threading.Event, threading.Event | None]
+        ] = {}
+        self._shutting_down = False
         self.content_workers: dict[str, ContentWorker[object]] = {}
         self.content_plans: dict[str, core.ContentChangePlan] = {}
         self._content_discards: dict[
@@ -155,6 +160,7 @@ class HuroshikiApp(App[None]):
             self.push_screen(MainMenuScreen())
 
     def on_unmount(self) -> None:
+        self._shutting_down = True
         if self._transaction_discard_timer is not None:
             self._transaction_discard_timer.stop()
             self._transaction_discard_timer = None
@@ -165,6 +171,21 @@ class HuroshikiApp(App[None]):
             APP_TRANSACTION_SHUTDOWN_TIMEOUT_SECONDS,
             APP_CONTENT_SHUTDOWN_TIMEOUT_SECONDS,
         )
+        for _thread, _done, cancel_event in tuple(
+            self.update_apply_workers.values()
+        ):
+            if cancel_event is not None:
+                cancel_event.set()
+        unfinished_update_workers: set[str] = set()
+        for project_key, (_thread, done, _cancel_event) in tuple(
+            self.update_apply_workers.items()
+        ):
+            if not done.wait(max(0.0, deadline - time.monotonic())):
+                unfinished_update_workers.add(project_key)
+                print(
+                    f"Update apply worker did not stop before shutdown for {project_key}",
+                    file=sys.stderr,
+                )
         for worker in tuple(self.content_workers.values()):
             worker.cancel()
         unfinished_content_workers: set[str] = set()
@@ -231,6 +252,8 @@ class HuroshikiApp(App[None]):
                 if self.content_plans.get(project_key) is plan:
                     self.content_plans.pop(project_key, None)
         for project_key, transaction in tuple(self.transactions.items()):
+            if project_key in unfinished_update_workers:
+                continue
             try:
                 transaction.discard(deadline=deadline)
             except BaseException as error:
@@ -241,6 +264,13 @@ class HuroshikiApp(App[None]):
             else:
                 if self.transactions.get(project_key) is transaction:
                     self.transactions.pop(project_key, None)
+        try:
+            core.retry_all_retained_template_creation_cleanup(deadline=deadline)
+        except BaseException as error:
+            print(
+                f"Failed to clean retained Template creation state: {error}",
+                file=sys.stderr,
+            )
 
     def go_main(self) -> None:
         self.selected_project = None
@@ -4767,6 +4797,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         self.default_client = True
         self.default_server = True
         self.search_results: list[core.InstallSearchResult] = []
+        self.packwiz_menu_items: list[MenuItem] = []
         self.staged: list[core.ModInfo] = []
         self.operation: (
             core.ProviderSearchOperation
@@ -4848,6 +4879,13 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
     def refresh_search_results(self) -> None:
         table = self.query_one("#search-results-table", DataTable)
         table.clear()
+        for item in self.packwiz_menu_items:
+            table.add_row(
+                item.label,
+                "curseforge",
+                "pending verification",
+                "Packwiz candidate label",
+            )
         for item in self.search_results:
             table.add_row(
                 item.title,
@@ -4882,7 +4920,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         placeholders = {
             "modrinth": "Search; use mr:<ID-or-slug> or a Modrinth URL for exact lookup",
             "curseforge": (
-                "Search; use cf:<numeric-ID> or a CurseForge project URL for exact lookup"
+                "Search with Packwiz; cf:<numeric-ID> also uses Packwiz identity verification"
             ),
             "url": "Public URL of the self-hosted MOD JAR",
         }
@@ -5030,9 +5068,18 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         self.app.notify(message, severity="error")
 
     def discard_search_results(self) -> None:
-        if not self.search_results:
+        if not self.search_results and not self.packwiz_menu_items:
+            return
+        operation = self.operation
+        if isinstance(operation, core.PackwizAddOperation) and not operation.done.is_set():
+            operation.cancel_menu()
+            self.packwiz_menu_items = []
+            self.refresh_search_results()
+            self.state = "cancelling"
+            self.set_status("Cancelling Packwiz search...")
             return
         self.search_results = []
+        self.packwiz_menu_items = []
         self.refresh_search_results()
         self.state = "idle"
         self.set_status("Search results discarded")
@@ -5051,6 +5098,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             return
 
         self.search_results = []
+        self.packwiz_menu_items = []
         self.refresh_search_results()
         lowered_query = query.lower()
         exact_modrinth_selector = lowered_query.startswith("mr:") or (
@@ -5065,14 +5113,8 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             self.app.notify(str(error), severity="error")
             return
 
-        exact_curseforge_selector = normalized_provider == "curseforge" and (
-            normalized_query.isdecimal() or "curseforge.com/" in lowered_query
-        )
-
         event.input.disabled = True
-        if normalized_provider in {"modrinth", "curseforge"} and not (
-            exact_modrinth_selector or exact_curseforge_selector
-        ):
+        if normalized_provider == "modrinth" and not exact_modrinth_selector:
             minecraft, loader, _ = core.packctl.project_versions(
                 self.transaction().source
             )
@@ -5084,19 +5126,13 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             )
             self.operation = operation
             self.state = "searching"
-            provider_label = (
-                "CurseForge" if normalized_provider == "curseforge" else "Modrinth"
-            )
-            self.set_status(f"Searching {provider_label}...")
+            self.set_status("Searching Modrinth...")
             target = self._run_search
         else:
             try:
-                canonical_id = (
-                    core.canonical_curseforge_project_id(normalized_query)
-                    if normalized_provider == "curseforge"
-                    and normalized_query.isdecimal()
-                    else None
-                )
+                canonical_id = None
+                if normalized_provider == "curseforge" and normalized_query.isdecimal():
+                    canonical_id = core.canonical_curseforge_project_id(normalized_query)
                 self._start_resolved_operation(
                     provider=normalized_provider,
                     selector=canonical_id or normalized_query,
@@ -5136,16 +5172,23 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         canonical_project_id: str | None,
     ) -> None:
         side = core.side_from_flags(self.default_client, self.default_server)
-        if provider == "url":
+        if provider in {"url", "curseforge"}:
             operation: core.ResolvedAddOperation | core.PackwizAddOperation = (
                 self.transaction().begin_add(
                     provider,
                     selector,
                     client=self.default_client,
                     server=self.default_server,
+                    on_event=(
+                        self._on_packwiz_event if provider == "curseforge" else None
+                    ),
                 )
             )
-            status = "Downloading and staging the self-hosted MOD URL..."
+            status = (
+                "Downloading and staging the self-hosted MOD URL..."
+                if provider == "url"
+                else "Searching CurseForge with Packwiz..."
+            )
         else:
             operation = self.transaction().begin_resolved_add(
                 provider=provider,
@@ -5185,6 +5228,46 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             self.set_status(message)
             self.app.notify(message, severity="error")
             search.focus()
+
+    def _on_packwiz_event(self, event: ParserEvent) -> None:
+        try:
+            self.app.call_from_thread(self._handle_packwiz_event, event)
+        except Exception:
+            pass
+
+    def _handle_packwiz_event(self, event: ParserEvent) -> None:
+        operation = self.operation
+        if (
+            self._closing
+            or not isinstance(operation, core.PackwizAddOperation)
+            or operation.done.is_set()
+        ):
+            return
+        if event.kind == "search_started":
+            self.state = "searching"
+            self.set_status(f"Packwiz is searching CurseForge for {event.message}...")
+        elif event.kind == "search_results":
+            self.packwiz_menu_items = list(visible_menu_items(event.items))
+            self.refresh_search_results()
+            self.state = "showing_results"
+            if self.packwiz_menu_items:
+                self.set_status(
+                    f"{len(self.packwiz_menu_items)} Packwiz candidate(s); "
+                    "select with j/k and Enter"
+                )
+                self.query_one("#search-results-table", DataTable).focus()
+            else:
+                self.set_status("Packwiz returned no selectable CurseForge candidates")
+        elif event.kind == "confirmation":
+            self.state = "resolving"
+            self.set_status("Verifying the selected CurseForge root without dependencies...")
+        elif event.kind == "identity_verified":
+            self.state = "resolving"
+            self.packwiz_menu_items = []
+            self.refresh_search_results()
+            self.set_status(f"{event.message}; resolving its complete dependency closure...")
+        elif event.kind == "diagnostic":
+            self.set_status(event.message)
 
     def _run_search(self, operation: core.ProviderSearchOperation) -> None:
         operation.run()
@@ -5266,6 +5349,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         search.disabled = False
         self.state = "idle"
         self.search_results = []
+        self.packwiz_menu_items = []
         self.refresh_search_results()
         self.refresh_staged()
 
@@ -5288,6 +5372,24 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         return None if index is None else self.search_results[index]
 
     def choose_search_result(self) -> None:
+        operation = self.operation
+        if isinstance(operation, core.PackwizAddOperation) and self.packwiz_menu_items:
+            table = self.query_one("#search-results-table", DataTable)
+            index = self.current_index(table, len(self.packwiz_menu_items))
+            if index is None:
+                self.app.notify("No Packwiz result is selected", severity="warning")
+                return
+            item = self.packwiz_menu_items[index]
+            try:
+                operation.send_selection(item.index)
+            except Exception as error:
+                self.app.notify(str(error), severity="error")
+                return
+            self.state = "resolving"
+            self.packwiz_menu_items = []
+            self.refresh_search_results()
+            self.set_status(f"Verifying {item.label}'s canonical CurseForge identity...")
+            return
         item = self.current_search_result()
         if item is None:
             self.app.notify("No provider result is selected", severity="warning")
@@ -5438,12 +5540,13 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             return
 
         key = event.key
-        if key == "q" and self.search_results:
+        result_count = len(self.packwiz_menu_items) or len(self.search_results)
+        if key == "q" and result_count:
             self.discard_search_results()
         elif focused is results and key == "j":
-            self.move_table(results, len(self.search_results), 1)
+            self.move_table(results, result_count, 1)
         elif focused is results and key == "k":
-            self.move_table(results, len(self.search_results), -1)
+            self.move_table(results, result_count, -1)
         elif focused is results and key == "enter":
             self.choose_search_result()
         elif focused is staged and key == "j":
@@ -5731,6 +5834,10 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
         self.discard_timer: Timer | None = None
         self.pending_destination: Callable[[], None] | None = None
         self.leave_after_cancel = False
+        self.apply_thread: threading.Thread | None = None
+        self.apply_done = threading.Event()
+        self.apply_error: BaseException | None = None
+        self.apply_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -5894,24 +6001,91 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
             return
         if self.transaction is None:
             return
+        if self.apply_thread is not None:
+            return
+        self.apply_done.clear()
+        self.apply_error = None
+        self.query_one("#update-message", Static).update(
+            "Verifying selected dependency closures and applying updates..."
+        )
+        self.apply_thread = threading.Thread(
+            target=self._run_update_apply,
+            name=f"huroshiki-update-apply-{self.project_key}",
+            daemon=False,
+        )
         try:
-            self.transaction.select_updates(self.selected_paths)
-            with self.app.suspend():
-                self.transaction.apply(
-                    cancel_event=self.transaction_cancel_event,
-                    deadline=self.transaction_deadline,
-                )
-            self.app.notify(f"Applied {len(self.selected_paths)} MOD update(s)")
-            if self.app.transactions.get(self.project_key) is self.transaction:
-                self.app.transactions.pop(self.project_key, None)
-            self.transaction = None
-            self.transaction_cancel_event = None
-            self.transaction_deadline = None
-            self.app.open_list(self.project_key)
-        except Exception as error:
+            self.apply_thread.start()
+        except BaseException as error:
+            self.apply_thread = None
+            self.apply_error = error
+            self.apply_done.set()
             self.app.notify(str(error), severity="error")
+            return
+        self.app.update_apply_workers[self.project_key] = (
+            self.apply_thread,
+            self.apply_done,
+            self.transaction_cancel_event,
+        )
+        self.apply_timer = self.set_interval(0.05, self._poll_update_apply)
+
+    def _run_update_apply(self) -> None:
+        try:
+            assert self.transaction is not None
+            self.transaction.select_updates(
+                self.selected_paths,
+                cancel_event=self.transaction_cancel_event,
+                deadline=self.transaction_deadline,
+            )
+            self.transaction.apply(
+                cancel_event=self.transaction_cancel_event,
+                deadline=self.transaction_deadline,
+            )
+        except BaseException as error:
+            self.apply_error = error
+        finally:
+            if (
+                self.app._shutting_down
+                and self.transaction is not None
+                and self.transaction.active
+            ):
+                try:
+                    self.transaction.discard(
+                        deadline=(
+                            time.monotonic()
+                            + core.TRANSACTION_DISCARD_TIMEOUT_SECONDS
+                        )
+                    )
+                except BaseException as cleanup_error:
+                    if self.apply_error is None:
+                        self.apply_error = cleanup_error
+            self.apply_done.set()
+
+    def _poll_update_apply(self) -> None:
+        if not self.apply_done.is_set():
+            return
+        if self.apply_timer is not None:
+            self.apply_timer.stop()
+            self.apply_timer = None
+        self.app.update_apply_workers.pop(self.project_key, None)
+        self.apply_thread = None
+        if self.apply_error is not None:
+            self.query_one("#update-message", Static).update(str(self.apply_error))
+            self.app.notify(str(self.apply_error), severity="error")
+            return
+        self.app.notify(f"Applied {len(self.selected_paths)} MOD update(s)")
+        if self.app.transactions.get(self.project_key) is self.transaction:
+            self.app.transactions.pop(self.project_key, None)
+        self.transaction = None
+        self.transaction_cancel_event = None
+        self.transaction_deadline = None
+        self.app.open_list(self.project_key)
 
     def discard_and_leave(self) -> None:
+        if self.apply_thread is not None:
+            if self.transaction_cancel_event is not None:
+                self.transaction_cancel_event.set()
+            self.app.notify("Cancelling update apply before leaving", severity="warning")
+            return
         if self.discard_operation is not None:
             self.app.notify("Transaction cleanup is already running", severity="warning")
             return
@@ -5925,6 +6099,11 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
         self._begin_transaction_discard(self.return_to_project)
 
     def discard_and_navigate(self, destination: Callable[[], None]) -> None:
+        if self.apply_thread is not None:
+            if self.transaction_cancel_event is not None:
+                self.transaction_cancel_event.set()
+            self.app.notify("Cancelling update apply before leaving", severity="warning")
+            return
         if self.discard_operation is not None:
             self.app.notify("Transaction cleanup is already running", severity="warning")
             return
@@ -5981,6 +6160,10 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
         if self.discard_timer is not None:
             self.discard_timer.stop()
             self.discard_timer = None
+        if self.apply_thread is not None:
+            if self.transaction_cancel_event is not None:
+                self.transaction_cancel_event.set()
+            return
         if self.transaction is not None and self.discard_operation is None:
             try:
                 self.discard_operation = self.transaction.begin_discard()
@@ -5995,6 +6178,12 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
     def on_key(self, event: events.Key) -> None:
         table = self.query_one("#update-options", DataTable)
         key = event.key
+        if self.apply_thread is not None:
+            if key in {"escape", "p"} and self.transaction_cancel_event is not None:
+                self.transaction_cancel_event.set()
+            self.app.notify("Wait for update apply to finish", severity="warning")
+            event.stop()
+            return
         if self.discard_operation is not None:
             self.app.notify("Wait for transaction cleanup to finish", severity="warning")
             event.stop()

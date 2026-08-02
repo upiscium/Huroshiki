@@ -10,10 +10,11 @@ import unittest
 from unittest.mock import patch
 
 from textual.app import App
-from textual.widgets import Input, TextArea
+from textual.widgets import DataTable, Input, TextArea
 
 import huroshiki
 import huroshiki_core as core
+from packwiz_parser import MenuItem, ParserEvent
 
 
 PROJECT = core.ProjectInfo(
@@ -104,6 +105,58 @@ class _PackwizCleanupOperation(core.PackwizAddOperation):
         return self.termination_result
 
 
+class _PackwizMenuOperation(core.PackwizAddOperation):
+    """Small PTY substitute that exposes the menu through the UI callback."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.cancel_event = threading.Event()
+        self.cancelled = False
+        self.cancel_deadline = None
+        self.cleanup_error = None
+        self.termination_result = None
+        self.termination_incomplete = False
+        self.on_event = None
+        self.menu_selection: list[int] = []
+        self.menu_cancelled = False
+        self.menu_ready = threading.Event()
+        self.release = threading.Event()
+
+    def run(self) -> core.AddOperationResult:
+        assert self.on_event is not None
+        self.on_event(
+            ParserEvent(
+                "search_results",
+                "Choose a number",
+                (MenuItem(4, "Create"), MenuItem(9, "Create (beta)")),
+            )
+        )
+        self.menu_ready.set()
+        self.release.wait(2)
+        self.done.set()
+        return core.AddOperationResult(
+            0,
+            (),
+            Path("raw.log"),
+            Path("output.log"),
+            Path("events.log"),
+            "staged",
+        )
+
+    def send_selection(self, index: int) -> None:
+        self.menu_selection.append(index)
+        self.release.set()
+
+    def cancel_menu(self) -> None:
+        self.menu_cancelled = True
+        self.cancel_event.set()
+
+    def cancel(self, *, deadline=None) -> None:
+        self.cancelled = True
+        self.cancel_deadline = deadline
+        self.release.set()
+
+
 class _InstallTransaction(_Transaction):
     source = Path("/fake/source")
 
@@ -127,7 +180,10 @@ class _InstallTransaction(_Transaction):
         self.add_calls.append(
             {"provider": provider, "selector": selector, **kwargs}
         )
-        return self._next_operation()
+        operation = self._next_operation()
+        if "on_event" in kwargs:
+            operation.on_event = kwargs["on_event"]
+        return operation
 
     def begin_resolved_add(self, **kwargs):
         self.resolved_calls.append(kwargs)
@@ -275,7 +331,7 @@ class _PreparedUpdateTransaction(_UpdateTransaction):
             )
         ]
 
-    def select_updates(self, selected: set[Path]) -> None:
+    def select_updates(self, selected: set[Path], **_) -> None:
         self.selected = set(selected)
 
     def apply(self, *, cancel_event=None, deadline=None) -> None:
@@ -287,6 +343,8 @@ class _NavigationApp(App[None]):
 
     def __init__(self, screen) -> None:
         super().__init__()
+        self.update_apply_workers = {}
+        self._shutting_down = False
         self.initial_screen = screen
         self.transactions: dict[str, object] = {}
 
@@ -387,7 +445,7 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause()
                     self.assertIsInstance(app.screen, huroshiki.ConfirmModal)
                     await pilot.press("enter")
-                    await pilot.pause()
+                    await pilot.pause(0.15)
 
         self.assertEqual(transaction.apply_controls, transaction.prepare_controls)
         self.assertEqual(transaction.selected, {Path("mods/first.pw.toml")})
@@ -1034,25 +1092,13 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.2)
                 self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
 
-    async def test_curseforge_name_search_keeps_canonical_project_id(self) -> None:
-        projects = (
-            core.ProviderProject(
-                "curseforge",
-                "328085",
-                "create",
-                "Create",
-                "Aesthetic Technology",
-                "simibubi",
-            ),
-        )
+    async def test_curseforge_input_starts_packwiz_operation(self) -> None:
         transaction = _InstallTransaction()
         with self.patches(), patch.object(
-            huroshiki.core.packctl,
-            "project_versions",
-            return_value=("1.21.1", "neoforge", "21.1.0"),
-        ), patch.object(
-            huroshiki.core, "search_provider_projects", return_value=projects
+            huroshiki.core, "search_provider_projects"
         ) as search:
+            operation = _PackwizMenuOperation()
+            transaction.queued_operations.append(operation)
             screen = huroshiki.InstallScreen("pack:demo")
             screen.provider = "curseforge"
             app = _NavigationApp(screen)
@@ -1062,25 +1108,48 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                 field.value = "Create"
                 await pilot.press("enter")
                 await pilot.pause(0.2)
-                self.assertEqual(screen.state, "showing_results")
-                self.assertEqual(screen.search_results[0].provider, "curseforge")
-                self.assertEqual(screen.search_results[0].project_id, "328085")
-                self.assertIn("simibubi", screen.search_results[0].subtitle)
-                self.assertIn("Aesthetic Technology", screen.search_results[0].subtitle)
-                await pilot.press("enter")
-                await pilot.pause(0.2)
-        self.assertEqual(search.call_args.args[:2], ("curseforge", "Create"))
-        self.assertEqual(transaction.resolved_calls[0]["provider"], "curseforge")
-        self.assertEqual(transaction.resolved_calls[0]["selector"], "328085")
-        self.assertEqual(
-            transaction.resolved_calls[0]["canonical_project_id"], "328085"
-        )
+                self.assertTrue(operation.menu_ready.wait(1))
+                self.assertIs(screen.operation, operation)
+                self.assertIsInstance(operation, core.PackwizAddOperation)
+                self.assertEqual(transaction.add_calls[0]["provider"], "curseforge")
+                search.assert_not_called()
+                operation.release.set()
 
-    async def test_numeric_curseforge_id_bypasses_name_search(self) -> None:
+    async def test_packwiz_menu_is_identity_pending_and_selection_uses_exact_index(self) -> None:
+        transaction = _InstallTransaction()
+        operation = _PackwizMenuOperation()
+        transaction.queued_operations.append(operation)
+        with self.patches():
+            screen = huroshiki.InstallScreen("pack:demo")
+            app = _NavigationApp(screen)
+            app.transactions["pack:demo"] = transaction
+            async with app.run_test() as pilot:
+                field = screen.query_one("#mod-search", Input)
+                field.value = "Create"
+                screen.provider = "curseforge"
+                await pilot.press("enter")
+                self.assertTrue(operation.menu_ready.wait(1))
+                await pilot.pause()
+
+                row = screen.query_one("#search-results-table", DataTable).get_row_at(0)
+                self.assertEqual(row[0], "Create")
+                self.assertEqual(row[2], "pending verification")
+                self.assertEqual(row[3], "Packwiz candidate label")
+                await pilot.press("j")
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertEqual(operation.menu_selection, [9])
+                self.assertEqual(screen.search_results, [])
+                self.assertEqual(transaction.resolved_calls, [])
+                operation.release.set()
+
+    async def test_numeric_curseforge_id_uses_packwiz_identity_verification(self) -> None:
         transaction = _InstallTransaction()
         with self.patches(), patch.object(
             huroshiki.core, "search_provider_projects"
         ) as search:
+            operation = _PackwizMenuOperation()
+            transaction.queued_operations.append(operation)
             screen = huroshiki.InstallScreen("pack:demo")
             screen.provider = "curseforge"
             app = _NavigationApp(screen)
@@ -1091,10 +1160,9 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("enter")
                 await pilot.pause(0.2)
         search.assert_not_called()
-        self.assertEqual(transaction.resolved_calls[0]["selector"], "328085")
-        self.assertEqual(
-            transaction.resolved_calls[0]["canonical_project_id"], "328085"
-        )
+        self.assertEqual(transaction.add_calls[0]["selector"], "328085")
+        self.assertIsInstance(operation, core.PackwizAddOperation)
+        operation.release.set()
 
 
 if __name__ == "__main__":

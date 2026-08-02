@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import huroshiki_core as core
 import packctl
+from pack_migration_roots import PackRootRecord, write_pack_root_manifest
 from template_import import ImportConflictResolution, resolve_template_import_plan
 
 
@@ -20,19 +21,32 @@ pack-format = "packwiz:1.1.0"
 minecraft = "1.21.1"
 neoforge = "21.1.1"
 """
+SHA256 = "0" * 64
+BAD_SHA256 = "1" * 64
 
 
-def metadata(name: str, project_id: str, filename: str) -> bytes:
+def metadata(
+    name: str,
+    project_id: str,
+    filename: str,
+    *,
+    provider: str = "modrinth",
+    side: str = "both",
+    hash_value: str = SHA256,
+) -> bytes:
+    update = (
+        f'[update.modrinth]\nmod-id = "{project_id}"\nversion = "1"'
+        if provider == "modrinth"
+        else f"[update.curseforge]\nproject-id = {project_id}"
+    )
     return f'''name = "{name}"
 filename = "{filename}"
-side = "both"
+side = "{side}"
 [download]
 url = "https://cdn.example/{filename}"
 hash-format = "sha256"
-hash = "00"
-[update.modrinth]
-mod-id = "{project_id}"
-version = "1"
+hash = "{hash_value}"
+{update}
     '''.encode()
 
 
@@ -43,7 +57,7 @@ side = "both"
 [download]
 url = "{url}"
 hash-format = "sha256"
-hash = "00"
+hash = "{SHA256}"
 '''.encode()
 
 
@@ -521,6 +535,87 @@ class TemplateImportCoreTest(unittest.TestCase):
             ["shared"],
         )
         self.assertEqual(operation.preview.removed, ())
+        operation.discard()
+
+    def test_cross_provider_dependency_collision_merges_once_with_side_union(self) -> None:
+        mods = self.source / "mods"
+        mods.mkdir()
+        (mods / "existing-root.pw.toml").write_bytes(
+            metadata("Existing Root", "existing-root", "existing-root.jar", provider="modrinth")
+        )
+        (mods / "shared.pw.toml").write_bytes(
+            metadata("Shared", "202", "shared.jar", provider="curseforge", side="client")
+        )
+        write_pack_root_manifest(
+            self.source,
+            (PackRootRecord("modrinth", "existing-root", "client"),),
+        )
+        self.template.joinpath("template.yaml").write_text(
+            "id: base\ndisplay_name: Base\nenabled: true\n"
+            "minecraft: 1.21.1\nloader: neoforge\nreference_loader_version: 21.1.0\nmods:\n"
+            "  - name: Root\n    provider: modrinth\n    project_id: root\n    side: server\n",
+            encoding="utf-8",
+        )
+        incoming = core.ResolvedModClosure(
+            ("modrinth", "root"),
+            (
+                core.ResolvedMetadata(
+                    ("modrinth", "root"), Path("mods/root.pw.toml"), "root.jar",
+                    metadata("Root", "root", "root.jar"), "modrinth", "root",
+                ),
+                core.ResolvedMetadata(
+                    ("modrinth", "equivalent-dependency"), Path("mods/shared.pw.toml"),
+                    "shared.jar", metadata("Shared", "equivalent-dependency", "shared.jar", side="server"),
+                    "modrinth", "equivalent-dependency",
+                ),
+            ),
+        )
+        operation = self.operation()
+        with patch.object(core, "resolve_mod_closure", return_value=incoming), patch.object(
+            core, "run_resolver_process", side_effect=self.refresh_ok
+        ):
+            operation.run()
+        self.assertIsNone(operation.error)
+        self.assertEqual(len(list(operation.transaction.source.glob("mods/*.pw.toml"))), 3)
+        self.assertIn('side = "both"', (operation.transaction.source / "mods/shared.pw.toml").read_text())
+        roots = {(item.provider, item.project_id) for item in core.read_pack_root_manifest(operation.transaction.source)}
+        self.assertEqual(roots, {("modrinth", "existing-root"), ("modrinth", "root")})
+        operation.discard()
+
+    def test_cross_provider_version_mismatch_fails_closed_without_preview(self) -> None:
+        mods = self.source / "mods"
+        mods.mkdir()
+        (mods / "existing-root.pw.toml").write_bytes(
+            metadata("Existing Root", "existing-root", "existing-root.jar")
+        )
+        (mods / "shared.pw.toml").write_bytes(
+            metadata("Shared", "202", "shared.jar", provider="curseforge")
+        )
+        write_pack_root_manifest(
+            self.source,
+            (PackRootRecord("modrinth", "existing-root", "client"),),
+        )
+        incoming = core.ResolvedModClosure(
+            ("modrinth", "root"),
+            (
+                core.ResolvedMetadata(
+                    ("modrinth", "root"), Path("mods/root.pw.toml"), "root.jar",
+                    metadata("Root", "root", "root.jar"), "modrinth", "root",
+                ),
+                core.ResolvedMetadata(
+                    ("modrinth", "different-version"), Path("mods/shared.pw.toml"),
+                    "shared.jar", metadata("Shared", "different-version", "shared.jar", hash_value=BAD_SHA256),
+                    "modrinth", "different-version",
+                ),
+            ),
+        )
+        before = core.tree_digest_snapshot(self.source)
+        operation = self.operation()
+        with patch.object(core, "resolve_mod_closure", return_value=incoming):
+            operation.run()
+        self.assertIsNotNone(operation.error)
+        self.assertIsNone(operation.preview)
+        self.assertEqual(core.tree_digest_snapshot(self.source), before)
         operation.discard()
 
     def test_side_changed_candidate_is_not_reported_unchanged(self) -> None:

@@ -102,15 +102,20 @@ class AddTransactionTest(unittest.TestCase):
         return subprocess.CompletedProcess(command, returncode)
 
     @staticmethod
-    def run_fake_resolver(command, *, cwd, cancel_event, deadline):
+    def run_fake_resolver(
+        command, *, cwd, cancel_event, deadline, result_callback=None
+    ):
         result = core.subprocess.run(command, cwd=cwd, check=False)
-        return core.ResolverProcessResult(
+        resolved = core.ResolverProcessResult(
             result.returncode,
             result.stdout or "",
             result.stderr or "",
             False,
             False,
         )
+        if result_callback is not None:
+            result_callback(resolved)
+        return resolved
 
     @staticmethod
     def provider_lookup(arguments, **_):
@@ -506,6 +511,10 @@ class AddTransactionTest(unittest.TestCase):
                 )
 
     def test_curseforge_requires_canonical_numeric_identity(self) -> None:
+        for selector in ("12345", "0012345", "cf:0012345"):
+            resolved = core.resolve_project_selector("curseforge", selector)
+            self.assertEqual(resolved.canonical_project_id, "12345")
+
         def run(command, *, cwd, **_):
             self.assertEqual(command[-2:], ["--addon-id", "12345"])
             (cwd / "mods/root.pw.toml").write_text(
@@ -518,7 +527,7 @@ class AddTransactionTest(unittest.TestCase):
             )
             return self.completed(command)
 
-        for selector in ("12345", "cf:12345"):
+        for selector in ("12345", "0012345", "cf:0012345"):
             with self.subTest(selector=selector), patch.object(
                 core.subprocess, "run", side_effect=run
             ):
@@ -531,40 +540,420 @@ class AddTransactionTest(unittest.TestCase):
                 )
             self.assertEqual(closure.root_identity, ("curseforge", "12345"))
 
-        lookup_result = {
-            "provider": "curseforge",
-            "project_id": "12345",
-            "slug": "example",
-            "title": "Example",
-        }
-        with patch.object(
-            core, "_run_provider_lookup", return_value=lookup_result
-        ), patch.object(core.subprocess, "run", side_effect=run):
-            closure = core.resolve_mod_closure(
-                provider="curseforge",
-                selector="https://www.curseforge.com/minecraft/mc-mods/example",
-                minecraft="1.21.1",
-                loader="neoforge",
-                loader_version="21.1.234",
-            )
-        self.assertEqual(closure.root_identity, ("curseforge", "12345"))
+        for selector in (
+            "example",
+            "example-mod",
+            "https://www.curseforge.com/minecraft/mc-mods/example",
+        ):
+            with self.subTest(selector=selector), patch.object(
+                core, "_run_provider_lookup"
+            ) as lookup, patch.object(core, "run_resolver_process") as process:
+                with self.assertRaisesRegex(core.HuroshikiError, "positive decimal"):
+                    core.resolve_mod_closure(
+                        provider="curseforge",
+                        selector=selector,
+                        minecraft="1.21.1",
+                        loader="neoforge",
+                        loader_version="21.1.234",
+                    )
+                lookup.assert_not_called()
+                process.assert_not_called()
 
-        with patch.object(
-            core,
-            "_run_provider_lookup",
-            side_effect=core.HuroshikiError(
-                "CurseForge resolve requires a numeric project ID or project URL"
-            ),
-        ), patch.object(core.subprocess, "run") as process:
-            with self.assertRaisesRegex(core.HuroshikiError, "numeric project ID"):
-                core.resolve_mod_closure(
-                    provider="curseforge",
-                    selector="search terms",
-                    minecraft="1.21.1",
-                    loader="neoforge",
-                    loader_version="21.1.234",
+    def test_curseforge_interactive_probe_uses_one_root_then_resolves_complete_closure(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        probe_id = "12345"
+        base_closure = self.closure(probe_id, ("dependency", "dependency.jar"))
+        closure = core.ResolvedModClosure(
+            ("curseforge", probe_id),
+            tuple(
+                core.ResolvedMetadata(
+                    ("curseforge", item.project_id),
+                    item.relative_path,
+                    item.filename,
+                    item.contents.replace(b"update.modrinth", b"update.curseforge")
+                    .replace(
+                        b'mod-id = "' + item.project_id.encode() + b'"',
+                        b'project-id = "' + item.project_id.encode() + b'"',
+                    ),
+                    "curseforge",
+                    item.project_id,
                 )
-            process.assert_not_called()
+                for item in base_closure.metadata
+            ),
+        )
+        sessions: list[object] = []
+
+        class Session:
+            termination_result = None
+
+            def __init__(self, command, *, cwd, on_event, cancel_event, **kwargs):
+                self.command = command
+                self.cwd = cwd
+                self.on_event = on_event
+                self.cancel_event = cancel_event
+                self.sent: list[str] = []
+                sessions.append(self)
+
+            def send_line(self, value: str) -> None:
+                self.sent.append(value)
+
+            def run(self, *, deadline):
+                self.on_event(core.ParserEvent("confirmation", "confirm"))
+                (self.cwd / "mods/root.pw.toml").write_text(
+                    metadata("Human label", probe_id)
+                    .replace("update.modrinth", "update.curseforge")
+                    .replace('mod-id = "' + probe_id + '"', "project-id = " + probe_id),
+                    encoding="utf-8",
+                )
+                return core.PtyResult(
+                    0, self.cwd / "raw", self.cwd / "events", self.cwd / "text", ""
+                )
+
+        def resolve(**kwargs):
+            source = kwargs["resolver_root"] / "source"
+            (source / "mods").mkdir(parents=True)
+            (source / "mods/root.pw.toml").write_bytes(closure.metadata[0].contents)
+            (source / "mods/dependency.pw.toml").write_bytes(closure.metadata[1].contents)
+            return closure
+
+        try:
+            with patch.object(core, "PackwizPtySession", Session), patch.object(
+                core, "resolve_mod_closure", side_effect=resolve
+            ) as resolve_mock:
+                operation = transaction.begin_add(
+                    "curseforge", "friendly label", client=True, server=False
+                )
+                result = operation.run()
+
+            self.assertTrue(result.success, result.message)
+            self.assertEqual(resolve_mock.call_args.kwargs["selector"], probe_id)
+            self.assertEqual(
+                resolve_mock.call_args.kwargs["canonical_project_id"], probe_id
+            )
+            self.assertEqual(sessions[0].command[-1], "friendly label")
+            self.assertIs(sessions[0].cancel_event, operation.cancel_event)
+            self.assertEqual(sessions[0].sent, ["n"])
+            self.assertTrue((transaction.source / "mods/dependency.pw.toml").exists())
+            self.assertIsNone(transaction._operation)
+        finally:
+            transaction.discard()
+
+    def test_verified_cross_provider_dependency_collapses_and_unions_side(self) -> None:
+        digest = "a" * 64
+        existing_contents = (
+            metadata("Shared", "200", "server")
+            .replace("update.modrinth", "update.curseforge")
+            .replace('mod-id = "200"', "project-id = 200")
+            .replace('hash = "00"', f'hash = "{digest}"')
+            .replace('filename = "200.jar"', 'filename = "shared.jar"')
+        )
+        existing_path = self.source / "mods/shared.pw.toml"
+        existing_path.write_text(existing_contents, encoding="utf-8")
+        core.write_pack_root_manifest(self.source, ())
+        root = self.closure("root").metadata[0]
+        incoming_contents = (
+            metadata("Shared", "shared", "both")
+            .replace('hash = "00"', f'hash = "{digest}"')
+            .replace('filename = "shared.jar"', 'filename = "shared.jar"')
+        ).encode()
+        incoming = core.ResolvedMetadata(
+            ("modrinth", "shared"),
+            Path("mods/shared.pw.toml"),
+            "shared.jar",
+            incoming_contents,
+            "modrinth",
+            "shared",
+        )
+        closure = core.ResolvedModClosure(("modrinth", "root"), (root, incoming))
+
+        changed = core.merge_metadata_closure(
+            self.source, closure, requested_side="client"
+        )
+
+        self.assertIn(Path("mods/shared.pw.toml"), changed)
+        retained = core.read_mod(self.source, Path("mods/shared.pw.toml"))
+        self.assertEqual(
+            (core.canonical_provider(retained.provider), retained.project_id),
+            ("curseforge", "200"),
+        )
+        self.assertEqual(retained.side, "both")
+        self.assertEqual(len(list(self.source.rglob("shared.pw.toml"))), 1)
+
+    def test_equivalent_dependencies_inside_one_closure_collapse(self) -> None:
+        digest = "c" * 64
+        root = self.closure("root").metadata[0]
+        modrinth_contents = metadata("Shared", "shared", "client").replace(
+            'hash = "00"', f'hash = "{digest}"'
+        ).encode()
+        curseforge_contents = (
+            metadata("Shared", "200", "server")
+            .replace("update.modrinth", "update.curseforge")
+            .replace('mod-id = "200"', "project-id = 200")
+            .replace('hash = "00"', f'hash = "{digest}"')
+            .replace('filename = "200.jar"', 'filename = "shared.jar"')
+            .encode()
+        )
+        closure = core.ResolvedModClosure(
+            ("modrinth", "root"),
+            (
+                root,
+                core.ResolvedMetadata(
+                    ("curseforge", "200"),
+                    Path("mods/shared.pw.toml"),
+                    "shared.jar",
+                    curseforge_contents,
+                    "curseforge",
+                    "200",
+                ),
+                core.ResolvedMetadata(
+                    ("modrinth", "shared"),
+                    Path("mods/shared.pw.toml"),
+                    "shared.jar",
+                    modrinth_contents,
+                    "modrinth",
+                    "shared",
+                ),
+            ),
+        )
+
+        core.merge_metadata_closure(self.source, closure, requested_side="client")
+
+        retained = core.read_mod(self.source, Path("mods/shared.pw.toml"))
+        self.assertEqual(
+            (core.canonical_provider(retained.provider), retained.project_id),
+            ("modrinth", "shared"),
+        )
+        self.assertFalse(
+            any(
+                path.name == "200.pw.toml"
+                for path in self.source.rglob("*.pw.toml")
+            )
+        )
+
+    def test_incoming_explicit_root_replaces_equivalent_existing_dependency(self) -> None:
+        digest = "b" * 64
+        existing = (
+            metadata("Shared", "200", "server")
+            .replace("update.modrinth", "update.curseforge")
+            .replace('mod-id = "200"', "project-id = 200")
+            .replace('hash = "00"', f'hash = "{digest}"')
+            .replace('filename = "200.jar"', 'filename = "shared.jar"')
+        )
+        (self.source / "mods/old.pw.toml").write_text(existing, encoding="utf-8")
+        core.write_pack_root_manifest(self.source, ())
+        incoming_contents = (
+            metadata("Shared", "shared", "client")
+            .replace('hash = "00"', f'hash = "{digest}"')
+            .replace('filename = "shared.jar"', 'filename = "shared.jar"')
+        ).encode()
+        incoming = core.ResolvedMetadata(
+            ("modrinth", "shared"),
+            Path("mods/new.pw.toml"),
+            "shared.jar",
+            incoming_contents,
+            "modrinth",
+            "shared",
+        )
+
+        core.merge_metadata_closure(
+            self.source,
+            core.ResolvedModClosure(("modrinth", "shared"), (incoming,)),
+            requested_side="client",
+        )
+
+        self.assertFalse((self.source / "mods/old.pw.toml").exists())
+        retained = core.read_mod(self.source, Path("mods/new.pw.toml"))
+        self.assertEqual(
+            (core.canonical_provider(retained.provider), retained.project_id),
+            ("modrinth", "shared"),
+        )
+        self.assertEqual(retained.side, "both")
+        roots = core.read_pack_root_manifest(self.source)
+        self.assertEqual([(item.provider, item.project_id) for item in roots], [("modrinth", "shared")])
+
+    def test_curseforge_probe_rejects_mismatch_provider_and_multiple_metadata(self) -> None:
+        cases = (
+            ("mismatch", (metadata("Root", "999"),), "different project ID"),
+            ("non-curseforge", (metadata("Root", "12345"),), "non-CurseForge"),
+            (
+                "multiple",
+                (metadata("Root", "12345"), metadata("Other", "678")),
+                "exactly one",
+            ),
+        )
+        for name, records, message in cases:
+            with self.subTest(name=name):
+                transaction = core.PackTransaction.create(self.key)
+
+                class Session:
+                    termination_result = None
+
+                    def __init__(self, command, *, cwd, **kwargs):
+                        self.cwd = cwd
+
+                    def run(self, *, deadline):
+                        for index, contents in enumerate(records):
+                            if name != "non-curseforge" and index == 0:
+                                contents = contents.replace(
+                                    "update.modrinth", "update.curseforge"
+                                ).replace(
+                                    'mod-id = "' + ("999" if name == "mismatch" else "12345") + '"',
+                                    "project-id = " + ("999" if name == "mismatch" else "12345"),
+                                )
+                            (self.cwd / "mods" / f"{index}.pw.toml").write_text(
+                                contents, encoding="utf-8"
+                            )
+                        return core.PtyResult(
+                            0, self.cwd / "raw", self.cwd / "events", self.cwd / "text", ""
+                        )
+
+                try:
+                    with patch.object(core, "PackwizPtySession", Session), patch.object(
+                        core, "resolve_mod_closure"
+                    ) as resolve:
+                        operation = transaction.begin_add(
+                            "curseforge", "12345", client=True, server=False
+                        )
+                        result = operation.run()
+                    self.assertFalse(result.success)
+                    self.assertIn(message, result.message)
+                    resolve.assert_not_called()
+                    self.assertIsNone(transaction._operation)
+                    self.assertTrue(operation.done.is_set())
+                finally:
+                    transaction.discard()
+
+    def test_curseforge_closure_incomplete_termination_retains_ownership_for_retry(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        parent = object()
+
+        class Session:
+            termination_result = None
+
+            def __init__(self, command, *, cwd, **kwargs):
+                self.cwd = cwd
+
+            def run(self, *, deadline):
+                (self.cwd / "mods/root.pw.toml").write_text(
+                    metadata("Root", "12345")
+                    .replace("update.modrinth", "update.curseforge")
+                    .replace('mod-id = "12345"', "project-id = 12345"),
+                    encoding="utf-8",
+                )
+                return core.PtyResult(
+                    0, self.cwd / "raw", self.cwd / "events", self.cwd / "text", ""
+                )
+
+            def cancel(self, *, deadline):
+                return core.ProcessTerminationResult(True, True, False)
+
+        def fail_resolution(**kwargs):
+            kwargs["process_result_callback"](
+                core.BoundedProcessResult(
+                    -15,
+                    "",
+                    "",
+                    True,
+                    False,
+                    termination_incomplete=True,
+                    process_group=4242,
+                    parent_process=parent,
+                )
+            )
+            raise core.HuroshikiError("Packwiz resolver process termination was incomplete")
+
+        try:
+            with patch.object(core, "PackwizPtySession", Session), patch.object(
+                core, "resolve_mod_closure", side_effect=fail_resolution
+            ):
+                operation = transaction.begin_add(
+                    "curseforge", "12345", client=True, server=False
+                )
+                result = operation.run()
+
+            self.assertFalse(result.success)
+            self.assertTrue(operation.done.is_set())
+            self.assertTrue(operation.termination_incomplete)
+            self.assertIs(transaction._operation, operation)
+
+            with patch.object(
+                core,
+                "stop_resolver_process_group",
+                return_value=core.ProcessTerminationResult(True, True, True),
+            ) as stop:
+                deadline = time.monotonic() + 1
+                operation.cancel(deadline=deadline)
+            stop.assert_called_once_with(
+                4242,
+                parent=parent,
+                cleanup_deadline=deadline,
+            )
+            self.assertFalse(operation.termination_incomplete)
+            self.assertIsNone(transaction._operation)
+        finally:
+            transaction.discard()
+
+    def test_curseforge_closure_interrupt_retains_incomplete_process_ownership(self) -> None:
+        transaction = core.PackTransaction.create(self.key)
+        parent = object()
+
+        class Session:
+            termination_result = None
+
+            def __init__(self, command, *, cwd, **kwargs):
+                self.cwd = cwd
+
+            def run(self, *, deadline):
+                (self.cwd / "mods/root.pw.toml").write_text(
+                    metadata("Root", "12345")
+                    .replace("update.modrinth", "update.curseforge")
+                    .replace('mod-id = "12345"', "project-id = 12345"),
+                    encoding="utf-8",
+                )
+                return core.PtyResult(
+                    0, self.cwd / "raw", self.cwd / "events", self.cwd / "text", ""
+                )
+
+            def cancel(self, *, deadline):
+                return core.ProcessTerminationResult(True, True, False)
+
+        def interrupt(command, **kwargs):
+            kwargs["result_callback"](
+                core.BoundedProcessResult(
+                    None,
+                    "",
+                    "",
+                    False,
+                    False,
+                    termination_incomplete=True,
+                    process_group=4243,
+                    parent_process=parent,
+                )
+            )
+            raise KeyboardInterrupt
+
+        try:
+            with patch.object(core, "PackwizPtySession", Session), patch.object(
+                core, "run_resolver_process", side_effect=interrupt
+            ):
+                operation = transaction.begin_add(
+                    "curseforge", "12345", client=True, server=False
+                )
+                with self.assertRaises(KeyboardInterrupt):
+                    operation.run()
+
+            self.assertTrue(operation.done.is_set())
+            self.assertTrue(operation.termination_incomplete)
+            self.assertIs(transaction._operation, operation)
+            with patch.object(
+                core,
+                "stop_resolver_process_group",
+                return_value=core.ProcessTerminationResult(True, True, True),
+            ):
+                operation.cancel(deadline=time.monotonic() + 1)
+            self.assertIsNone(transaction._operation)
+        finally:
+            transaction.discard()
 
     def test_resolved_add_failure_restores_existing_staged_changes(self) -> None:
         transaction = core.PackTransaction.create(self.key)

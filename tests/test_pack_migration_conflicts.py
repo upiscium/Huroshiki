@@ -244,6 +244,44 @@ class PackMigrationConflictTest(unittest.TestCase):
         self.assertIn('"schema": 3', diagnostic)
         pack_migration.discard_pack_migration_plan(plan)
 
+    def test_replace_does_not_auto_collapse_two_explicit_equivalent_roots(self) -> None:
+        self.source.joinpath("pack.toml").write_text(
+            '[versions]\nminecraft = "1.21.1"\nfabric = "0.16.0"\n', encoding="utf-8"
+        )
+        digest = "d" * 64
+        existing = (
+            'name = "123"\nfilename = "shared.jar"\nside = "server"\n'
+            '[download]\nhash-format = "sha256"\n'
+            f'hash = "{digest}"\nurl = "https://example.invalid/123.jar"\n'
+            '[update.curseforge]\nproject-id = 123\nfile-id = 1\n'
+        ).encode()
+        incoming = (
+            'name = "replacement"\nfilename = "shared.jar"\nside = "client"\n'
+            '[download]\nhash-format = "sha256"\n'
+            f'hash = "{digest}"\nurl = "https://example.invalid/replacement.jar"\n'
+            '[update.modrinth]\nmod-id = "replacement"\nversion = "v2"\n'
+        ).encode()
+        (self.source / "mods/existing.pw.toml").write_bytes(existing)
+        write_pack_root_manifest(
+            self.source,
+            (PackRootRecord("curseforge", "123", "server"),),
+        )
+        closure = core.ResolvedModClosure(
+            ("modrinth", "replacement"),
+            (core.ResolvedMetadata(
+                ("modrinth", "replacement"), Path("mods/incoming.pw.toml"),
+                "shared.jar", incoming, "modrinth", "replacement",
+            ),),
+        )
+        with self.assertRaisesRegex(core.HuroshikiError, "two explicit roots cannot be merged"):
+            core.merge_metadata_closure(
+                self.source, closure, requested_side="client",
+            )
+        self.assertEqual(
+            [item.canonical_identity for item in core.read_pack_root_manifest(self.source)],
+            ["curseforge:123"],
+        )
+
     def test_unresolved_replacement_keeps_staging_and_stale_request_never_reaches_resolver(self) -> None:
         plan = self._unresolved_plan()
         identity = plan.resolution.unresolved_roots[0].source_root.canonical_identity

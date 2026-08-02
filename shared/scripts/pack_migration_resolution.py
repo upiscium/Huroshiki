@@ -1161,6 +1161,7 @@ def _resolve_effective_root_set(
                         resolver_root=bound_workspace / "roots" / f"root-{index}",
                         url_max_jar_size_bytes=plan.source_snapshot.url_max_jar_size_bytes,
                         url_allow_private_networks=plan.source_snapshot.url_allow_private_networks,
+                        process_result_callback=plan._record_resolver_process_result,
                     )
                 except Exception as error:
                     if _operation_failure(error):
@@ -1273,6 +1274,10 @@ def _resolve_effective_root_set(
                         bound_workspace / "source",
                         closure,
                         requested_side=root.source_side,
+                        cancel_event=cancel_event,
+                        deadline=deadline,
+                        equivalence_workspace=bound_workspace / "equivalence",
+                        process_result_callback=plan._record_resolver_process_result,
                     )
                 except Exception as error:
                     collision_reason = _classify_collision(str(error))
@@ -1345,11 +1350,13 @@ def _resolve_effective_root_set(
                 progress,
                 PackMigrationProgress("refreshing", len(roots), len(roots), None, "Refreshing target"),
             )
-            packctl.run_packwiz(
+            core._run_noninteractive_packwiz(
                 ["packwiz", "refresh"],
                 cwd=bound_workspace / "source",
                 cancel_event=cancel_event,
                 deadline=effective_deadline,
+                label="Pack migration target refresh",
+                process_result_callback=plan._record_resolver_process_result,
             )
             _progress(
                 progress,

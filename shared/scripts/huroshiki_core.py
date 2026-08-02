@@ -29,6 +29,13 @@ from uuid import uuid4
 import tomlkit
 
 import packctl
+from dependency_equivalence import (
+    DependencyCandidate,
+    EQUIVALENCE_POLICY_VERSION,
+    EquivalenceContext,
+    EquivalenceError,
+    verify_equivalence,
+)
 from pack_migration_roots import (
     PackRootRecord,
     identify_pack_metadata_by_slug,
@@ -38,6 +45,7 @@ from pack_migration_roots import (
     write_pack_root_manifest,
 )
 from provider_identity import parse_provider_metadata
+from provider_artifacts import materialize_provider_artifact
 
 if TYPE_CHECKING:
     from pack_migration_conflicts import (
@@ -821,6 +829,8 @@ class ProviderSearchOperation:
         loader: str,
         deadline: float | None = None,
     ) -> None:
+        if canonical_provider(provider) != "modrinth":
+            raise HuroshikiError("Provider API search is available only for Modrinth")
         self.provider = provider
         self.query = query
         self.minecraft = minecraft
@@ -886,6 +896,9 @@ class _AddOperationLifecycle:
         )
         self.result: AddOperationResult | None = None
         self.cleanup_error: BaseException | None = None
+        self.resolver_process_result: BoundedProcessResult | None = None
+        self.resolver_termination_result: ProcessTerminationResult | None = None
+        self.resolver_termination_incomplete = False
         self._checkpoint_complete = False
         self._pending_batch: TransactionBatch | None = None
         self._state: Literal["created", "running", "done"] = "created"
@@ -991,6 +1004,30 @@ class _AddOperationLifecycle:
     def wait(self, timeout: float | None = None) -> bool:
         return self.done.wait(timeout)
 
+    def _record_resolver_process_result(self, result: BoundedProcessResult) -> None:
+        self.resolver_process_result = result
+        if result.termination_incomplete:
+            self.resolver_termination_incomplete = True
+
+    def _retry_resolver_cleanup(self, deadline: float | None) -> None:
+        process = self.resolver_process_result
+        if (
+            deadline is None
+            or not self.resolver_termination_incomplete
+            or process is None
+            or process.process_group is None
+        ):
+            return
+        self.resolver_termination_result = stop_resolver_process_group(
+            process.process_group,
+            parent=process.parent_process,
+            cleanup_deadline=deadline,
+        )
+        self.resolver_termination_incomplete = not (
+            self.resolver_termination_result.group_drained
+            and self.resolver_termination_result.parent_reaped
+        )
+
 
 class ResolvedAddOperation(_AddOperationLifecycle):
     def __init__(
@@ -1071,6 +1108,7 @@ class ResolvedAddOperation(_AddOperationLifecycle):
                 cancel_event=self.cancel_event,
                 deadline=self.deadline,
                 resolver_root=self.resolver_root,
+                process_result_callback=self._record_resolver_process_result,
             )
             self._checkpoint()
             with self.transaction._lock:
@@ -1083,6 +1121,10 @@ class ResolvedAddOperation(_AddOperationLifecycle):
                     self.transaction.source,
                     closure,
                     requested_side=self.side,
+                    cancel_event=self.cancel_event,
+                    deadline=self.deadline,
+                    equivalence_workspace=self.resolver_root / "equivalence",
+                    process_result_callback=self._record_resolver_process_result,
                 )
                 self._checkpoint()
                 batch = TransactionBatch(
@@ -1122,6 +1164,9 @@ class ResolvedAddOperation(_AddOperationLifecycle):
 
     def cancel(self, *, deadline: float | None = None) -> None:
         self._request_cancel(deadline=deadline)
+        if self.done.is_set():
+            self._retry_resolver_cleanup(deadline)
+            self.transaction._release_add_cleanup_ownership(self)
 
 
 class PackwizAddOperation(_AddOperationLifecycle):
@@ -1138,11 +1183,16 @@ class PackwizAddOperation(_AddOperationLifecycle):
     ) -> None:
         super().__init__(transaction, deadline=deadline)
         self.provider, self.query = normalize_add_selector(provider, query)
+        if self.provider == "curseforge" and self.query.isdecimal():
+            self.query = canonical_curseforge_project_id(self.query)
         self.client = client
         self.server = server
         self.on_event = on_event
         self.termination_result: ProcessTerminationResult | None = None
         self.termination_incomplete = False
+        self.resolver_process_result: BoundedProcessResult | None = None
+        self.resolver_termination_result: ProcessTerminationResult | None = None
+        self.resolver_termination_incomplete = False
         self.menu_items: dict[int, str] = {}
         self.selection: str | None = None
         operation_id = uuid4().hex
@@ -1158,6 +1208,7 @@ class PackwizAddOperation(_AddOperationLifecycle):
             transaction.root / f"retained-failed-add-source-{operation_id}"
         )
         self.resolver_source = self.resolver_root / "source"
+        self.closure_resolver_root = self.resolver_root / "closure"
         self.minecraft = ""
         self.loader = ""
         self.loader_version = ""
@@ -1212,12 +1263,19 @@ class PackwizAddOperation(_AddOperationLifecycle):
                         self.menu_items = {item.index: item.label for item in event.items}
                     if self.on_event is not None:
                         self.on_event(event)
+                    if self.provider == "curseforge" and event.kind == "confirmation":
+                        if self.session is None:
+                            raise HuroshikiError("Packwiz PTY session was not initialized")
+                        # The interactive pass is an identity probe. Dependencies are
+                        # resolved only after the selected root's numeric ID is verified.
+                        self.session.send_line("n")
 
                 self.session = PackwizPtySession(
                     build_add_command(self.provider, self.query),
                     cwd=self.resolver_source,
                     log_dir=self.log_dir,
                     on_event=record_event,
+                    cancel_event=self.cancel_event,
                 )
             self._checkpoint()
 
@@ -1261,7 +1319,7 @@ class PackwizAddOperation(_AddOperationLifecycle):
                 self.termination_incomplete = not (
                     self.termination_result.group_drained
                     and self.termination_result.parent_reaped
-                )
+                ) or getattr(self, "resolver_termination_incomplete", False)
             if result is None:
                 result = self._error_result(HuroshikiError("Add operation failed"))
         completed = self._complete(result)
@@ -1302,6 +1360,26 @@ class PackwizAddOperation(_AddOperationLifecycle):
             )
         )
         effective_deadline = self._request_cancel(deadline=deadline)
+        resolver_process = getattr(self, "resolver_process_result", None)
+        resolver_termination_incomplete = getattr(
+            self, "resolver_termination_incomplete", False
+        )
+        if (
+            retrying_cleanup
+            and resolver_termination_incomplete
+            and deadline is not None
+            and resolver_process is not None
+            and resolver_process.process_group is not None
+        ):
+            self.resolver_termination_result = stop_resolver_process_group(
+                resolver_process.process_group,
+                parent=resolver_process.parent_process,
+                cleanup_deadline=deadline,
+            )
+            self.resolver_termination_incomplete = not (
+                self.resolver_termination_result.group_drained
+                and self.resolver_termination_result.parent_reaped
+            )
         session = self.session
         if session is not None:
             cleanup_deadline = (
@@ -1314,16 +1392,99 @@ class PackwizAddOperation(_AddOperationLifecycle):
                 self.termination_incomplete = not (
                     self.termination_result.group_drained
                     and self.termination_result.parent_reaped
-                )
+                ) or getattr(self, "resolver_termination_incomplete", False)
+        elif not getattr(self, "resolver_termination_incomplete", False):
+            self.termination_incomplete = False
         if self.done.is_set():
             self.transaction._release_add_cleanup_ownership(self)
-        return self.termination_result
+        return self.termination_result or self.resolver_termination_result
+
+    def _record_resolver_process_result(self, result: BoundedProcessResult) -> None:
+        self.resolver_process_result = result
+        self.resolver_termination_incomplete = result.termination_incomplete
+        self.termination_incomplete = (
+            self.termination_incomplete or self.resolver_termination_incomplete
+        )
 
     def resize(self, width: int, height: int) -> None:
         if self.session is not None:
             self.session.resize(width, height)
 
 TRANSACTION_DISCARD_TIMEOUT_SECONDS = 10.0
+_RETAINED_FAILED_TRANSACTIONS: dict[str, "PackTransaction"] = {}
+_RETAINED_TEMPLATE_CREATIONS: dict[
+    str, tuple[object, Path, list[BoundedProcessResult]]
+] = {}
+
+
+class TemplateCreationCleanupRequired(HuroshikiError):
+    def __init__(
+        self, workspace: Path, results: list[BoundedProcessResult]
+    ) -> None:
+        self.workspace = workspace
+        self.results = results
+        super().__init__(
+            "Template creation process cleanup was incomplete; state retained at "
+            f"{workspace}"
+        )
+
+
+def _cleanup_template_creation_processes(
+    workspace: Path,
+    results: list[BoundedProcessResult],
+    *,
+    deadline: float,
+) -> None:
+    remaining: list[BoundedProcessResult] = []
+    for result in results:
+        if result.process_group is None:
+            remaining.append(result)
+            continue
+        cleanup = stop_resolver_process_group(
+            result.process_group,
+            parent=result.parent_process,
+            cleanup_deadline=deadline,
+        )
+        if not (cleanup.group_drained and cleanup.parent_reaped):
+            remaining.append(result)
+    results[:] = remaining
+    if remaining:
+        raise TemplateCreationCleanupRequired(workspace, results)
+    if workspace.exists():
+        shutil.rmtree(workspace)
+
+
+def retry_retained_template_creation_cleanup(
+    project_key_value: str, *, deadline: float | None = None
+) -> None:
+    retained = _RETAINED_TEMPLATE_CREATIONS.get(project_key_value)
+    if retained is None:
+        return
+    lock, workspace, results = retained
+    _cleanup_template_creation_processes(
+        workspace,
+        results,
+        deadline=(
+            deadline
+            if deadline is not None
+            else time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS
+        ),
+    )
+    lock.release()
+    _RETAINED_TEMPLATE_CREATIONS.pop(project_key_value, None)
+
+
+def retry_all_retained_template_creation_cleanup(*, deadline: float) -> None:
+    failures: list[str] = []
+    for project_key_value in tuple(_RETAINED_TEMPLATE_CREATIONS):
+        try:
+            retry_retained_template_creation_cleanup(
+                project_key_value, deadline=deadline
+            )
+        except BaseException as error:
+            failures.append(f"{project_key_value}: {error}")
+    if failures:
+        raise HuroshikiError("; ".join(failures))
 
 
 class TransactionDiscardError(HuroshikiError):
@@ -1414,6 +1575,9 @@ class PackTransaction:
     batches: list[TransactionBatch] = field(default_factory=list)
     update_candidates: tuple[UpdateCandidate, ...] = field(default_factory=tuple)
     selected_update_changes: tuple[UpdateChange, ...] = field(default_factory=tuple)
+    _equivalence_process_results: list[BoundedProcessResult] = field(
+        default_factory=list, init=False, repr=False
+    )
     active: bool = True
     _project_lock: packctl.ProjectLock | None = field(default=None, init=False, repr=False)
     _operation: PackwizAddOperation | ResolvedAddOperation | None = field(
@@ -1596,6 +1760,31 @@ class PackTransaction:
         if not self.active or not self.source.is_dir():
             raise HuroshikiError("This transaction is no longer active")
 
+    def _record_equivalence_process_result(
+        self, result: BoundedProcessResult
+    ) -> None:
+        if result.termination_incomplete:
+            self._equivalence_process_results.append(result)
+
+    def _retry_equivalence_process_cleanup(self, deadline: float) -> None:
+        remaining: list[BoundedProcessResult] = []
+        for result in self._equivalence_process_results:
+            if result.process_group is None:
+                remaining.append(result)
+                continue
+            cleanup = stop_resolver_process_group(
+                result.process_group,
+                parent=result.parent_process,
+                cleanup_deadline=deadline,
+            )
+            if not (cleanup.group_drained and cleanup.parent_reaped):
+                remaining.append(result)
+        self._equivalence_process_results = remaining
+        if remaining:
+            raise TransactionDiscardIntegrityError(
+                "Dependency-equivalence process-group cleanup was incomplete"
+            )
+
     def begin_add(
         self,
         provider: str,
@@ -1687,17 +1876,19 @@ class PackTransaction:
     def _add_termination_incomplete(
         operation: PackwizAddOperation | ResolvedAddOperation,
     ) -> bool:
-        if not isinstance(operation, PackwizAddOperation):
-            return False
-        termination = operation.termination_result
-        return operation.termination_incomplete or (
-            termination is not None
-            and not (termination.group_drained and termination.parent_reaped)
+        termination = getattr(operation, "termination_result", None)
+        return (
+            getattr(operation, "termination_incomplete", False)
+            or getattr(operation, "resolver_termination_incomplete", False)
+            or (
+                termination is not None
+                and not (termination.group_drained and termination.parent_reaped)
+            )
         )
 
     def _release_add_cleanup_ownership(
         self,
-        operation: PackwizAddOperation,
+        operation: PackwizAddOperation | ResolvedAddOperation,
     ) -> None:
         with self._lock:
             if (
@@ -1734,11 +1925,15 @@ class PackTransaction:
                 minecraft=minecraft,
                 loader=loader,
                 loader_version=loader_version,
+                resolver_root=self.root / f"resolver-{uuid4().hex}",
+                process_result_callback=self._record_equivalence_process_result,
             )
             changed = merge_metadata_closure(
                 self.source,
                 closure,
                 requested_side="both",
+                equivalence_workspace=self.root / "equivalence",
+                process_result_callback=self._record_equivalence_process_result,
             )
         except Exception as error:
             return subprocess.CompletedProcess(
@@ -1782,12 +1977,16 @@ class PackTransaction:
                 minecraft=minecraft,
                 loader=loader,
                 loader_version=loader_version,
+                resolver_root=self.root / f"resolver-{uuid4().hex}",
+                process_result_callback=self._record_equivalence_process_result,
             )
             try:
                 changed = merge_metadata_closure(
                     self.source,
                     closure,
                     requested_side=normalized_side,
+                    equivalence_workspace=self.root / "equivalence",
+                    process_result_callback=self._record_equivalence_process_result,
                 )
             except Exception as error:
                 raise HuroshikiError(f"Could not merge resolved MOD closure: {error}") from error
@@ -1861,28 +2060,72 @@ class PackTransaction:
                 )
 
             operation._checkpoint()
-            metadata = _read_resolver_metadata(operation.resolver_source)
+            ensure_safe_pack_source(operation.resolver_source)
+            probe_metadata = _read_resolver_metadata(operation.resolver_source)
             operation._checkpoint()
-            selected = operation.selection or operation.query
-            project_id = resolve_project_selector(
-                operation.provider,
-                selected,
-                cancel_event=operation.cancel_event,
-                deadline=operation.deadline,
-            ).canonical_project_id
-            operation._checkpoint()
-            if project_id is None:
-                raise HuroshikiError(
-                    "Selected Packwiz result has no canonical project ID; "
-                    "retry with an explicit provider project ID"
+            if operation.provider == "curseforge":
+                if len(probe_metadata) != 1:
+                    raise HuroshikiError(
+                        "CurseForge identity probe must produce exactly one root metadata file"
+                    )
+                probe_root = probe_metadata[0]
+                if probe_root.provider != "curseforge":
+                    raise HuroshikiError(
+                        "CurseForge identity probe produced non-CurseForge metadata"
+                    )
+                project_id = canonical_curseforge_project_id(probe_root.project_id)
+                if operation.query.isdecimal() and project_id != operation.query:
+                    raise HuroshikiError(
+                        "CurseForge identity probe returned a different project ID"
+                    )
+                if operation.on_event is not None:
+                    operation.on_event(
+                        ParserEvent(
+                            "identity_verified",
+                            f"Verified CurseForge project ID {project_id}",
+                        )
+                    )
+                operation._checkpoint()
+                closure = resolve_mod_closure(
+                    provider="curseforge",
+                    selector=project_id,
+                    canonical_project_id=project_id,
+                    minecraft=operation.minecraft,
+                    loader=operation.loader,
+                    loader_version=operation.loader_version,
+                    cancel_event=operation.cancel_event,
+                    deadline=operation.deadline,
+                    resolver_root=operation.closure_resolver_root,
+                    process_result_callback=operation._record_resolver_process_result,
                 )
-            root_identity = resolved_root_identity(
-                operation.provider, project_id, metadata
-            )
+                ensure_safe_pack_source(operation.closure_resolver_root / "source")
+            else:
+                selected = operation.selection or operation.query
+                project_id = resolve_project_selector(
+                    operation.provider,
+                    selected,
+                    cancel_event=operation.cancel_event,
+                    deadline=operation.deadline,
+                ).canonical_project_id
+                operation._checkpoint()
+                if project_id is None:
+                    raise HuroshikiError(
+                        "Selected Packwiz result has no canonical project ID; "
+                        "retry with an explicit provider project ID"
+                    )
+                root_identity = resolved_root_identity(
+                    operation.provider, project_id, probe_metadata
+                )
+                closure = ResolvedModClosure(root_identity, probe_metadata)
+            operation._checkpoint()
             changed = merge_metadata_closure(
                 self.source,
-                ResolvedModClosure(root_identity, metadata),
+                closure,
                 requested_side=side_from_flags(operation.client, operation.server),
+                cancel_event=operation.cancel_event,
+                deadline=operation.deadline,
+                equivalence_workspace=operation.resolver_root / "equivalence",
+                process_result_callback=operation._record_resolver_process_result,
             )
             operation._checkpoint()
 
@@ -2204,11 +2447,18 @@ class PackTransaction:
             cancel_event=cancel_event,
             deadline=deadline,
             on_progress=on_progress,
+            process_result_callback=self._record_equivalence_process_result,
         )
         self.update_candidates = tuple(candidates)
         return candidates
 
-    def select_updates(self, selected_paths: Iterable[Path]) -> None:
+    def select_updates(
+        self,
+        selected_paths: Iterable[Path],
+        *,
+        cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> None:
         self.ensure_active()
         selected = set(selected_paths)
         available = {
@@ -2221,11 +2471,32 @@ class PackTransaction:
             raise HuroshikiError(
                 f"Unknown update selection: {', '.join(map(str, sorted(unknown)))}"
             )
-        for change in reversed(self.selected_update_changes):
+        previous_changes = self.selected_update_changes
+        for change in reversed(previous_changes):
             _apply_update_change(self.source, change, use_after=False)
-        merged = _merge_update_closures(
-            available[path] for path in sorted(selected)
-        )
+        try:
+            merged = _merge_update_closures(
+                (available[path] for path in sorted(selected)),
+                source=self.source,
+                workspace=self.root / "update-equivalence",
+                cancel_event=cancel_event,
+                deadline=(
+                    deadline
+                    if deadline is not None
+                    else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+                ),
+                process_result_callback=self._record_equivalence_process_result,
+            )
+        except BaseException as error:
+            try:
+                for change in previous_changes:
+                    _apply_update_change(self.source, change, use_after=True)
+            except BaseException as restore_error:
+                raise HuroshikiError(
+                    f"{error}; failed to restore previously selected updates: "
+                    f"{restore_error}"
+                ) from error
+            raise
         for change in merged:
             _apply_update_change(self.source, change, use_after=True)
         self.selected_update_changes = merged
@@ -2290,6 +2561,7 @@ class PackTransaction:
                 cancel_event=cancel_event,
                 deadline=operation_deadline,
                 label=f"Packwiz remove {slug}",
+                process_result_callback=self._record_equivalence_process_result,
             )
             if removed_identity is not None:
                 remove_pack_root(self.source, removed_identity)
@@ -2318,6 +2590,11 @@ class PackTransaction:
         deadline: float | None,
     ) -> None:
         self.ensure_active()
+        if self._equivalence_process_results:
+            cleanup_deadline = time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS
+            if deadline is not None:
+                cleanup_deadline = min(cleanup_deadline, deadline)
+            self._retry_equivalence_process_cleanup(cleanup_deadline)
         with self._lock:
             if self._operation is not None:
                 raise HuroshikiError("Wait for the active add operation to finish")
@@ -2379,6 +2656,7 @@ class PackTransaction:
                 cancel_event=cancel_event,
                 deadline=operation_deadline,
                 label="Packwiz refresh",
+                process_result_callback=self._record_equivalence_process_result,
             )
             ensure_safe_pack_source(self.source)
 
@@ -2598,11 +2876,13 @@ class PackTransaction:
             raise TransactionDiscardTimeout(
                 f"Transaction discard deadline exceeded for {self.project_key}"
             )
+        self._retry_equivalence_process_cleanup(discard.deadline)
         self._finish_discard_once(deadline=discard.deadline)
         with self._lock:
             if self._discard_operation is discard:
                 self._discard_error = None
                 self._discard_state = "discarded"
+                _RETAINED_FAILED_TRANSACTIONS.pop(str(self.root), None)
 
     def _record_discard_failure(
         self,
@@ -2613,6 +2893,7 @@ class PackTransaction:
             if self._discard_operation is operation:
                 self._discard_error = error
                 self._discard_state = "failed"
+                _RETAINED_FAILED_TRANSACTIONS[str(self.root)] = self
 
     def _finish_discard_once(self, *, deadline: float) -> None:
         with self._lock:
@@ -2839,7 +3120,7 @@ def resolve_project_selector(
     if cancel_event is not None and cancel_event.is_set():
         raise HuroshikiError("Provider lookup was cancelled")
     normalized_provider, normalized_selector = normalize_add_selector(provider, selector)
-    if normalized_provider == "curseforge" and normalized_selector.isdecimal():
+    if normalized_provider == "curseforge":
         project_id = canonical_curseforge_project_id(normalized_selector)
         return ResolvedSelector(
             normalized_provider,
@@ -2847,7 +3128,7 @@ def resolve_project_selector(
             project_id,
             project_id,
         )
-    if normalized_provider in {"modrinth", "curseforge"}:
+    if normalized_provider == "modrinth":
         record = _run_provider_lookup(
             [normalized_provider, "resolve", normalized_selector],
             cancel_event=cancel_event,
@@ -2883,7 +3164,7 @@ def search_provider_projects(
     deadline: float | None = None,
 ) -> tuple[ProviderProject, ...]:
     normalized_provider = canonical_provider(provider)
-    if normalized_provider not in {"modrinth", "curseforge"}:
+    if normalized_provider != "modrinth":
         raise HuroshikiError(f"Provider search is unavailable for {provider}")
     if not 1 <= limit <= 50:
         raise HuroshikiError("Provider search limit must be between 1 and 50")
@@ -4641,16 +4922,21 @@ def _update_metadata_snapshot(
             )
         path_owner = paths.get(path_key)
         if path_owner is not None and path_owner != record.identity:
-            raise HuroshikiError(
-                f"Update resolver produced portable metadata path collision at "
-                f"{record.relative_path}"
-            )
+            if {path_owner[0], record.identity[0]} != {"modrinth", "curseforge"}:
+                raise HuroshikiError(
+                    f"Update resolver produced portable metadata path collision at "
+                    f"{record.relative_path}"
+                )
         filename_owner = filenames.get(filename_key)
         if filename_owner is not None and filename_owner != record.identity:
-            raise HuroshikiError(
-                f"Update resolver produced portable filename collision "
-                f"{record.filename!r}"
-            )
+            if {filename_owner[0], record.identity[0]} != {
+                "modrinth",
+                "curseforge",
+            }:
+                raise HuroshikiError(
+                    f"Update resolver produced portable filename collision "
+                    f"{record.filename!r}"
+                )
         records[record.identity] = record
         paths[path_key] = record.identity
         filenames[filename_key] = record.identity
@@ -4689,12 +4975,20 @@ def _prepare_update_candidates(
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
     on_progress: Callable[[UpdateProgress], None] | None = None,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> list[UpdateCandidate]:
     effective_deadline = (
         deadline
         if deadline is not None
         else time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS
     )
+    process_incomplete = False
+
+    def record_process_result(result: BoundedProcessResult) -> None:
+        nonlocal process_incomplete
+        process_incomplete = process_incomplete or result.termination_incomplete
+        if process_result_callback is not None:
+            process_result_callback(result)
 
     def progress(value: UpdateProgress) -> None:
         if on_progress is not None:
@@ -4799,6 +5093,7 @@ def _prepare_update_candidates(
                 effective_deadline,
                 time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
             ),
+            result_callback=record_process_result,
         )
         if normalization.cancelled:
             progress(UpdateProgress("cancelled", len(candidates), total))
@@ -4847,7 +5142,8 @@ def _prepare_update_candidates(
             progress(
                 UpdateProgress("failed", total, total, message=normalization_error)
             )
-            shutil.rmtree(resolver_root, ignore_errors=True)
+            if not process_incomplete:
+                shutil.rmtree(resolver_root, ignore_errors=True)
             return sorted(candidates, key=lambda item: item.root)
         check_cancel(len(candidates), total)
         ensure_safe_pack_source(
@@ -4863,7 +5159,8 @@ def _prepare_update_candidates(
             lambda: copy_checkpoint(len(candidates), total),
         )
     except UpdatePreparationCancelled:
-        shutil.rmtree(resolver_root, ignore_errors=True)
+        if not process_incomplete:
+            shutil.rmtree(resolver_root, ignore_errors=True)
         raise
     except UpdatePreparationDeadlineExceeded as error:
         message = str(error)
@@ -4877,14 +5174,16 @@ def _prepare_update_candidates(
                     error_kind="operation_deadline",
                 )
             )
-        shutil.rmtree(resolver_root, ignore_errors=True)
+        if not process_incomplete:
+            shutil.rmtree(resolver_root, ignore_errors=True)
         progress(UpdateProgress("failed", total, total, message=message))
         return sorted(candidates, key=lambda item: item.root)
     except (OSError, HuroshikiError) as error:
         message = f"disposable baseline normalization failed: {error}"
         for relative_path, _, old_data, old_mod in eligible:
             candidates.append(_candidate_error(relative_path, old_mod, old_data, message))
-        shutil.rmtree(resolver_root, ignore_errors=True)
+        if not process_incomplete:
+            shutil.rmtree(resolver_root, ignore_errors=True)
         progress(UpdateProgress("failed", total, total, message=message))
         return sorted(candidates, key=lambda item: item.root)
 
@@ -4933,8 +5232,8 @@ def _prepare_update_candidates(
         )
 
         try:
-            with tempfile.TemporaryDirectory(
-                prefix=f"{old_mod.slug}-", dir=resolver_root
+            with nullcontext(
+                tempfile.mkdtemp(prefix=f"{old_mod.slug}-", dir=resolver_root)
             ) as directory:
                 resolver = Path(directory) / "source"
                 copy_transaction_source(
@@ -4951,6 +5250,7 @@ def _prepare_update_candidates(
                         effective_deadline,
                         time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
                     ),
+                    result_callback=record_process_result,
                 )
                 if result.cancelled:
                     raise UpdatePreparationCancelled(
@@ -5051,7 +5351,8 @@ def _prepare_update_candidates(
                 )
         except UpdatePreparationCancelled:
             progress(UpdateProgress("cancelled", completed, total))
-            shutil.rmtree(resolver_root, ignore_errors=True)
+            if not process_incomplete:
+                shutil.rmtree(resolver_root, ignore_errors=True)
             raise
         except UpdatePreparationDeadlineExceeded as error:
             message = str(error)
@@ -5106,9 +5407,11 @@ def _prepare_update_candidates(
     try:
         check_cancel(total, total)
     except UpdatePreparationCancelled:
-        shutil.rmtree(resolver_root, ignore_errors=True)
+        if not process_incomplete:
+            shutil.rmtree(resolver_root, ignore_errors=True)
         raise
-    shutil.rmtree(resolver_root)
+    if not process_incomplete:
+        shutil.rmtree(resolver_root)
     if not any(candidate.error_kind == "operation_deadline" for candidate in candidates):
         progress(UpdateProgress("complete", total, total))
     return sorted(candidates, key=lambda item: item.root)
@@ -5158,6 +5461,12 @@ def _merge_metadata_records(
 
 def _merge_update_closures(
     candidates: Iterable[UpdateCandidate],
+    *,
+    source: Path | None = None,
+    workspace: Path | None = None,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> tuple[UpdateChange, ...]:
     selected = tuple(candidates)
     if not selected:
@@ -5165,6 +5474,19 @@ def _merge_update_closures(
     baseline_by_identity: dict[tuple[str, str], _UpdateMetadata] = {}
     metadata_operations: dict[tuple[str, str], _UpdateMetadata | None] = {}
     other_operations: dict[str, UpdateChange] = {}
+
+    if source is not None:
+        ensure_safe_pack_source(source)
+        for metadata_path in sorted(source.rglob("*.pw.toml")):
+            relative_path = metadata_path.relative_to(source)
+            record = _update_metadata_record(relative_path, metadata_path.read_bytes())
+            previous = baseline_by_identity.get(record.identity)
+            if previous is not None:
+                raise HuroshikiError(
+                    "Update baseline contains duplicate metadata identity "
+                    f"{record.provider}:{record.project_id}"
+                )
+            baseline_by_identity[record.identity] = record
 
     for candidate in selected:
         before_records: dict[tuple[str, str], _UpdateMetadata] = {}
@@ -5235,6 +5557,108 @@ def _merge_update_closures(
     for identity, record in metadata_operations.items():
         if record is None:
             final_records.pop(identity, None)
+
+    if source is not None:
+        root_manifest = source / ".huroshiki-roots.json"
+        manifest_exists = root_manifest.is_file() and not root_manifest.is_symlink()
+        explicit_roots = (
+            {
+                (canonical_provider(record.provider), record.project_id)
+                for record in read_pack_root_manifest(source)
+            }
+            if manifest_exists
+            else set()
+        )
+        context: EquivalenceContext | None = None
+        effective_workspace = workspace or (
+            source.parent / f"update-equivalence-{uuid4().hex}"
+        )
+        while True:
+            owners: dict[tuple[str, str], tuple[str, str]] = {}
+            collision: tuple[tuple[str, str], tuple[str, str]] | None = None
+            for identity, record in final_records.items():
+                keys = (
+                    ("path", portable_relative_path_key(record.relative_path)),
+                    ("filename", portable_basename_key(record.filename)),
+                )
+                for key in keys:
+                    owner = owners.get(key)
+                    if owner is not None and owner != identity:
+                        collision = (owner, identity)
+                        break
+                    owners[key] = identity
+                if collision is not None:
+                    break
+            if collision is None:
+                break
+            left_identity, right_identity = collision
+            if {left_identity[0], right_identity[0]} != {"modrinth", "curseforge"}:
+                break
+            if not manifest_exists:
+                raise HuroshikiError(
+                    "Cross-provider Update equivalence requires explicit root provenance"
+                )
+            if context is None:
+                minecraft, loader, loader_version = packctl.project_versions(source)
+                context = EquivalenceContext(
+                    minecraft,
+                    loader,
+                    loader_version,
+                    _equivalence_snapshot_digest(source),
+                    EQUIVALENCE_POLICY_VERSION,
+                )
+            left = final_records[left_identity]
+            right = final_records[right_identity]
+            left_mod = read_mod_data(
+                left.relative_path, tomllib.loads(left.contents.decode("utf-8"))
+            )
+            right_mod = read_mod_data(
+                right.relative_path, tomllib.loads(right.contents.decode("utf-8"))
+            )
+            left_candidate = _dependency_candidate(
+                identity=left_identity,
+                relative_path=left.relative_path,
+                filename=left.filename,
+                contents=left.contents,
+                side=left_mod.side,
+                explicit_root=left_identity in explicit_roots,
+                existing=left_identity in baseline_by_identity,
+            )
+            right_candidate = _dependency_candidate(
+                identity=right_identity,
+                relative_path=right.relative_path,
+                filename=right.filename,
+                contents=right.contents,
+                side=right_mod.side,
+                explicit_root=right_identity in explicit_roots,
+                existing=right_identity in baseline_by_identity,
+            )
+            evidence = _verify_dependency_collision(
+                left_candidate,
+                right_candidate,
+                context=context,
+                workspace=effective_workspace,
+                cancel_event=cancel_event,
+                deadline=deadline,
+                process_result_callback=process_result_callback,
+            )
+            winner_identity = tuple(evidence.selected_identity.split(":", 1))
+            loser_identity = (
+                right_identity if winner_identity == left_identity else left_identity
+            )
+            winner = final_records[winner_identity]
+            unioned = union_side(left_mod.side, right_mod.side)
+            winner = replace(
+                winner,
+                contents=_metadata_contents_with_side(winner.contents, unioned),
+            )
+            final_records[winner_identity] = winner
+            metadata_operations[winner_identity] = winner
+            final_records.pop(loser_identity)
+            if loser_identity in baseline_by_identity:
+                metadata_operations[loser_identity] = None
+            else:
+                metadata_operations.pop(loser_identity, None)
 
     path_owners: dict[str, tuple[str, str]] = {}
     filename_owners: dict[str, tuple[str, str]] = {}
@@ -5460,7 +5884,13 @@ def set_installed_mod_side(
         raise HuroshikiError(str(error)) from error
 
 
-def _apply_profile_entry(transaction: PackTransaction, entry: Mapping[str, object]) -> Path:
+def _apply_profile_entry(
+    transaction: PackTransaction,
+    entry: Mapping[str, object],
+    *,
+    cancel_event: threading.Event,
+    deadline: float,
+) -> Path:
     provider = entry.get("source")
     project = entry.get("project")
     requested_side = entry.get("side")
@@ -5492,11 +5922,19 @@ def _apply_profile_entry(transaction: PackTransaction, entry: Mapping[str, objec
         loader=loader,
         loader_version=loader_version,
         canonical_project_id=str(project_id),
+        cancel_event=cancel_event,
+        deadline=deadline,
+        resolver_root=transaction.root / f"profile-resolver-{uuid4().hex}",
+        process_result_callback=transaction._record_equivalence_process_result,
     )
     changed = merge_metadata_closure(
         transaction.source,
         closure,
         requested_side=str(requested_side),
+        cancel_event=cancel_event,
+        deadline=deadline,
+        equivalence_workspace=transaction.root / "profile-equivalence",
+        process_result_callback=transaction._record_equivalence_process_result,
     )
     metadata_path = packctl.find_metadata(transaction.source, str(provider), project_id)
     if metadata_path is None:
@@ -5520,6 +5958,8 @@ def apply_profiles(
         raise HuroshikiError("Profiles can only be applied to MODPACK projects")
     selected_names = tuple(names)
     transaction = PackTransaction.create(project_key_value)
+    cancel_event = threading.Event()
+    deadline = time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
     try:
         for name in selected_names:
             if name not in profiles:
@@ -5538,7 +5978,12 @@ def apply_profiles(
                         f"Profile {name!r} entry {index} {entry!r}: expected a mapping"
                     )
                 try:
-                    relative_path = _apply_profile_entry(transaction, entry)
+                    relative_path = _apply_profile_entry(
+                        transaction,
+                        entry,
+                        cancel_event=cancel_event,
+                        deadline=deadline,
+                    )
                     side = str(packctl.read_toml(transaction.source / relative_path)["side"])
                 except Exception as error:
                     raise HuroshikiError(
@@ -5977,6 +6422,7 @@ def _run_noninteractive_packwiz(
     cancel_event: threading.Event | None,
     deadline: float,
     label: str,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> ResolverProcessResult:
     process_deadline = min(
         deadline,
@@ -5987,6 +6433,7 @@ def _run_noninteractive_packwiz(
         cwd=cwd,
         cancel_event=cancel_event,
         deadline=process_deadline,
+        result_callback=process_result_callback,
     )
     failure = process_failure_message(result, label=label)
     if failure is not None:
@@ -6120,6 +6567,7 @@ def resolve_mod_closure(
     resolver_root: Path | None = None,
     url_max_jar_size_bytes: int | None = None,
     url_allow_private_networks: bool = False,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> ResolvedModClosure:
     if cancel_event is not None and cancel_event.is_set():
         raise HuroshikiError("MOD resolution was cancelled")
@@ -6224,12 +6672,21 @@ def resolve_mod_closure(
                 deadline,
                 resolver_deadline,
             )
-        process = run_resolver_process(
-            command,
-            cwd=source,
-            cancel_event=cancel_event,
-            deadline=resolver_deadline,
-        )
+        if process_result_callback is None:
+            process = run_resolver_process(
+                command,
+                cwd=source,
+                cancel_event=cancel_event,
+                deadline=resolver_deadline,
+            )
+        else:
+            process = run_resolver_process(
+                command,
+                cwd=source,
+                cancel_event=cancel_event,
+                deadline=resolver_deadline,
+                result_callback=process_result_callback,
+            )
         if process.termination_incomplete:
             raise HuroshikiError(
                 "Packwiz resolver process termination was incomplete"
@@ -6256,11 +6713,79 @@ def _closure_metadata_semantics(contents: bytes) -> tuple[object, object, object
     return document.get("filename"), document.get("download"), document.get("update")
 
 
+def _equivalence_snapshot_digest(source: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(source.rglob("*.pw.toml")):
+        relative = portable_relative_path(path.relative_to(source))
+        digest.update(str(relative).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _dependency_candidate(
+    *,
+    identity: tuple[str, str],
+    relative_path: Path,
+    filename: str,
+    contents: bytes,
+    side: str,
+    explicit_root: bool,
+    existing: bool,
+) -> DependencyCandidate:
+    return DependencyCandidate(
+        f"{identity[0]}:{identity[1]}",
+        str(relative_path),
+        filename,
+        contents,
+        side,
+        explicit_root,
+        existing,
+    )
+
+
+def _verify_dependency_collision(
+    existing: DependencyCandidate,
+    incoming: DependencyCandidate,
+    *,
+    context: EquivalenceContext,
+    workspace: Path,
+    cancel_event: threading.Event | None,
+    deadline: float | None,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None,
+):
+    def materialize(candidate: DependencyCandidate, _: EquivalenceContext):
+        workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return materialize_provider_artifact(
+            candidate,
+            context,
+            workspace=workspace,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            process_result_callback=process_result_callback,
+        )
+
+    try:
+        evidence = verify_equivalence(existing, incoming, context, materialize)
+    except EquivalenceError as error:
+        raise HuroshikiError(str(error)) from error
+    if evidence is None:
+        raise HuroshikiError(
+            "Cross-provider dependency collision could not be verified as equivalent"
+        )
+    return evidence
+
+
 def merge_metadata_closure(
     staged_source: Path,
     closure: ResolvedModClosure,
     *,
     requested_side: str,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    equivalence_workspace: Path | None = None,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> tuple[Path, ...]:
     side = packctl.normalize_side(requested_side)
     ensure_safe_pack_source(staged_source)
@@ -6273,6 +6798,111 @@ def merge_metadata_closure(
         read_mod(staged_source, path.relative_to(staged_source))
         for path in sorted(staged_source.rglob("*.pw.toml"))
     ]
+    root_manifest = staged_source / ".huroshiki-roots.json"
+    manifest_exists = root_manifest.is_file() and not root_manifest.is_symlink()
+    explicit_roots = (
+        {
+            (canonical_provider(record.provider), record.project_id)
+            for record in read_pack_root_manifest(staged_source)
+        }
+        if manifest_exists
+        else set()
+    )
+    minecraft, loader, loader_version = packctl.project_versions(staged_source)
+    context = EquivalenceContext(
+        minecraft,
+        loader,
+        loader_version,
+        _equivalence_snapshot_digest(staged_source),
+        EQUIVALENCE_POLICY_VERSION,
+    )
+    workspace = equivalence_workspace or (
+        staged_source.parent / f"equivalence-{uuid4().hex}"
+    )
+    incoming_records: dict[tuple[str, str], ResolvedMetadata] = {}
+    for item in closure.metadata:
+        canonical_identity = (canonical_provider(item.provider), item.project_id)
+        if item.identity != canonical_identity:
+            raise HuroshikiError(
+                f"Resolved metadata identity mismatch for {item.relative_path}: "
+                f"{item.identity!r} vs {canonical_identity!r}"
+            )
+        if item.identity in incoming_records:
+            raise HuroshikiError(
+                f"Resolved closure contains duplicate identity "
+                f"{item.provider}:{item.project_id}"
+            )
+        incoming_records[item.identity] = item
+    while True:
+        incoming_path_owners: dict[str, tuple[str, str]] = {}
+        incoming_filename_owners: dict[str, tuple[str, str]] = {}
+        collision_pair: tuple[tuple[str, str], tuple[str, str]] | None = None
+        for identity, item in sorted(incoming_records.items()):
+            owners = {
+                owner
+                for owner in (
+                    incoming_path_owners.get(
+                        portable_relative_path_key(item.relative_path)
+                    ),
+                    incoming_filename_owners.get(
+                        portable_basename_key(item.filename)
+                    ),
+                )
+                if owner is not None and owner != identity
+            }
+            if len(owners) > 1:
+                raise HuroshikiError(
+                    "Resolved closure metadata path and filename have different owners"
+                )
+            if owners:
+                collision_pair = (next(iter(owners)), identity)
+                break
+            incoming_path_owners[
+                portable_relative_path_key(item.relative_path)
+            ] = identity
+            incoming_filename_owners[portable_basename_key(item.filename)] = identity
+        if collision_pair is None:
+            break
+        left_identity, right_identity = collision_pair
+        if {left_identity[0], right_identity[0]} != {"modrinth", "curseforge"}:
+            raise HuroshikiError(
+                "Resolved closure contains a metadata path or filename collision"
+            )
+        left_item = incoming_records[left_identity]
+        right_item = incoming_records[right_identity]
+        left_candidate = _dependency_candidate(
+            identity=left_identity,
+            relative_path=left_item.relative_path,
+            filename=left_item.filename,
+            contents=left_item.contents,
+            side=side,
+            explicit_root=left_identity == closure.root_identity,
+            existing=False,
+        )
+        right_candidate = _dependency_candidate(
+            identity=right_identity,
+            relative_path=right_item.relative_path,
+            filename=right_item.filename,
+            contents=right_item.contents,
+            side=side,
+            explicit_root=right_identity == closure.root_identity,
+            existing=False,
+        )
+        evidence = _verify_dependency_collision(
+            left_candidate,
+            right_candidate,
+            context=context,
+            workspace=workspace,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            process_result_callback=process_result_callback,
+        )
+        selected_identity = tuple(evidence.selected_identity.split(":", 1))
+        losing_identity = (
+            right_identity if selected_identity == left_identity else left_identity
+        )
+        incoming_records.pop(losing_identity)
+    closure_metadata = tuple(incoming_records.values())
     existing_by_identity: dict[tuple[str, str], ModInfo] = {}
     path_owners: dict[str, tuple[str, str]] = {}
     filename_owners: dict[str, tuple[str, str]] = {}
@@ -6286,37 +6916,106 @@ def merge_metadata_closure(
         path_owners[portable_relative_path_key(mod.relative_path)] = identity
         filename_owners[portable_basename_key(mod.filename)] = identity
 
-    pending: list[tuple[ResolvedMetadata, ModInfo | None, str]] = []
+    pending: list[
+        tuple[ResolvedMetadata | None, ModInfo, Path, bytes, str]
+        | tuple[ResolvedMetadata, None, Path, bytes, str]
+    ] = []
+    removals: list[Path] = []
     incoming_identities: set[tuple[str, str]] = set()
-    for item in closure.metadata:
+    for item in closure_metadata:
         canonical_identity = (canonical_provider(item.provider), item.project_id)
         if item.identity != canonical_identity:
             raise HuroshikiError(
                 f"Resolved metadata identity mismatch for {item.relative_path}: "
                 f"{item.identity!r} vs {canonical_identity!r}"
             )
-        if item.identity in incoming_identities:
-            raise HuroshikiError(
-                f"Resolved closure contains duplicate identity "
-                f"{item.provider}:{item.project_id}"
-            )
         incoming_identities.add(item.identity)
         path_key = portable_relative_path_key(item.relative_path)
         filename_key = portable_basename_key(item.filename)
         existing = existing_by_identity.get(item.identity)
         path_owner = path_owners.get(path_key)
-        if path_owner is not None and path_owner != item.identity:
-            raise HuroshikiError(
-                f"Metadata path collision at {item.relative_path}: "
-                f"{path_owner[0]}:{path_owner[1]} vs {item.provider}:{item.project_id}"
-            )
         filename_owner = filename_owners.get(filename_key)
-        if filename_owner is not None and filename_owner != item.identity:
-            raise HuroshikiError(
-                f"Filename collision for {item.filename!r}: "
-                f"{filename_owner[0]}:{filename_owner[1]} vs "
-                f"{item.provider}:{item.project_id}"
+        collision_owners = {
+            owner
+            for owner in (path_owner, filename_owner)
+            if owner is not None and owner != item.identity
+        }
+        if collision_owners:
+            if len(collision_owners) != 1:
+                raise HuroshikiError(
+                    "Metadata path and filename are owned by different identities"
+                )
+            collision_identity = next(iter(collision_owners))
+            collision = existing_by_identity.get(collision_identity)
+            if collision is None:
+                raise HuroshikiError("Cross-provider collision owner is unavailable")
+            if {
+                canonical_provider(collision.provider),
+                canonical_provider(item.provider),
+            } != {"modrinth", "curseforge"}:
+                if path_owner is not None and path_owner != item.identity:
+                    raise HuroshikiError(
+                        f"Metadata path collision at {item.relative_path}: "
+                        f"{collision_identity[0]}:{collision_identity[1]} vs "
+                        f"{item.provider}:{item.project_id}"
+                    )
+                raise HuroshikiError(
+                    f"Filename collision for {item.filename!r}: "
+                    f"{collision_identity[0]}:{collision_identity[1]} vs "
+                    f"{item.provider}:{item.project_id}"
+                )
+            if not manifest_exists:
+                raise HuroshikiError(
+                    "Cross-provider dependency equivalence requires explicit root provenance"
+                )
+            collision_contents = safe_child(
+                staged_source, collision.relative_path
+            ).read_bytes()
+            existing_candidate = _dependency_candidate(
+                identity=collision_identity,
+                relative_path=collision.relative_path,
+                filename=collision.filename,
+                contents=collision_contents,
+                side=collision.side,
+                explicit_root=collision_identity in explicit_roots,
+                existing=True,
             )
+            incoming_candidate = _dependency_candidate(
+                identity=item.identity,
+                relative_path=item.relative_path,
+                filename=item.filename,
+                contents=item.contents,
+                side=side,
+                explicit_root=item.identity == closure.root_identity,
+                existing=False,
+            )
+            evidence = _verify_dependency_collision(
+                existing_candidate,
+                incoming_candidate,
+                context=context,
+                workspace=workspace,
+                cancel_event=cancel_event,
+                deadline=deadline,
+                process_result_callback=process_result_callback,
+            )
+            assigned_side = union_side(collision.side, side)
+            if evidence.selected_identity == existing_candidate.provider_identity:
+                updated = _metadata_contents_with_side(
+                    collision_contents, assigned_side
+                )
+                pending.append(
+                    (None, collision, collision.relative_path, updated, assigned_side)
+                )
+                continue
+            updated = _metadata_contents_with_side(item.contents, assigned_side)
+            pending.append((item, None, item.relative_path, updated, assigned_side))
+            removals.append(collision.relative_path)
+            path_owners.pop(portable_relative_path_key(collision.relative_path), None)
+            filename_owners.pop(portable_basename_key(collision.filename), None)
+            existing_by_identity.pop(collision_identity, None)
+            path_owners[path_key] = item.identity
+            filename_owners[filename_key] = item.identity
+            continue
         if existing is not None:
             existing_contents = safe_child(staged_source, existing.relative_path).read_bytes()
             if item.provider != "url" and (
@@ -6338,10 +7037,6 @@ def merge_metadata_closure(
             path_owners[path_key] = item.identity
             filename_owners[filename_key] = item.identity
             assigned_side = side
-        pending.append((item, existing, assigned_side))
-
-    changed: list[Path] = []
-    for item, existing, assigned_side in pending:
         relative_path = existing.relative_path if existing is not None else item.relative_path
         path = safe_child(staged_source, relative_path)
         contents = (
@@ -6349,14 +7044,30 @@ def merge_metadata_closure(
             if existing is not None and item.provider != "url"
             else item.contents
         )
-        updated = _metadata_contents_with_side(contents, assigned_side)
+        pending.append(
+            (
+                item,
+                existing,
+                relative_path,
+                _metadata_contents_with_side(contents, assigned_side),
+                assigned_side,
+            )
+        )
+
+    changed: list[Path] = []
+    for relative_path in removals:
+        path = safe_child(staged_source, relative_path)
+        if path.exists():
+            path.unlink()
+            changed.append(relative_path)
+    for _item, _existing, relative_path, updated, _assigned_side in pending:
+        path = safe_child(staged_source, relative_path)
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists() or path.read_bytes() != updated:
             path.write_bytes(updated)
             changed.append(relative_path)
-    root_manifest = staged_source / ".huroshiki-roots.json"
-    if root_manifest.is_file() and not root_manifest.is_symlink():
+    if manifest_exists:
         record_pack_root(
             staged_source,
             closure.root_identity[0],
@@ -6374,6 +7085,8 @@ def _resolve_template_root(
     loader_version: str,
     cancel_event: threading.Event,
     deadline: float,
+    resolver_root: Path | None = None,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> _ResolvedTemplateRoot:
     expected_identity = (
         canonical_provider(entry.provider),
@@ -6389,6 +7102,8 @@ def _resolve_template_root(
             canonical_project_id=entry.project_id,
             cancel_event=cancel_event,
             deadline=deadline,
+            resolver_root=resolver_root,
+            process_result_callback=process_result_callback,
         )
         metadata = _resolved_metadata_with_side(closure.metadata, entry.side)
         if closure.root_identity != expected_identity:
@@ -6470,21 +7185,44 @@ def _resolve_template_root(
 
 def _merge_resolved_template_roots(
     roots: Iterable[_ResolvedTemplateRoot],
+    *,
+    minecraft: str,
+    loader: str,
+    loader_version: str,
+    workspace: Path,
+    cancel_event: threading.Event,
+    deadline: float,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> tuple[
     tuple[ResolvedMetadata, ...],
     tuple[RetainedTemplateCandidate, ...],
     tuple[TemplateInstallFailure, ...],
 ]:
+    roots = tuple(roots)
+    closure_digest = hashlib.sha256()
+    for root in roots:
+        for item in sorted(root.metadata, key=lambda value: value.identity):
+            closure_digest.update(item.contents)
+    context = EquivalenceContext(
+        minecraft,
+        loader,
+        loader_version,
+        closure_digest.hexdigest(),
+        EQUIVALENCE_POLICY_VERSION,
+    )
     merged: dict[tuple[str, str], ResolvedMetadata] = {}
     path_owners: dict[str, tuple[str, str]] = {}
     filename_owners: dict[str, tuple[str, str]] = {}
     url_root_owners: dict[tuple[str, str], str] = {}
     retained: list[RetainedTemplateCandidate] = []
     failures: list[TemplateInstallFailure] = []
+    explicit_identities: set[tuple[str, str]] = set()
 
     for root in roots:
         entry = root.entry
         reason: str | None = None
+        resolved_items = {item.identity: item for item in root.metadata}
+        skipped_items: set[tuple[str, str]] = set()
         if root.root_identity[0] == "url":
             previous = url_root_owners.get(root.root_identity)
             if previous is not None and previous != entry.candidate_key:
@@ -6495,11 +7233,12 @@ def _merge_resolved_template_roots(
 
         pending_paths = dict(path_owners)
         pending_filenames = dict(filename_owners)
+        pending_merged = dict(merged)
         if reason is None:
             for item in root.metadata:
                 path_key = portable_relative_path_key(item.relative_path)
                 filename_key = portable_basename_key(item.filename)
-                existing = merged.get(item.identity)
+                existing = pending_merged.get(item.identity)
                 if existing is not None:
                     existing_document = tomllib.loads(
                         existing.contents.decode("utf-8")
@@ -6528,21 +7267,93 @@ def _merge_resolved_template_roots(
                         break
                     continue
                 path_owner = pending_paths.get(path_key)
-                if path_owner is not None and path_owner != item.identity:
-                    reason = (
-                        f"metadata path collision at {item.relative_path}: "
-                        f"{path_owner[0]}:{path_owner[1]} vs "
-                        f"{item.provider}:{item.project_id}"
-                    )
-                    break
                 filename_owner = pending_filenames.get(filename_key)
-                if filename_owner is not None and filename_owner != item.identity:
-                    reason = (
-                        f"filename collision for {item.filename!r}: "
-                        f"{filename_owner[0]}:{filename_owner[1]} vs "
-                        f"{item.provider}:{item.project_id}"
+                collision_owners = {
+                    owner
+                    for owner in (path_owner, filename_owner)
+                    if owner is not None and owner != item.identity
+                }
+                if collision_owners:
+                    if len(collision_owners) != 1:
+                        reason = "metadata path and filename have different owners"
+                        break
+                    owner = next(iter(collision_owners))
+                    previous = pending_merged[owner]
+                    if {owner[0], item.identity[0]} != {"modrinth", "curseforge"}:
+                        reason = (
+                            f"metadata path or filename collision: "
+                            f"{owner[0]}:{owner[1]} vs "
+                            f"{item.provider}:{item.project_id}"
+                        )
+                        break
+                    previous_mod = read_mod_data(
+                        previous.relative_path,
+                        tomllib.loads(previous.contents.decode("utf-8")),
                     )
-                    break
+                    existing_candidate = _dependency_candidate(
+                        identity=owner,
+                        relative_path=previous.relative_path,
+                        filename=previous.filename,
+                        contents=previous.contents,
+                        side=previous_mod.side,
+                        explicit_root=owner in explicit_identities,
+                        existing=True,
+                    )
+                    incoming_candidate = _dependency_candidate(
+                        identity=item.identity,
+                        relative_path=item.relative_path,
+                        filename=item.filename,
+                        contents=item.contents,
+                        side=entry.side,
+                        explicit_root=item.identity == root.root_identity,
+                        existing=False,
+                    )
+                    if (
+                        existing_candidate.explicit_root
+                        and incoming_candidate.explicit_root
+                    ):
+                        reason = (
+                            "metadata path collision between explicit roots; "
+                            "automatic cross-provider collapse is prohibited"
+                        )
+                        break
+                    try:
+                        evidence = _verify_dependency_collision(
+                            existing_candidate,
+                            incoming_candidate,
+                            context=context,
+                            workspace=workspace,
+                            cancel_event=cancel_event,
+                            deadline=deadline,
+                            process_result_callback=process_result_callback,
+                        )
+                    except HuroshikiError as error:
+                        reason = str(error)
+                        break
+                    merged_side = union_side(previous_mod.side, entry.side)
+                    if evidence.selected_identity == existing_candidate.provider_identity:
+                        pending_merged[owner] = replace(
+                            previous,
+                            contents=_metadata_contents_with_side(
+                                previous.contents, merged_side
+                            ),
+                        )
+                        skipped_items.add(item.identity)
+                        continue
+                    pending_merged.pop(owner)
+                    pending_paths.pop(
+                        portable_relative_path_key(previous.relative_path), None
+                    )
+                    pending_filenames.pop(
+                        portable_basename_key(previous.filename), None
+                    )
+                    item = replace(
+                        item,
+                        contents=_metadata_contents_with_side(
+                            item.contents, merged_side
+                        ),
+                    )
+                    resolved_items[item.identity] = item
                 pending_paths[path_key] = item.identity
                 pending_filenames[filename_key] = item.identity
 
@@ -6556,9 +7367,12 @@ def _merge_resolved_template_roots(
 
         path_owners = pending_paths
         filename_owners = pending_filenames
+        merged = pending_merged
         if root.root_identity[0] == "url":
             url_root_owners[root.root_identity] = entry.candidate_key
-        for item in root.metadata:
+        for item in resolved_items.values():
+            if item.identity in skipped_items:
+                continue
             existing = merged.get(item.identity)
             if existing is None:
                 merged[item.identity] = item
@@ -6574,6 +7388,7 @@ def _merge_resolved_template_roots(
             )
 
         actual = merged[root.root_identity]
+        explicit_identities.add(root.root_identity)
         retained.append(
             RetainedTemplateCandidate(
                 entry.candidate_key,
@@ -7044,6 +7859,7 @@ def _run_template_import_refresh(
     *,
     cancel_event: threading.Event,
     deadline: float,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> None:
     refresh = run_resolver_process(
         ["packwiz", "refresh"],
@@ -7053,6 +7869,7 @@ def _run_template_import_refresh(
             deadline,
             time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
         ),
+        result_callback=process_result_callback,
     )
     if (
         refresh.returncode != 0
@@ -7116,18 +7933,28 @@ def _apply_resolved_import_to_source(
     checkpoint: Callable[[], None],
     cancel_event: threading.Event,
     deadline: float,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> None:
     checkpoint()
     _remove_import_candidates(source, removed)
     for candidate, closure in resolved_roots:
         checkpoint()
-        merge_metadata_closure(source, closure, requested_side=candidate.side)
+        merge_metadata_closure(
+            source,
+            closure,
+            requested_side=candidate.side,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            equivalence_workspace=source.parent / "template-import-equivalence",
+            process_result_callback=process_result_callback,
+        )
     _assert_removed_identities_absent(source, removed)
     _apply_import_side_changes(source, side_changes)
     _run_template_import_refresh(
         source,
         cancel_event=cancel_event,
         deadline=deadline,
+        process_result_callback=process_result_callback,
     )
     _assert_removed_identities_absent(source, removed)
     ensure_safe_pack_source(source, checkpoint=checkpoint)
@@ -7157,9 +7984,11 @@ def _preflight_import_closures(
             checkpoint=checkpoint,
             cancel_event=cancel_event,
             deadline=deadline,
+            process_result_callback=transaction._record_equivalence_process_result,
         )
     finally:
-        shutil.rmtree(preflight_source, ignore_errors=True)
+        if not transaction._equivalence_process_results:
+            shutil.rmtree(preflight_source, ignore_errors=True)
 
 
 class TemplateImportOperation:
@@ -7268,6 +8097,13 @@ class TemplateImportOperation:
                             self.deadline,
                             time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
                         ),
+                        resolver_root=(
+                            self.transaction.root
+                            / f"template-import-resolver-{uuid4().hex}"
+                        ),
+                        process_result_callback=(
+                            self.transaction._record_equivalence_process_result
+                        ),
                     )
                 if closure.root_identity != verification.actual_identity:
                     raise HuroshikiError(
@@ -7305,6 +8141,9 @@ class TemplateImportOperation:
                 checkpoint=self._checkpoint,
                 cancel_event=self.cancel_event,
                 deadline=self.deadline,
+                process_result_callback=(
+                    self.transaction._record_equivalence_process_result
+                ),
             )
             if not self.session.templates_unchanged():
                 raise HuroshikiError("Template manifest changed during import")
@@ -7537,6 +8376,23 @@ def _create_pack_from_templates(
 ) -> TemplateCreationReport:
     resolved_roots: list[_ResolvedTemplateRoot] = []
     resolution_failures: list[TemplateInstallFailure] = []
+    template_state_root = ROOT / ".huroshiki"
+    template_transaction_root = template_state_root / "transactions"
+    packctl.make_state_directory(
+        template_transaction_root,
+        state_root=template_state_root,
+        repository_root=ROOT,
+    )
+    equivalence_workspace = (
+        template_transaction_root / f"template-equivalence-{uuid4().hex}"
+    )
+    equivalence_workspace.mkdir(mode=0o700)
+    process_results: list[BoundedProcessResult] = []
+
+    def record_process_result(result: BoundedProcessResult) -> None:
+        if result.termination_incomplete:
+            process_results.append(result)
+
     for entry in resolved.mods:
         if cancel_event.is_set():
             raise HuroshikiError("Template creation was cancelled")
@@ -7555,9 +8411,29 @@ def _create_pack_from_templates(
                     loader_version=loader_version,
                     cancel_event=cancel_event,
                     deadline=deadline,
+                    resolver_root=(
+                        equivalence_workspace / f"root-{len(resolved_roots) + 1}"
+                        if canonical_provider(entry.provider) != "url"
+                        else None
+                    ),
+                    process_result_callback=record_process_result,
                 )
             )
         except (HuroshikiError, UnicodeError, tomllib.TOMLDecodeError) as error:
+            if process_results:
+                try:
+                    _cleanup_template_creation_processes(
+                        equivalence_workspace,
+                        process_results,
+                        deadline=(
+                            time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS
+                        ),
+                    )
+                except TemplateCreationCleanupRequired as cleanup_error:
+                    raise cleanup_error from error
+                raise HuroshikiError(
+                    "Template resolver failed after bounded process cleanup"
+                ) from error
             if cancel_event.is_set():
                 raise HuroshikiError("Template creation was cancelled") from error
             if time.monotonic() >= deadline:
@@ -7570,7 +8446,42 @@ def _create_pack_from_templates(
                 )
             )
 
-    metadata, retained, merge_failures = _merge_resolved_template_roots(resolved_roots)
+    try:
+        metadata, retained, merge_failures = _merge_resolved_template_roots(
+            resolved_roots,
+            minecraft=minecraft,
+            loader=loader,
+            loader_version=loader_version,
+            workspace=equivalence_workspace,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            process_result_callback=record_process_result,
+        )
+    except BaseException as error:
+        if process_results:
+            try:
+                _cleanup_template_creation_processes(
+                    equivalence_workspace,
+                    process_results,
+                    deadline=time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS,
+                )
+            except TemplateCreationCleanupRequired as cleanup_error:
+                raise cleanup_error from error
+        elif equivalence_workspace.exists():
+            shutil.rmtree(equivalence_workspace)
+        raise
+    else:
+        if process_results:
+            _cleanup_template_creation_processes(
+                equivalence_workspace,
+                process_results,
+                deadline=time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS,
+            )
+            raise HuroshikiError(
+                "Template dependency verification left incomplete process ownership"
+            )
+        if equivalence_workspace.exists():
+            shutil.rmtree(equivalence_workspace)
     failures = [*resolution_failures, *merge_failures]
     multi_selected = {
         candidate_key
@@ -7638,12 +8549,26 @@ def _create_pack_from_templates(
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(item.contents)
 
+        retained_entries = {entry.candidate_key: entry for entry in resolved.mods}
+        write_pack_root_manifest(
+            source,
+            tuple(
+                PackRootRecord(
+                    canonical_provider(item.actual_provider),
+                    item.actual_project_id,
+                    retained_entries[item.candidate_key].side,
+                )
+                for item in retained
+            ),
+        )
+
         _run_noninteractive_packwiz(
             ["packwiz", "refresh"],
             cwd=source,
             cancel_event=cancel_event,
             deadline=deadline,
             label="Template creation Packwiz refresh",
+            process_result_callback=record_process_result,
         )
 
         return TemplateCreationReport(
@@ -7656,7 +8581,16 @@ def _create_pack_from_templates(
             retained=retained,
         )
     except BaseException as error:
-        if owns_destination:
+        if process_results:
+            try:
+                _cleanup_template_creation_processes(
+                    destination,
+                    process_results,
+                    deadline=time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS,
+                )
+            except TemplateCreationCleanupRequired as cleanup_error:
+                raise cleanup_error from error
+        if owns_destination and destination.exists():
             try:
                 shutil.rmtree(destination)
             except BaseException as rollback_error:
@@ -7695,7 +8629,11 @@ def create_pack_from_templates(
         else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
     )
     pack_key = project_key("pack", project_id)
-    with packctl.ProjectLock(pack_key, "create project"):
+    retry_retained_template_creation_cleanup(pack_key)
+    project_lock = packctl.ProjectLock(pack_key, "create project")
+    project_lock.acquire()
+    release_lock = True
+    try:
         composition = prepare_template_composition(
             template_ids=template_ids,
             minecraft=minecraft,
@@ -7709,17 +8647,29 @@ def create_pack_from_templates(
             resolved = resolve_composition(composition, conflict_resolutions)
         except TemplateMergeError as error:
             raise HuroshikiError(str(error)) from error
-        return _create_pack_from_templates(
-            composition=composition,
-            resolved=resolved,
-            project_id=project_id,
-            display_name=display_name,
-            minecraft=minecraft,
-            loader=loader,
-            loader_version=loader_version,
-            cancel_event=operation_cancel,
-            deadline=operation_deadline,
-        )
+        try:
+            return _create_pack_from_templates(
+                composition=composition,
+                resolved=resolved,
+                project_id=project_id,
+                display_name=display_name,
+                minecraft=minecraft,
+                loader=loader,
+                loader_version=loader_version,
+                cancel_event=operation_cancel,
+                deadline=operation_deadline,
+            )
+        except TemplateCreationCleanupRequired as error:
+            _RETAINED_TEMPLATE_CREATIONS[pack_key] = (
+                project_lock,
+                error.workspace,
+                error.results,
+            )
+            release_lock = False
+            raise
+    finally:
+        if release_lock:
+            project_lock.release()
 
 
 def create_pack_from_template(
