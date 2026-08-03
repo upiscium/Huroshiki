@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from typing import Callable
+from typing import Callable, Literal
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -33,6 +33,12 @@ INSTALLER_ENV = "HUROSHIKI_PACKWIZ_INSTALLER_JAR"
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
 SUPPORTED_HASH_ALGORITHMS = {"sha1", "sha256", "sha512", "md5", "murmur2"}
 METADATA_CURSEFORGE_MODE = "metadata:curseforge"
+DownloadMode = Literal["url", "metadata:curseforge"]
+MANUAL_DOWNLOAD_MARKERS = (
+    "requires manual download",
+    "manual download",
+    "cannot be distributed automatically",
+)
 
 
 @dataclass(frozen=True)
@@ -41,9 +47,11 @@ class ProviderArtifactMetadata:
     filename: str
     algorithm: str
     expected_hash: str
-    mode: str | None
+    mode: DownloadMode
     download_url: str | None
     contents: bytes
+    curseforge_project_id: int | None
+    curseforge_file_id: int | None
 
 
 class ProviderArtifactError(RuntimeError):
@@ -59,18 +67,49 @@ def _process_ok(result: BoundedProcessResult, label: str) -> None:
         raise ProviderArtifactError(f"{label} was cancelled")
     if result.timed_out:
         raise ProviderArtifactError(f"{label} deadline exceeded")
+    if _requires_manual_download(result.stdout, result.stderr):
+        raise ProviderArtifactError(
+            "CurseForge artifact requires manual download and cannot be automatically verified"
+        )
     if result.returncode != 0:
         raise ProviderArtifactError(f"{label} failed with exit code {result.returncode}")
 
 
-def _artifact_mode(raw_mode: object) -> str | None:
+def _artifact_mode(raw_mode: object) -> DownloadMode:
     if raw_mode is None:
-        return None
+        return "url"
     mode = str(raw_mode).strip().lower()
-    return None if mode in {"", "url"} else mode
+    return "url" if mode in {"", "url"} else mode
 
 
-def _validate_curseforge_metadata(document: object) -> None:
+def _parse_provider_identity(identity: str) -> tuple[str, int]:
+    provider, _, project_id = identity.partition(":")
+    if not project_id:
+        raise ProviderArtifactError("provider identity must be provider:project-id")
+    if provider.strip().lower() != "curseforge":
+        raise ProviderArtifactError("provider artifact is not CurseForge")
+    return "curseforge", _parse_positive_integer(
+        project_id,
+        "provider artifact has no positive numeric CurseForge project ID",
+    )
+
+
+def _parse_positive_integer(value: object, message: str) -> int:
+    text = str(value).strip()
+    if not text.isdecimal():
+        raise ProviderArtifactError(message)
+    number = int(text)
+    if number <= 0:
+        raise ProviderArtifactError(message)
+    return number
+
+
+def _requires_manual_download(stdout: str, stderr: str) -> bool:
+    message = f"{stdout}\n{stderr}".lower()
+    return any(marker in message for marker in MANUAL_DOWNLOAD_MARKERS)
+
+
+def _validate_curseforge_metadata(document: object) -> tuple[int, int]:
     if not isinstance(document, dict):
         raise ProviderArtifactError("provider metadata has no update data")
     update = document.get("update")
@@ -79,16 +118,15 @@ def _validate_curseforge_metadata(document: object) -> None:
     curseforge = update.get("curseforge")
     if not isinstance(curseforge, dict):
         raise ProviderArtifactError("provider metadata has no curseforge update section")
-    project_id = str(curseforge.get("project-id", "")).strip()
-    if not project_id.isdecimal() or int(project_id) <= 0:
-        raise ProviderArtifactError(
-            "provider metadata has no positive numeric CurseForge project ID"
-        )
-    file_id = str(curseforge.get("file-id", curseforge.get("fileId", ""))).strip()
-    if file_id and not file_id.isdecimal():
-        raise ProviderArtifactError("provider metadata has no positive numeric CurseForge file ID")
-    if file_id and int(file_id) <= 0:
-        raise ProviderArtifactError("provider metadata has no positive numeric CurseForge file ID")
+    project_id = _parse_positive_integer(
+        curseforge.get("project-id", ""),
+        "provider metadata has no positive numeric CurseForge project ID",
+    )
+    file_id = _parse_positive_integer(
+        curseforge.get("file-id", curseforge.get("fileId", "")),
+        "provider metadata has no positive numeric CurseForge file ID",
+    )
+    return project_id, file_id
 
 
 def _metadata(candidate: DependencyCandidate) -> ProviderArtifactMetadata:
@@ -110,33 +148,46 @@ def _metadata(candidate: DependencyCandidate) -> ProviderArtifactMetadata:
     if algorithm not in SUPPORTED_HASH_ALGORITHMS:
         raise ProviderArtifactError("provider metadata uses an unsupported hash")
     if not expected:
-        raise ProviderArtifactError("provider artifact metadata is incomplete")
-    if mode is None:
+        raise ProviderArtifactError("provider metadata has no declared hash")
+    parsed = tomlkit.parse(candidate.contents.decode("utf-8"))
+    if mode == "url":
         if not url:
-            provider = candidate.provider_identity.split(":", 1)[0].strip().lower()
-            if provider == "curseforge":
-                raise ProviderArtifactError(
-                    "CurseForge artifact requires manual download and cannot be automatically verified"
-                )
-            raise ProviderArtifactError("provider artifact metadata is incomplete")
+            raise ProviderArtifactError(
+                "provider artifact URL mode requires an HTTP(S) URL"
+            )
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise ProviderArtifactError(
+                "provider artifact URL mode requires an HTTP(S) URL"
+            )
     elif mode == METADATA_CURSEFORGE_MODE:
         if url:
             raise ProviderArtifactError(
                 "metadata:curseforge mode must not include download.url"
             )
-        provider_identity = candidate.provider_identity.split(":", 1)[0].strip().lower()
-        if provider_identity != "curseforge":
+        provider = candidate.provider_identity.split(":", 1)[0].strip().lower()
+        if provider != "curseforge":
             raise ProviderArtifactError(
                 "metadata:curseforge mode is unsupported for non-CurseForge metadata"
             )
-        _validate_curseforge_metadata(document)
-    else:
-        if candidate.provider_identity.split(":", 1)[0].strip().lower() == "curseforge":
+        _, candidate_project_id = _parse_provider_identity(candidate.provider_identity)
+        metadata_project_id, metadata_file_id = _validate_curseforge_metadata(document)
+        if candidate_project_id != metadata_project_id:
             raise ProviderArtifactError(
-                "CurseForge artifact requires manual download and cannot be automatically verified"
+                "provider identity project ID does not match metadata project-id"
             )
+        return ProviderArtifactMetadata(
+            relative,
+            filename,
+            algorithm,
+            expected,
+            mode,
+            None,
+            tomlkit.dumps(parsed).encode("utf-8"),
+            metadata_project_id,
+            metadata_file_id,
+        )
+    else:
         raise ProviderArtifactError(f"provider artifact mode {mode!r} is unsupported")
-    parsed = tomlkit.parse(candidate.contents.decode("utf-8"))
     parsed["side"] = "both"
     return ProviderArtifactMetadata(
         relative,
@@ -146,6 +197,8 @@ def _metadata(candidate: DependencyCandidate) -> ProviderArtifactMetadata:
         mode,
         url or None,
         tomlkit.dumps(parsed).encode("utf-8"),
+        None,
+        None,
     )
 
 

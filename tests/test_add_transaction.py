@@ -783,6 +783,61 @@ class AddTransactionTest(unittest.TestCase):
                 self.assertFalse((self.source / ".huroshiki-roots.json").exists())
                 existing_path.unlink()
 
+    def test_transitive_cross_provider_curseforge_metadata_collision_preserves_existing_modrinth(self) -> None:
+        from dependency_equivalence import MaterializedArtifact
+
+        existing_digest = "c" * 64
+        existing_contents = (
+            metadata("Shared", "shared", "server")
+            .replace("update.modrinth", "update.modrinth")
+            .replace(f'hash = "00"', f'hash = "{existing_digest}"')
+            .replace('filename = "shared.jar"', 'filename = "shared.jar"')
+            .encode()
+        )
+        (self.source / "mods/shared.pw.toml").write_bytes(existing_contents)
+
+        root = self.closure("root").metadata[0]
+        incoming_contents = (
+            'name = "Shared"\n'
+            'filename = "shared.jar"\n'
+            'side = "client"\n'
+            '[download]\n'
+            'hash-format = "sha256"\n'
+            f'hash = "{existing_digest}"\n'
+            'mode = "metadata:curseforge"\n'
+            '[update.curseforge]\n'
+            'project-id = 200\n'
+            'file-id = 3000\n'
+            '\n'
+        ).encode()
+        incoming = core.ResolvedMetadata(
+            ("curseforge", "200"),
+            Path("mods/shared.pw.toml"),
+            "shared.jar",
+            incoming_contents,
+            "curseforge",
+            "200",
+        )
+
+        with patch.object(
+            core,
+            "materialize_provider_artifact",
+            return_value=MaterializedArtifact(existing_digest),
+        ) as materialize:
+            core.merge_metadata_closure(
+                self.source,
+                core.ResolvedModClosure(root.identity, (root, incoming)),
+                requested_side="client",
+            )
+
+        retained = core.read_mod(self.source, Path("mods/shared.pw.toml"))
+        self.assertEqual(
+            (core.canonical_provider(retained.provider), retained.project_id),
+            ("modrinth", "shared"),
+        )
+        self.assertEqual(retained.side, "both")
+        self.assertEqual(materialize.call_count, 0)
+
     def test_legacy_unknown_dependency_semantic_equivalence_preserves_existing(self) -> None:
         from dependency_equivalence import MaterializedArtifact, SemanticJarIdentity
 

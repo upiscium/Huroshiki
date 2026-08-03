@@ -66,21 +66,29 @@ class ProviderArtifactTest(unittest.TestCase):
         output: bytes | None = None,
         process_result=None,
         candidate: DependencyCandidate | None = None,
+        process_callable=None,
     ):
         candidate = self.candidate if candidate is None else candidate
         calls = []
 
-        def process(command, **kwargs):
-            calls.append((list(command), kwargs))
-            if command[0] == "java":
-                destination = Path(kwargs["cwd"]).parent / "output" / "mods" / "demo.jar"
-                destination.parent.mkdir(parents=True)
-                destination.write_bytes(self.payload if output is None else output)
-            result = process_result or BoundedProcessResult(0, "", "", False, False)
-            callback = kwargs.get("result_callback")
-            if callback is not None:
-                callback(result)
-            return result
+        if process_callable is None:
+
+            def process(command, **kwargs):
+                calls.append((list(command), kwargs))
+                if command[0] == "java":
+                    destination = Path(kwargs["cwd"]).parent / "output" / "mods" / "demo.jar"
+                    destination.parent.mkdir(parents=True)
+                    destination.write_bytes(self.payload if output is None else output)
+                result = process_result or BoundedProcessResult(0, "", "", False, False)
+                callback = kwargs.get("result_callback")
+                if callback is not None:
+                    callback(result)
+                return result
+        else:
+
+            def process(command, **kwargs):
+                calls.append((list(command), kwargs))
+                return process_callable(command, **kwargs)
 
         with mock.patch("provider_artifacts.run_bounded_process", side_effect=process):
             result = materialize_provider_artifact(
@@ -107,6 +115,7 @@ class ProviderArtifactTest(unittest.TestCase):
                 'mode = "metadata:curseforge"\n'
                 '[update.curseforge]\n'
                 'project-id = 12345\n'
+                'file-id = 54321\n'
             ).encode(
                 "utf-8"
             ),
@@ -162,6 +171,7 @@ class ProviderArtifactTest(unittest.TestCase):
                 'mode = "metadata:curseforge"\n'
                 '[update.curseforge]\n'
                 'project-id = 12345\n'
+                'file-id = 54321\n'
             ).encode(
                 "utf-8"
             ),
@@ -270,7 +280,7 @@ class ProviderArtifactTest(unittest.TestCase):
                 self.assertEqual(len(server_instances), 1)
                 self.assertTrue(server_instances[0].closed)
 
-    def test_missing_curseforge_url_is_treated_as_manual_download(self) -> None:
+    def test_missing_curseforge_url_is_invalid_for_url_mode(self) -> None:
         candidate = DependencyCandidate(
             "curseforge:123",
             self.candidate.relative_metadata_path,
@@ -282,8 +292,6 @@ class ProviderArtifactTest(unittest.TestCase):
                 '[download]\n'
                 'hash-format = "sha256"\n'
                 f'hash = "{hashlib.sha256(self.payload).hexdigest()}"\n'
-                '[update.curseforge]\n'
-                'project-id = 123\n'
             ).encode(
                 "utf-8"
             ),
@@ -291,13 +299,54 @@ class ProviderArtifactTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             ProviderArtifactError,
-            "CurseForge artifact requires manual download and cannot be automatically verified",
+            r"provider artifact URL mode requires an HTTP\(S\) URL",
         ):
             self._run(candidate=candidate)
 
+    def test_curseforge_manual_download_is_detected_from_installer_output(self) -> None:
+        candidate = DependencyCandidate(
+            "curseforge:12345",
+            self.candidate.relative_metadata_path,
+            self.candidate.filename,
+            (
+                'name = "Demo"\n'
+                'filename = "demo.jar"\n'
+                'side = "both"\n'
+                '[download]\n'
+                'hash-format = "sha256"\n'
+                f'hash = "{hashlib.sha256(self.payload).hexdigest()}"\n'
+                'mode = "metadata:curseforge"\n'
+                '[update.curseforge]\n'
+                'project-id = 12345\n'
+                'file-id = 54321\n'
+            ).encode(
+                "utf-8"
+            ),
+            "both",
+        )
+
+        def process(command, **kwargs):
+            if command[0] == "packwiz":
+                return BoundedProcessResult(0, "", "", False, False)
+            if command[0] == "java":
+                return BoundedProcessResult(
+                    1,
+                    "Packwiz installer output:\nThis project requires manual download",
+                    "",
+                    False,
+                    False,
+                )
+            raise AssertionError(command)
+
+        with self.assertRaisesRegex(
+            ProviderArtifactError,
+            "CurseForge artifact requires manual download and cannot be automatically verified",
+        ):
+            self._run(candidate=candidate, process_callable=process)
+
     def test_zero_project_id_is_rejected_in_metadata_curseforge_mode(self) -> None:
         candidate = DependencyCandidate(
-            "curseforge:0",
+            "curseforge:123",
             self.candidate.relative_metadata_path,
             self.candidate.filename,
             (
@@ -310,6 +359,7 @@ class ProviderArtifactTest(unittest.TestCase):
                 'mode = "metadata:curseforge"\n'
                 '[update.curseforge]\n'
                 'project-id = 0\n'
+                'file-id = 0\n'
             ).encode(
                 "utf-8"
             ),
@@ -318,6 +368,59 @@ class ProviderArtifactTest(unittest.TestCase):
         with self.assertRaisesRegex(
             ProviderArtifactError,
             "provider metadata has no positive numeric CurseForge project ID",
+        ):
+            self._run(candidate=candidate)
+
+    def test_missing_file_id_is_rejected_in_metadata_curseforge_mode(self) -> None:
+        candidate = DependencyCandidate(
+            "curseforge:123",
+            self.candidate.relative_metadata_path,
+            self.candidate.filename,
+            (
+                'name = "Demo"\n'
+                'filename = "demo.jar"\n'
+                'side = "both"\n'
+                '[download]\n'
+                'hash-format = "sha256"\n'
+                f'hash = "{hashlib.sha256(self.payload).hexdigest()}"\n'
+                'mode = "metadata:curseforge"\n'
+                '[update.curseforge]\n'
+                'project-id = 123\n'
+            ).encode(
+                "utf-8"
+            ),
+            "both",
+        )
+        with self.assertRaisesRegex(
+            ProviderArtifactError,
+            "provider metadata has no positive numeric CurseForge file ID",
+        ):
+            self._run(candidate=candidate)
+
+    def test_project_id_mismatch_between_identity_and_metadata_is_rejected(self) -> None:
+        candidate = DependencyCandidate(
+            "curseforge:111",
+            self.candidate.relative_metadata_path,
+            self.candidate.filename,
+            (
+                'name = "Demo"\n'
+                'filename = "demo.jar"\n'
+                'side = "both"\n'
+                '[download]\n'
+                'hash-format = "sha256"\n'
+                f'hash = "{hashlib.sha256(self.payload).hexdigest()}"\n'
+                'mode = "metadata:curseforge"\n'
+                '[update.curseforge]\n'
+                'project-id = 999\n'
+                'file-id = 123\n'
+            ).encode(
+                "utf-8"
+            ),
+            "both",
+        )
+        with self.assertRaisesRegex(
+            ProviderArtifactError,
+            "provider identity project ID does not match metadata project-id",
         ):
             self._run(candidate=candidate)
 
@@ -396,7 +499,7 @@ class ProviderArtifactTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             ProviderArtifactError,
-            "CurseForge artifact requires manual download and cannot be automatically verified",
+            "provider artifact mode 'mystery' is unsupported",
         ):
             self._run(candidate=candidate)
 
