@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import os
 from pathlib import Path
@@ -30,6 +31,19 @@ from url_artifacts import download_url_artifact
 
 INSTALLER_ENV = "HUROSHIKI_PACKWIZ_INSTALLER_JAR"
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
+SUPPORTED_HASH_ALGORITHMS = {"sha1", "sha256", "sha512", "md5", "murmur2"}
+METADATA_CURSEFORGE_MODE = "metadata:curseforge"
+
+
+@dataclass(frozen=True)
+class ProviderArtifactMetadata:
+    relative: Path
+    filename: str
+    algorithm: str
+    expected_hash: str
+    mode: str | None
+    download_url: str | None
+    contents: bytes
 
 
 class ProviderArtifactError(RuntimeError):
@@ -49,9 +63,35 @@ def _process_ok(result: BoundedProcessResult, label: str) -> None:
         raise ProviderArtifactError(f"{label} failed with exit code {result.returncode}")
 
 
-def _metadata(
-    candidate: DependencyCandidate,
-) -> tuple[Path, str, str, str, str, bytes]:
+def _artifact_mode(raw_mode: object) -> str | None:
+    if raw_mode is None:
+        return None
+    mode = str(raw_mode).strip().lower()
+    return None if mode in {"", "url"} else mode
+
+
+def _validate_curseforge_metadata(document: object) -> None:
+    if not isinstance(document, dict):
+        raise ProviderArtifactError("provider metadata has no update data")
+    update = document.get("update")
+    if not isinstance(update, dict):
+        raise ProviderArtifactError("provider metadata has no update data")
+    curseforge = update.get("curseforge")
+    if not isinstance(curseforge, dict):
+        raise ProviderArtifactError("provider metadata has no curseforge update section")
+    project_id = str(curseforge.get("project-id", "")).strip()
+    if not project_id.isdecimal() or int(project_id) <= 0:
+        raise ProviderArtifactError(
+            "provider metadata has no positive numeric CurseForge project ID"
+        )
+    file_id = str(curseforge.get("file-id", curseforge.get("fileId", ""))).strip()
+    if file_id and not file_id.isdecimal():
+        raise ProviderArtifactError("provider metadata has no positive numeric CurseForge file ID")
+    if file_id and int(file_id) <= 0:
+        raise ProviderArtifactError("provider metadata has no positive numeric CurseForge file ID")
+
+
+def _metadata(candidate: DependencyCandidate) -> ProviderArtifactMetadata:
     try:
         relative = portable_relative_path(Path(candidate.relative_metadata_path))
         filename = portable_basename(
@@ -65,19 +105,46 @@ def _metadata(
         raise ProviderArtifactError("provider metadata has no download mapping")
     algorithm = str(download.get("hash-format", "")).strip().lower()
     expected = str(download.get("hash", "")).strip().lower()
+    mode = _artifact_mode(download.get("mode"))
     url = str(download.get("url", "")).strip()
-    if algorithm not in {"sha1", "sha256", "sha512", "md5", "murmur2"}:
+    if algorithm not in SUPPORTED_HASH_ALGORITHMS:
         raise ProviderArtifactError("provider metadata uses an unsupported hash")
-    if not expected or not url:
+    if not expected:
         raise ProviderArtifactError("provider artifact metadata is incomplete")
+    if mode is None:
+        if not url:
+            provider = candidate.provider_identity.split(":", 1)[0].strip().lower()
+            if provider == "curseforge":
+                raise ProviderArtifactError(
+                    "CurseForge artifact requires manual download and cannot be automatically verified"
+                )
+            raise ProviderArtifactError("provider artifact metadata is incomplete")
+    elif mode == METADATA_CURSEFORGE_MODE:
+        if url:
+            raise ProviderArtifactError(
+                "metadata:curseforge mode must not include download.url"
+            )
+        provider_identity = candidate.provider_identity.split(":", 1)[0].strip().lower()
+        if provider_identity != "curseforge":
+            raise ProviderArtifactError(
+                "metadata:curseforge mode is unsupported for non-CurseForge metadata"
+            )
+        _validate_curseforge_metadata(document)
+    else:
+        if candidate.provider_identity.split(":", 1)[0].strip().lower() == "curseforge":
+            raise ProviderArtifactError(
+                "CurseForge artifact requires manual download and cannot be automatically verified"
+            )
+        raise ProviderArtifactError(f"provider artifact mode {mode!r} is unsupported")
     parsed = tomlkit.parse(candidate.contents.decode("utf-8"))
     parsed["side"] = "both"
-    return (
+    return ProviderArtifactMetadata(
         relative,
         filename,
         algorithm,
         expected,
-        url,
+        mode,
+        url or None,
         tomlkit.dumps(parsed).encode("utf-8"),
     )
 
@@ -168,78 +235,96 @@ def materialize_provider_artifact(
     effective_deadline = deadline if deadline is not None else time.monotonic() + 120
     if time.monotonic() >= effective_deadline:
         raise ProviderArtifactError("provider artifact materialization deadline exceeded")
-    relative, filename, algorithm, expected_hash, url, contents = _metadata(candidate)
+    metadata = _metadata(candidate)
+    relative = metadata.relative
+    filename = metadata.filename
+    algorithm = metadata.algorithm
+    expected_hash = metadata.expected_hash
+    contents = metadata.contents
 
     root = Path(tempfile.mkdtemp(prefix="provider-artifact-", dir=workspace))
     project = root / "project"
     output = root / "output"
     project.mkdir()
     output.mkdir()
-    downloaded = root / "downloaded.jar"
     remaining = effective_deadline - time.monotonic()
     if remaining <= 0:
         raise ProviderArtifactError("provider artifact materialization deadline exceeded")
-    try:
-        download_url_artifact(
-            url,
-            cancel_event or threading.Event(),
-            root / "logs",
-            context.target_loader,
-            MAX_ARTIFACT_BYTES,
-            total_timeout_seconds=remaining,
-            retained_path=downloaded,
+
+    downloaded = None
+    downloaded_sha256: str | None = None
+    server_started = False
+    server: HTTPServer | None = None
+    server_thread: threading.Thread | None = None
+    if metadata.download_url is not None:
+        downloaded = root / "downloaded.jar"
+        try:
+            download_url_artifact(
+                metadata.download_url,
+                cancel_event or threading.Event(),
+                root / "logs",
+                context.target_loader,
+                MAX_ARTIFACT_BYTES,
+                total_timeout_seconds=remaining,
+                retained_path=downloaded,
+            )
+        except Exception as error:
+            raise ProviderArtifactError(f"provider artifact download failed: {error}") from error
+
+        declared_hash, downloaded_sha256 = _artifact_hash(
+            downloaded, algorithm, cancel_event, effective_deadline
         )
-    except Exception as error:
-        raise ProviderArtifactError(f"provider artifact download failed: {error}") from error
-    declared_hash, downloaded_sha256 = _artifact_hash(
-        downloaded, algorithm, cancel_event, effective_deadline
-    )
-    if declared_hash.lower() != expected_hash.lower():
-        raise ProviderArtifactError("downloaded artifact hash does not match metadata")
+        if declared_hash.lower() != expected_hash.lower():
+            raise ProviderArtifactError("downloaded artifact hash does not match metadata")
 
     installer = os.environ.get(INSTALLER_ENV, "")
     installer_path = Path(installer)
     if not installer or not installer_path.is_file() or installer_path.is_symlink():
         raise ProviderArtifactError("Packwiz Installer is unavailable")
-    artifact_route = f"/{uuid4().hex}/artifact.jar"
 
-    class ArtifactHandler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
-            if self.path != artifact_route:
-                self.send_error(404)
-                return
-            _check(cancel_event, effective_deadline)
-            self.connection.settimeout(
-                max(0.001, min(1.0, effective_deadline - time.monotonic()))
-            )
-            self.send_response(200)
-            self.send_header("Content-Type", "application/java-archive")
-            self.send_header("Content-Length", str(downloaded.stat().st_size))
-            self.end_headers()
-            with downloaded.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    _check(cancel_event, effective_deadline)
-                    self.wfile.write(chunk)
-
-        def log_message(self, _format: str, *_args: object) -> None:
-            return
-
-    server = HTTPServer(("127.0.0.1", 0), ArtifactHandler)
-    server_thread = threading.Thread(
-        target=lambda: server.serve_forever(poll_interval=0.05),
-        name="huroshiki-provider-artifact-server",
-        daemon=False,
-    )
-    server_started = False
     try:
-        server_thread.start()
-        server_started = True
-        local_url = f"http://127.0.0.1:{server.server_port}{artifact_route}"
+        local_url = None
+        if downloaded is not None:
+            artifact_route = f"/{uuid4().hex}/artifact.jar"
+
+            class ArtifactHandler(BaseHTTPRequestHandler):
+                def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+                    if self.path != artifact_route:
+                        self.send_error(404)
+                        return
+                    _check(cancel_event, effective_deadline)
+                    self.connection.settimeout(
+                        max(0.001, min(1.0, effective_deadline - time.monotonic()))
+                    )
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/java-archive")
+                    self.send_header("Content-Length", str(downloaded.stat().st_size))
+                    self.end_headers()
+                    with downloaded.open("rb") as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            _check(cancel_event, effective_deadline)
+                            self.wfile.write(chunk)
+
+                def log_message(self, _format: str, *_args: object) -> None:
+                    return
+
+            server = HTTPServer(("127.0.0.1", 0), ArtifactHandler)
+            server_thread = threading.Thread(
+                target=lambda: server.serve_forever(poll_interval=0.05),
+                name="huroshiki-provider-artifact-server",
+                daemon=False,
+            )
+            server_thread.start()
+            server_started = True
+            local_url = f"http://127.0.0.1:{server.server_port}{artifact_route}"
+
         document = tomlkit.parse(contents.decode("utf-8"))
         download = document["download"]
-        download["url"] = local_url
-        download["hash-format"] = "sha256"
-        download["hash"] = downloaded_sha256
+        if local_url is not None:
+            download["url"] = local_url
+            download["hash-format"] = "sha256"
+            assert downloaded_sha256 is not None
+            download["hash"] = downloaded_sha256
         contents = tomlkit.dumps(document).encode("utf-8")
         metadata = project / relative
         metadata.parent.mkdir(parents=True, exist_ok=True)
@@ -286,16 +371,19 @@ def materialize_provider_artifact(
         )
         _process_ok(install, "Packwiz Installer")
     finally:
-        if server_started:
-            server.shutdown()
-        server.server_close()
-        if server_started:
+        if server is not None:
+            try:
+                if server_started:
+                    server.shutdown()
+            finally:
+                server.server_close()
+        if server_thread is not None and server is not None and server_started:
             server_thread.join(
                 timeout=max(
                     0.0, min(5.0, effective_deadline - time.monotonic())
                 )
             )
-        if server_started and server_thread.is_alive():
+        if server_thread is not None and server_started and server_thread.is_alive():
             raise ProviderArtifactError("provider artifact server cleanup was incomplete")
 
     artifact = output / relative.parent / filename
