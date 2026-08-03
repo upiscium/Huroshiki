@@ -121,11 +121,25 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertIn("file `6529130`", release_scope_words)
         self.assertIn("release metadata verification for this pr is deterministic-only", release_scope_words_lower)
         self.assertIn("live investigation", release_scope_words_lower)
-        self.assertIn("lifecycle failure priority remains unchanged", release_scope_words_lower)
+        self.assertIn("lifecycle-integrity failures retain priority", release_scope_words_lower)
+        lifecycle_priority = (
+            "termination incomplete > orphaned descendants > cancellation > deadline >"
+            " manual-download classification > generic nonzero process-output diagnostics"
+        )
+        self.assertIn(lifecycle_priority, release_scope_words_lower)
         self.assertIn(
-            "lifecycle-integrity failures > manual-download classification > generic process-output diagnostics",
+            "lifecycle-integrity failures > manual-download classification >"
+            " generic process-output diagnostics",
             release_scope_words_lower,
         )
+        old_head = "bf41b5b15fabcae1eec01a6944105b8349e9e5dc"
+        self.assertNotIn(old_head, release_notes)
+        scope_audit_command = (
+            "git diff --name-only"
+            " 01c445b2bed6978ff86dfa1db377bccb270eb63e...HEAD"
+        ).strip()
+        self.assertIn(scope_audit_command, release_notes)
+        self.assertNotIn(f"01c445b2bed6978ff86dfa1db377bccb270eb63e...{old_head}", release_notes)
 
         self.assertIn("## Known limitations", release_notes)
         self.assertIn(
@@ -140,10 +154,19 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertIn("sha-256", release_scope_words_lower)
         self.assertIn("artifact", release_scope_words_lower)
         self.assertIn("Packwiz Installer entrypoint and bootstrap handling", release_notes)
-        self.assertIn("actionlint", release_scope_words_lower)
-        self.assertIn("packctl validate", release_scope_words_lower)
         self.assertIn("git diff --check", release_scope_words_lower)
         self.assertIn("5-file scope audit", release_scope_words_lower)
+        self.assertIn("actionlint", release_scope_words_lower)
+        self.assertIn("packctl validate", release_scope_words_lower)
+
+        priority_index = release_scope_words_lower.find("lifecycle-integrity failures")
+        self.assertNotEqual(priority_index, -1)
+        manual_index = release_scope_words_lower.find("manual-download classification", priority_index)
+        generic_index = release_scope_words_lower.find("generic nonzero process-output diagnostics", priority_index)
+        self.assertNotEqual(manual_index, -1)
+        self.assertNotEqual(generic_index, -1)
+        self.assertLess(priority_index, manual_index)
+        self.assertLess(manual_index, generic_index)
 
         rc4_scope_words = " ".join(rc4_changelog.split())
         self.assertIn("legacy Packs without", rc4_scope_words)
