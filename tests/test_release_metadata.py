@@ -121,7 +121,11 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertIn("file `6529130`", release_scope_words)
         self.assertIn("release metadata verification for this pr is deterministic-only", release_scope_words_lower)
         self.assertIn("live investigation", release_scope_words_lower)
-        self.assertIn("lifecycle error priority", release_scope_words_lower)
+        self.assertIn("lifecycle failure priority remains unchanged", release_scope_words_lower)
+        self.assertIn(
+            "lifecycle-integrity failures > manual-download classification > generic process-output diagnostics",
+            release_scope_words_lower,
+        )
 
         self.assertIn("## Known limitations", release_notes)
         self.assertIn(
