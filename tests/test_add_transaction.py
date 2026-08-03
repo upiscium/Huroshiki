@@ -787,6 +787,7 @@ class AddTransactionTest(unittest.TestCase):
         from dependency_equivalence import MaterializedArtifact
 
         existing_digest = "c" * 64
+        incoming_digest = "d" * 64
         existing_contents = (
             metadata("Shared", "shared", "server")
             .replace("update.modrinth", "update.modrinth")
@@ -803,7 +804,7 @@ class AddTransactionTest(unittest.TestCase):
             'side = "client"\n'
             '[download]\n'
             'hash-format = "sha256"\n'
-            f'hash = "{existing_digest}"\n'
+            f'hash = "{incoming_digest}"\n'
             'mode = "metadata:curseforge"\n'
             '[update.curseforge]\n'
             'project-id = 200\n'
@@ -836,7 +837,11 @@ class AddTransactionTest(unittest.TestCase):
             ("modrinth", "shared"),
         )
         self.assertEqual(retained.side, "both")
-        self.assertEqual(materialize.call_count, 0)
+        self.assertEqual(materialize.call_count, 2)
+        self.assertIn(
+            "curseforge:200",
+            {str(call.args[0].provider_identity) for call in materialize.call_args_list},
+        )
 
     def test_legacy_unknown_dependency_semantic_equivalence_preserves_existing(self) -> None:
         from dependency_equivalence import MaterializedArtifact, SemanticJarIdentity

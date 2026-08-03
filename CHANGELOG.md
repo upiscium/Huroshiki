@@ -12,6 +12,12 @@
   existing metadata, unions sides, omits the duplicate incoming metadata/JAR, and does not infer or
   create a root manifest. Ambiguous collisions with an incoming explicit root still fail closed
   before materialization.
+- Normalized materialized `metadata:curseforge` artifacts so generated metadata is always written with
+  `side = "both"`, preventing `mode = "metadata:curseforge"` + explicit `side` combinations from
+  regressing into side mismatches during collision handling.
+- Updated cross-provider collision behavior so transitive CurseForge metadata candidates participate in
+  the same `MaterializedArtifact` materialization/evidence path as metadata roots, avoiding
+  unintended replacement of existing Modrinth metadata during verified collisions.
 - Kept artifact/JAR equivalence verification mandatory through strict declared SHA-256, verified
   materialized SHA-256, or an exact target-loader MOD ID/version set. Canonical candidate provenance
   and existing-state now participate in the evidence binding with metadata, target context, and

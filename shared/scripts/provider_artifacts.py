@@ -150,6 +150,10 @@ def _metadata(candidate: DependencyCandidate) -> ProviderArtifactMetadata:
     if not expected:
         raise ProviderArtifactError("provider metadata has no declared hash")
     parsed = tomlkit.parse(candidate.contents.decode("utf-8"))
+    url_value: str | None
+    metadata_project_id: int | None = None
+    metadata_file_id: int | None = None
+
     if mode == "url":
         if not url:
             raise ProviderArtifactError(
@@ -159,6 +163,7 @@ def _metadata(candidate: DependencyCandidate) -> ProviderArtifactMetadata:
             raise ProviderArtifactError(
                 "provider artifact URL mode requires an HTTP(S) URL"
             )
+        url_value = url
     elif mode == METADATA_CURSEFORGE_MODE:
         if url:
             raise ProviderArtifactError(
@@ -175,30 +180,22 @@ def _metadata(candidate: DependencyCandidate) -> ProviderArtifactMetadata:
             raise ProviderArtifactError(
                 "provider identity project ID does not match metadata project-id"
             )
-        return ProviderArtifactMetadata(
-            relative,
-            filename,
-            algorithm,
-            expected,
-            mode,
-            None,
-            tomlkit.dumps(parsed).encode("utf-8"),
-            metadata_project_id,
-            metadata_file_id,
-        )
+        url_value = None
     else:
         raise ProviderArtifactError(f"provider artifact mode {mode!r} is unsupported")
+
     parsed["side"] = "both"
+
     return ProviderArtifactMetadata(
         relative,
         filename,
         algorithm,
         expected,
         mode,
-        url or None,
+        url_value,
         tomlkit.dumps(parsed).encode("utf-8"),
-        None,
-        None,
+        metadata_project_id,
+        metadata_file_id,
     )
 
 

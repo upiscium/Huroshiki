@@ -108,7 +108,7 @@ class ProviderArtifactTest(unittest.TestCase):
             (
                 'name = "Demo"\n'
                 'filename = "demo.jar"\n'
-                'side = "both"\n'
+                'side = "server"\n'
                 '[download]\n'
                 'hash-format = "sha256"\n'
                 f'hash = "{hashlib.sha256(self.payload).hexdigest()}"\n'
@@ -164,7 +164,7 @@ class ProviderArtifactTest(unittest.TestCase):
             (
                 'name = "Demo"\n'
                 'filename = "demo.jar"\n'
-                'side = "both"\n'
+                'side = "server"\n'
                 '[download]\n'
                 'hash-format = "sha256"\n'
                 f'hash = "{hashlib.sha256(self.payload).hexdigest()}"\n'
@@ -206,6 +206,7 @@ class ProviderArtifactTest(unittest.TestCase):
         self.assertNotIn("url", download)
         self.assertEqual(download["hash-format"], "sha256")
         self.assertEqual(download["hash"], hashlib.sha256(self.payload).hexdigest())
+        self.assertEqual(materialized["side"], "both")
 
     def test_metadata_curseforge_with_download_url_is_rejected(self) -> None:
         candidate = DependencyCandidate(
