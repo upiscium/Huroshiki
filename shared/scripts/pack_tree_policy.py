@@ -181,6 +181,7 @@ def _scan_directory(
     relative: Path,
     entries: list[PackMigrationTreeEntry],
     checkpoint: Callable[[], None],
+    excluded_roots: frozenset[str],
 ) -> None:
     checkpoint()
     opened = os.fstat(directory_fd)
@@ -216,6 +217,8 @@ def _scan_directory(
 
     for child in children:
         checkpoint()
+        if relative == Path(".") and child.name in excluded_roots:
+            continue
         child_relative = (
             Path(child.name) if relative == Path(".") else relative / child.name
         )
@@ -268,7 +271,13 @@ def _scan_directory(
                     )
                     continue
                 child_index = len(entries)
-                _scan_directory(child_fd, child_relative, entries, checkpoint)
+                _scan_directory(
+                    child_fd,
+                    child_relative,
+                    entries,
+                    checkpoint,
+                    excluded_roots,
+                )
                 try:
                     bound = os.stat(
                         child.name,
@@ -372,6 +381,7 @@ def scan_pack_migration_source(
     pack_root: Path,
     *,
     checkpoint: Callable[[], None],
+    excluded_roots: frozenset[str] = frozenset(),
 ) -> PackTreeScan:
     checkpoint()
     descriptor_bound_path = (
@@ -394,7 +404,7 @@ def scan_pack_migration_source(
         if (listed.st_dev, listed.st_ino) != (opened.st_dev, opened.st_ino):
             raise PackTreePolicyError("Pack migration source changed while opening")
         entries: list[PackMigrationTreeEntry] = []
-        _scan_directory(root_fd, Path("."), entries, checkpoint)
+        _scan_directory(root_fd, Path("."), entries, checkpoint, excluded_roots)
         checkpoint()
         try:
             bound = (
