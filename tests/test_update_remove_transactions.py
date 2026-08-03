@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 import os
 import stat
@@ -989,6 +991,70 @@ url = "https://example.invalid/manual.jar"
         self.assertEqual(report.selected, ())
         self.assertEqual(report.failures, ())
         self.assertEqual(target.read_bytes(), original)
+
+    def test_update_version_label_prefers_file_id(self) -> None:
+        self.assertEqual(core.update_version_label("1.0", "12345"), "1.0 (12345)")
+        self.assertEqual(core.update_version_label("1.0", "-"), "1.0")
+        self.assertEqual(core.update_version_label("1.0", "1.0"), "1.0")
+
+    def test_metadata_file_id_prefers_provider_specific_keys(self) -> None:
+        modrinth = {
+            "update": {
+                "modrinth": {
+                    "version": "123",
+                    "version-id": "456",
+                }
+            }
+        }
+        curseforge = {
+            "update": {
+                "curseforge": {
+                    "file-id": "123",
+                    "fileId": "456",
+                }
+            }
+        }
+
+        self.assertEqual(core.metadata_file_id(modrinth, "modrinth"), "456")
+        self.assertEqual(core.metadata_file_id(curseforge, "curseforge"), "123")
+        self.assertEqual(core.metadata_file_id({}, "modrinth"), "-")
+
+    def test_update_all_prints_file_ids_in_cli_output(self) -> None:
+        class Transaction:
+            def __init__(self, candidate: core.UpdateCandidate) -> None:
+                self.candidate = candidate
+
+            def prepare_updates(self, **_) -> list[core.UpdateCandidate]:
+                return [self.candidate]
+
+            def select_updates(self, _selected) -> None:
+                return None
+
+            def apply(self, **_) -> None:
+                return None
+
+            def discard(self, **_) -> None:
+                return None
+
+        candidate = core.UpdateCandidate(
+            "modrinth:first",
+            Path("mods/first.pw.toml"),
+            "first",
+            "First",
+            "modrinth",
+            "1.0",
+            "2.0",
+            "update",
+            (),
+            "old-id",
+            "new-id",
+        )
+        with patch.object(core.PackTransaction, "create", return_value=Transaction(candidate)):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                core.update_all(self.key)
+
+        self.assertIn("1.0 (old-id) -> 2.0 (new-id)", output.getvalue())
 
     def test_update_preparation_reports_ordered_progress(self) -> None:
         self.write_mod("first")
