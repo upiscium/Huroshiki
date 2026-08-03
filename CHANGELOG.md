@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0-rc.5 - 2026-08-03
+
 ### Provider Artifacts
 
 - Fixed valid Packwiz-native `mode = "metadata:curseforge"` artifacts being rejected
