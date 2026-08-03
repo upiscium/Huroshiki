@@ -522,6 +522,8 @@ class UpdateCandidate:
     new_version: str
     status: str
     changes: tuple[UpdateChange, ...] = ()
+    current_file_id: str = "-"
+    new_file_id: str = "-"
     added_dependencies: int = 0
     error: str | None = None
     error_returncode: int | None = None
@@ -4604,6 +4606,28 @@ def metadata_version(data: dict[str, object], provider: str) -> str:
     return filename or "unknown"
 
 
+def metadata_file_id(data: dict[str, object], provider: str) -> str:
+    update = data.get("update", {})
+    if isinstance(update, dict):
+        provider_data = update.get(canonical_provider(provider), {})
+        if isinstance(provider_data, dict):
+            ordered_keys: tuple[str, ...]
+            if canonical_provider(provider) == "modrinth":
+                ordered_keys = ("version-id", "file-id", "fileId", "version")
+            elif canonical_provider(provider) == "curseforge":
+                ordered_keys = ("file-id", "fileId", "version")
+            else:
+                ordered_keys = ("file-id", "fileId", "version-id", "version")
+            for key in ordered_keys:
+                if key in provider_data:
+                    return str(provider_data[key])
+    return "-"
+
+
+def update_version_label(version: str, file_id: str) -> str:
+    return f"{version} ({file_id})" if file_id not in {"", "-", version} else version
+
+
 def metadata_is_pinned(data: dict[str, object]) -> bool:
     if data.get("pin") is True:
         return True
@@ -4960,7 +4984,9 @@ def _candidate_error(
         name=mod.name,
         provider=mod.provider,
         current_version=metadata_version(data, mod.provider),
+        current_file_id=metadata_file_id(data, mod.provider),
         new_version="-",
+        new_file_id="-",
         status="unavailable",
         error=message,
         error_returncode=returncode,
@@ -5030,6 +5056,7 @@ def _prepare_update_candidates(
             name=old_mod.name,
             provider=old_mod.provider,
             current_version=metadata_version(old_data, old_mod.provider),
+            current_file_id=metadata_file_id(old_data, old_mod.provider),
         )
         if old_mod.slug in ambiguous:
             paths = ", ".join(str(path) for path in ambiguous[old_mod.slug])
@@ -5384,14 +5411,13 @@ def _prepare_update_candidates(
             )
             continue
         resolved_root = resolved_records.get((provider, old_mod.project_id))
-        new_version = (
-            metadata_version(
-                tomllib.loads(resolved_root.contents.decode("utf-8")),
-                old_mod.provider,
-            )
-            if resolved_root is not None
-            else "-"
-        )
+        if resolved_root is not None:
+            resolved_data = tomllib.loads(resolved_root.contents.decode("utf-8"))
+            new_version = metadata_version(resolved_data, old_mod.provider)
+            new_file_id = metadata_file_id(resolved_data, old_mod.provider)
+        else:
+            new_version = "-"
+            new_file_id = "-"
         added_dependencies = sum(
             identity not in baseline_records and identity != (provider, old_mod.project_id)
             for identity in resolved_records
@@ -5400,6 +5426,7 @@ def _prepare_update_candidates(
             UpdateCandidate(
                 **common,
                 new_version=new_version,
+                new_file_id=new_file_id,
                 status="update",
                 changes=changes,
                 added_dependencies=added_dependencies,
@@ -6383,9 +6410,17 @@ def update_all(
             return UpdateRunReport(candidates, (), (), False, False)
         print("MOD updates:")
         for candidate in available:
+            current_label = update_version_label(
+                candidate.current_version,
+                candidate.current_file_id,
+            )
+            new_label = update_version_label(
+                candidate.new_version,
+                candidate.new_file_id,
+            )
             print(
                 f"  {candidate.name} [{candidate.provider}] "
-                f"{candidate.current_version} -> {candidate.new_version} "
+                f"{current_label} -> {new_label} "
                 f"({candidate.file_count} files, "
                 f"{candidate.added_dependencies} added dependencies)"
             )

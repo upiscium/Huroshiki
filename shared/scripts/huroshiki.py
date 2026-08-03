@@ -5933,8 +5933,8 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
                 "[*]" if candidate.relative_path in self.selected_paths else "[ ]",
                 candidate.name,
                 candidate.provider,
-                candidate.current_version,
-                candidate.new_version,
+                self._version_label(candidate.current_version, candidate.current_file_id),
+                self._version_label(candidate.new_version, candidate.new_file_id),
                 str(candidate.file_count) if candidate.available else "-",
                 (
                     f"unavailable: {candidate.error}"
@@ -5942,6 +5942,10 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
                     else candidate.status
                 ),
             )
+
+    @staticmethod
+    def _version_label(version: str, file_id: str) -> str:
+        return core.update_version_label(version, file_id)
 
     def toggle_candidate(self) -> None:
         if self.operation is not None:
@@ -5982,7 +5986,8 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
                 [
                     *(
                         f"{item.name} [{item.provider}] "
-                        f"{item.current_version} -> {item.new_version}"
+                        f"{self._version_label(item.current_version, item.current_file_id)} "
+                        f"-> {self._version_label(item.new_version, item.new_file_id)}"
                         for item in selected
                     ),
                     "",
