@@ -56,9 +56,14 @@ class ReleaseMetadataTest(unittest.TestCase):
         rc4_heading = f"## {VERSION} - 2026-08-02"
         self.assertTrue(
             changelog.startswith(
-                f"# Changelog\n\n## Unreleased\n\n{rc4_heading}\n"
+                "# Changelog\n\n## Unreleased\n"
             ),
-            "Unreleased must remain empty before the rc.4 entry",
+            "Unreleased section is missing",
+        )
+        unreleased_payload = changelog.split(rc4_heading, 1)[0].split("## Unreleased", 1)[1]
+        self.assertTrue(
+            unreleased_payload.strip(),
+            "Unreleased section must not be empty",
         )
         rc4_changelog = changelog.split(rc4_heading, 1)[1].split(
             "## 0.2.0-rc.3 -", 1
@@ -71,7 +76,7 @@ class ReleaseMetadataTest(unittest.TestCase):
             release_notes,
         )
 
-        release_scope = f"{rc4_changelog}\n{release_notes}"
+        release_scope = f"{unreleased_payload}\n{rc4_changelog}\n{release_notes}"
         release_scope_words = " ".join(release_scope.split())
         self.assertIn("legacy Packs without", release_scope_words)
         for provenance in ("explicit", "dependency", "unknown"):

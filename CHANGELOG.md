@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-## 0.2.0-rc.4 - 2026-08-02
-
 ### Dependency Equivalence
 
 - Fixed the `v0.2.0-rc.3` regression that rejected verified cross-provider transitive dependency
@@ -22,6 +20,8 @@
   materialized SHA-256, or an exact target-loader MOD ID/version set. Canonical candidate provenance
   and existing-state now participate in the evidence binding with metadata, target context, and
   artifact evidence. The shared policy applies to Add, Profiles, Template Import, and Update.
+
+## 0.2.0-rc.4 - 2026-08-02
 
 ## 0.2.0-rc.3 - 2026-08-02
 
