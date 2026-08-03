@@ -4,6 +4,7 @@ import hashlib
 from pathlib import Path
 import subprocess
 import tempfile
+import zipfile
 import threading
 import time
 import unittest
@@ -839,6 +840,16 @@ class AddTransactionTest(unittest.TestCase):
                 run_commands.append(tuple(command))
                 return result
             if "--pack-folder" in command:
+                self.assertEqual(
+                    command[:4],
+                    [
+                        "java",
+                        "-cp",
+                        str(installer),
+                        provider_artifacts.PACKWIZ_INSTALLER_MAIN_CLASS,
+                    ],
+                )
+                self.assertNotIn("-jar", command)
                 output = Path(command[command.index("--pack-folder") + 1])
                 artifact = output / "mods" / "shared.jar"
                 artifact.parent.mkdir(parents=True, exist_ok=True)
@@ -848,7 +859,13 @@ class AddTransactionTest(unittest.TestCase):
             raise AssertionError(f"unexpected process command: {command}")
 
         installer = self.root / "huroshiki-installer.jar"
-        installer.touch()
+        with zipfile.ZipFile(installer, "w") as archive:
+            archive.writestr(
+                "META-INF/MANIFEST.MF",
+                "Manifest-Version: 1.0\n"
+                "Main-Class: link.infra.packwiz.installer.RequiresBootstrap\n",
+            )
+            archive.writestr("link/infra/packwiz/installer/Main.class", b"\x00")
 
         with patch.dict(
             provider_artifacts.os.environ,
@@ -874,6 +891,19 @@ class AddTransactionTest(unittest.TestCase):
         self.assertEqual(len(downloads), 1)
         self.assertEqual(run_commands[0], ("packwiz", "refresh"))
         self.assertEqual(run_commands[1][0], "java")
+        self.assertEqual(
+            list(run_commands[1][0:4]),
+            [
+                "java",
+                "-cp",
+                str(installer),
+                provider_artifacts.PACKWIZ_INSTALLER_MAIN_CLASS,
+            ],
+        )
+        self.assertEqual(
+            run_commands[1][3],
+            provider_artifacts.PACKWIZ_INSTALLER_MAIN_CLASS,
+        )
 
     def test_legacy_unknown_dependency_semantic_equivalence_preserves_existing(self) -> None:
         from dependency_equivalence import MaterializedArtifact, SemanticJarIdentity
