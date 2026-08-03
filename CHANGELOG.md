@@ -19,13 +19,19 @@
   ```
 
   This avoids `java -jar` and the upstream `RequiresBootstrap` manifest entrypoint,
-  so runtime behavior no longer depends on a bundled bootstrapper and never replaces
-  the pinned installer. Manual-download-only failures remain scoped to failed
+  so runtime behavior no longer depends on a bundled bootstrapper and never patches,
+  rewrites, or replaces the pinned installer JAR. Manual-download-only failures
+  remain scoped to failed
   metadata-mode runs, and installer diagnostics are now surfaced with bounded tails
   plus the failed artifact identity.
 - Added a regression in metadata/cross-provider artifact workflows that
   preserves explicit command-line identity under `metadata:curseforge` even when the
   installer JAR manifest reports `RequiresBootstrap`.
+- Issue #122 live investigation verified this path against CurseForge project
+  `309927` and file `6529130` in a manual live investigation.
+
+- Release metadata verification for this PR is deterministic-only and does not
+  rerun that live call.
 
 ## 0.2.0-rc.4 - 2026-08-02
 
