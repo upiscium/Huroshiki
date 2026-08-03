@@ -11,6 +11,7 @@ from unittest import mock
 import zipfile
 
 from dependency_equivalence import DependencyCandidate, EquivalenceContext
+import provider_artifacts
 from provider_artifacts import ProviderArtifactError, materialize_provider_artifact
 from process_runner import BoundedProcessResult
 
@@ -51,6 +52,19 @@ class ProviderArtifactTest(unittest.TestCase):
             side_effect=self._download,
         )
         self.download.start()
+
+    def _install_jar_with_requires_bootstrap_manifest(self) -> Path:
+        installer = self.workspace / "bootstrap-manifest-installer.jar"
+        with zipfile.ZipFile(installer, "w") as archive:
+            archive.writestr(
+                "META-INF/MANIFEST.MF",
+                "Manifest-Version: 1.0\n"
+                "Main-Class: link.infra.packwiz.installer.RequiresBootstrap\n",
+            )
+            archive.writestr(
+                "link/infra/packwiz/installer/Main.class", b"000000",
+            )
+        return installer
 
     def _download(self, _url, _cancel, _log, _loader, _limit, **kwargs):
         kwargs["retained_path"].write_bytes(self.payload)
@@ -146,15 +160,38 @@ class ProviderArtifactTest(unittest.TestCase):
         self.assertEqual(result.sha256, hashlib.sha256(self.payload).hexdigest())
         download.assert_not_called()
         self.assertEqual(calls[0][0], ["packwiz", "refresh"])
-        self.assertEqual(calls[1][0][:7], [
+        self.assertEqual(calls[1][0][:8], [
             "java",
-            "-jar",
+            "-cp",
             str(self.installer),
+            provider_artifacts.PACKWIZ_INSTALLER_MAIN_CLASS,
             "--no-gui",
             "--side",
             "client",
             "--pack-folder",
         ])
+
+    def test_installer_entrypoint_is_used_even_with_bootstrap_manifest(self) -> None:
+        bootstrap_installer = self._install_jar_with_requires_bootstrap_manifest()
+
+        def process(command, **kwargs):
+            if command[0] == "packwiz":
+                return BoundedProcessResult(0, "", "", False, False)
+            if command[0] == "java":
+                destination = Path(kwargs["cwd"]).parent / "output" / "mods" / "demo.jar"
+                destination.parent.mkdir(parents=True)
+                destination.write_bytes(self.payload)
+            return BoundedProcessResult(0, "", "", False, False)
+
+        with mock.patch.dict(
+            "os.environ",
+            {"HUROSHIKI_PACKWIZ_INSTALLER_JAR": str(bootstrap_installer)},
+        ):
+            result, calls = self._run(process_callable=process)
+
+        self.assertEqual(result.sha256, hashlib.sha256(self.payload).hexdigest())
+        self.assertEqual(calls[1][0][:2], ["java", "-cp"])
+        self.assertEqual(calls[1][0][2], str(bootstrap_installer))
 
     def test_metadata_contents_are_preserved_when_materializing_metadata_mode(self) -> None:
         candidate = DependencyCandidate(
@@ -361,7 +398,7 @@ class ProviderArtifactTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ProviderArtifactError,
-            "Packwiz Installer failed with exit code 1",
+            r"Packwiz Installer failed with exit code 1 for artifact modrinth:demo:[\s\S]*This project requires manual download",
         ):
             self._run(process_callable=process)
 
@@ -415,10 +452,11 @@ class ProviderArtifactTest(unittest.TestCase):
         )
         self.assertEqual(result.sha256, hashlib.sha256(self.payload).hexdigest())
         self.assertEqual(invoked[0][0], ["packwiz", "refresh"])
-        self.assertEqual(invoked[1][0][:7], [
+        self.assertEqual(invoked[1][0][:8], [
             "java",
-            "-jar",
+            "-cp",
             str(self.installer),
+            provider_artifacts.PACKWIZ_INSTALLER_MAIN_CLASS,
             "--no-gui",
             "--side",
             "client",
@@ -588,8 +626,15 @@ class ProviderArtifactTest(unittest.TestCase):
         result, calls = self._run()
         self.assertEqual(result.sha256, hashlib.sha256(self.payload).hexdigest())
         self.assertEqual(calls[0][0], ["packwiz", "refresh"])
-        self.assertEqual(calls[1][0][:7], [
-            "java", "-jar", str(self.installer), "--no-gui", "--side", "client", "--pack-folder"
+        self.assertEqual(calls[1][0][:8], [
+            "java",
+            "-cp",
+            str(self.installer),
+            provider_artifacts.PACKWIZ_INSTALLER_MAIN_CLASS,
+            "--no-gui",
+            "--side",
+            "client",
+            "--pack-folder",
         ])
         self.assertEqual(calls[0][1]["deadline"], self.deadline)
         self.assertIs(calls[0][1]["cancel_event"], self.cancel)

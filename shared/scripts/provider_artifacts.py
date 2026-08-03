@@ -30,9 +30,12 @@ from url_artifacts import download_url_artifact
 
 
 INSTALLER_ENV = "HUROSHIKI_PACKWIZ_INSTALLER_JAR"
+PACKWIZ_INSTALLER_MAIN_CLASS = "link.infra.packwiz.installer.Main"
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
 SUPPORTED_HASH_ALGORITHMS = {"sha1", "sha256", "sha512", "md5", "murmur2"}
 METADATA_CURSEFORGE_MODE = "metadata:curseforge"
+PROCESS_ERROR_OUTPUT_BYTES = 1024
+PROCESS_ERROR_OUTPUT_LINES = 8
 DownloadMode = Literal["url", "metadata:curseforge"]
 MANUAL_DOWNLOAD_MARKERS = (
     "requires manual download",
@@ -59,7 +62,11 @@ class ProviderArtifactError(RuntimeError):
 
 
 def _process_ok(
-    result: BoundedProcessResult, label: str, *, supports_manual_download: bool = False
+    result: BoundedProcessResult,
+    label: str,
+    *,
+    supports_manual_download: bool = False,
+    artifact_identity: str | None = None,
 ) -> None:
     if result.termination_incomplete:
         raise ProviderArtifactError(f"{label} process termination was incomplete")
@@ -76,7 +83,54 @@ def _process_ok(
             raise ProviderArtifactError(
                 "CurseForge artifact requires manual download and cannot be automatically verified"
             )
-        raise ProviderArtifactError(f"{label} failed with exit code {result.returncode}")
+        identity = f" for artifact {artifact_identity}" if artifact_identity else ""
+        output = _bounded_process_output_tail(
+            result.stdout,
+            result.stderr,
+            max_lines=PROCESS_ERROR_OUTPUT_LINES,
+            max_bytes=PROCESS_ERROR_OUTPUT_BYTES,
+        )
+        if output:
+            raise ProviderArtifactError(
+                f"{label} failed with exit code {result.returncode}{identity}: {output}"
+            )
+        raise ProviderArtifactError(f"{label} failed with exit code {result.returncode}{identity}")
+
+
+def _bounded_process_output_tail(
+    stdout: str,
+    stderr: str,
+    *,
+    max_lines: int,
+    max_bytes: int,
+) -> str:
+    text = f"{stdout}\n{stderr}" if stdout or stderr else ""
+    lines = tuple(line.strip() for line in text.splitlines() if line.strip())
+    if not lines:
+        return ""
+    selected = "\n".join(lines[-max_lines:]).strip()
+    if len(selected) <= max_bytes:
+        return selected
+    return selected[-max_bytes:]
+
+
+def _artifact_identity(provider_identity: str, mode: str, *, curseforge_file_id: int | None) -> str:
+    if mode == METADATA_CURSEFORGE_MODE and curseforge_file_id is not None:
+        return f"{provider_identity} file {curseforge_file_id}"
+    return provider_identity
+
+
+def packwiz_installer_command(
+    installer_path: Path,
+    *arguments: str,
+) -> list[str]:
+    return [
+        "java",
+        "-cp",
+        str(installer_path),
+        PACKWIZ_INSTALLER_MAIN_CLASS,
+        *arguments,
+    ]
 
 
 def _artifact_mode(raw_mode: object) -> DownloadMode:
@@ -381,9 +435,9 @@ def materialize_provider_artifact(
             assert downloaded_sha256 is not None
             download["hash"] = downloaded_sha256
         contents = tomlkit.dumps(document).encode("utf-8")
-        metadata = project / relative
-        metadata.parent.mkdir(parents=True, exist_ok=True)
-        metadata.write_bytes(contents)
+        metadata_path = project / relative
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_bytes(contents)
         (project / "pack.toml").write_text(
             'name = "Artifact verification"\nauthor = "huroshiki"\nversion = "0"\n'
             'pack-format = "packwiz:1.1.0"\n\n[index]\nfile = "index.toml"\n'
@@ -409,10 +463,8 @@ def materialize_provider_artifact(
             raise ProviderArtifactError("packwiz refresh did not retain pack.toml")
         pack_url = "file://" + quote(str(pack_toml), safe="/:@")
         install = run_bounded_process(
-            [
-                "java",
-                "-jar",
-                str(installer_path),
+            packwiz_installer_command(
+                installer_path,
                 "--no-gui",
                 "--side",
                 "client",
@@ -421,13 +473,18 @@ def materialize_provider_artifact(
                 "--meta-file",
                 "packwiz.json",
                 pack_url,
-            ],
+            ),
             **process_kwargs,
         )
         _process_ok(
             install,
             "Packwiz Installer",
             supports_manual_download=manual_download_supported,
+            artifact_identity=_artifact_identity(
+                candidate.provider_identity,
+                metadata.mode,
+                curseforge_file_id=metadata.curseforge_file_id,
+            ),
         )
     finally:
         if server is not None:
