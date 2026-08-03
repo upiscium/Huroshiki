@@ -58,7 +58,9 @@ class ProviderArtifactError(RuntimeError):
     pass
 
 
-def _process_ok(result: BoundedProcessResult, label: str) -> None:
+def _process_ok(
+    result: BoundedProcessResult, label: str, *, supports_manual_download: bool = False
+) -> None:
     if result.termination_incomplete:
         raise ProviderArtifactError(f"{label} process termination was incomplete")
     if result.orphaned_descendants:
@@ -67,11 +69,13 @@ def _process_ok(result: BoundedProcessResult, label: str) -> None:
         raise ProviderArtifactError(f"{label} was cancelled")
     if result.timed_out:
         raise ProviderArtifactError(f"{label} deadline exceeded")
-    if _requires_manual_download(result.stdout, result.stderr):
-        raise ProviderArtifactError(
-            "CurseForge artifact requires manual download and cannot be automatically verified"
-        )
     if result.returncode != 0:
+        if supports_manual_download and _requires_manual_download(
+            result.stdout, result.stderr
+        ):
+            raise ProviderArtifactError(
+                "CurseForge artifact requires manual download and cannot be automatically verified"
+            )
         raise ProviderArtifactError(f"{label} failed with exit code {result.returncode}")
 
 
@@ -419,7 +423,11 @@ def materialize_provider_artifact(
             ],
             **process_kwargs,
         )
-        _process_ok(install, "Packwiz Installer")
+        _process_ok(
+            install,
+            "Packwiz Installer",
+            supports_manual_download=True,
+        )
     finally:
         if server is not None:
             try:

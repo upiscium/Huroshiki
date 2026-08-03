@@ -345,6 +345,66 @@ class ProviderArtifactTest(unittest.TestCase):
         ):
             self._run(candidate=candidate, process_callable=process)
 
+    def test_manual_download_markers_in_success_output_do_not_fail(self) -> None:
+        candidate = DependencyCandidate(
+            "curseforge:12345",
+            self.candidate.relative_metadata_path,
+            self.candidate.filename,
+            (
+                'name = "Demo"\n'
+                'filename = "demo.jar"\n'
+                'side = "both"\n'
+                '[download]\n'
+                'hash-format = "sha256"\n'
+                f'hash = "{hashlib.sha256(self.payload).hexdigest()}"\n'
+                'mode = "metadata:curseforge"\n'
+                '[update.curseforge]\n'
+                'project-id = 12345\n'
+                'file-id = 54321\n'
+            ).encode(
+                "utf-8"
+            ),
+            "both",
+        )
+
+        def process(command, **kwargs):
+            if command[0] == "packwiz":
+                return BoundedProcessResult(
+                    0,
+                    "Packwiz refresh output: manual download is not required\n",
+                    "",
+                    False,
+                    False,
+                )
+            if command[0] == "java":
+                destination = Path(kwargs["cwd"]).parent / "output" / "mods" / "demo.jar"
+                destination.parent.mkdir(parents=True)
+                destination.write_bytes(self.payload)
+                return BoundedProcessResult(
+                    0,
+                    "Packwiz installer output: this project requires manual download\n",
+                    "",
+                    False,
+                    False,
+                )
+            raise AssertionError(command)
+
+        result, invoked = self._run(
+            candidate=candidate,
+            process_callable=process,
+        )
+        self.assertEqual(result.sha256, hashlib.sha256(self.payload).hexdigest())
+        self.assertEqual(invoked[0][0], ["packwiz", "refresh"])
+        self.assertEqual(invoked[1][0][:7], [
+            "java",
+            "-jar",
+            str(self.installer),
+            "--no-gui",
+            "--side",
+            "client",
+            "--pack-folder",
+        ])
+
     def test_zero_project_id_is_rejected_in_metadata_curseforge_mode(self) -> None:
         candidate = DependencyCandidate(
             "curseforge:123",

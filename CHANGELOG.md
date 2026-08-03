@@ -2,26 +2,31 @@
 
 ## Unreleased
 
+### Provider Artifacts
+
+- Fixed manual-download output classification for provider artifact materialization: manual download
+  is now treated as a failure only when the Packwiz Installer exits non-zero.
+
+## 0.2.0-rc.4 - 2026-08-02
+
 ### Dependency Equivalence
 
 - Fixed the `v0.2.0-rc.3` regression that rejected verified cross-provider transitive dependency
   collisions in legacy Packs without `.huroshiki-roots.json`. Provenance is now separated into
-  `explicit`, `dependency`, and `unknown`; `existing unknown + incoming dependency` preserves the
+  `explicit`, `dependency`, and `unknown`; existing unknown + incoming dependency preserves the
   existing metadata, unions sides, omits the duplicate incoming metadata/JAR, and does not infer or
   create a root manifest. Ambiguous collisions with an incoming explicit root still fail closed
   before materialization.
 - Normalized materialized `metadata:curseforge` artifacts so generated metadata is always written with
   `side = "both"`, preventing `mode = "metadata:curseforge"` + explicit `side` combinations from
   regressing into side mismatches during collision handling.
-- Updated cross-provider collision behavior so transitive CurseForge metadata candidates participate in
+- Updated cross-provider transitive collision behavior so metadata-only CurseForge candidates participate in
   the same `MaterializedArtifact` materialization/evidence path as metadata roots, avoiding
   unintended replacement of existing Modrinth metadata during verified collisions.
 - Kept artifact/JAR equivalence verification mandatory through strict declared SHA-256, verified
   materialized SHA-256, or an exact target-loader MOD ID/version set. Canonical candidate provenance
   and existing-state now participate in the evidence binding with metadata, target context, and
   artifact evidence. The shared policy applies to Add, Profiles, Template Import, and Update.
-
-## 0.2.0-rc.4 - 2026-08-02
 
 ## 0.2.0-rc.3 - 2026-08-02
 
