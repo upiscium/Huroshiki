@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Provider Artifacts
+
+- Fixed valid Packwiz-native `mode = "metadata:curseforge"` artifacts being rejected
+  for lacking `download.url`. Huroshiki now delegates this mode to the pinned
+  Packwiz Installer, verifies the produced artifact against the original declared
+  hash, normalizes the isolated verification metadata side, and continues to fail
+  closed for manual-download-only or unverifiable files.
+
 ## 0.2.0-rc.4 - 2026-08-02
 
 ### Dependency Equivalence

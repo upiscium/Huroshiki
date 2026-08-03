@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 import subprocess
 import tempfile
@@ -10,6 +11,8 @@ from unittest.mock import patch
 
 import huroshiki_core as core
 import packctl
+import provider_artifacts
+from process_runner import BoundedProcessResult
 
 
 def metadata(name: str, project_id: str, side: str = "both") -> str:
@@ -782,6 +785,95 @@ class AddTransactionTest(unittest.TestCase):
                 self.assertFalse((self.source / "mods/incoming-shared.pw.toml").exists())
                 self.assertFalse((self.source / ".huroshiki-roots.json").exists())
                 existing_path.unlink()
+
+    def test_transitive_cross_provider_curseforge_metadata_collision_preserves_existing_modrinth(self) -> None:
+        artifact_payload = b"metadata artifact for transitive collision regression"
+        artifact_md5 = hashlib.md5(artifact_payload).hexdigest()
+        existing_contents = (
+            metadata("Shared", "shared", "server")
+            .replace("update.modrinth", "update.modrinth")
+            .replace('hash-format = "sha256"', 'hash-format = "md5"')
+            .replace(f'hash = "00"', f'hash = "{artifact_md5}"')
+            .replace('filename = "shared.jar"', 'filename = "shared.jar"')
+            .encode()
+        )
+        (self.source / "mods/shared.pw.toml").write_bytes(existing_contents)
+
+        root = self.closure("root").metadata[0]
+        incoming_contents = (
+            'name = "Shared"\n'
+            'filename = "shared.jar"\n'
+            'side = "client"\n'
+            '[download]\n'
+            'hash-format = "md5"\n'
+            f'hash = "{artifact_md5}"\n'
+            'mode = "metadata:curseforge"\n'
+            '[update.curseforge]\n'
+            'project-id = 200\n'
+            'file-id = 3000\n'
+            '\n'
+        ).encode()
+        incoming = core.ResolvedMetadata(
+            ("curseforge", "200"),
+            Path("mods/shared.pw.toml"),
+            "shared.jar",
+            incoming_contents,
+            "curseforge",
+            "200",
+        )
+
+        downloads: list[str] = []
+
+        def download(
+            _url, _cancel_event, _logs, _loader, _max_bytes, *, retained_path, **_
+        ):
+            downloads.append(str(retained_path))
+            retained_path.write_bytes(artifact_payload)
+
+        run_commands: list[tuple[str, ...]] = []
+
+        def run_process(command, *, cwd, **_):
+            assert isinstance(cwd, Path)
+            result = BoundedProcessResult(0, "", "", False, False)
+            if command == ["packwiz", "refresh"]:
+                run_commands.append(tuple(command))
+                return result
+            if "--pack-folder" in command:
+                output = Path(command[command.index("--pack-folder") + 1])
+                artifact = output / "mods" / "shared.jar"
+                artifact.parent.mkdir(parents=True, exist_ok=True)
+                artifact.write_bytes(artifact_payload)
+                run_commands.append(tuple(command))
+                return result
+            raise AssertionError(f"unexpected process command: {command}")
+
+        installer = self.root / "huroshiki-installer.jar"
+        installer.touch()
+
+        with patch.dict(
+            provider_artifacts.os.environ,
+            {provider_artifacts.INSTALLER_ENV: str(installer)},
+        ), patch.object(
+            provider_artifacts,
+            "download_url_artifact",
+            side_effect=download,
+        ), patch.object(provider_artifacts, "run_bounded_process", side_effect=run_process) as run_proc:
+            core.merge_metadata_closure(
+                self.source,
+                core.ResolvedModClosure(root.identity, (root, incoming)),
+                requested_side="client",
+            )
+
+        retained = core.read_mod(self.source, Path("mods/shared.pw.toml"))
+        self.assertEqual(
+            (core.canonical_provider(retained.provider), retained.project_id),
+            ("modrinth", "shared"),
+        )
+        self.assertEqual(retained.side, "both")
+        self.assertEqual(run_proc.call_count, 4)
+        self.assertEqual(len(downloads), 1)
+        self.assertEqual(run_commands[0], ("packwiz", "refresh"))
+        self.assertEqual(run_commands[1][0], "java")
 
     def test_legacy_unknown_dependency_semantic_equivalence_preserves_existing(self) -> None:
         from dependency_equivalence import MaterializedArtifact, SemanticJarIdentity

@@ -54,15 +54,23 @@ class ReleaseMetadataTest(unittest.TestCase):
         release_notes = release_note_path.read_text(encoding="utf-8")
 
         rc4_heading = f"## {VERSION} - 2026-08-02"
+        next_release_heading = "## 0.2.0-rc.3 -"
         self.assertTrue(
             changelog.startswith(
-                f"# Changelog\n\n## Unreleased\n\n{rc4_heading}\n"
+                "# Changelog\n\n## Unreleased\n"
             ),
-            "Unreleased must remain empty before the rc.4 entry",
+            "Unreleased section is missing",
         )
-        rc4_changelog = changelog.split(rc4_heading, 1)[1].split(
-            "## 0.2.0-rc.3 -", 1
-        )[0]
+        unreleased_payload = (
+            changelog.split("## Unreleased", 1)[1]
+            .split(rc4_heading, 1)[0]
+            .strip()
+        )
+        self.assertTrue(
+            unreleased_payload.strip(),
+            "Unreleased section must not be empty",
+        )
+        rc4_changelog = changelog.split(rc4_heading, 1)[1].split(next_release_heading, 1)[0]
         self.assertTrue(release_notes.startswith(f"# Huroshiki v{VERSION}\n"))
         self.assertIn("Release date: 2026-08-02", release_notes)
         self.assertIn("github:upiscium/Huroshiki/v0.2.0-rc.4", readme)
@@ -71,35 +79,41 @@ class ReleaseMetadataTest(unittest.TestCase):
             release_notes,
         )
 
-        release_scope = f"{rc4_changelog}\n{release_notes}"
-        release_scope_words = " ".join(release_scope.split())
-        self.assertIn("legacy Packs without", release_scope_words)
+        unreleased_scope_words = " ".join(unreleased_payload.split())
+        self.assertIn("manual-download", unreleased_scope_words)
+        self.assertNotIn("legacy Packs without", unreleased_scope_words)
+
+        rc4_scope_words = " ".join(rc4_changelog.split())
+        self.assertIn("legacy Packs without", rc4_scope_words)
         for provenance in ("explicit", "dependency", "unknown"):
-            self.assertIn(provenance, release_scope_words)
-        self.assertIn("preserves the existing metadata", release_scope_words)
-        self.assertIn("does not infer or create a root manifest", release_scope_words)
-        self.assertIn("evidence binding", release_scope_words)
-        self.assertIn("unions sides", release_scope_words)
-        self.assertIn("incoming explicit root", release_scope_words)
-        self.assertIn("fails closed", release_scope_words)
+            self.assertIn(provenance, rc4_scope_words)
+        self.assertIn("preserves the existing metadata", rc4_scope_words)
+        self.assertIn("does not infer or create a root manifest", rc4_scope_words)
+        self.assertIn("evidence binding", rc4_scope_words)
+        self.assertIn("unions sides", rc4_scope_words)
+        self.assertIn("incoming explicit root", rc4_scope_words)
+        self.assertIn("fail closed", rc4_scope_words)
         for evidence in (
             "strict declared SHA-256",
             "verified materialized SHA-256",
             "target-loader MOD ID/version set",
         ):
-            self.assertIn(evidence, release_scope_words)
+            self.assertIn(evidence, rc4_scope_words)
         self.assertIn("## Known limitations", release_notes)
         self.assertIn(
             "No live network-backed CurseForge install or cross-provider artifact "
             "collapse was executed as part of release verification.",
-            release_scope_words,
+            " ".join(release_notes.split()),
         )
+        release_scope_words = " ".join((
+            f"{unreleased_payload}\n{rc4_changelog}\n{release_notes}".split()
+        ))
         self.assertIn("Packwiz-native CurseForge Install", release_notes)
         self.assertIn("no API key is required", release_notes)
         readme_words = " ".join(readme.split())
         self.assertIn("CurseForge uses Packwiz-native interactive search", readme_words)
         self.assertIn("CurseForge API key is unnecessary", readme_words)
-        excluded_release_scope = release_scope.lower()
+        excluded_release_scope = release_scope_words.lower()
         for excluded in (
             "#104",
             "#105",
