@@ -345,6 +345,26 @@ class ProviderArtifactTest(unittest.TestCase):
         ):
             self._run(candidate=candidate, process_callable=process)
 
+    def test_url_mode_manual_download_marker_is_a_generic_installer_failure(self) -> None:
+        def process(command, **kwargs):
+            if command[0] == "packwiz":
+                return BoundedProcessResult(0, "", "", False, False)
+            if command[0] == "java":
+                return BoundedProcessResult(
+                    1,
+                    "Packwiz installer output:\nThis project requires manual download",
+                    "",
+                    False,
+                    False,
+                )
+            raise AssertionError(command)
+
+        with self.assertRaisesRegex(
+            ProviderArtifactError,
+            "Packwiz Installer failed with exit code 1",
+        ):
+            self._run(process_callable=process)
+
     def test_manual_download_markers_in_success_output_do_not_fail(self) -> None:
         candidate = DependencyCandidate(
             "curseforge:12345",

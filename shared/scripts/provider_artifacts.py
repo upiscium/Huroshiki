@@ -295,6 +295,7 @@ def materialize_provider_artifact(
     algorithm = metadata.algorithm
     expected_hash = metadata.expected_hash
     contents = metadata.contents
+    manual_download_supported = metadata.mode == METADATA_CURSEFORGE_MODE
 
     root = Path(tempfile.mkdtemp(prefix="provider-artifact-", dir=workspace))
     project = root / "project"
@@ -426,7 +427,7 @@ def materialize_provider_artifact(
         _process_ok(
             install,
             "Packwiz Installer",
-            supports_manual_download=True,
+            supports_manual_download=manual_download_supported,
         )
     finally:
         if server is not None:
