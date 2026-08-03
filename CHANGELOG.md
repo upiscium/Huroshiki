@@ -2,13 +2,36 @@
 
 ## Unreleased
 
+## 0.2.0-rc.5 - 2026-08-03
+
 ### Provider Artifacts
 
 - Fixed valid Packwiz-native `mode = "metadata:curseforge"` artifacts being rejected
   for lacking `download.url`. Huroshiki now delegates this mode to the pinned
   Packwiz Installer, verifies the produced artifact against the original declared
-  hash, normalizes the isolated verification metadata side, and continues to fail
-  closed for manual-download-only or unverifiable files.
+  hash, normalizes the isolated verification metadata side, and continues to
+  fail closed for manual-download-only or unverifiable files.
+- Fixed Packwiz artifact materialization command construction to invoke the pinned
+  Packwiz Installer JAR via explicit class entrypoint:
+
+  ```text
+  java -cp <packwiz-installer.jar> link.infra.packwiz.installer.Main
+  ```
+
+  This avoids `java -jar` and the upstream `RequiresBootstrap` manifest entrypoint,
+  so runtime behavior no longer depends on a bundled bootstrapper and never patches,
+  rewrites, or replaces the pinned installer JAR. Manual-download-only failures
+  remain scoped to failed
+  metadata-mode runs, and installer diagnostics are now surfaced with bounded tails
+  plus the failed artifact identity.
+- Added a regression in metadata/cross-provider artifact workflows that
+  preserves explicit command-line identity under `metadata:curseforge` even when the
+  installer JAR manifest reports `RequiresBootstrap`.
+- Issue #122 live investigation verified this path against CurseForge project
+  `309927` and file `6529130` in a manual live investigation.
+
+- Release metadata verification for this PR is deterministic-only and does not
+  rerun that live call.
 
 ## 0.2.0-rc.4 - 2026-08-02
 

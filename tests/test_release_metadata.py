@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
+import re
 
 from huroshiki_version import VERSION
 
@@ -16,7 +17,7 @@ SCRIPTS = ROOT / "shared" / "scripts"
 class ReleaseMetadataTest(unittest.TestCase):
     def test_runtime_version_source(self) -> None:
         self.assertRegex(VERSION, r"^[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$")
-        self.assertEqual(VERSION, "0.2.0-rc.4")
+        self.assertEqual(VERSION, "0.2.0-rc.5")
         self.assertEqual(
             (SCRIPTS / "VERSION").read_text(encoding="utf-8").strip(),
             VERSION,
@@ -46,6 +47,13 @@ class ReleaseMetadataTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
 
+    def _extract_release_block(self, changelog: str, heading: str) -> str:
+        pattern = rf"## {re.escape(heading)}\n(?:(?:.|\n)*?)(?=\n## [0-9]|\Z)"
+        match = re.search(pattern, changelog, re.MULTILINE)
+        self.assertIsNotNone(match, f"missing release heading: {heading}")
+        assert match is not None
+        return match.group(0)
+
     def test_release_documents_match_version(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -53,8 +61,7 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertTrue(release_note_path.is_file())
         release_notes = release_note_path.read_text(encoding="utf-8")
 
-        rc4_heading = f"## {VERSION} - 2026-08-02"
-        next_release_heading = "## 0.2.0-rc.3 -"
+        rc5_heading = f"## {VERSION} - 2026-08-03"
         self.assertTrue(
             changelog.startswith(
                 "# Changelog\n\n## Unreleased\n"
@@ -63,25 +70,103 @@ class ReleaseMetadataTest(unittest.TestCase):
         )
         unreleased_payload = (
             changelog.split("## Unreleased", 1)[1]
-            .split(rc4_heading, 1)[0]
+            .split(rc5_heading, 1)[0]
             .strip()
         )
         self.assertTrue(
-            unreleased_payload.strip(),
-            "Unreleased section must not be empty",
+            not unreleased_payload.strip(),
+            "Unreleased section should be empty",
         )
-        rc4_changelog = changelog.split(rc4_heading, 1)[1].split(next_release_heading, 1)[0]
+        rc5_changelog = self._extract_release_block(changelog, f"{VERSION} - 2026-08-03").split("\n", 1)[1]
+        rc4_changelog = self._extract_release_block(changelog, "0.2.0-rc.4 - 2026-08-02").split("\n", 1)[1]
         self.assertTrue(release_notes.startswith(f"# Huroshiki v{VERSION}\n"))
-        self.assertIn("Release date: 2026-08-02", release_notes)
-        self.assertIn("github:upiscium/Huroshiki/v0.2.0-rc.4", readme)
+        self.assertIn("Release date: 2026-08-03", release_notes)
+        self.assertIn("github:upiscium/Huroshiki/v0.2.0-rc.5", readme)
         self.assertIn(
-            "compare/v0.2.0-rc.3...v0.2.0-rc.4",
+            "compare/v0.2.0-rc.4...v0.2.0-rc.5",
             release_notes,
         )
 
-        unreleased_scope_words = " ".join(unreleased_payload.split())
-        self.assertIn("manual-download", unreleased_scope_words)
-        self.assertNotIn("legacy Packs without", unreleased_scope_words)
+        release_scope_words = " ".join(
+            (f"{unreleased_payload}\n{rc5_changelog}\n{release_notes}").split()
+        )
+        release_scope_words_lower = release_scope_words.lower()
+
+        self.assertIn("metadata:curseforge", release_scope_words_lower)
+        self.assertIn("download.url", release_scope_words_lower)
+        self.assertIn("packwiz installer", release_scope_words_lower)
+        self.assertIn("java -cp", release_scope_words)
+        self.assertIn("link.infra.packwiz.installer.Main", release_scope_words)
+        self.assertIn("link.infra.packwiz.installer.main", release_scope_words_lower)
+        self.assertIn("requiresbootstrap", release_scope_words_lower)
+        self.assertIn("bootstrap updater", release_scope_words_lower)
+        self.assertIn("runtime does not patch", release_scope_words_lower)
+        self.assertIn("rewrites, or", release_scope_words_lower)
+        self.assertIn("replace", release_scope_words_lower)
+        self.assertIn("bounded process-output", release_scope_words_lower)
+        self.assertIn("artifact identity", release_scope_words_lower)
+        self.assertIn("packwiz-installer.jar", release_scope_words)
+        self.assertIn("declared hash", release_scope_words_lower)
+        self.assertIn("side = \"both\"", release_scope_words)
+        self.assertIn("manual-download", release_scope_words)
+        self.assertIn("fail closed", release_scope_words_lower)
+        self.assertIn(
+            "no live network-backed curseforge metadata materialization",
+            release_scope_words_lower,
+        )
+        self.assertIn("positive numeric project id", release_scope_words_lower)
+        self.assertIn("positive file id", release_scope_words_lower)
+        self.assertIn("candidate project identity", release_scope_words_lower)
+        self.assertIn("CurseForge project `309927`", release_scope_words)
+        self.assertIn("file `6529130`", release_scope_words)
+        self.assertIn("release metadata verification for this pr is deterministic-only", release_scope_words_lower)
+        self.assertIn("live investigation", release_scope_words_lower)
+        self.assertIn("lifecycle-integrity failures retain priority", release_scope_words_lower)
+        lifecycle_priority = (
+            "termination incomplete > orphaned descendants > cancellation > deadline >"
+            " manual-download classification > generic nonzero process-output diagnostics"
+        )
+        self.assertIn(lifecycle_priority, release_scope_words_lower)
+        self.assertIn(
+            "lifecycle-integrity failures > manual-download classification >"
+            " generic process-output diagnostics",
+            release_scope_words_lower,
+        )
+        old_head = "bf41b5b15fabcae1eec01a6944105b8349e9e5dc"
+        self.assertNotIn(old_head, release_notes)
+        scope_audit_command = (
+            "git diff --name-only"
+            " 01c445b2bed6978ff86dfa1db377bccb270eb63e...HEAD"
+        ).strip()
+        self.assertIn(scope_audit_command, release_notes)
+        self.assertNotIn(f"01c445b2bed6978ff86dfa1db377bccb270eb63e...{old_head}", release_notes)
+
+        self.assertIn("## Known limitations", release_notes)
+        self.assertIn(
+            "no api key",
+            release_scope_words_lower,
+        )
+        self.assertIn("bounded direct-download", release_scope_words_lower)
+        self.assertIn("manifest", release_scope_words_lower)
+        self.assertIn("loopback", release_scope_words_lower)
+        self.assertIn("rewrite", release_scope_words_lower)
+        self.assertIn("installer jar", release_scope_words_lower)
+        self.assertIn("sha-256", release_scope_words_lower)
+        self.assertIn("artifact", release_scope_words_lower)
+        self.assertIn("Packwiz Installer entrypoint and bootstrap handling", release_notes)
+        self.assertIn("git diff --check", release_scope_words_lower)
+        self.assertIn("5-file scope audit", release_scope_words_lower)
+        self.assertIn("actionlint", release_scope_words_lower)
+        self.assertIn("packctl validate", release_scope_words_lower)
+
+        priority_index = release_scope_words_lower.find("lifecycle-integrity failures")
+        self.assertNotEqual(priority_index, -1)
+        manual_index = release_scope_words_lower.find("manual-download classification", priority_index)
+        generic_index = release_scope_words_lower.find("generic nonzero process-output diagnostics", priority_index)
+        self.assertNotEqual(manual_index, -1)
+        self.assertNotEqual(generic_index, -1)
+        self.assertLess(priority_index, manual_index)
+        self.assertLess(manual_index, generic_index)
 
         rc4_scope_words = " ".join(rc4_changelog.split())
         self.assertIn("legacy Packs without", rc4_scope_words)
@@ -101,13 +186,10 @@ class ReleaseMetadataTest(unittest.TestCase):
             self.assertIn(evidence, rc4_scope_words)
         self.assertIn("## Known limitations", release_notes)
         self.assertIn(
-            "No live network-backed CurseForge install or cross-provider artifact "
-            "collapse was executed as part of release verification.",
+            "No live network-backed CurseForge metadata materialization was performed in release "
+            "verification.",
             " ".join(release_notes.split()),
         )
-        release_scope_words = " ".join((
-            f"{unreleased_payload}\n{rc4_changelog}\n{release_notes}".split()
-        ))
         self.assertIn("Packwiz-native CurseForge Install", release_notes)
         self.assertIn("no API key is required", release_notes)
         readme_words = " ".join(readme.split())
