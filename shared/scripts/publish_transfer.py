@@ -440,7 +440,14 @@ def process_transfer(header):
                 discard_exact(sys.stdin.buffer, frame_size)
             if sys.stdin.buffer.read(1):
                 raise RuntimeError("trailing publish transfer data")
-            return {"ok": True, "status": "reused", "generation_id": generation_name}
+            return {
+                "ok": True,
+                "status": "reused",
+                "operation_id": header["operation_id"],
+                "manifest_digest": header["manifest_digest"],
+                "target_config_digest": header["target_config_digest"],
+                "generation_id": generation_name,
+            }
         try:
             os.mkdir(stage_name, 0o700, dir_fd=generations_fd)
         except FileExistsError:
@@ -472,7 +479,14 @@ def process_transfer(header):
         finally:
             os.close(stage)
         os.rename(stage_name, generation_name, src_dir_fd=generations_fd, dst_dir_fd=generations_fd)
-        return {"ok": True, "status": "committed", "generation_id": generation_name}
+        return {
+            "ok": True,
+            "status": "committed",
+            "operation_id": header["operation_id"],
+            "manifest_digest": header["manifest_digest"],
+            "target_config_digest": header["target_config_digest"],
+            "generation_id": generation_name,
+        }
     except BaseException:
         try:
             generations = open_child_dir(root, "generations", create=False)
@@ -509,7 +523,14 @@ def process_status(header):
                     verify_tree(final, expected)
                 finally:
                     os.close(final)
-                return {"ok": True, "status": "committed", "generation_id": header["generation_id"]}
+                return {
+                    "ok": True,
+                    "status": "committed",
+                    "operation_id": header["operation_id"],
+                    "manifest_digest": header["manifest_digest"],
+                    "target_config_digest": header["target_config_digest"],
+                    "generation_id": header["generation_id"],
+                }
             stage_name = ".huroshiki-stage-" + header["operation_id"]
             try:
                 os.stat(stage_name, dir_fd=generations, follow_symlinks=False)
@@ -1188,6 +1209,23 @@ def _result_files(plan: PublishTransferPlan) -> tuple[PublishStagedFile, ...]:
     )
 
 
+def _validate_committed_response(
+    plan: PublishTransferPlan,
+    response: dict[str, object],
+) -> None:
+    expected = {
+        "operation_id": plan.operation_id,
+        "manifest_digest": plan.manifest_digest,
+        "target_config_digest": plan.target_config_digest,
+        "generation_id": plan.generation_id,
+    }
+    for key, value in expected.items():
+        if response.get(key) != value:
+            raise PublishTransferExecutionError(
+                f"remote helper response does not bind to transfer {key}"
+            )
+
+
 def execute_publish_transfer(
     plan: PublishTransferPlan,
     *,
@@ -1236,6 +1274,7 @@ def execute_publish_transfer(
             status = response.get("status")
             if status not in {"committed", "reused"}:
                 raise PublishTransferExecutionError("remote helper did not commit a generation")
+            _validate_committed_response(plan, response)
             reused = status == "reused"
             staged = PublishStagedGeneration(
                 plan.manifest_digest,
@@ -1289,6 +1328,7 @@ def execute_publish_transfer(
                     )
                 raise PublishTransferExecutionError("Publish transfer was not committed")
             if status == "committed":
+                _validate_committed_response(plan, status_response)
                 with plan._lock:
                     plan._state = "executed"
                 return PublishStagedGeneration(

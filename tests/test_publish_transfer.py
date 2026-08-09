@@ -233,6 +233,9 @@ class PublishTransferTest(PackPublishManifestTest):
         committed = json.dumps({
             "ok": True,
             "status": "committed",
+            "operation_id": plan.operation_id,
+            "manifest_digest": plan.manifest_digest,
+            "target_config_digest": plan.target_config_digest,
             "generation_id": plan.generation_id,
         })
         responses = iter([
