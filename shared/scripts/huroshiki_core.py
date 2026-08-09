@@ -201,6 +201,21 @@ from pack_publish import (
     PublishWarning,
     plan_pack_publish_manifest,
 )
+from publish_target import (
+    LEGACY_SERVER_ID,
+    PUBLISH_RESERVED_NAMES,
+    PUBLISH_RESERVED_PREFIX,
+    PublishRemoteTarget,
+    PublishRestartTarget,
+    PublishSshEndpoint,
+    PublishTargetError,
+    compute_publish_remote_target_digest,
+    is_publish_reserved_child,
+    parse_publish_ssh_endpoint,
+    publish_remote_target_from_legacy_settings,
+    validate_publish_remote_path,
+    validate_publish_ssh_port,
+)
 
 ROOT = packctl.ROOT
 PACKS = packctl.PACKS
@@ -298,6 +313,32 @@ def deployment_settings(key: str) -> DeploymentSettings:
     try:
         return packctl.deployment_settings(project_id)
     except packctl.ConfigError as error:
+        raise HuroshikiError(str(error)) from error
+
+
+def resolve_publish_remote_target(
+    pack_id: str,
+    *,
+    server_id: str | None = None,
+    remote_path: str | None = None,
+) -> PublishRemoteTarget:
+    """Resolve the current legacy Pack settings into a transport-neutral target."""
+
+    if server_id is not None:
+        raise HuroshikiError(
+            "Named Publish server profiles are not implemented yet"
+        )
+    try:
+        settings = packctl.deployment_settings(pack_id)
+        return publish_remote_target_from_legacy_settings(
+            rsync_target=settings.rsync_target,
+            ssh_host=settings.ssh_host,
+            stack_dir=settings.stack_dir,
+            service=settings.service,
+            server_id=LEGACY_SERVER_ID,
+            remote_path=remote_path,
+        )
+    except (packctl.ConfigError, PublishTargetError) as error:
         raise HuroshikiError(str(error)) from error
 
 
