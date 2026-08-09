@@ -138,7 +138,7 @@ class TemplateCompositionInteractionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(screen.selected_template_ids, ["alpha", "beta"])
                 self.assertIn("2", str(screen.query_one("#template-selected-count", Static).content))
 
-                await pilot.press("q")
+                await pilot.press("c")
                 await pilot.pause()
                 self.assertEqual(screen.selected_template_ids, [])
 
