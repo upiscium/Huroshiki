@@ -45,6 +45,7 @@ ROOT = resolve_root(_bootstrap_args.root)
 set_import_root(ROOT)
 
 try:
+    from rich.text import Text
     from textual import events, on
     from textual.app import App, ComposeResult
     from textual.binding import Binding
@@ -84,6 +85,10 @@ CONTENT_DISCARD_TIMEOUT_SECONDS = 10.0
 
 def enabled_marker(enabled: bool) -> str:
     return "+" if enabled else "-"
+
+
+def checkbox_marker(selected: bool) -> Text:
+    return Text("[x]" if selected else "[ ]")
 
 
 def mod_side_marker(mod: core.ModInfo, enabled: bool) -> str:
@@ -3979,7 +3984,7 @@ class TemplateImportConflictScreen(BaseScreen):
                     else candidate.filename or "-"
                 )
             table.add_row(
-                "[x]" if selected else "[ ]",
+                checkbox_marker(selected),
                 label,
                 conflict.key,
                 option.option_key,
@@ -4533,7 +4538,7 @@ class TemplateCandidateScreen(BaseScreen):
         table.clear()
         for template in self.templates:
             table.add_row(
-                "[x]" if template.project_id in self.selected_template_ids else "[ ]",
+                checkbox_marker(template.project_id in self.selected_template_ids),
                 template.display_name,
                 template.project_id,
                 template.minecraft,
@@ -4657,7 +4662,7 @@ class TemplateConflictScreen(BaseScreen):
         table.clear()
         for conflict, candidate in self.rows:
             table.add_row(
-                "[x]" if candidate.candidate_key in self.selected[conflict.key] else "[ ]",
+                checkbox_marker(candidate.candidate_key in self.selected[conflict.key]),
                 candidate.name,
                 " -> ".join(candidate.template_ids),
                 candidate.provider,
@@ -5631,7 +5636,7 @@ class InstalledModsScreen(ProjectChildScreen, FilterListScreen):
         table.clear()
         for mod in self.visible_mods:
             table.add_row(
-                "[*]" if mod.selected else "[ ]",
+                checkbox_marker(mod.selected),
                 mod.name,
                 mod_side_marker(mod, mod.client),
                 mod_side_marker(mod, mod.server),
@@ -5930,7 +5935,7 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
         table.clear()
         for candidate in self.candidates:
             table.add_row(
-                "[*]" if candidate.relative_path in self.selected_paths else "[ ]",
+                checkbox_marker(candidate.relative_path in self.selected_paths),
                 candidate.name,
                 candidate.provider,
                 self._version_label(candidate.current_version, candidate.current_file_id),

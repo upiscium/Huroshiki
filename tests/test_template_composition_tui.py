@@ -126,7 +126,12 @@ class TemplateCompositionInteractionTest(unittest.IsolatedAsyncioTestCase):
                 screen = app.screen
                 table = screen.query_one("#template-candidate-table", DataTable)
                 self.assertEqual(table.row_count, 3)
-                self.assertTrue(all(row[0] == "[ ]" for row in (table.get_row_at(i) for i in range(3))))
+                self.assertTrue(
+                    all(
+                        row[0].plain == "[ ]"
+                        for row in (table.get_row_at(i) for i in range(3))
+                    )
+                )
 
                 await pilot.press("space", "j", "space")
                 await pilot.pause()
