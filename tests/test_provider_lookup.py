@@ -24,6 +24,33 @@ class FakeResponse(BytesIO):
 
 
 class ProviderLookupHelperTest(unittest.TestCase):
+    def test_normalize_description_collapses_display_whitespace(self) -> None:
+        cases = {
+            "hello": "hello",
+            "": "",
+            "  hello  ": "hello",
+            "hello   world": "hello world",
+            "hello\tworld": "hello world",
+            "hello\nworld": "hello world",
+            "hello\rworld": "hello world",
+            "hello\r\nworld": "hello world",
+            "one\n\n two\tthree": "one two three",
+            # str.split() intentionally applies the same policy to Unicode
+            # whitespace while the ASCII control check remains explicit.
+            "hello\u00a0\u2003world": "hello world",
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=repr(value)):
+                self.assertEqual(provider_lookup.normalize_description(value), expected)
+
+    def test_normalize_description_rejects_unsafe_controls(self) -> None:
+        for control in ("\x00", "\x01", "\x07", "\x1b", "\x1f", "\x7f"):
+            with self.subTest(control=repr(control)):
+                with self.assertRaisesRegex(
+                    provider_lookup.LookupError, "unsafe control characters"
+                ):
+                    provider_lookup.normalize_description(f"before{control}after")
+
     def test_modrinth_resolve_accepts_id_slug_and_url(self) -> None:
         calls = []
 
@@ -79,6 +106,63 @@ class ProviderLookupHelperTest(unittest.TestCase):
         self.assertIn(["versions:1.21.1"], facets)
         self.assertIn(["categories:neoforge"], facets)
         self.assertEqual(result["results"][0]["project_id"], "one")
+
+    def test_modrinth_search_normalizes_multiline_description(self) -> None:
+        def open_request(request, *, timeout):
+            return FakeResponse(
+                json.dumps(
+                    {
+                        "hits": [
+                            {
+                                "project_id": "one",
+                                "slug": "first",
+                                "title": "First",
+                                "description": "First line\nSecond\tline\r\nThird",
+                                "author": "author",
+                            }
+                        ]
+                    }
+                ).encode()
+            )
+
+        with patch.object(provider_lookup, "urlopen", side_effect=open_request):
+            result = provider_lookup.search_modrinth(
+                "query", minecraft="1.21.1", loader="fabric", limit=20
+            )
+        self.assertEqual(
+            result["results"][0]["description"],
+            "First line Second line Third",
+        )
+
+    def test_modrinth_search_multiline_hit_does_not_fail_other_results(self) -> None:
+        descriptions = ["normal description", "multiline\ndescription", "another"]
+
+        def open_request(request, *, timeout):
+            return FakeResponse(
+                json.dumps(
+                    {
+                        "hits": [
+                            {
+                                "project_id": str(index),
+                                "slug": f"project-{index}",
+                                "title": f"Project {index}",
+                                "description": description,
+                                "author": "author",
+                            }
+                            for index, description in enumerate(descriptions)
+                        ]
+                    }
+                ).encode()
+            )
+
+        with patch.object(provider_lookup, "urlopen", side_effect=open_request):
+            result = provider_lookup.search_modrinth(
+                "query", minecraft="1.21.1", loader="fabric", limit=20
+            )
+        self.assertEqual(
+            [item["description"] for item in result["results"]],
+            ["normal description", "multiline description", "another"],
+        )
 
     def test_strict_json_and_response_limits(self) -> None:
         invalid_payloads = (
@@ -204,6 +288,68 @@ class ProviderLookupCoreTest(unittest.TestCase):
                 core.search_provider_projects(
                     "modrinth", "same", minecraft="1.21.1", loader="neoforge"
                 )
+
+    def test_search_accepts_normalized_description_but_rejects_raw_newline(self) -> None:
+        payload = {
+            "provider": "modrinth",
+            "results": [
+                {
+                    "project_id": "one",
+                    "slug": "first",
+                    "title": "First",
+                    "description": "First line Second line",
+                    "author": "author",
+                }
+            ],
+        }
+        with patch.object(
+            core, "run_resolver_process", side_effect=self.responder(payload)
+        ):
+            projects = core.search_provider_projects(
+                "modrinth", "first", minecraft="1.21.1", loader="neoforge"
+            )
+        self.assertEqual(projects[0].description, "First line Second line")
+
+        payload["results"][0]["description"] = "First line\nSecond line"
+        with patch.object(
+            core, "run_resolver_process", side_effect=self.responder(payload)
+        ):
+            with self.assertRaisesRegex(
+                core.HuroshikiError,
+                "Provider lookup returned control characters in description",
+            ):
+                core.search_provider_projects(
+                    "modrinth", "first", minecraft="1.21.1", loader="neoforge"
+                )
+
+    def test_search_identity_fields_remain_strict(self) -> None:
+        base_result = {
+            "project_id": "one",
+            "slug": "first",
+            "title": "First",
+            "description": "description",
+            "author": "author",
+        }
+        for field, value, message in (
+            ("project_id", "bad\nid", "control characters in project_id"),
+            ("slug", "first\tsecond", "control characters in slug"),
+            ("title", "First\nSecond", "control characters in title"),
+            ("author", "author\x1b", "control characters in author"),
+        ):
+            with self.subTest(field=field):
+                result = dict(base_result)
+                result[field] = value
+                payload = {"provider": "modrinth", "results": [result]}
+                with patch.object(
+                    core, "run_resolver_process", side_effect=self.responder(payload)
+                ):
+                    with self.assertRaisesRegex(core.HuroshikiError, message):
+                        core.search_provider_projects(
+                            "modrinth",
+                            "first",
+                            minecraft="1.21.1",
+                            loader="neoforge",
+                        )
 
     def test_lookup_process_and_protocol_failures(self) -> None:
         valid = {

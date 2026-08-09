@@ -97,6 +97,17 @@ def optional_text(record: object, key: str) -> str:
     return value
 
 
+def normalize_description(value: str) -> str:
+    """Validate and collapse display-only description whitespace to one line."""
+    if any(
+        (ord(character) < 32 and character not in "\t\n\r")
+        or ord(character) == 127
+        for character in value
+    ):
+        raise LookupError("Provider description contains unsafe control characters")
+    return " ".join(value.split())
+
+
 def resolve_modrinth(selector: str) -> dict[str, str]:
     reference = modrinth_project_reference(selector)
     record = request_json(f"{API_ROOT}/project/{quote(reference, safe='')}")
@@ -142,7 +153,9 @@ def search_modrinth(
                 "project_id": required_text(hit, "project_id"),
                 "slug": required_text(hit, "slug"),
                 "title": required_text(hit, "title"),
-                "description": optional_text(hit, "description"),
+                "description": normalize_description(
+                    optional_text(hit, "description")
+                ),
                 "author": optional_text(hit, "author"),
             }
         )
