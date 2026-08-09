@@ -6225,15 +6225,29 @@ def _restart_confirmation(
 def prepare_deploy_preview(
     project_key_value: str,
     action: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> ProjectDeployPreview:
     kind, project_id = split_project_key(project_key_value)
     if kind != "pack" or action not in {"deploy", "publish"}:
         raise HuroshikiError(f"Deploy preview is not available for {action}")
     try:
         with packctl.ProjectLock(project_key_value, f"{action} preview"):
-            if packctl._build_pack(project_id) != 0:
+            if (
+                packctl._build_pack(
+                    project_id,
+                    cancel_event=cancel_event,
+                    deadline=deadline,
+                )
+                != 0
+            ):
                 raise HuroshikiError("Build failed; deploy preview was not created")
-            preview = packctl._deploy_preview(project_id)
+            preview = packctl._deploy_preview(
+                project_id,
+                cancel_event=cancel_event,
+                deadline=deadline,
+            )
             restart_target = (
                 packctl.minecraft_server_target(project_id)
                 if action == "publish"
@@ -6266,6 +6280,9 @@ def run_project_action(
     project_key_value: str,
     action: str,
     confirmation: tuple[str, ...] | ProjectDeployPreview | None = None,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> int:
     kind, project_id = split_project_key(project_key_value)
     ctl = [sys.executable, str(SCRIPTS / "packctl.py")]
@@ -6324,6 +6341,8 @@ def run_project_action(
                     expected_target=deploy_confirmation.target,
                     expected_dist_digest=deploy_confirmation.dist_digest,
                     snapshot=snapshot,
+                    cancel_event=cancel_event,
+                    deadline=deadline,
                 )
                 if result != 0 or action == "deploy":
                     return result

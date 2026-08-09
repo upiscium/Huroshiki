@@ -30,6 +30,16 @@ class RsyncTargetParts:
     path: str
 
 
+_RSYNC_CONNECT_TIMEOUT_SECONDS = 10
+
+
+def rsync_rsh_command() -> str:
+    return (
+        "ssh -o BatchMode=yes -o ConnectTimeout="
+        f"{_RSYNC_CONNECT_TIMEOUT_SECONDS}"
+    )
+
+
 _RSYNC_TARGET_RE = re.compile(
     r"(?:(?P<user>[A-Za-z0-9][A-Za-z0-9._-]*)@)?"
     r"(?P<host>[A-Za-z0-9][A-Za-z0-9._-]*|\[[0-9A-Fa-f:.]+\])"
@@ -57,7 +67,7 @@ def distribution_digest(dist: Path) -> str:
 
 def rsync_deploy_command(dist: Path, target: str, *, dry_run: bool) -> list[str]:
     validate_rsync_target(target)
-    command = ["rsync", "-av", "--delete"]
+    command = ["rsync", "-av", "--delete", "-e", rsync_rsh_command()]
     if dry_run:
         command.extend(("--dry-run", "--itemize-changes"))
     command.extend(("--", f"{dist}/", target.rstrip("/") + "/"))
