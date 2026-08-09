@@ -92,9 +92,10 @@
             test -f ${huroshiki}/lib/huroshiki/deploy_support.py
             test -f ${huroshiki}/lib/huroshiki/pack_publish.py
             test -f ${huroshiki}/lib/huroshiki/pack_snapshot_io.py
-            test -f ${huroshiki}/lib/huroshiki/publish_target.py
-            test -f ${huroshiki}/lib/huroshiki/publish_transfer.py
-            test -f ${huroshiki}/lib/huroshiki/url_artifacts.py
+             test -f ${huroshiki}/lib/huroshiki/publish_target.py
+             test -f ${huroshiki}/lib/huroshiki/publish_transfer.py
+             test -f ${huroshiki}/lib/huroshiki/publish_activation.py
+             test -f ${huroshiki}/lib/huroshiki/url_artifacts.py
             test -f ${huroshiki}/lib/huroshiki/project_locks.py
             test -f ${huroshiki}/lib/huroshiki/pack_migration.py
             test -f ${huroshiki}/lib/huroshiki/pack_migration_resolution.py

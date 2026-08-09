@@ -19,6 +19,7 @@ import struct
 import tempfile
 import threading
 import time
+import tomllib
 from typing import Callable, Literal
 from uuid import uuid4
 import shlex
@@ -193,22 +194,27 @@ _MAX_HEADER_BYTES = 16 * 1024 * 1024
 _MAX_FILES = 100_000
 _MAX_FILE_BYTES = 512 * 1024 * 1024
 _MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_DESCRIPTOR_BYTES = 64 * 1024 * 1024
 _FRAME_HEADER = b"HUROSHIKI-PUBLISH-TRANSFER\x00"
 _FRAME_VERSION = 1
 _CHUNK = 1024 * 1024
 _D_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _F_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 _F_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+PublishRemoteRequest = Literal["transfer", "status", "cleanup", "verify"]
 
 
 def _remote_helper_source() -> str:
-    return r'''import ctypes, errno, fcntl, hashlib, json, os, re, stat, struct, sys, unicodedata
+    return r'''import ctypes, errno, fcntl, hashlib, json, os, re, stat, struct, sys, tomllib, unicodedata
 
 MAGIC = b"HUROSHIKI-PUBLISH-TRANSFER\x00"
 VERSION = 1
 MAX_HEADER = 16 * 1024 * 1024
 MAX_FILE_BYTES = 512 * 1024 * 1024
 MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+MAX_DESCRIPTOR_BYTES = 64 * 1024 * 1024
+MAX_INDEX_RECORDS = 100000
+HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 CHUNK = 1024 * 1024
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -423,6 +429,7 @@ def verify_tree(root, expected):
     walk(root, "")
     if set(found) != set(expected):
         raise RuntimeError("staging tree contains an unexpected file")
+    verified = {}
     for path, (parts, size, digest, mode) in expected.items():
         metadata = found[path]
         if metadata.st_size != size or stat.S_IMODE(metadata.st_mode) != mode:
@@ -439,9 +446,128 @@ def verify_tree(root, expected):
                 actual.update(chunk)
             if actual.hexdigest() != digest:
                 raise RuntimeError("staged file digest mismatch")
+            verified[path] = (size, digest, mode)
         finally:
             os.close(fd)
             close_owned(root, parent, owned)
+    return verified
+
+def read_generation_file(root, path):
+    parts = validate_relative(path)
+    parent, owned = open_relative_dir(root, parts[:-1], create=False)
+    fd = os.open(parts[-1], READ_FLAGS, dir_fd=parent)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RuntimeError("semantic descriptor is not a regular file")
+        if metadata.st_size > MAX_DESCRIPTOR_BYTES:
+            raise RuntimeError("semantic descriptor exceeds the supported limit")
+        chunks = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(fd, min(CHUNK, remaining))
+            if not chunk:
+                raise RuntimeError("semantic descriptor was truncated")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+        close_owned(root, parent, owned)
+
+def semantic_file_map(header):
+    files = header.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("invalid semantic publication file list")
+    result = {}
+    for item in files:
+        if not isinstance(item, dict):
+            raise RuntimeError("invalid semantic publication file descriptor")
+        path = item.get("path")
+        source_kind = item.get("source_kind")
+        if not isinstance(path, str) or not isinstance(source_kind, str):
+            raise RuntimeError("semantic publication file source is missing")
+        validate_relative(path)
+        if source_kind not in {"packwiz", "content", "generated"}:
+            raise RuntimeError("unsupported semantic publication source")
+        if path in result:
+            raise RuntimeError("duplicate semantic publication file")
+        result[path] = source_kind
+    return result
+
+def verify_semantics(header, generation, expected, verified):
+    semantic_files = semantic_file_map(header)
+    if set(semantic_files) != set(expected):
+        raise RuntimeError("semantic file set does not match the manifest")
+    if semantic_files.get("pack.toml") != "generated" or semantic_files.get("index.toml") != "generated":
+        raise RuntimeError("semantic descriptors must be generated manifest files")
+    target_side = header.get("target_side")
+    minecraft = header.get("minecraft_version")
+    loader = header.get("loader")
+    loader_version = header.get("loader_version")
+    loader_names = header.get("loader_names")
+    if (
+        target_side not in {"client", "server"}
+        or not isinstance(minecraft, str) or not minecraft
+        or not isinstance(loader, str) or not loader
+        or not isinstance(loader_version, str) or not loader_version
+        or not isinstance(loader_names, list)
+        or any(not isinstance(name, str) or not name for name in loader_names)
+        or len(set(loader_names)) != len(loader_names)
+    ):
+        raise RuntimeError("semantic publication metadata is invalid")
+    pack_bytes = read_generation_file(generation, "pack.toml")
+    index_bytes = read_generation_file(generation, "index.toml")
+    try:
+        pack = tomllib.loads(pack_bytes.decode("utf-8"))
+        index = tomllib.loads(index_bytes.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError(f"invalid remote Packwiz TOML: {error}") from error
+    versions = pack.get("versions")
+    if not isinstance(versions, dict) or versions.get("minecraft") != minecraft:
+        raise RuntimeError("remote pack.toml Minecraft version does not match manifest")
+    active_loaders = [name for name in loader_names if name in versions]
+    if active_loaders != [loader] or versions.get(loader) != loader_version:
+        raise RuntimeError("remote pack.toml loader tuple does not match manifest")
+    pack_index = pack.get("index")
+    index_digest = hashlib.sha256(index_bytes).hexdigest()
+    if (
+        not isinstance(pack_index, dict)
+        or pack_index.get("file") != "index.toml"
+        or pack_index.get("hash-format") != "sha256"
+        or pack_index.get("hash") != index_digest
+    ):
+        raise RuntimeError("remote pack.toml index reference is invalid")
+    records = index.get("files")
+    if index.get("hash-format") != "sha256" or not isinstance(records, list) or len(records) > MAX_INDEX_RECORDS:
+        raise RuntimeError("remote index.toml structure is invalid")
+    expected_records = {
+        path: path.endswith(".pw.toml")
+        for path, source_kind in semantic_files.items()
+        if source_kind == "packwiz" and path not in {"pack.toml", "index.toml"}
+    }
+    actual_records = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise RuntimeError("remote index.toml contains an invalid record")
+        if set(record) - {"file", "hash", "metafile"}:
+            raise RuntimeError("remote index.toml contains unsupported record fields")
+        path = record.get("file")
+        digest = record.get("hash")
+        if not isinstance(path, str) or not isinstance(digest, str) or not HEX_DIGEST_RE.fullmatch(digest):
+            raise RuntimeError("remote index.toml contains an invalid record")
+        validate_relative(path)
+        if path in actual_records or path not in expected_records:
+            raise RuntimeError("remote index.toml contains an unexpected path")
+        metafile = record.get("metafile", False)
+        if not isinstance(metafile, bool) or metafile != expected_records[path]:
+            raise RuntimeError("remote index.toml metafile semantics are invalid")
+        if verified[path][1] != digest:
+            raise RuntimeError("remote index.toml file digest does not match generation")
+        actual_records[path] = metafile
+    if actual_records != expected_records:
+        raise RuntimeError("remote index.toml records do not match manifest semantics")
+    return hashlib.sha256(pack_bytes).hexdigest(), index_digest
 
 def lock_root(root):
     fd = os.open(".huroshiki-lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=root)
@@ -640,6 +766,42 @@ def process_status(header):
         os.close(lock)
         os.close(root)
 
+def process_verify(header):
+    root = open_absolute(header["publication_root"], create=False)
+    lock = lock_root(root)
+    try:
+        generations = open_child_dir(root, "generations", create=False)
+        try:
+            expected = expected_map(header)
+            generation = os.open(header["generation_id"], DIR_FLAGS, dir_fd=generations)
+            try:
+                verified = verify_tree(generation, expected)
+                pack_digest, index_digest = verify_semantics(
+                    header,
+                    generation,
+                    expected,
+                    verified,
+                )
+            finally:
+                os.close(generation)
+            return {
+                "ok": True,
+                "request": "verify",
+                "status": "verified",
+                "operation_id": header["operation_id"],
+                "manifest_digest": header["manifest_digest"],
+                "target_config_digest": header["target_config_digest"],
+                "generation_id": header["generation_id"],
+                "pack_toml_sha256": pack_digest,
+                "index_toml_sha256": index_digest,
+            }
+        finally:
+            os.close(generations)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
+        os.close(root)
+
 def process_cleanup(header):
     root = open_absolute(header["publication_root"], create=False)
     lock = lock_root(root)
@@ -678,6 +840,8 @@ def main():
             send(process_transfer(header))
         elif request == "status":
             send(process_status(header))
+        elif request == "verify":
+            send(process_verify(header))
         elif request == "cleanup":
             send(process_cleanup(header))
         else:
@@ -1181,31 +1345,68 @@ def _ssh_command(target: PublishRemoteTarget) -> list[str]:
 
 
 def _header(
-    request: Literal["transfer", "status", "cleanup"],
+    request: PublishRemoteRequest,
     plan: PublishTransferPlan,
 ) -> dict[str, object]:
     files = [
         {
-            "path": item.relative_path.as_posix(),
-            "size": item.size,
-            "sha256": item.sha256,
-            "mode": item.mode,
+            "path": entry.relative_path.as_posix(),
+            "size": entry.size,
+            "sha256": entry.sha256,
+            "mode": entry.mode,
+            "source_kind": entry.source_kind,
         }
-        for item in plan.manifest.files
+        for entry in plan.manifest.files
     ]
-    return {
+    return build_publish_remote_header(
+        request,
+        operation_id=plan.operation_id,
+        manifest_digest=plan.manifest_digest,
+        source_snapshot_digest=plan.source_snapshot_digest,
+        target_config_digest=plan.target_config_digest,
+        generation_id=plan.generation_id,
+        publication_root=plan.target.publication_root,
+        files=files,
+        total_bytes=plan.manifest.total_bytes,
+        semantic={
+            "target_side": plan.target_side,
+            "minecraft_version": plan.manifest.minecraft_version,
+            "loader": plan.manifest.loader,
+            "loader_version": plan.manifest.loader_version,
+            "loader_names": sorted(packctl.LOADER_FLAGS),
+        },
+    )
+
+
+def build_publish_remote_header(
+    request: PublishRemoteRequest,
+    *,
+    operation_id: str,
+    manifest_digest: str,
+    source_snapshot_digest: str,
+    target_config_digest: str,
+    generation_id: str,
+    publication_root: PurePosixPath,
+    files: list[dict[str, object]],
+    total_bytes: int,
+    semantic: dict[str, object] | None = None,
+) -> dict[str, object]:
+    header = {
         "schema": _TRANSFER_SCHEMA,
         "version": _FRAME_VERSION,
         "request": request,
-        "operation_id": plan.operation_id,
-        "manifest_digest": plan.manifest_digest,
-        "source_snapshot_digest": plan.source_snapshot_digest,
-        "target_config_digest": plan.target_config_digest,
-        "generation_id": plan.generation_id,
-        "publication_root": plan.target.publication_root.as_posix(),
+        "operation_id": operation_id,
+        "manifest_digest": manifest_digest,
+        "source_snapshot_digest": source_snapshot_digest,
+        "target_config_digest": target_config_digest,
+        "generation_id": generation_id,
+        "publication_root": publication_root.as_posix(),
         "files": files,
-        "total_bytes": plan.manifest.total_bytes,
+        "total_bytes": total_bytes,
     }
+    if semantic is not None:
+        header.update(semantic)
+    return header
 
 
 def _write_protocol_header(handle, header: dict[str, object]) -> None:
@@ -1240,7 +1441,69 @@ def _make_spool(plan: PublishTransferPlan, spool_path: Path, deadline: float, ca
 
 def _run_remote_request(
     plan: PublishTransferPlan,
-    request: Literal["transfer", "status", "cleanup"],
+    request: PublishRemoteRequest,
+    *,
+    deadline: float,
+    cancel_event: threading.Event | None,
+) -> tuple[BoundedProcessResult, dict[str, object] | None]:
+    if request != "transfer":
+        return run_publish_remote_control_request(
+            plan.target,
+            _header(request, plan),
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
+    repository = _repository_root()
+    state_root = repository / ".huroshiki"
+    packctl.make_state_directory(
+        state_root,
+        state_root=state_root,
+        repository_root=repository,
+    )
+    spool = tempfile.NamedTemporaryFile(
+        prefix="publish-transfer-",
+        dir=state_root,
+        delete=False,
+    )
+    spool_path = Path(spool.name)
+    spool.close()
+    try:
+        _make_spool(plan, spool_path, deadline, cancel_event, None)
+        with spool_path.open("rb") as input_handle:
+            result = run_bounded_process(
+                _ssh_command(plan.target),
+                cwd=repository,
+                stdin_file=input_handle,
+                cancel_event=cancel_event,
+                deadline=deadline,
+                max_output_bytes=_MAX_REMOTE_OUTPUT,
+            )
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
+            return result, None
+        if len(lines) != 1:
+            return result, None
+        try:
+            response = json.loads(lines[0])
+        except (TypeError, json.JSONDecodeError):
+            return result, None
+        if not isinstance(response, dict):
+            return result, None
+        return result, response
+    finally:
+        try:
+            spool.close()
+        except OSError:
+            pass
+        try:
+            spool_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def run_publish_remote_control_request(
+    target: PublishRemoteTarget,
+    header: dict[str, object],
     *,
     deadline: float,
     cancel_event: threading.Event | None,
@@ -1260,16 +1523,13 @@ def _run_remote_request(
     spool_path = Path(spool.name)
     spool.close()
     try:
-        if request == "transfer":
-            _make_spool(plan, spool_path, deadline, cancel_event, None)
-        else:
-            with spool_path.open("wb") as control:
-                _write_protocol_header(control, _header(request, plan))
-                control.flush()
-                os.fsync(control.fileno())
+        with spool_path.open("wb") as control:
+            _write_protocol_header(control, header)
+            control.flush()
+            os.fsync(control.fileno())
         with spool_path.open("rb") as input_handle:
             result = run_bounded_process(
-                _ssh_command(plan.target),
+                _ssh_command(target),
                 cwd=repository,
                 stdin_file=input_handle,
                 cancel_event=cancel_event,
@@ -1277,8 +1537,6 @@ def _run_remote_request(
                 max_output_bytes=_MAX_REMOTE_OUTPUT,
             )
         lines = [line for line in result.stdout.splitlines() if line.strip()]
-        if not lines:
-            return result, None
         if len(lines) != 1:
             return result, None
         try:

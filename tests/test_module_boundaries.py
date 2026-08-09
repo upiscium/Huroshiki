@@ -3,6 +3,7 @@ import unittest
 import deploy_support
 import huroshiki_core
 import packctl
+import publish_activation
 import publish_transfer
 import project_locks
 import publish_target
@@ -65,6 +66,16 @@ class ModuleBoundaryTest(unittest.TestCase):
         self.assertIs(
             huroshiki_core.execute_publish_transfer,
             publish_transfer.execute_publish_transfer,
+        )
+
+    def test_core_reexports_publish_semantic_verification_api(self) -> None:
+        self.assertIs(
+            huroshiki_core.PublishSemanticVerification,
+            publish_activation.PublishSemanticVerification,
+        )
+        self.assertIs(
+            huroshiki_core.verify_publish_generation,
+            publish_activation.verify_publish_generation,
         )
 
 

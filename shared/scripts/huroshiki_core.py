@@ -232,6 +232,12 @@ from publish_transfer import (
     prepare_publish_transfer,
     retry_discard_publish_transfer_plan,
 )
+from publish_activation import (
+    PublishSemanticVerification,
+    PublishSemanticVerificationError,
+    PublishSemanticVerificationUncertainError,
+    verify_publish_generation,
+)
 
 ROOT = packctl.ROOT
 PACKS = packctl.PACKS
