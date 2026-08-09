@@ -11,7 +11,7 @@ from pathlib import Path
 import hashlib
 import os
 import stat
-from typing import Callable
+from typing import BinaryIO, Callable
 
 
 _DIR_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -32,6 +32,7 @@ def read_snapshot_file(
     directories: dict[Path, object] | None = None,
     max_bytes: int | None = None,
     retain_bytes: bool = True,
+    sink: BinaryIO | None = None,
 ) -> bytes:
     """Read a file that has already been validated in a snapshot scan.
 
@@ -76,7 +77,9 @@ def read_snapshot_file(
             if max_bytes is not None and total > max_bytes:
                 raise PackSnapshotReadError(f"descriptor is too large: {relative}")
             digest.update(chunk)
-            if retain_bytes:
+            if sink is not None:
+                sink.write(chunk)
+            elif retain_bytes:
                 chunks.append(chunk)
 
         after = os.fstat(fd)
