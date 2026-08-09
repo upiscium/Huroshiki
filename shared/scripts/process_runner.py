@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Callable, Sequence
+from typing import BinaryIO, Callable, Sequence
 
 
 PACKWIZ_PROCESS_TIMEOUT_SECONDS = 120
@@ -32,6 +32,7 @@ class BoundedProcessResult:
     parent_process: subprocess.Popen[bytes] | None = field(
         default=None, compare=False, repr=False
     )
+    output_limit_exceeded: bool = False
 
     @property
     def succeeded(self) -> bool:
@@ -41,6 +42,7 @@ class BoundedProcessResult:
             and not self.timed_out
             and not self.orphaned_descendants
             and not self.termination_incomplete
+            and not self.output_limit_exceeded
         )
 
 
@@ -154,6 +156,33 @@ def _cleanup_deadline(*, include_reap: bool) -> float:
     )
 
 
+def _output_limit_exceeded(
+    stdout_file: BinaryIO,
+    stderr_file: BinaryIO,
+    max_output_bytes: int | None,
+) -> bool:
+    if max_output_bytes is None:
+        return False
+    return any(
+        os.fstat(handle.fileno()).st_size > max_output_bytes
+        for handle in (stdout_file, stderr_file)
+    )
+
+
+def _read_process_output(
+    handle: BinaryIO,
+    *,
+    max_output_bytes: int | None,
+) -> str:
+    handle.seek(0)
+    payload = (
+        handle.read()
+        if max_output_bytes is None
+        else handle.read(max_output_bytes + 1)
+    )
+    return payload.decode("utf-8", errors="replace")
+
+
 def run_bounded_process(
     command: Sequence[str],
     *,
@@ -161,7 +190,10 @@ def run_bounded_process(
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
     result_callback: Callable[[BoundedProcessResult], None] | None = None,
+    max_output_bytes: int | None = None,
 ) -> BoundedProcessResult:
+    if max_output_bytes is not None and max_output_bytes <= 0:
+        raise ValueError("max_output_bytes must be positive")
     if cancel_event is not None and cancel_event.is_set():
         return BoundedProcessResult(-signal.SIGTERM, "", "", True, False)
     if deadline is not None and time.monotonic() >= deadline:
@@ -179,6 +211,7 @@ def run_bounded_process(
         timed_out = False
         orphaned_descendants = False
         termination_incomplete = False
+        output_limit_exceeded = False
         try:
             while process.poll() is None:
                 if cancel_event is not None and cancel_event.is_set():
@@ -194,6 +227,21 @@ def run_bounded_process(
                     break
                 if deadline is not None and time.monotonic() >= deadline:
                     timed_out = True
+                    cleanup = stop_process_group(
+                        process.pid,
+                        parent=process,
+                        cleanup_deadline=_cleanup_deadline(include_reap=True),
+                    )
+                    termination_incomplete = not (
+                        cleanup.group_drained and cleanup.parent_reaped
+                    )
+                    break
+                if _output_limit_exceeded(
+                    stdout_file,
+                    stderr_file,
+                    max_output_bytes,
+                ):
+                    output_limit_exceeded = True
                     cleanup = stop_process_group(
                         process.pid,
                         parent=process,
@@ -239,10 +287,19 @@ def run_bounded_process(
                 cleanup_deadline=_cleanup_deadline(include_reap=False),
             )
             termination_incomplete = not cleanup.group_drained
-        stdout_file.seek(0)
-        stderr_file.seek(0)
-        stdout = stdout_file.read().decode("utf-8", errors="replace")
-        stderr = stderr_file.read().decode("utf-8", errors="replace")
+        output_limit_exceeded = output_limit_exceeded or _output_limit_exceeded(
+            stdout_file,
+            stderr_file,
+            max_output_bytes,
+        )
+        stdout = _read_process_output(
+            stdout_file,
+            max_output_bytes=max_output_bytes if output_limit_exceeded else None,
+        )
+        stderr = _read_process_output(
+            stderr_file,
+            max_output_bytes=max_output_bytes if output_limit_exceeded else None,
+        )
     result = BoundedProcessResult(
         process.returncode,
         stdout,
@@ -253,6 +310,7 @@ def run_bounded_process(
         termination_incomplete,
         process_group=process.pid,
         parent_process=process,
+        output_limit_exceeded=output_limit_exceeded,
     )
     if result_callback is not None:
         result_callback(result)
@@ -278,6 +336,8 @@ def process_failure_message(
         return f"{label} was cancelled"
     if result.timed_out:
         return f"{label} timed out"
+    if result.output_limit_exceeded:
+        return f"{label} output exceeded the supported limit"
     if result.returncode != 0:
         return f"{label} failed: {concise_process_output(result)}"
     return None

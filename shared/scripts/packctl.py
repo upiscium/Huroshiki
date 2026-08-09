@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from typing import Any, Callable, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal, Sequence
 import unicodedata
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
@@ -77,6 +77,10 @@ TRANSACTION_ROOT = STATE_ROOT / "transactions"
 LOG_ROOT = STATE_ROOT / "logs"
 TRASH_ROOT = STATE_ROOT / "trash"
 DEPLOY_SNAPSHOT_ROOT = STATE_ROOT / "deploy-snapshots"
+RSYNC_PROCESS_TIMEOUT_SECONDS = 120
+RSYNC_PREVIEW_OUTPUT_MAX_BYTES = 4 * 1024 * 1024
+RSYNC_OUTPUT_MAX_BYTES = RSYNC_PREVIEW_OUTPUT_MAX_BYTES
+RSYNC_DIAGNOSTIC_MAX_CHARS = 4096
 VALID_SIDES = {"client", "server", "both"}
 SIDE_ALIASES = {
     "b": "both",
@@ -1997,6 +2001,71 @@ def run_packwiz(
         deadline=process_deadline,
     )
     failure = process_failure_message(result, label="Packwiz")
+    if failure is not None:
+        raise ConfigError(failure)
+    return result
+
+
+def bounded_diagnostic(text: str, *, limit: int = RSYNC_DIAGNOSTIC_MAX_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return f"{text[:limit]}... [diagnostic truncated; {omitted} characters omitted]"
+
+
+def _rsync_failure_message(
+    result: BoundedProcessResult,
+    *,
+    phase: str,
+) -> str | None:
+    phase_detail = f" (phase={phase})"
+    if result.termination_incomplete:
+        return f"Rsync process cleanup did not complete{phase_detail}"
+    if result.orphaned_descendants:
+        return f"Rsync left descendant processes running{phase_detail}"
+    if result.cancelled:
+        return f"Rsync operation was cancelled{phase_detail}"
+    if result.timed_out:
+        return f"Rsync operation exceeded its deadline{phase_detail}"
+    if result.output_limit_exceeded:
+        if phase == "rsync-preview":
+            return f"Rsync preview output exceeded the supported limit{phase_detail}"
+        return f"Rsync transfer output exceeded the supported limit{phase_detail}"
+    if result.returncode != 0:
+        diagnostic = bounded_diagnostic(result.stderr or result.stdout).strip()
+        suffix = f": {diagnostic}" if diagnostic else ""
+        return f"Rsync exited with status {result.returncode}{phase_detail}{suffix}"
+    return None
+
+
+def run_rsync_process(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    phase: str = "rsync",
+    max_output_bytes: int | None = None,
+) -> BoundedProcessResult:
+    print("+", " ".join(shlex.quote(part) for part in command))
+    process_deadline = time.monotonic() + RSYNC_PROCESS_TIMEOUT_SECONDS
+    if deadline is not None:
+        process_deadline = min(deadline, process_deadline)
+    try:
+        result = run_bounded_process(
+            command,
+            cwd=cwd,
+            cancel_event=cancel_event,
+            deadline=process_deadline,
+            max_output_bytes=(
+                RSYNC_OUTPUT_MAX_BYTES
+                if max_output_bytes is None
+                else max_output_bytes
+            ),
+        )
+    except OSError as error:
+        raise ConfigError(f"Rsync process could not start (phase={phase}): {error}") from error
+    failure = _rsync_failure_message(result, phase=phase)
     if failure is not None:
         raise ConfigError(failure)
     return result
@@ -4185,19 +4254,37 @@ def discard_deploy_snapshot(snapshot: Path) -> None:
         shutil.rmtree(safe)
 
 
-def _deploy_preview(pack_id: str) -> DeployPreview:
+def _deploy_preview(
+    pack_id: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> DeployPreview:
     dist = distribution_root(pack_id)
     target = distribution_target(pack_id)
     snapshot = _make_deploy_snapshot(pack_id, dist)
     try:
         digest = distribution_digest(snapshot)
         command = rsync_deploy_command(snapshot, target, dry_run=True)
-        print("+", " ".join(shlex.quote(part) for part in command))
-        result = subprocess.run(command, check=True, text=True, capture_output=True)
+        result = run_rsync_process(
+            command,
+            cwd=ROOT,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            phase="rsync-preview",
+            max_output_bytes=RSYNC_PREVIEW_OUTPUT_MAX_BYTES,
+        )
+        if len(result.stdout.encode("utf-8")) > RSYNC_PREVIEW_OUTPUT_MAX_BYTES:
+            raise ConfigError("Rsync preview output exceeded the supported limit")
         if result.stdout:
             print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
         if result.stderr:
-            print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+            diagnostic = bounded_diagnostic(result.stderr)
+            print(
+                diagnostic,
+                file=sys.stderr,
+                end="" if diagnostic.endswith("\n") else "\n",
+            )
         if distribution_target(pack_id) != target or distribution_digest(snapshot) != digest:
             raise ConfigError("Deploy target or snapshot changed during preview")
         raw_lines = tuple(line for line in result.stdout.splitlines() if line.strip())
@@ -4209,11 +4296,29 @@ def _deploy_preview(pack_id: str) -> DeployPreview:
         raise
 
 
-def deploy_preview(pack_id: str, *, build: bool = False) -> DeployPreview:
+def deploy_preview(
+    pack_id: str,
+    *,
+    build: bool = False,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> DeployPreview:
     with ProjectLock(f"pack:{pack_id}", "deploy preview"):
-        if build and _build_pack(pack_id) != 0:
+        if (
+            build
+            and _build_pack(
+                pack_id,
+                cancel_event=cancel_event,
+                deadline=deadline,
+            )
+            != 0
+        ):
             raise ConfigError("Build failed; deploy preview was not created")
-        return _deploy_preview(pack_id)
+        return _deploy_preview(
+            pack_id,
+            cancel_event=cancel_event,
+            deadline=deadline,
+        )
 
 
 def print_deploy_preview(pack_id: str, preview: DeployPreview) -> None:
@@ -4259,8 +4364,18 @@ def _deploy_pack(
     expected_dist_digest: str | None = None,
     snapshot: Path | None = None,
     confirmed_target: str | None = None,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> int:
-    if build and _build_pack(pack_id) != 0:
+    if (
+        build
+        and _build_pack(
+            pack_id,
+            cancel_event=cancel_event,
+            deadline=deadline,
+        )
+        != 0
+    ):
         return 1
     target = (
         confirmed_target
@@ -4285,7 +4400,14 @@ def _deploy_pack(
             and distribution_digest(dist) != expected_dist_digest
         ):
             raise ConfigError("Distribution changed after preview; deployment aborted")
-        run(rsync_deploy_command(dist, target, dry_run=False))
+        run_rsync_process(
+            rsync_deploy_command(dist, target, dry_run=False),
+            cwd=ROOT,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            phase="rsync-transfer",
+            max_output_bytes=RSYNC_OUTPUT_MAX_BYTES,
+        )
         print(f"Deployed {pack_id} to {target}")
         return 0
     finally:
@@ -4300,6 +4422,8 @@ def deploy_pack(
     expected_target: str | None = None,
     expected_dist_digest: str | None = None,
     snapshot: Path | None = None,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> int:
     with ProjectLock(f"pack:{pack_id}", "deploy"):
         return _deploy_pack(
@@ -4308,6 +4432,8 @@ def deploy_pack(
             expected_target=expected_target,
             expected_dist_digest=expected_dist_digest,
             snapshot=snapshot,
+            cancel_event=cancel_event,
+            deadline=deadline,
         )
 
 
