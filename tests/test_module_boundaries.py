@@ -3,6 +3,7 @@ import unittest
 import deploy_support
 import huroshiki_core
 import packctl
+import publish_transfer
 import project_locks
 import publish_target
 import url_artifacts
@@ -46,6 +47,24 @@ class ModuleBoundaryTest(unittest.TestCase):
         self.assertIs(
             huroshiki_core.compute_publish_remote_target_digest,
             publish_target.compute_publish_remote_target_digest,
+        )
+
+    def test_core_reexports_publish_transfer_api(self) -> None:
+        self.assertIs(
+            huroshiki_core.PublishTransferPlan,
+            publish_transfer.PublishTransferPlan,
+        )
+        self.assertIs(
+            huroshiki_core.PublishStagedGeneration,
+            publish_transfer.PublishStagedGeneration,
+        )
+        self.assertIs(
+            huroshiki_core.prepare_publish_transfer,
+            publish_transfer.prepare_publish_transfer,
+        )
+        self.assertIs(
+            huroshiki_core.execute_publish_transfer,
+            publish_transfer.execute_publish_transfer,
         )
 
 

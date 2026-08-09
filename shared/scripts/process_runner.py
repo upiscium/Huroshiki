@@ -189,117 +189,142 @@ def run_bounded_process(
     cwd: Path,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
+    stdin: bytes | None = None,
+    stdin_file: BinaryIO | os.PathLike[str] | str | None = None,
     result_callback: Callable[[BoundedProcessResult], None] | None = None,
     max_output_bytes: int | None = None,
 ) -> BoundedProcessResult:
     if max_output_bytes is not None and max_output_bytes <= 0:
         raise ValueError("max_output_bytes must be positive")
+
     if cancel_event is not None and cancel_event.is_set():
         return BoundedProcessResult(-signal.SIGTERM, "", "", True, False)
     if deadline is not None and time.monotonic() >= deadline:
         return BoundedProcessResult(-signal.SIGTERM, "", "", False, True)
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-        process = subprocess.Popen(
-            list(command),
-            cwd=cwd,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            shell=False,
-            start_new_session=True,
-        )
-        cancelled = False
-        timed_out = False
-        orphaned_descendants = False
-        termination_incomplete = False
-        output_limit_exceeded = False
-        try:
-            while process.poll() is None:
-                if cancel_event is not None and cancel_event.is_set():
-                    cancelled = True
-                    cleanup = stop_process_group(
-                        process.pid,
-                        parent=process,
-                        cleanup_deadline=_cleanup_deadline(include_reap=True),
-                    )
-                    termination_incomplete = not (
-                        cleanup.group_drained and cleanup.parent_reaped
-                    )
-                    break
-                if deadline is not None and time.monotonic() >= deadline:
-                    timed_out = True
-                    cleanup = stop_process_group(
-                        process.pid,
-                        parent=process,
-                        cleanup_deadline=_cleanup_deadline(include_reap=True),
-                    )
-                    termination_incomplete = not (
-                        cleanup.group_drained and cleanup.parent_reaped
-                    )
-                    break
-                if _output_limit_exceeded(
-                    stdout_file,
-                    stderr_file,
-                    max_output_bytes,
-                ):
-                    output_limit_exceeded = True
-                    cleanup = stop_process_group(
-                        process.pid,
-                        parent=process,
-                        cleanup_deadline=_cleanup_deadline(include_reap=True),
-                    )
-                    termination_incomplete = not (
-                        cleanup.group_drained and cleanup.parent_reaped
-                    )
-                    break
-                time.sleep(PROCESS_POLL_SECONDS)
-        except BaseException:
-            cleanup: ProcessTerminationResult | None = None
+
+    if stdin is not None and stdin_file is not None:
+        raise ValueError("set either stdin or stdin_file, not both")
+
+    stdin_handle: BinaryIO | None = None
+    close_stdin = False
+    if stdin is not None:
+        stdin_handle = tempfile.TemporaryFile(mode="w+b")
+        close_stdin = True
+        stdin_handle.write(stdin)
+        stdin_handle.seek(0)
+    elif stdin_file is not None:
+        if isinstance(stdin_file, (str, os.PathLike)):
+            stdin_handle = open(stdin_file, "rb")
+            close_stdin = True
+        else:
+            stdin_handle = stdin_file
+    try:
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            process = subprocess.Popen(
+                list(command),
+                cwd=cwd,
+                stdin=stdin_handle,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                shell=False,
+                start_new_session=True,
+            )
+            cancelled = False
+            timed_out = False
+            orphaned_descendants = False
+            termination_incomplete = False
+            output_limit_exceeded = False
             try:
+                while process.poll() is None:
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancelled = True
+                        cleanup = stop_process_group(
+                            process.pid,
+                            parent=process,
+                            cleanup_deadline=_cleanup_deadline(include_reap=True),
+                        )
+                        termination_incomplete = not (
+                            cleanup.group_drained and cleanup.parent_reaped
+                        )
+                        break
+                    if deadline is not None and time.monotonic() >= deadline:
+                        timed_out = True
+                        cleanup = stop_process_group(
+                            process.pid,
+                            parent=process,
+                            cleanup_deadline=_cleanup_deadline(include_reap=True),
+                        )
+                        termination_incomplete = not (
+                            cleanup.group_drained and cleanup.parent_reaped
+                        )
+                        break
+                    if _output_limit_exceeded(
+                        stdout_file,
+                        stderr_file,
+                        max_output_bytes,
+                    ):
+                        output_limit_exceeded = True
+                        cleanup = stop_process_group(
+                            process.pid,
+                            parent=process,
+                            cleanup_deadline=_cleanup_deadline(include_reap=True),
+                        )
+                        termination_incomplete = not (
+                            cleanup.group_drained and cleanup.parent_reaped
+                        )
+                        break
+                    time.sleep(PROCESS_POLL_SECONDS)
+            except BaseException:
+                cleanup: ProcessTerminationResult | None = None
+                try:
+                    cleanup = stop_process_group(
+                        process.pid,
+                        parent=process,
+                        cleanup_deadline=_cleanup_deadline(include_reap=True),
+                    )
+                finally:
+                    if result_callback is not None:
+                        result_callback(
+                            BoundedProcessResult(
+                                process.returncode,
+                                "",
+                                "",
+                                cancelled,
+                                timed_out,
+                                termination_incomplete=(
+                                    cleanup is None
+                                    or not (
+                                        cleanup.group_drained and cleanup.parent_reaped
+                                    )
+                                ),
+                                process_group=process.pid,
+                                parent_process=process,
+                            )
+                        )
+                raise
+            if not cancelled and not timed_out and live_process_group_members(process.pid):
+                orphaned_descendants = True
                 cleanup = stop_process_group(
                     process.pid,
-                    parent=process,
-                    cleanup_deadline=_cleanup_deadline(include_reap=True),
+                    cleanup_deadline=_cleanup_deadline(include_reap=False),
                 )
-            finally:
-                if result_callback is not None:
-                    result_callback(
-                        BoundedProcessResult(
-                            process.returncode,
-                            "",
-                            "",
-                            cancelled,
-                            timed_out,
-                            termination_incomplete=(
-                                cleanup is None
-                                or not (
-                                    cleanup.group_drained and cleanup.parent_reaped
-                                )
-                            ),
-                            process_group=process.pid,
-                            parent_process=process,
-                        )
-                    )
-            raise
-        if not cancelled and not timed_out and live_process_group_members(process.pid):
-            orphaned_descendants = True
-            cleanup = stop_process_group(
-                process.pid,
-                cleanup_deadline=_cleanup_deadline(include_reap=False),
+                termination_incomplete = not cleanup.group_drained
+            output_limit_exceeded = output_limit_exceeded or _output_limit_exceeded(
+                stdout_file,
+                stderr_file,
+                max_output_bytes,
             )
-            termination_incomplete = not cleanup.group_drained
-        output_limit_exceeded = output_limit_exceeded or _output_limit_exceeded(
-            stdout_file,
-            stderr_file,
-            max_output_bytes,
-        )
-        stdout = _read_process_output(
-            stdout_file,
-            max_output_bytes=max_output_bytes if output_limit_exceeded else None,
-        )
-        stderr = _read_process_output(
-            stderr_file,
-            max_output_bytes=max_output_bytes if output_limit_exceeded else None,
-        )
+            stdout = _read_process_output(
+                stdout_file,
+                max_output_bytes=max_output_bytes if output_limit_exceeded else None,
+            )
+            stderr = _read_process_output(
+                stderr_file,
+                max_output_bytes=max_output_bytes if output_limit_exceeded else None,
+            )
+    finally:
+        if close_stdin and stdin_handle is not None and not stdin_handle.closed:
+            stdin_handle.close()
     result = BoundedProcessResult(
         process.returncode,
         stdout,

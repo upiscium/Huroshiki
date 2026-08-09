@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import stat
 import sys
 import threading
@@ -22,6 +23,7 @@ from overlay_policy import is_packwiz_owned_name
 from pack_tree_policy import PackTreePolicyError, PackTreeScan, scan_pack_migration_source
 from portable_paths import PortablePathError, portable_basename_key, portable_relative_path_key
 from provider_identity import ProviderIdentityError, parse_provider_metadata
+from pack_snapshot_io import PackSnapshotReadError, read_snapshot_file
 
 
 class PackPublishError(RuntimeError):
@@ -50,17 +52,37 @@ class PublishFileEntry:
     mode: int
     source_kind: Literal["packwiz", "content", "generated"]
     contents: bytes | None = field(default=None, repr=False)
+    source_relative_path: PurePosixPath | None = None
 
     def __post_init__(self) -> None:
+        if self.source_kind not in {"packwiz", "content", "generated"}:
+            raise ValueError(f"unsupported publication source kind: {self.source_kind}")
+        if self.source_relative_path is not None:
+            source_path = PurePosixPath(str(self.source_relative_path))
+            if (
+                source_path.is_absolute()
+                or not source_path.parts
+                or any(part in {".", ".."} for part in source_path.parts)
+                or source_path.as_posix() != str(source_path)
+            ):
+                raise ValueError("source-backed publication path must be normalized and relative")
+            object.__setattr__(self, "source_relative_path", source_path)
         if self.source_kind == "generated":
             if self.contents is None:
                 raise ValueError("generated publication files must retain their contents")
+            if self.source_relative_path is not None:
+                raise ValueError("generated publication files must not retain source paths")
             if self.size != len(self.contents):
                 raise ValueError("generated publication file size does not match contents")
             if self.sha256 != hashlib.sha256(self.contents).hexdigest():
                 raise ValueError("generated publication file digest does not match contents")
         elif self.contents is not None:
             raise ValueError("source-backed publication files must not retain duplicate contents")
+        else:
+            if self.source_relative_path is None:
+                raise ValueError("source-backed publication files must retain their source path")
+            if self.source_relative_path.is_absolute():
+                raise ValueError("source-backed publication path must be relative")
 
 
 @dataclass(frozen=True)
@@ -79,7 +101,6 @@ class PackPublishManifest:
 
 Progress = Callable[[str], object]
 _D_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-_F_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 _CHUNK = 1024 * 1024
 _MAX_DESCRIPTOR = 64 * 1024 * 1024
 _MAX_INDEX_RECORDS = 100_000
@@ -134,67 +155,18 @@ def _read_bound(
     retain_bytes: bool = True,
 ) -> bytes:
     """Read one initially-scanned file through an already-open root FD."""
-    current = root_fd
-    opened: list[int] = []
-    fd = -1
     try:
-        for part in relative.parts[:-1]:
-            _checkpoint(cancel_event, deadline)
-            child = os.open(part, _D_FLAGS, dir_fd=current)
-            ancestor = Path(*relative.parts[: len(opened) + 1])
-            expected_ancestor = directories.get(ancestor) if directories is not None else None
-            if expected_ancestor is not None:
-                opened_metadata = os.fstat(child)
-                if (opened_metadata.st_dev, opened_metadata.st_ino) != (expected_ancestor.device, expected_ancestor.inode):
-                    os.close(child)
-                    raise PackPublishError(f"directory changed while opening: {ancestor}")
-            opened.append(child)
-            current = child
-        _checkpoint(cancel_event, deadline)
-        fd = os.open(relative.name, _F_FLAGS, dir_fd=current)
-        metadata = os.fstat(fd)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise PackPublishError(f"unsafe publication file: {relative}")
-        if (metadata.st_dev, metadata.st_ino) != (expected.device, expected.inode):
-            raise PackPublishError(f"file changed before reading: {relative}")
-        digest = hashlib.sha256()
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            _checkpoint(cancel_event, deadline)
-            chunk = os.read(fd, _CHUNK)
-            if not chunk:
-                break
-            total += len(chunk)
-            if max_bytes is not None and total > max_bytes:
-                raise PackPublishError(f"descriptor is too large: {relative}")
-            digest.update(chunk)
-            if retain_bytes:
-                chunks.append(chunk)
-        after = os.fstat(fd)
-        if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
-            expected.device, expected.inode, expected.size, expected.mtime_ns, expected.ctime_ns
-        ) or digest.hexdigest() != expected.digest:
-            raise PackPublishError(f"file changed while reading: {relative}")
-        for index, ancestor_fd in enumerate(opened):
-            _checkpoint(cancel_event, deadline)
-            ancestor_path = Path(*relative.parts[: index + 1])
-            expected_ancestor = directories.get(ancestor_path) if directories is not None else None
-            if expected_ancestor is not None:
-                bound = os.fstat(ancestor_fd)
-                if (bound.st_dev, bound.st_ino, bound.st_mtime_ns, bound.st_ctime_ns) != (
-                    expected_ancestor.device, expected_ancestor.inode,
-                    expected_ancestor.mtime_ns, expected_ancestor.ctime_ns,
-                ):
-                    raise PackPublishError(f"directory changed while reading: {ancestor_path}")
-        return b"".join(chunks) if retain_bytes else b""
-    except OSError as error:
-        raise PackPublishError(f"cannot read descriptor-bound file {relative}: {error}") from error
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        for item in reversed(opened):
-            os.close(item)
+        return read_snapshot_file(
+            root_fd,
+            relative,
+            expected,
+            directories=directories,
+            checkpoint=lambda: _checkpoint(cancel_event, deadline),
+            max_bytes=max_bytes,
+            retain_bytes=retain_bytes,
+        )
+    except PackSnapshotReadError as error:
+        raise PackPublishError(str(error)) from error
 
 
 def _yaml_bytes(data: bytes, name: str) -> dict[str, object]:
@@ -261,11 +233,26 @@ def _content_files(scan: PackTreeScan, target_side: str) -> list[tuple[Path, obj
     return selected
 
 
-def _file_entry(scan: PackTreeScan, relative: Path, output: PurePosixPath, kind: Literal["packwiz", "content"]) -> PublishFileEntry:
+def _file_entry(
+    scan: PackTreeScan,
+    relative: Path,
+    output: PurePosixPath,
+    kind: Literal["packwiz", "content"],
+    *,
+    source_relative_path: Path,
+) -> PublishFileEntry:
     item = next((entry for entry in scan.entries if entry.relative_path == relative), None)
     if item is None or item.kind != "file" or item.digest is None:
         raise PackPublishError(f"unsafe or missing publication file: {relative}")
-    return PublishFileEntry(output, item.size, item.digest, stat.S_IMODE(item.mode), kind)
+    return PublishFileEntry(
+        output,
+        item.size,
+        item.digest,
+        stat.S_IMODE(item.mode),
+        kind,
+        None,
+        source_relative_path,
+    )
 
 
 def _generated_entry(
@@ -287,6 +274,7 @@ def _generated_entry(
         stat.S_IMODE(item.mode),
         "generated",
         contents,
+        None,
     )
 
 
@@ -404,7 +392,13 @@ def _packwiz_files(root_fd: int, scan: PackTreeScan, side: str, *, cancel_event:
                 f"index.toml file record collides with generated descriptor: {path}"
             )
         indexed_paths.add(indexed_key)
-        found = _file_entry(scan, Path("source") / path, PurePosixPath(path.as_posix()), "packwiz")
+        found = _file_entry(
+            scan,
+            Path("source") / path,
+            PurePosixPath(path.as_posix()),
+            "packwiz",
+            source_relative_path=Path("source") / path,
+        )
         if found.sha256 != record["hash"]:
             raise PackPublishError(f"index hash mismatch: {path}")
         metafile = record.get("metafile", False)
@@ -518,38 +512,103 @@ def _packwiz_files(root_fd: int, scan: PackTreeScan, side: str, *, cancel_event:
                     Path("source") / path,
                     PurePosixPath(path.as_posix()),
                     "packwiz",
+                    source_relative_path=Path("source") / path,
                 )
             )
     for relative, parsed in metadata:
         if parsed.side in (side, "both"):
-            files.append(_file_entry(scan, Path("source") / relative, PurePosixPath(relative.as_posix()), "packwiz"))
+            files.append(
+                _file_entry(
+                    scan,
+                    Path("source") / relative,
+                    PurePosixPath(relative.as_posix()),
+                    "packwiz",
+                    source_relative_path=Path("source") / relative,
+                )
+            )
     return files, tuple(tuple_value), frozenset(jar_destinations)
 
 
-def _manifest_digest(manifest: PackPublishManifest) -> str:
+def compute_publish_manifest_digest(manifest: PackPublishManifest) -> str:
     payload = {
         "pack_id": manifest.pack_id, "target_side": manifest.target_side,
         "source_snapshot_digest": manifest.source_snapshot_digest,
         "minecraft_version": manifest.minecraft_version, "loader": manifest.loader,
         "loader_version": manifest.loader_version,
-        "files": [{"path": e.relative_path.as_posix(), "size": e.size, "sha256": e.sha256, "mode": e.mode, "source_kind": e.source_kind} for e in manifest.files],
+        "files": [{
+            "path": e.relative_path.as_posix(),
+            "size": e.size,
+            "sha256": e.sha256,
+            "mode": e.mode,
+            "source_kind": e.source_kind,
+            "source_relative_path": None if e.source_relative_path is None else e.source_relative_path.as_posix(),
+        } for e in manifest.files],
         "total_bytes": manifest.total_bytes,
         "warnings": [{"code": w.code, "message": w.message} for w in manifest.warnings],
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _semantic_snapshot_digest(scan: PackTreeScan) -> str:
-    """Bind the plan to meaningful Pack inputs, never to absolute paths/inodes."""
-    payload = []
-    for entry in scan.entries:
-        payload.append({
-            "path": entry.relative_path.as_posix(), "kind": entry.kind,
-            "size": entry.size, "mode": stat.S_IMODE(entry.mode),
-            "digest": entry.digest, "portable": entry.portable_key,
-            "errors": list(entry.errors),
-        })
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+def validate_publish_manifest(manifest: PackPublishManifest) -> PackPublishManifest:
+    """Validate a manifest before handing it to a detached transfer."""
+
+    if not isinstance(manifest, PackPublishManifest):
+        raise PackPublishError("publish transfer requires a PackPublishManifest")
+    try:
+        packctl.validate_pack_id(manifest.pack_id)
+    except packctl.ConfigError as error:
+        raise PackPublishError(str(error)) from error
+    if manifest.target_side not in {"client", "server"}:
+        raise PackPublishError("target_side must be client or server")
+    if not isinstance(manifest.files, tuple):
+        raise PackPublishError("publication manifest files must be a tuple")
+    if not isinstance(manifest.source_snapshot_digest, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", manifest.source_snapshot_digest
+    ):
+        raise PackPublishError("publication source snapshot digest is invalid")
+    if manifest.total_bytes < 0:
+        raise PackPublishError("publication manifest byte total is invalid")
+
+    previous: PurePosixPath | None = None
+    seen: set[str] = set()
+    total = 0
+    for entry in manifest.files:
+        if not isinstance(entry, PublishFileEntry):
+            raise PackPublishError("publication manifest contains an invalid file entry")
+        path = entry.relative_path
+        if (
+            path.is_absolute()
+            or not path.parts
+            or any(part in {".", ".."} for part in path.parts)
+            or path.as_posix() != str(path)
+        ):
+            raise PackPublishError(f"publication path is not normalized: {path}")
+        try:
+            portable_key = portable_relative_path_key(Path(*path.parts))
+        except PortablePathError as error:
+            raise PackPublishError(f"invalid publication path: {path}") from error
+        if portable_key in seen:
+            raise PackPublishError(f"publication path collision: {path}")
+        seen.add(portable_key)
+        if previous is not None and path.as_posix() <= previous.as_posix():
+            raise PackPublishError("publication manifest files are not sorted")
+        previous = path
+        if entry.size < 0 or not re.fullmatch(r"[0-9a-f]{64}", entry.sha256):
+            raise PackPublishError(f"invalid publication file metadata: {path}")
+        if entry.mode < 0 or entry.mode > 0o777:
+            raise PackPublishError(f"unsupported publication file mode: {path}")
+        total += entry.size
+    if total != manifest.total_bytes:
+        raise PackPublishError("publication manifest byte total does not match files")
+    if not isinstance(manifest.manifest_digest, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", manifest.manifest_digest
+    ) or manifest.manifest_digest != compute_publish_manifest_digest(manifest):
+        raise PackPublishError("publication manifest digest is invalid")
+    return manifest
+
+
+# Kept as a private compatibility alias for existing manifest tests/callers.
+_manifest_digest = compute_publish_manifest_digest
 
 
 def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", cancel_event: threading.Event | None = None, deadline: float | None = None, progress: Progress | None = None) -> PackPublishManifest:
@@ -609,7 +668,17 @@ def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", can
                     deadline=deadline,
                     retain_bytes=False,
                 )
-                files.append(PublishFileEntry(destination, item.size, item.digest, stat.S_IMODE(item.mode), "content"))
+                files.append(
+                    PublishFileEntry(
+                        destination,
+                        item.size,
+                        item.digest,
+                        stat.S_IMODE(item.mode),
+                        "content",
+                        None,
+                        overlay_path,
+                    )
+                )
             files.sort(key=lambda entry: entry.relative_path.as_posix())
             _portable_output_map(files)
             _progress(progress, "building-manifest")
@@ -618,8 +687,8 @@ def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", can
                 if entry.size < 0 or total_bytes > _MAX_TOTAL_BYTES - entry.size:
                     raise PackPublishError("publication manifest byte total overflow")
                 total_bytes += entry.size
-            result = PackPublishManifest(pack_id, target_side, _semantic_snapshot_digest(scan), tuple_value[0], tuple_value[1], tuple_value[2], tuple(files), total_bytes, "", ())
-            result = PackPublishManifest(result.pack_id, result.target_side, result.source_snapshot_digest, result.minecraft_version, result.loader, result.loader_version, result.files, result.total_bytes, _manifest_digest(result), result.warnings)
+            result = PackPublishManifest(pack_id, target_side, scan.content_digest, tuple_value[0], tuple_value[1], tuple_value[2], tuple(files), total_bytes, "", ())
+            result = PackPublishManifest(result.pack_id, result.target_side, result.source_snapshot_digest, result.minecraft_version, result.loader, result.loader_version, result.files, result.total_bytes, compute_publish_manifest_digest(result), result.warnings)
             _checkpoint(cancel_event, deadline)
             try:
                 final = scan_pack_migration_source(
