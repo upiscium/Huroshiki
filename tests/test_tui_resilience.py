@@ -381,7 +381,7 @@ class _FilesTestApp(App[None]):
 
 
 class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
-    async def test_main_q_types_in_input_then_clears_from_list_and_quits(self) -> None:
+    async def test_main_q_types_in_input_ctrl_l_clears_and_table_q_quits(self) -> None:
         projects = [project("alpha"), project("beta")]
         with patch.object(huroshiki.core, "list_projects", return_value=projects):
             app = _MainTestApp()
@@ -401,7 +401,7 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                     screen.reload_projects("missing")
                     self.assertEqual(table.row_count, 0)
                     self.assertIs(screen.focused, search)
-                    await pilot.press("q")
+                    await pilot.press("ctrl+l")
                     await pilot.pause()
                     self.assertEqual(search.value, "")
                     self.assertIs(screen.focused, table)
@@ -412,7 +412,7 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause()
                     exit_app.assert_called_once()
 
-    async def test_installed_q_clears_zero_results_and_preserves_delete_selection(self) -> None:
+    async def test_installed_ctrl_l_clears_zero_results_and_preserves_delete_selection(self) -> None:
         mods = [mod("Alpha"), mod("Beta")]
         with (
             patch.object(
@@ -436,7 +436,7 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                     screen.query_one("#installed-table", DataTable).row_count,
                     0,
                 )
-                await pilot.press("q")
+                await pilot.press("ctrl+l")
                 await pilot.pause()
                 self.assertEqual(search.value, "")
                 self.assertEqual(len(screen.visible_mods), 2)
@@ -486,7 +486,7 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                     [(True, False), (False, True), (True, True)],
                 )
 
-    async def test_project_files_q_clears_zero_result_filter_from_input(self) -> None:
+    async def test_project_files_ctrl_l_clears_zero_result_filter_from_input(self) -> None:
         files = [
             core.TemplateInfo("common", Path("a.toml"), Path("/a.toml"), 1),
             core.TemplateInfo("server", Path("b.toml"), Path("/b.toml"), 2),
@@ -507,7 +507,7 @@ class FilterAndErrorInteractionTest(unittest.IsolatedAsyncioTestCase):
                     screen.query_one("#template-table", DataTable).row_count,
                     0,
                 )
-                await pilot.press("q")
+                await pilot.press("ctrl+l")
                 await pilot.pause()
                 self.assertEqual(search.value, "")
                 self.assertEqual(len(screen.visible_templates), 2)

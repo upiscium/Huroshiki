@@ -338,6 +338,18 @@ class _PreparedUpdateTransaction(_UpdateTransaction):
         self.apply_controls = (cancel_event, deadline)
 
 
+class _BlockingApplyUpdateTransaction(_PreparedUpdateTransaction):
+    def __init__(self) -> None:
+        super().__init__()
+        self.apply_release = threading.Event()
+        self.apply_cancel_event: threading.Event | None = None
+
+    def apply(self, *, cancel_event=None, deadline=None) -> None:
+        self.apply_controls = (cancel_event, deadline)
+        self.apply_cancel_event = cancel_event
+        self.apply_release.wait(2)
+
+
 class _NavigationApp(App[None]):
     CSS_PATH = str(Path(huroshiki.__file__).with_name("huroshiki.tcss"))
 
@@ -449,6 +461,127 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(transaction.apply_controls, transaction.prepare_controls)
         self.assertEqual(transaction.selected, {Path("mods/first.pw.toml")})
+
+    async def test_project_child_q_returns_project(self) -> None:
+        with self.patches(), patch.object(
+            huroshiki.core.PackTransaction,
+            "create",
+            return_value=_UpdateTransaction(),
+        ):
+            for screen in (
+                huroshiki.InstallScreen("pack:demo"),
+                huroshiki.InstalledModsScreen("pack:demo"),
+                huroshiki.TemplateScreen("pack:demo"),
+                huroshiki.UpdateScreen("pack:demo"),
+            ):
+                with self.subTest(screen=screen.__class__.__name__):
+                    app = _NavigationApp(screen)
+                    async with app.run_test() as pilot:
+                        if isinstance(screen, huroshiki.InstallScreen):
+                            screen.query_one("#search-results-table", DataTable).focus()
+                        await pilot.press("q")
+                        await pilot.pause()
+                        self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+                        self.assertEqual(app.screen.project_key, "pack:demo")
+
+    async def test_project_child_inputs_keep_literal_q(self) -> None:
+        with self.patches():
+            app = _NavigationApp(huroshiki.InstalledModsScreen("pack:demo"))
+            async with app.run_test() as pilot:
+                search = app.screen.query_one("#installed-search", Input)
+                search.focus()
+                await pilot.press("q")
+                await pilot.pause()
+                self.assertEqual(search.value, "q")
+                self.assertIsInstance(app.screen, huroshiki.InstalledModsScreen)
+
+        with self.patches():
+            app = _NavigationApp(huroshiki.TemplateScreen("pack:demo"))
+            async with app.run_test() as pilot:
+                search = app.screen.query_one("#template-search", Input)
+                search.focus()
+                await pilot.press("q")
+                await pilot.pause()
+                self.assertEqual(search.value, "q")
+                self.assertIsInstance(app.screen, huroshiki.TemplateScreen)
+
+    async def test_install_active_q_deferred_to_project_navigation_until_cleanup(self) -> None:
+        transaction = _InstallTransaction()
+        operation = _BlockingInstallOperation(transaction)
+        transaction.queued_operations.append(operation)
+        with self.patches():
+            screen = huroshiki.InstallScreen("pack:demo")
+            screen.provider = "url"
+            app = _NavigationApp(screen)
+            app.transactions["pack:demo"] = transaction
+            async with app.run_test() as pilot:
+                field = screen.query_one("#mod-search", Input)
+                field.value = "https://example.invalid/private.jar"
+                await pilot.press("enter")
+                await pilot.pause(0.05)
+
+                self.assertTrue(operation.started.is_set())
+                await pilot.press("q")
+                await pilot.pause(0.05)
+
+                self.assertTrue(operation.cancelled)
+                self.assertEqual(operation.cancel_deadline, screen._navigation_deadline)
+                self.assertIs(app.screen, screen)
+
+                operation.release_cleanup.set()
+                await pilot.pause(0.15)
+                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+
+    async def test_update_q_during_preparation_requests_cancel_and_navigates_after_cleanup(self) -> None:
+        transaction = _BlockingUpdateTransaction()
+        with self.patches(), patch.object(
+            huroshiki.core.PackTransaction,
+            "create",
+            return_value=transaction,
+        ):
+            screen = huroshiki.UpdateScreen("pack:demo")
+            app = _NavigationApp(screen)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                self.assertIsNotNone(screen.operation)
+                operation = screen.operation
+                await pilot.press("q")
+                await pilot.pause(0.05)
+
+                self.assertTrue(operation.cancel_event.is_set())
+                await pilot.pause(0.1)
+                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+
+    async def test_update_q_during_apply_cancels_and_waits_for_transaction_cleanup(self) -> None:
+        transaction = _BlockingApplyUpdateTransaction()
+        with self.patches(), patch.object(
+            huroshiki.core.PackTransaction,
+            "create",
+            return_value=transaction,
+        ):
+            screen = huroshiki.UpdateScreen("pack:demo")
+            app = _NavigationApp(screen)
+            async with app.run_test() as pilot:
+                await pilot.pause(0.2)
+                self.assertIs(app.transactions["pack:demo"], transaction)
+                await pilot.press("enter")
+                await pilot.pause(0.05)
+                self.assertIsInstance(app.screen, huroshiki.ConfirmModal)
+                await pilot.press("enter")
+                await pilot.pause(0.05)
+
+                await pilot.press("q")
+                await pilot.pause(0.05)
+
+                self.assertIsNotNone(transaction.apply_cancel_event)
+                self.assertTrue(transaction.apply_cancel_event.is_set())
+                self.assertIs(app.transactions["pack:demo"], transaction)
+                self.assertIs(app.screen, screen)
+
+                transaction.apply_release.set()
+                await pilot.pause(0.15)
+                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+                self.assertNotIn("pack:demo", app.transactions)
 
     async def test_update_navigation_waits_for_discard_and_rejects_duplicates(self) -> None:
         transaction = _PreparedUpdateTransaction()
