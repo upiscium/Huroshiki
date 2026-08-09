@@ -33,7 +33,11 @@ from pack_publish import (
 )
 from pack_snapshot_io import PackSnapshotReadError, read_snapshot_file
 from pack_tree_policy import scan_pack_migration_source
-from process_runner import BoundedProcessResult, run_bounded_process
+from process_runner import (
+    BoundedProcessResult,
+    process_failure_message,
+    run_bounded_process,
+)
 from publish_target import (
     PublishRemoteTarget,
     PublishTargetError,
@@ -198,7 +202,7 @@ _F_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLO
 
 
 def _remote_helper_source() -> str:
-    return r'''import errno, fcntl, hashlib, json, os, re, stat, struct, sys, unicodedata
+    return r'''import ctypes, errno, fcntl, hashlib, json, os, re, stat, struct, sys, unicodedata
 
 MAGIC = b"HUROSHIKI-PUBLISH-TRANSFER\x00"
 VERSION = 1
@@ -209,6 +213,12 @@ CHUNK = 1024 * 1024
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+RENAME_NOREPLACE = 1
+
+class TransferIntegrityFailure(RuntimeError):
+    def __init__(self, message, recovery_path=None):
+        super().__init__(message)
+        self.recovery_path = recovery_path
 
 def read_exact(stream, size):
     chunks = []
@@ -299,6 +309,32 @@ def close_owned(root, current, owned):
         os.close(current)
     for fd in reversed(owned):
         os.close(fd)
+
+def rename_noreplace(old_dir_fd, old_name, new_dir_fd, new_name):
+    if sys.platform != "linux":
+        raise OSError(errno.ENOTSUP, "atomic generation commit is unavailable")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as error:
+        raise OSError(errno.ENOTSUP, "atomic generation commit is unavailable") from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        old_dir_fd,
+        os.fsencode(old_name),
+        new_dir_fd,
+        os.fsencode(new_name),
+        RENAME_NOREPLACE,
+    ) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), new_name)
 
 def remove_tree(parent, name):
     metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
@@ -478,7 +514,31 @@ def process_transfer(header):
                 raise RuntimeError("trailing publish transfer data")
         finally:
             os.close(stage)
-        os.rename(stage_name, generation_name, src_dir_fd=generations_fd, dst_dir_fd=generations_fd)
+        try:
+            rename_noreplace(
+                generations_fd,
+                stage_name,
+                generations_fd,
+                generation_name,
+            )
+        except FileExistsError:
+            final = os.open(generation_name, DIR_FLAGS, dir_fd=generations_fd)
+            try:
+                verify_tree(final, expected)
+            finally:
+                os.close(final)
+            try:
+                remove_tree(generations_fd, stage_name)
+            except FileNotFoundError:
+                pass
+            return {
+                "ok": True,
+                "status": "reused",
+                "operation_id": header["operation_id"],
+                "manifest_digest": header["manifest_digest"],
+                "target_config_digest": header["target_config_digest"],
+                "generation_id": generation_name,
+            }
         return {
             "ok": True,
             "status": "committed",
@@ -487,17 +547,26 @@ def process_transfer(header):
             "target_config_digest": header["target_config_digest"],
             "generation_id": generation_name,
         }
-    except BaseException:
+    except BaseException as error:
+        cleanup_error = None
         try:
             generations = open_child_dir(root, "generations", create=False)
             try:
                 remove_tree(generations, stage_name)
             except FileNotFoundError:
                 pass
+            except BaseException as cleanup:
+                cleanup_error = cleanup
             finally:
                 os.close(generations)
-        except BaseException:
-            pass
+        except BaseException as cleanup:
+            cleanup_error = cleanup
+        if cleanup_error is not None:
+            recovery_path = header["publication_root"] + "/generations/" + stage_name
+            raise TransferIntegrityFailure(
+                f"{error}; remote staging cleanup failed: {cleanup_error}",
+                recovery_path=recovery_path,
+            ) from error
         raise
     finally:
         if lock is not None:
@@ -523,7 +592,7 @@ def process_status(header):
                     verify_tree(final, expected)
                 finally:
                     os.close(final)
-                return {
+                response = {
                     "ok": True,
                     "status": "committed",
                     "operation_id": header["operation_id"],
@@ -531,12 +600,39 @@ def process_status(header):
                     "target_config_digest": header["target_config_digest"],
                     "generation_id": header["generation_id"],
                 }
+                stage_name = ".huroshiki-stage-" + header["operation_id"]
+                try:
+                    os.stat(stage_name, dir_fd=generations, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    response["recovery_path"] = (
+                        header["publication_root"]
+                        + "/generations/"
+                        + stage_name
+                    )
+                return response
             stage_name = ".huroshiki-stage-" + header["operation_id"]
             try:
                 os.stat(stage_name, dir_fd=generations, follow_symlinks=False)
-                return {"ok": True, "status": "not_committed", "recovery_path": header["publication_root"] + "/generations/" + stage_name}
+                return {
+                    "ok": True,
+                    "status": "not_committed",
+                    "operation_id": header["operation_id"],
+                    "manifest_digest": header["manifest_digest"],
+                    "target_config_digest": header["target_config_digest"],
+                    "generation_id": header["generation_id"],
+                    "recovery_path": header["publication_root"] + "/generations/" + stage_name,
+                }
             except FileNotFoundError:
-                return {"ok": True, "status": "not_committed", "generation_id": header["generation_id"]}
+                return {
+                    "ok": True,
+                    "status": "not_committed",
+                    "operation_id": header["operation_id"],
+                    "manifest_digest": header["manifest_digest"],
+                    "target_config_digest": header["target_config_digest"],
+                    "generation_id": header["generation_id"],
+                }
         finally:
             os.close(generations)
     finally:
@@ -586,6 +682,16 @@ def main():
             send(process_cleanup(header))
         else:
             raise RuntimeError("unknown publish transfer request")
+    except TransferIntegrityFailure as error:
+        response = {
+            "ok": False,
+            "status": "integrity_failure",
+            "error": str(error)[:512],
+        }
+        if error.recovery_path is not None:
+            response["recovery_path"] = error.recovery_path
+        send(response)
+        return 1
     except BaseException as error:
         send({"ok": False, "status": "integrity_failure", "error": str(error)[:512]})
         return 1
@@ -1025,8 +1131,13 @@ def discard_publish_transfer_plan(
             return
         if plan._state == "discarding":
             raise PublishTransferCleanupError("publish transfer cleanup is already running")
+        remote_cleanup_pending = (
+            plan._state == "cleanup-pending" or plan._recovery_path is not None
+        )
         plan._state = "discarding"
     try:
+        if remote_cleanup_pending:
+            _cleanup_remote_publish_stage(plan, cleanup_deadline)
         _cleanup_plan_workspace(plan, cleanup_deadline)
     except BaseException as error:
         with plan._lock:
@@ -1188,6 +1299,50 @@ def _run_remote_request(
             pass
 
 
+def _cleanup_remote_publish_stage(
+    plan: PublishTransferPlan,
+    deadline: float,
+) -> None:
+    try:
+        cleanup_result, cleanup_response = _run_remote_request(
+            plan,
+            "cleanup",
+            deadline=min(deadline, time.monotonic() + 30.0),
+            cancel_event=None,
+        )
+    except BaseException as error:
+        with plan._lock:
+            plan._state = "cleanup-pending"
+        raise PublishTransferCleanupError(
+            "remote transfer cleanup could not be verified"
+        ) from error
+    cleanup_lifecycle_failure = _process_lifecycle_failure(
+        cleanup_result,
+        label="Publish transfer cleanup",
+    )
+    if (
+        cleanup_lifecycle_failure is not None
+        or not cleanup_result.succeeded
+        or not cleanup_response
+        or cleanup_response.get("ok") is not True
+        or cleanup_response.get("status") != "cleaned"
+    ):
+        with plan._lock:
+            plan._state = "cleanup-pending"
+        detail = (
+            cleanup_lifecycle_failure
+            or (
+                str(cleanup_response.get("error"))
+                if cleanup_response is not None
+                and cleanup_response.get("error") is not None
+                else "remote transfer cleanup did not complete"
+            )
+        )
+        raise PublishTransferCleanupError(detail)
+    with plan._lock:
+        plan._recovery_path = None
+
+
 def _resolve_current_target(plan: PublishTransferPlan) -> PublishRemoteTarget:
     try:
         settings = packctl.deployment_settings(plan.pack_id)
@@ -1224,6 +1379,47 @@ def _validate_committed_response(
             raise PublishTransferExecutionError(
                 f"remote helper response does not bind to transfer {key}"
             )
+    if (
+        "recovery_path" in response
+        and response.get("recovery_path") != plan.staging_path.as_posix()
+    ):
+        raise PublishTransferExecutionError(
+            "remote helper response does not bind to transfer recovery path"
+        )
+
+
+def _process_lifecycle_failure(
+    result: BoundedProcessResult,
+    *,
+    label: str,
+) -> str | None:
+    if result.termination_incomplete:
+        return f"{label} process termination was incomplete"
+    if result.orphaned_descendants:
+        return f"{label} left background processes after completion"
+    return None
+
+
+def _remember_recovery_path(
+    plan: PublishTransferPlan,
+    response: dict[str, object] | None,
+) -> None:
+    if response is None:
+        return
+    if "recovery_path" not in response:
+        return
+    recovery = response.get("recovery_path")
+    if recovery == plan.staging_path.as_posix():
+        with plan._lock:
+            plan._recovery_path = plan.staging_path
+    else:
+        _retain_stage_recovery_path(plan)
+
+
+def _retain_stage_recovery_path(plan: PublishTransferPlan) -> None:
+    with plan._lock:
+        if plan._recovery_path is None:
+            plan._recovery_path = plan.staging_path
 
 
 def execute_publish_transfer(
@@ -1270,11 +1466,26 @@ def execute_publish_transfer(
             deadline=operation_deadline,
             cancel_event=cancel_event,
         )
+        lifecycle_failure = _process_lifecycle_failure(result, label="Publish transfer")
+        if lifecycle_failure is not None:
+            _retain_stage_recovery_path(plan)
+            with plan._lock:
+                plan._state = "uncertain"
+            raise PublishTransferUncertainError(lifecycle_failure)
         if result.succeeded and response is not None and response.get("ok") is True:
             status = response.get("status")
             if status not in {"committed", "reused"}:
                 raise PublishTransferExecutionError("remote helper did not commit a generation")
-            _validate_committed_response(plan, response)
+            try:
+                _validate_committed_response(plan, response)
+            except PublishTransferExecutionError as error:
+                _retain_stage_recovery_path(plan)
+                with plan._lock:
+                    plan._state = "uncertain"
+                raise PublishTransferUncertainError(str(error)) from error
+            _remember_recovery_path(plan, response)
+            if plan.recovery_path is not None:
+                _cleanup_remote_publish_stage(plan, operation_deadline)
             reused = status == "reused"
             staged = PublishStagedGeneration(
                 plan.manifest_digest,
@@ -1290,45 +1501,73 @@ def execute_publish_transfer(
             _emit(progress, PublishTransferProgress("done", len(plan.manifest.files), len(plan.manifest.files), plan.manifest.total_bytes, plan.manifest.total_bytes))
             return staged
 
-        if response is not None and response.get("status") == "integrity_failure":
-            with plan._lock:
-                plan._state = "failed"
-            detail = response.get("error", "remote helper rejected the transfer")
-            raise PublishTransferExecutionError(str(detail))
+        _remember_recovery_path(plan, response)
+        transfer_failure = process_failure_message(result, label="Publish transfer")
+        if (
+            response is not None
+            and response.get("status") == "integrity_failure"
+            and not result.cancelled
+            and not result.timed_out
+            and not result.output_limit_exceeded
+        ):
+            transfer_failure = str(
+                response.get("error", "remote helper rejected the transfer")
+            )
 
-        recovery_deadline = time.monotonic() + 30.0
-        status_result, status_response = _run_remote_request(
-            plan,
-            "status",
-            deadline=recovery_deadline,
-            cancel_event=None,
+        recovery_deadline = min(operation_deadline, time.monotonic() + 30.0)
+        try:
+            status_result, status_response = _run_remote_request(
+                plan,
+                "status",
+                deadline=recovery_deadline,
+                cancel_event=None,
+            )
+        except BaseException as error:
+            _retain_stage_recovery_path(plan)
+            with plan._lock:
+                plan._state = "uncertain"
+            reason = transfer_failure or "Publish generation commit state is uncertain"
+            raise PublishTransferUncertainError(
+                f"{reason}; Publish generation commit state is uncertain"
+            ) from error
+        status_lifecycle_failure = _process_lifecycle_failure(
+            status_result,
+            label="Publish transfer status",
         )
-        if status_result.succeeded and status_response is not None:
+        if status_lifecycle_failure is not None:
+            _retain_stage_recovery_path(plan)
+            with plan._lock:
+                plan._state = "uncertain"
+            reason = transfer_failure or status_lifecycle_failure
+            raise PublishTransferUncertainError(
+                f"{reason}; Publish generation commit state is uncertain"
+            )
+        if (
+            status_result.succeeded
+            and status_response is not None
+            and status_response.get("ok") is True
+        ):
             status = status_response.get("status")
-            if status == "not_committed":
-                recovery = status_response.get("recovery_path")
-                if isinstance(recovery, str):
-                    with plan._lock:
-                        plan._recovery_path = PurePosixPath(recovery)
+            if status in {"not_committed", "committed"}:
                 try:
-                    cleanup_result, cleanup_response = _run_remote_request(
-                        plan,
-                        "cleanup",
-                        deadline=time.monotonic() + 30.0,
-                        cancel_event=None,
-                    )
-                finally:
+                    _validate_committed_response(plan, status_response)
+                except PublishTransferExecutionError as error:
+                    _retain_stage_recovery_path(plan)
                     with plan._lock:
-                        plan._state = "failed"
-                if not cleanup_result.succeeded or not cleanup_response or cleanup_response.get("ok") is not True:
-                    with plan._lock:
-                        plan._state = "cleanup-pending"
-                    raise PublishTransferCleanupError(
-                        "remote transfer cleanup did not complete"
-                    )
-                raise PublishTransferExecutionError("Publish transfer was not committed")
+                        plan._state = "uncertain"
+                    raise PublishTransferUncertainError(str(error)) from error
+            if status == "not_committed":
+                _remember_recovery_path(plan, status_response)
+                _cleanup_remote_publish_stage(plan, operation_deadline)
+                with plan._lock:
+                    plan._state = "failed"
+                raise PublishTransferExecutionError(
+                    transfer_failure or "Publish transfer was not committed"
+                )
             if status == "committed":
-                _validate_committed_response(plan, status_response)
+                _remember_recovery_path(plan, status_response)
+                if plan.recovery_path is not None:
+                    _cleanup_remote_publish_stage(plan, operation_deadline)
                 with plan._lock:
                     plan._state = "executed"
                 return PublishStagedGeneration(
@@ -1342,7 +1581,16 @@ def execute_publish_transfer(
                 )
         with plan._lock:
             plan._state = "uncertain"
-        raise PublishTransferUncertainError("Publish generation commit state is uncertain")
+        _retain_stage_recovery_path(plan)
+        reason = transfer_failure or process_failure_message(
+            status_result,
+            label="Publish transfer status",
+        )
+        if reason is None:
+            reason = "Publish generation commit state is uncertain"
+        else:
+            reason = f"{reason}; Publish generation commit state is uncertain"
+        raise PublishTransferUncertainError(reason)
     except BaseException:
         with plan._lock:
             if plan._state == "executing":

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -158,7 +159,7 @@ class PublishTransferTest(PackPublishManifestTest):
         ):
             with self.assertRaises(transfer.PublishTransferExecutionError):
                 transfer.execute_publish_transfer(plan3)
-        transfer.discard_publish_transfer_plan(plan3)
+            transfer.discard_publish_transfer_plan(plan3)
 
     def test_remote_helper_handles_protocol_and_hostile_root_without_shell(self) -> None:
         target = self._target(remote_path=str(self.root / "remote;$(touch_p)"))
@@ -250,6 +251,348 @@ class PublishTransferTest(PackPublishManifestTest):
         self.assertEqual(run.call_count, 2)
         transfer.discard_publish_transfer_plan(plan)
 
+    def test_status_recovery_failure_retains_uncertain_state(self) -> None:
+        manifest, target = self._manifest_and_target()
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        recovery = (
+            Path(target.publication_root)
+            / "generations"
+            / f".huroshiki-stage-{plan.operation_id}"
+        ).as_posix()
+        responses = iter(
+            [
+                BoundedProcessResult(
+                    1,
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "status": "integrity_failure",
+                            "error": "remote staging cleanup failed",
+                            "recovery_path": recovery,
+                        }
+                    )
+                    + "\n",
+                    "",
+                    False,
+                    False,
+                )
+            ]
+        )
+
+        def run(*args, **kwargs):
+            try:
+                return next(responses)
+            except StopIteration as error:
+                raise OSError("status SSH launch failed") from error
+
+        with patch.object(packctl, "deployment_settings", return_value=self._settings(target)), patch.object(
+            transfer, "run_bounded_process", side_effect=run
+        ) as process:
+            with self.assertRaisesRegex(
+                transfer.PublishTransferUncertainError,
+                "commit state is uncertain",
+            ):
+                transfer.execute_publish_transfer(plan)
+        self.assertEqual(process.call_count, 2)
+        self.assertEqual(plan.state, "uncertain")
+        self.assertEqual(plan.recovery_path, Path(recovery))
+        with patch.object(
+            transfer,
+            "run_bounded_process",
+            return_value=BoundedProcessResult(
+                0,
+                '{"ok":true,"status":"cleaned"}\n',
+                "",
+                False,
+                False,
+            ),
+        ):
+            transfer.retry_discard_publish_transfer_plan(plan)
+        self.assertEqual(plan.state, "discarded")
+
+    def test_status_failure_without_response_retains_deterministic_stage_for_discard(self) -> None:
+        manifest, target = self._manifest_and_target()
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        responses = iter([BoundedProcessResult(0, "", "", False, False)])
+
+        def run(*args, **kwargs):
+            try:
+                return next(responses)
+            except StopIteration as error:
+                raise OSError("status SSH launch failed") from error
+
+        with patch.object(packctl, "deployment_settings", return_value=self._settings(target)), patch.object(
+            transfer, "run_bounded_process", side_effect=run
+        ) as process:
+            with self.assertRaises(transfer.PublishTransferUncertainError):
+                transfer.execute_publish_transfer(plan)
+        self.assertEqual(process.call_count, 2)
+        self.assertEqual(plan.state, "uncertain")
+        self.assertEqual(plan.recovery_path, plan.staging_path)
+        with patch.object(
+            transfer,
+            "run_bounded_process",
+            return_value=BoundedProcessResult(
+                0,
+                '{"ok":true,"status":"cleaned"}\n',
+                "",
+                False,
+                False,
+            ),
+        ):
+            transfer.retry_discard_publish_transfer_plan(plan)
+        self.assertEqual(plan.state, "discarded")
+
+    def test_committed_status_cleans_retained_remote_stage_before_success(self) -> None:
+        manifest, target = self._manifest_and_target()
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        recovery = (
+            Path(target.publication_root)
+            / "generations"
+            / f".huroshiki-stage-{plan.operation_id}"
+        ).as_posix()
+        committed = {
+            "ok": True,
+            "status": "committed",
+            "operation_id": plan.operation_id,
+            "manifest_digest": plan.manifest_digest,
+            "target_config_digest": plan.target_config_digest,
+            "generation_id": plan.generation_id,
+            "recovery_path": recovery,
+        }
+        responses = iter(
+            [
+                BoundedProcessResult(
+                    1,
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "status": "integrity_failure",
+                            "error": "remote staging cleanup failed",
+                            "recovery_path": recovery,
+                        }
+                    )
+                    + "\n",
+                    "",
+                    False,
+                    False,
+                ),
+                BoundedProcessResult(0, json.dumps(committed) + "\n", "", False, False),
+                BoundedProcessResult(
+                    0,
+                    '{"ok":true,"status":"cleaned"}\n',
+                    "",
+                    False,
+                    False,
+                ),
+            ]
+        )
+        with patch.object(packctl, "deployment_settings", return_value=self._settings(target)), patch.object(
+            transfer, "run_bounded_process", side_effect=lambda *args, **kwargs: next(responses)
+        ) as run:
+            result = transfer.execute_publish_transfer(plan)
+        self.assertFalse(result.reused)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(plan.state, "executed")
+        self.assertIsNone(plan.recovery_path)
+        transfer.discard_publish_transfer_plan(plan)
+
+    def test_remote_integrity_failure_retains_cleanup_pending_recovery(self) -> None:
+        manifest, target = self._manifest_and_target()
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        recovery = (
+            Path(target.publication_root)
+            / "generations"
+            / f".huroshiki-stage-{plan.operation_id}"
+        ).as_posix()
+        responses = iter(
+            [
+                BoundedProcessResult(
+                    1,
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "status": "integrity_failure",
+                            "error": "remote staging cleanup failed",
+                            "recovery_path": recovery,
+                        }
+                    )
+                    + "\n",
+                    "",
+                    False,
+                    False,
+                ),
+                BoundedProcessResult(
+                    0,
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "status": "not_committed",
+                            "operation_id": plan.operation_id,
+                            "manifest_digest": plan.manifest_digest,
+                            "target_config_digest": plan.target_config_digest,
+                            "generation_id": plan.generation_id,
+                            "recovery_path": recovery,
+                        }
+                    )
+                    + "\n",
+                    "",
+                    False,
+                    False,
+                ),
+                BoundedProcessResult(
+                    1,
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "status": "integrity_failure",
+                            "error": "refusing to remove symlink",
+                        }
+                    )
+                    + "\n",
+                    "",
+                    False,
+                    False,
+                ),
+            ]
+        )
+        with patch.object(packctl, "deployment_settings", return_value=self._settings(target)), patch.object(
+            transfer, "run_bounded_process", side_effect=lambda *args, **kwargs: next(responses)
+        ) as run:
+            with self.assertRaises(transfer.PublishTransferCleanupError):
+                transfer.execute_publish_transfer(plan)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(plan.state, "cleanup-pending")
+        self.assertEqual(plan.recovery_path, Path(recovery))
+        with patch.object(
+            transfer,
+            "run_bounded_process",
+            return_value=BoundedProcessResult(
+                0,
+                '{"ok":true,"status":"unexpected"}\n',
+                "",
+                False,
+                False,
+            ),
+        ) as retry:
+            with self.assertRaises(transfer.PublishTransferCleanupError):
+                transfer.retry_discard_publish_transfer_plan(plan)
+        retry.assert_called_once()
+        self.assertEqual(plan.state, "cleanup-pending")
+        with patch.object(
+            transfer,
+            "run_bounded_process",
+            return_value=BoundedProcessResult(
+                0,
+                '{"ok":true,"status":"cleaned"}\n',
+                "",
+                False,
+                False,
+            ),
+        ) as retry:
+            transfer.retry_discard_publish_transfer_plan(plan)
+        retry.assert_called_once()
+        self.assertEqual(plan.state, "discarded")
+        self.assertIsNone(plan.recovery_path)
+
+    def test_lifecycle_failures_do_not_spawn_status_recovery(self) -> None:
+        manifest, target = self._manifest_and_target()
+        for field, message in (
+            (
+                "termination_incomplete",
+                "Publish transfer process termination was incomplete",
+            ),
+            (
+                "orphaned_descendants",
+                "Publish transfer left background processes after completion",
+            ),
+        ):
+            with self.subTest(field=field):
+                plan = transfer.prepare_publish_transfer("demo", manifest, target)
+                result = BoundedProcessResult(
+                    0,
+                    "",
+                    "",
+                    False,
+                    False,
+                    **{field: True},
+                )
+                with patch.object(packctl, "deployment_settings", return_value=self._settings(target)), patch.object(
+                    transfer, "run_bounded_process", return_value=result
+                ) as run:
+                    with self.assertRaisesRegex(transfer.PublishTransferUncertainError, message):
+                        transfer.execute_publish_transfer(plan)
+                run.assert_called_once()
+                self.assertEqual(plan.state, "uncertain")
+                with patch.object(
+                    transfer,
+                    "run_bounded_process",
+                    return_value=BoundedProcessResult(
+                        0,
+                        '{"ok":true,"status":"cleaned"}\n',
+                        "",
+                        False,
+                        False,
+                    ),
+                ):
+                    transfer.discard_publish_transfer_plan(plan)
+
+    def test_cancel_timeout_and_output_failures_preserve_their_cause(self) -> None:
+        manifest, target = self._manifest_and_target()
+        for result, message in (
+            (
+                BoundedProcessResult(-15, "", "", True, False),
+                "Publish transfer was cancelled",
+            ),
+            (
+                BoundedProcessResult(-15, "", "", False, True),
+                "Publish transfer timed out",
+            ),
+            (
+                BoundedProcessResult(0, "", "", False, False, output_limit_exceeded=True),
+                "Publish transfer output exceeded the supported limit",
+            ),
+        ):
+            with self.subTest(message=message):
+                plan = transfer.prepare_publish_transfer("demo", manifest, target)
+                responses = iter(
+                    [
+                        result,
+                        BoundedProcessResult(
+                            0,
+                            json.dumps(
+                                {
+                                    "ok": True,
+                                    "status": "not_committed",
+                                    "operation_id": plan.operation_id,
+                                    "manifest_digest": plan.manifest_digest,
+                                    "target_config_digest": plan.target_config_digest,
+                                    "generation_id": plan.generation_id,
+                                }
+                            )
+                            + "\n",
+                            "",
+                            False,
+                            False,
+                        ),
+                        BoundedProcessResult(
+                            0,
+                            '{"ok":true,"status":"cleaned"}\n',
+                            "",
+                            False,
+                            False,
+                        ),
+                    ]
+                )
+                with patch.object(packctl, "deployment_settings", return_value=self._settings(target)), patch.object(
+                    transfer, "run_bounded_process", side_effect=lambda *args, **kwargs: next(responses)
+                ) as run:
+                    with self.assertRaisesRegex(transfer.PublishTransferExecutionError, message):
+                        transfer.execute_publish_transfer(plan)
+                self.assertEqual(run.call_count, 3)
+                self.assertEqual(plan.state, "failed")
+                transfer.discard_publish_transfer_plan(plan)
+
 
 class PublishTransferProtocolTest(unittest.TestCase):
     def _request(self, root: str, header: dict[str, object], frames: tuple[bytes, ...]) -> tuple[int, dict[str, object]]:
@@ -337,6 +680,75 @@ class PublishTransferProtocolTest(unittest.TestCase):
             code, response = self._request(directory, self._header(directory), (b"payload",))
             self.assertNotEqual(code, 0)
             self.assertEqual(response["status"], "integrity_failure")
+
+    @unittest.skipUnless(sys.platform == "linux", "generation no-clobber uses Linux renameat2")
+    def test_generation_commit_is_atomic_no_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            header = self._header(directory)
+            encoded = json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            prefix = (
+                transfer._FRAME_HEADER
+                + struct.pack("!I", 1)
+                + struct.pack("!I", len(encoded))
+                + encoded
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", transfer._REMOTE_HELPER_SCRIPT],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert process.stdin is not None
+            process.stdin.write(prefix)
+            process.stdin.flush()
+            stage = Path(directory) / "generations" / (".huroshiki-stage-" + "a" * 32)
+            for _ in range(200):
+                if stage.is_dir():
+                    break
+                time.sleep(0.01)
+            self.assertTrue(stage.is_dir())
+            final = Path(directory) / "generations" / header["generation_id"]
+            final.mkdir()
+            marker = final / "external-marker"
+            marker.write_bytes(b"must survive")
+            process.stdin.write(struct.pack("!Q", len(b"payload")) + b"payload")
+            process.stdin.close()
+            stdout = process.stdout
+            stderr = process.stderr
+            output = stdout.read() if stdout is not None else b""
+            if stderr is not None:
+                stderr.read()
+            code = process.wait()
+            if stdout is not None:
+                stdout.close()
+            if stderr is not None:
+                stderr.close()
+            response = json.loads(output.decode("utf-8").splitlines()[-1])
+            self.assertNotEqual(code, 0)
+            self.assertEqual(response["status"], "integrity_failure")
+            self.assertEqual(marker.read_bytes(), b"must survive")
+            self.assertFalse(stage.exists())
+
+    def test_status_reports_a_retained_stage_even_when_generation_is_committed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            header = self._header(directory)
+            code, response = self._request(directory, header, (b"payload",))
+            self.assertEqual(code, 0)
+            self.assertEqual(response["status"], "committed")
+            stage = Path(directory) / "generations" / (".huroshiki-stage-" + "a" * 32)
+            stage.mkdir()
+            status_header = dict(header, request="status")
+            code, response = self._request(directory, status_header, ())
+            self.assertEqual(code, 0)
+            self.assertEqual(response["status"], "committed")
+            self.assertEqual(
+                response["recovery_path"],
+                f"{directory}/generations/{stage.name}",
+            )
+            cleanup_header = dict(header, request="cleanup")
+            code, response = self._request(directory, cleanup_header, ())
+            self.assertEqual(code, 0)
+            self.assertEqual(response["status"], "cleaned")
 
 
 if __name__ == "__main__":
