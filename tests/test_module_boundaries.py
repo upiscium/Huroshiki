@@ -4,6 +4,7 @@ import deploy_support
 import huroshiki_core
 import packctl
 import project_locks
+import publish_target
 import url_artifacts
 
 
@@ -23,6 +24,28 @@ class ModuleBoundaryTest(unittest.TestCase):
         self.assertIs(
             huroshiki_core.download_url_artifact,
             url_artifacts.download_url_artifact,
+        )
+
+    def test_core_reexports_publish_target_api(self) -> None:
+        self.assertIs(
+            huroshiki_core.PublishRemoteTarget,
+            publish_target.PublishRemoteTarget,
+        )
+        self.assertIs(
+            huroshiki_core.PublishRestartTarget,
+            publish_target.PublishRestartTarget,
+        )
+        self.assertIs(
+            huroshiki_core.PublishSshEndpoint,
+            publish_target.PublishSshEndpoint,
+        )
+        self.assertIs(
+            huroshiki_core.parse_publish_ssh_endpoint,
+            publish_target.parse_publish_ssh_endpoint,
+        )
+        self.assertIs(
+            huroshiki_core.compute_publish_remote_target_digest,
+            publish_target.compute_publish_remote_target_digest,
         )
 
 
