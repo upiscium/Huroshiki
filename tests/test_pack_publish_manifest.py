@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import threading
 import os
 import json
@@ -144,6 +145,56 @@ class PackPublishManifestTest(unittest.TestCase):
         self.assertEqual(first.files, second.files)
         self.assertEqual(index_bytes, self.generated_contents(second, "index.toml"))
         self.assertEqual(self.generated_contents(first, "pack.toml"), self.generated_contents(second, "pack.toml"))
+
+    def test_source_snapshot_digest_is_content_digest(self) -> None:
+        manifest = pack_publish.plan_pack_publish_manifest("demo")
+        scan = pack_publish.scan_pack_migration_source(
+            self.pack,
+            checkpoint=lambda: None,
+            excluded_roots=pack_publish._IGNORED_ROOTS,
+        )
+        self.assertEqual(manifest.source_snapshot_digest, scan.content_digest)
+
+    def test_source_backed_entries_have_source_paths_and_generated_entries_dont(self) -> None:
+        manifest = pack_publish.plan_pack_publish_manifest("demo")
+        for entry in manifest.files:
+            if entry.source_kind == "generated":
+                self.assertIsNone(entry.source_relative_path)
+                self.assertIsNotNone(entry.contents)
+                continue
+
+            self.assertIsNotNone(entry.source_relative_path)
+            self.assertIsNone(entry.contents)
+            self.assertFalse(entry.source_relative_path.is_absolute())
+
+            output_path = entry.relative_path.as_posix()
+            source_path = entry.source_relative_path.as_posix()
+            if source_path.startswith("source/"):
+                inferred = source_path.removeprefix("source/")
+            else:
+                self.assertTrue(source_path.startswith("content/"))
+                _, _, inferred = source_path.partition("/")
+                inferred = inferred.partition("/")[2]
+            self.assertEqual(output_path, inferred)
+
+    def test_manifest_digest_binds_source_locator(self) -> None:
+        manifest = pack_publish.plan_pack_publish_manifest("demo")
+        source_entry = next(entry for entry in manifest.files if entry.source_kind == "packwiz")
+        altered = replace(
+            source_entry,
+            source_relative_path=Path("source") / "alternate.toml",
+        )
+        altered_manifest = replace(
+            manifest,
+            files=tuple(
+                altered if entry == source_entry else entry
+                for entry in manifest.files
+            ),
+        )
+        self.assertNotEqual(
+            manifest.manifest_digest,
+            pack_publish._manifest_digest(altered_manifest),
+        )
 
     def test_client_selection_and_target_side_digest(self) -> None:
         client = pack_publish.plan_pack_publish_manifest("demo", target_side="client")
