@@ -19,6 +19,7 @@ import struct
 import tempfile
 import threading
 import time
+import tomllib
 from typing import Callable, Literal
 from uuid import uuid4
 import shlex
@@ -193,27 +194,41 @@ _MAX_HEADER_BYTES = 16 * 1024 * 1024
 _MAX_FILES = 100_000
 _MAX_FILE_BYTES = 512 * 1024 * 1024
 _MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_DESCRIPTOR_BYTES = 64 * 1024 * 1024
 _FRAME_HEADER = b"HUROSHIKI-PUBLISH-TRANSFER\x00"
 _FRAME_VERSION = 1
 _CHUNK = 1024 * 1024
 _D_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _F_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 _F_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+PublishRemoteRequest = Literal[
+    "transfer",
+    "status",
+    "cleanup",
+    "verify",
+    "activate",
+    "activation-status",
+    "activation-cleanup",
+]
 
 
 def _remote_helper_source() -> str:
-    return r'''import ctypes, errno, fcntl, hashlib, json, os, re, stat, struct, sys, unicodedata
+    return r'''import ctypes, errno, fcntl, hashlib, json, os, re, stat, struct, sys, tomllib, unicodedata
 
 MAGIC = b"HUROSHIKI-PUBLISH-TRANSFER\x00"
 VERSION = 1
 MAX_HEADER = 16 * 1024 * 1024
 MAX_FILE_BYTES = 512 * 1024 * 1024
 MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+MAX_DESCRIPTOR_BYTES = 64 * 1024 * 1024
+MAX_INDEX_RECORDS = 100000
+HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 CHUNK = 1024 * 1024
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 RENAME_NOREPLACE = 1
+RENAME_EXCHANGE = 2
 
 class TransferIntegrityFailure(RuntimeError):
     def __init__(self, message, recovery_path=None):
@@ -336,6 +351,32 @@ def rename_noreplace(old_dir_fd, old_name, new_dir_fd, new_name):
         error_number = ctypes.get_errno()
         raise OSError(error_number, os.strerror(error_number), new_name)
 
+def rename_exchange(first_dir_fd, first_name, second_dir_fd, second_name):
+    if sys.platform != "linux":
+        raise OSError(errno.ENOTSUP, "atomic activation exchange is unavailable")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as error:
+        raise OSError(errno.ENOTSUP, "atomic activation exchange is unavailable") from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        first_dir_fd,
+        os.fsencode(first_name),
+        second_dir_fd,
+        os.fsencode(second_name),
+        RENAME_EXCHANGE,
+    ) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), second_name)
+
 def remove_tree(parent, name):
     metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
     if stat.S_ISLNK(metadata.st_mode):
@@ -423,6 +464,7 @@ def verify_tree(root, expected):
     walk(root, "")
     if set(found) != set(expected):
         raise RuntimeError("staging tree contains an unexpected file")
+    verified = {}
     for path, (parts, size, digest, mode) in expected.items():
         metadata = found[path]
         if metadata.st_size != size or stat.S_IMODE(metadata.st_mode) != mode:
@@ -439,9 +481,169 @@ def verify_tree(root, expected):
                 actual.update(chunk)
             if actual.hexdigest() != digest:
                 raise RuntimeError("staged file digest mismatch")
+            verified[path] = (size, digest, mode)
         finally:
             os.close(fd)
             close_owned(root, parent, owned)
+    return verified
+
+def read_generation_file(root, path):
+    parts = validate_relative(path)
+    parent, owned = open_relative_dir(root, parts[:-1], create=False)
+    fd = os.open(parts[-1], READ_FLAGS, dir_fd=parent)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RuntimeError("semantic descriptor is not a regular file")
+        if metadata.st_size > MAX_DESCRIPTOR_BYTES:
+            raise RuntimeError("semantic descriptor exceeds the supported limit")
+        chunks = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(fd, min(CHUNK, remaining))
+            if not chunk:
+                raise RuntimeError("semantic descriptor was truncated")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+        close_owned(root, parent, owned)
+
+def validate_generation_shape(generations, generation):
+    fd = os.open(generation, DIR_FLAGS, dir_fd=generations)
+    found = set()
+    try:
+        def walk(directory, prefix):
+            for entry in os.scandir(directory):
+                relative = (prefix + "/" if prefix else "") + entry.name
+                metadata = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(metadata.st_mode) or not (stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)):
+                    raise RuntimeError("previous generation contains an unsafe entry")
+                if stat.S_ISDIR(metadata.st_mode):
+                    child = os.open(entry.name, DIR_FLAGS, dir_fd=directory)
+                    try:
+                        walk(child, relative)
+                    finally:
+                        os.close(child)
+                else:
+                    if metadata.st_nlink != 1:
+                        raise RuntimeError("previous generation contains a hard-linked file")
+                    found.add(relative)
+        walk(fd, "")
+        if "pack.toml" not in found or "index.toml" not in found:
+            raise RuntimeError("previous generation is missing semantic descriptors")
+        pack_bytes = read_generation_file(fd, "pack.toml")
+        index_bytes = read_generation_file(fd, "index.toml")
+        try:
+            pack = tomllib.loads(pack_bytes.decode("utf-8"))
+            tomllib.loads(index_bytes.decode("utf-8"))
+        except (UnicodeError, tomllib.TOMLDecodeError) as error:
+            raise RuntimeError("previous generation descriptors are invalid") from error
+        pack_index = pack.get("index")
+        if (
+            not isinstance(pack_index, dict)
+            or pack_index.get("file") != "index.toml"
+            or pack_index.get("hash-format") != "sha256"
+            or pack_index.get("hash") != hashlib.sha256(index_bytes).hexdigest()
+        ):
+            raise RuntimeError("previous generation index reference is invalid")
+    finally:
+        os.close(fd)
+
+def semantic_file_map(header):
+    files = header.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("invalid semantic publication file list")
+    result = {}
+    for item in files:
+        if not isinstance(item, dict):
+            raise RuntimeError("invalid semantic publication file descriptor")
+        path = item.get("path")
+        source_kind = item.get("source_kind")
+        if not isinstance(path, str) or not isinstance(source_kind, str):
+            raise RuntimeError("semantic publication file source is missing")
+        validate_relative(path)
+        if source_kind not in {"packwiz", "content", "generated"}:
+            raise RuntimeError("unsupported semantic publication source")
+        if path in result:
+            raise RuntimeError("duplicate semantic publication file")
+        result[path] = source_kind
+    return result
+
+def verify_semantics(header, generation, expected, verified):
+    semantic_files = semantic_file_map(header)
+    if set(semantic_files) != set(expected):
+        raise RuntimeError("semantic file set does not match the manifest")
+    if semantic_files.get("pack.toml") != "generated" or semantic_files.get("index.toml") != "generated":
+        raise RuntimeError("semantic descriptors must be generated manifest files")
+    target_side = header.get("target_side")
+    minecraft = header.get("minecraft_version")
+    loader = header.get("loader")
+    loader_version = header.get("loader_version")
+    loader_names = header.get("loader_names")
+    if (
+        target_side not in {"client", "server"}
+        or not isinstance(minecraft, str) or not minecraft
+        or not isinstance(loader, str) or not loader
+        or not isinstance(loader_version, str) or not loader_version
+        or not isinstance(loader_names, list)
+        or any(not isinstance(name, str) or not name for name in loader_names)
+        or len(set(loader_names)) != len(loader_names)
+    ):
+        raise RuntimeError("semantic publication metadata is invalid")
+    pack_bytes = read_generation_file(generation, "pack.toml")
+    index_bytes = read_generation_file(generation, "index.toml")
+    try:
+        pack = tomllib.loads(pack_bytes.decode("utf-8"))
+        index = tomllib.loads(index_bytes.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError(f"invalid remote Packwiz TOML: {error}") from error
+    versions = pack.get("versions")
+    if not isinstance(versions, dict) or versions.get("minecraft") != minecraft:
+        raise RuntimeError("remote pack.toml Minecraft version does not match manifest")
+    active_loaders = [name for name in loader_names if name in versions]
+    if active_loaders != [loader] or versions.get(loader) != loader_version:
+        raise RuntimeError("remote pack.toml loader tuple does not match manifest")
+    pack_index = pack.get("index")
+    index_digest = hashlib.sha256(index_bytes).hexdigest()
+    if (
+        not isinstance(pack_index, dict)
+        or pack_index.get("file") != "index.toml"
+        or pack_index.get("hash-format") != "sha256"
+        or pack_index.get("hash") != index_digest
+    ):
+        raise RuntimeError("remote pack.toml index reference is invalid")
+    records = index.get("files")
+    if index.get("hash-format") != "sha256" or not isinstance(records, list) or len(records) > MAX_INDEX_RECORDS:
+        raise RuntimeError("remote index.toml structure is invalid")
+    expected_records = {
+        path: path.endswith(".pw.toml")
+        for path, source_kind in semantic_files.items()
+        if source_kind == "packwiz" and path not in {"pack.toml", "index.toml"}
+    }
+    actual_records = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise RuntimeError("remote index.toml contains an invalid record")
+        if set(record) - {"file", "hash", "metafile"}:
+            raise RuntimeError("remote index.toml contains unsupported record fields")
+        path = record.get("file")
+        digest = record.get("hash")
+        if not isinstance(path, str) or not isinstance(digest, str) or not HEX_DIGEST_RE.fullmatch(digest):
+            raise RuntimeError("remote index.toml contains an invalid record")
+        validate_relative(path)
+        if path in actual_records or path not in expected_records:
+            raise RuntimeError("remote index.toml contains an unexpected path")
+        metafile = record.get("metafile", False)
+        if not isinstance(metafile, bool) or metafile != expected_records[path]:
+            raise RuntimeError("remote index.toml metafile semantics are invalid")
+        if verified[path][1] != digest:
+            raise RuntimeError("remote index.toml file digest does not match generation")
+        actual_records[path] = metafile
+    if actual_records != expected_records:
+        raise RuntimeError("remote index.toml records do not match manifest semantics")
+    return hashlib.sha256(pack_bytes).hexdigest(), index_digest
 
 def lock_root(root):
     fd = os.open(".huroshiki-lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=root)
@@ -640,6 +842,355 @@ def process_status(header):
         os.close(lock)
         os.close(root)
 
+def open_verified_generation(header, generations):
+    expected = expected_map(header)
+    generation = os.open(header["generation_id"], DIR_FLAGS, dir_fd=generations)
+    try:
+        verified = verify_tree(generation, expected)
+        pack_digest, index_digest = verify_semantics(
+            header,
+            generation,
+            expected,
+            verified,
+        )
+        return expected, verified, pack_digest, index_digest
+    finally:
+        os.close(generation)
+
+def current_generation(root, generations):
+    try:
+        metadata = os.stat("current", dir_fd=root, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISLNK(metadata.st_mode):
+        raise RuntimeError("current is not a symlink")
+    target = os.readlink("current", dir_fd=root)
+    match = re.fullmatch(r"generations/(v1-[0-9a-f]{64})", target)
+    if match is None:
+        raise RuntimeError("current symlink target is unsafe")
+    generation = match.group(1)
+    validate_generation_shape(generations, generation)
+    return generation
+
+def activation_receipt_name(operation_id):
+    return ".huroshiki-activation-" + operation_id + ".json"
+
+def write_activation_receipt(root, header, previous):
+    payload = json.dumps(
+        {
+            "schema": "huroshiki-publish-activation-v1",
+            "operation_id": header["operation_id"],
+            "manifest_digest": header["manifest_digest"],
+            "target_config_digest": header["target_config_digest"],
+            "generation_id": header["generation_id"],
+            "previous_generation_id": previous,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    name = activation_receipt_name(header["operation_id"])
+    fd = os.open(name, WRITE_FLAGS, 0o600, dir_fd=root)
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(fd, payload[offset:])
+            if written <= 0:
+                raise RuntimeError("could not write activation receipt")
+            offset += written
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.fsync(root)
+
+def read_activation_receipt(root, header):
+    name = activation_receipt_name(header["operation_id"])
+    try:
+        metadata = os.stat(name, dir_fd=root, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > 4096:
+        raise RuntimeError("activation receipt is unsafe")
+    fd = os.open(name, READ_FLAGS, dir_fd=root)
+    try:
+        data = os.read(fd, 4097)
+    finally:
+        os.close(fd)
+    try:
+        receipt = json.loads(data.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("activation receipt is malformed") from error
+    if not isinstance(receipt, dict) or receipt.get("schema") != "huroshiki-publish-activation-v1":
+        raise RuntimeError("activation receipt is invalid")
+    for key in ("operation_id", "manifest_digest", "target_config_digest", "generation_id"):
+        if receipt.get(key) != header[key]:
+            raise RuntimeError("activation receipt does not bind the request")
+    previous = receipt.get("previous_generation_id")
+    if previous is not None and (
+        not isinstance(previous, str) or re.fullmatch(r"v1-[0-9a-f]{64}", previous) is None
+    ):
+        raise RuntimeError("activation receipt contains an invalid previous generation")
+    return previous
+
+def remove_activation_receipt(root, header):
+    read_activation_receipt(root, header)
+    try:
+        os.unlink(activation_receipt_name(header["operation_id"]), dir_fd=root)
+    except FileNotFoundError:
+        pass
+
+def activation_response(header, status, *, pack_digest=None, index_digest=None, previous=None, current=None, reused=None, error=None):
+    response = {
+        "ok": error is None,
+        "request": header["request"],
+        "status": status,
+        "operation_id": header["operation_id"],
+        "manifest_digest": header["manifest_digest"],
+        "target_config_digest": header["target_config_digest"],
+        "generation_id": header["generation_id"],
+    }
+    if pack_digest is not None:
+        response["pack_toml_sha256"] = pack_digest
+    if index_digest is not None:
+        response["index_toml_sha256"] = index_digest
+    if previous is not None or "previous_generation_id" in header:
+        response["previous_generation_id"] = previous
+    if current is not None or status in {"activated", "not_activated", "uncertain"}:
+        response["current_generation_id"] = current
+    if reused is not None:
+        response["reused"] = reused
+    if error is not None:
+        response["error"] = str(error)[:512]
+    return response
+
+def process_verify(header):
+    root = open_absolute(header["publication_root"], create=False)
+    lock = lock_root(root)
+    try:
+        generations = open_child_dir(root, "generations", create=False)
+        try:
+            _, _, pack_digest, index_digest = open_verified_generation(header, generations)
+            return {
+                "ok": True,
+                "request": "verify",
+                "status": "verified",
+                "operation_id": header["operation_id"],
+                "manifest_digest": header["manifest_digest"],
+                "target_config_digest": header["target_config_digest"],
+                "generation_id": header["generation_id"],
+                "pack_toml_sha256": pack_digest,
+                "index_toml_sha256": index_digest,
+            }
+        finally:
+            os.close(generations)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
+        os.close(root)
+
+def remove_activation_temp(root, name, expected_target):
+    try:
+        metadata = os.stat(name, dir_fd=root, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISLNK(metadata.st_mode) or os.readlink(name, dir_fd=root) != expected_target:
+        raise RuntimeError("activation temporary entry is unsafe")
+    os.unlink(name, dir_fd=root)
+
+def process_activate(header):
+    root = open_absolute(header["publication_root"], create=False)
+    lock = lock_root(root)
+    generations = None
+    temp_name = ".huroshiki-current-" + header["operation_id"]
+    temp_target = "generations/" + header["generation_id"]
+    temp_created = False
+    try:
+        generations = open_child_dir(root, "generations", create=False)
+        _, _, pack_digest, index_digest = open_verified_generation(header, generations)
+        current = current_generation(root, generations)
+        if current == header["generation_id"]:
+            return activation_response(
+                header,
+                "reused",
+                pack_digest=pack_digest,
+                index_digest=index_digest,
+                previous=None,
+                current=current,
+                reused=True,
+            )
+        previous = current
+        try:
+            os.stat(temp_name, dir_fd=root, follow_symlinks=False)
+            raise RuntimeError("activation temporary entry already exists")
+        except FileNotFoundError:
+            pass
+        write_activation_receipt(root, header, previous)
+        os.symlink(temp_target, temp_name, dir_fd=root)
+        temp_created = True
+        os.fsync(root)
+        if current is None:
+            try:
+                rename_noreplace(root, temp_name, root, "current")
+            except FileExistsError as error:
+                raise RuntimeError("current changed while activation was preparing") from error
+            temp_created = False
+        else:
+            rename_exchange(root, temp_name, root, "current")
+            temp_created = False
+            try:
+                if os.readlink(temp_name, dir_fd=root) != "generations/" + current:
+                    raise RuntimeError("current changed while activation was preparing")
+                os.unlink(temp_name, dir_fd=root)
+            except BaseException:
+                try:
+                    rename_exchange(root, temp_name, root, "current")
+                except BaseException as rollback:
+                    raise TransferIntegrityFailure(
+                        "activation compare-and-swap rollback failed",
+                        recovery_path=header["publication_root"] + "/" + temp_name,
+                    ) from rollback
+                temp_created = True
+                raise
+        if current_generation(root, generations) != header["generation_id"]:
+            raise RuntimeError("current did not activate the expected generation")
+        current_fd = os.open(header["generation_id"], DIR_FLAGS, dir_fd=generations)
+        try:
+            verified = verify_tree(current_fd, expected_map(header))
+            verify_semantics(header, current_fd, expected_map(header), verified)
+        finally:
+            os.close(current_fd)
+        os.fsync(root)
+        return activation_response(
+            header,
+            "activated",
+            pack_digest=pack_digest,
+            index_digest=index_digest,
+            previous=previous,
+            current=header["generation_id"],
+            reused=False,
+        )
+    except BaseException as error:
+        cleanup_error = None
+        if temp_created:
+            try:
+                remove_activation_temp(root, temp_name, temp_target)
+            except BaseException as cleanup:
+                cleanup_error = cleanup
+        if cleanup_error is not None:
+            raise TransferIntegrityFailure(
+                f"{error}; activation temporary cleanup failed: {cleanup_error}",
+                recovery_path=header["publication_root"] + "/" + temp_name,
+            ) from error
+        raise
+    finally:
+        if generations is not None:
+            os.close(generations)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
+        os.close(root)
+
+def process_activation_status(header):
+    root = open_absolute(header["publication_root"], create=False)
+    lock = lock_root(root)
+    generations = None
+    try:
+        generations = open_child_dir(root, "generations", create=False)
+        try:
+            receipt_previous = read_activation_receipt(root, header)
+            current = current_generation(root, generations)
+        except BaseException:
+            return activation_response(header, "uncertain", current=None)
+        if current == header["generation_id"]:
+            try:
+                _, _, pack_digest, index_digest = open_verified_generation(header, generations)
+            except BaseException:
+                return activation_response(header, "uncertain", current=current)
+            return activation_response(
+                header,
+                "activated",
+                pack_digest=pack_digest,
+                index_digest=index_digest,
+                previous=receipt_previous,
+                current=current,
+                reused=False,
+            )
+        if receipt_previous is not None and current == receipt_previous:
+            return activation_response(
+                header,
+                "not_activated",
+                previous=receipt_previous,
+                current=current,
+                reused=False,
+            )
+        if receipt_previous is None and current is None:
+            return activation_response(
+                header,
+                "not_activated",
+                previous=None,
+                current=current,
+                reused=False,
+            )
+        return activation_response(
+            header,
+            "uncertain",
+            current=current,
+        )
+    finally:
+        if generations is not None:
+            os.close(generations)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
+        os.close(root)
+
+def process_activation_cleanup(header):
+    root = open_absolute(header["publication_root"], create=False)
+    lock = lock_root(root)
+    generations = None
+    try:
+        finalize_receipt = header.get("finalize_receipt", False)
+        if not isinstance(finalize_receipt, bool):
+            raise RuntimeError("activation cleanup finalization flag is invalid")
+        expected_status = header.get("expected_activation_status")
+        if finalize_receipt and expected_status not in {"activated", "not_activated"}:
+            raise RuntimeError("activation cleanup outcome binding is invalid")
+        if not finalize_receipt and expected_status is not None:
+            raise RuntimeError("activation cleanup outcome binding is unexpected")
+        receipt_previous = None
+        if finalize_receipt:
+            receipt_previous = read_activation_receipt(root, header)
+            generations = open_child_dir(root, "generations", create=False)
+            current = current_generation(root, generations)
+            if expected_status == "activated":
+                if current != header["generation_id"]:
+                    raise RuntimeError("activation cleanup outcome is not activated")
+                open_verified_generation(header, generations)
+            elif current != receipt_previous:
+                raise RuntimeError("activation cleanup outcome is not not-activated")
+        remove_activation_temp(
+            root,
+            ".huroshiki-current-" + header["operation_id"],
+            "generations/" + header["generation_id"],
+        )
+        if finalize_receipt:
+            remove_activation_receipt(root, header)
+        os.fsync(root)
+        return {
+            "ok": True,
+            "request": "activation-cleanup",
+            "status": "cleaned",
+            "operation_id": header["operation_id"],
+            "manifest_digest": header["manifest_digest"],
+            "target_config_digest": header["target_config_digest"],
+            "generation_id": header["generation_id"],
+            "finalize_receipt": finalize_receipt,
+            "expected_activation_status": expected_status,
+        }
+    finally:
+        if generations is not None:
+            os.close(generations)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
+        os.close(root)
+
 def process_cleanup(header):
     root = open_absolute(header["publication_root"], create=False)
     lock = lock_root(root)
@@ -678,6 +1229,14 @@ def main():
             send(process_transfer(header))
         elif request == "status":
             send(process_status(header))
+        elif request == "verify":
+            send(process_verify(header))
+        elif request == "activate":
+            send(process_activate(header))
+        elif request == "activation-status":
+            send(process_activation_status(header))
+        elif request == "activation-cleanup":
+            send(process_activation_cleanup(header))
         elif request == "cleanup":
             send(process_cleanup(header))
         else:
@@ -1181,31 +1740,68 @@ def _ssh_command(target: PublishRemoteTarget) -> list[str]:
 
 
 def _header(
-    request: Literal["transfer", "status", "cleanup"],
+    request: PublishRemoteRequest,
     plan: PublishTransferPlan,
 ) -> dict[str, object]:
     files = [
         {
-            "path": item.relative_path.as_posix(),
-            "size": item.size,
-            "sha256": item.sha256,
-            "mode": item.mode,
+            "path": entry.relative_path.as_posix(),
+            "size": entry.size,
+            "sha256": entry.sha256,
+            "mode": entry.mode,
+            "source_kind": entry.source_kind,
         }
-        for item in plan.manifest.files
+        for entry in plan.manifest.files
     ]
-    return {
+    return build_publish_remote_header(
+        request,
+        operation_id=plan.operation_id,
+        manifest_digest=plan.manifest_digest,
+        source_snapshot_digest=plan.source_snapshot_digest,
+        target_config_digest=plan.target_config_digest,
+        generation_id=plan.generation_id,
+        publication_root=plan.target.publication_root,
+        files=files,
+        total_bytes=plan.manifest.total_bytes,
+        semantic={
+            "target_side": plan.target_side,
+            "minecraft_version": plan.manifest.minecraft_version,
+            "loader": plan.manifest.loader,
+            "loader_version": plan.manifest.loader_version,
+            "loader_names": sorted(packctl.LOADER_FLAGS),
+        },
+    )
+
+
+def build_publish_remote_header(
+    request: PublishRemoteRequest,
+    *,
+    operation_id: str,
+    manifest_digest: str,
+    source_snapshot_digest: str,
+    target_config_digest: str,
+    generation_id: str,
+    publication_root: PurePosixPath,
+    files: list[dict[str, object]],
+    total_bytes: int,
+    semantic: dict[str, object] | None = None,
+) -> dict[str, object]:
+    header = {
         "schema": _TRANSFER_SCHEMA,
         "version": _FRAME_VERSION,
         "request": request,
-        "operation_id": plan.operation_id,
-        "manifest_digest": plan.manifest_digest,
-        "source_snapshot_digest": plan.source_snapshot_digest,
-        "target_config_digest": plan.target_config_digest,
-        "generation_id": plan.generation_id,
-        "publication_root": plan.target.publication_root.as_posix(),
+        "operation_id": operation_id,
+        "manifest_digest": manifest_digest,
+        "source_snapshot_digest": source_snapshot_digest,
+        "target_config_digest": target_config_digest,
+        "generation_id": generation_id,
+        "publication_root": publication_root.as_posix(),
         "files": files,
-        "total_bytes": plan.manifest.total_bytes,
+        "total_bytes": total_bytes,
     }
+    if semantic is not None:
+        header.update(semantic)
+    return header
 
 
 def _write_protocol_header(handle, header: dict[str, object]) -> None:
@@ -1240,7 +1836,69 @@ def _make_spool(plan: PublishTransferPlan, spool_path: Path, deadline: float, ca
 
 def _run_remote_request(
     plan: PublishTransferPlan,
-    request: Literal["transfer", "status", "cleanup"],
+    request: PublishRemoteRequest,
+    *,
+    deadline: float,
+    cancel_event: threading.Event | None,
+) -> tuple[BoundedProcessResult, dict[str, object] | None]:
+    if request != "transfer":
+        return run_publish_remote_control_request(
+            plan.target,
+            _header(request, plan),
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
+    repository = _repository_root()
+    state_root = repository / ".huroshiki"
+    packctl.make_state_directory(
+        state_root,
+        state_root=state_root,
+        repository_root=repository,
+    )
+    spool = tempfile.NamedTemporaryFile(
+        prefix="publish-transfer-",
+        dir=state_root,
+        delete=False,
+    )
+    spool_path = Path(spool.name)
+    spool.close()
+    try:
+        _make_spool(plan, spool_path, deadline, cancel_event, None)
+        with spool_path.open("rb") as input_handle:
+            result = run_bounded_process(
+                _ssh_command(plan.target),
+                cwd=repository,
+                stdin_file=input_handle,
+                cancel_event=cancel_event,
+                deadline=deadline,
+                max_output_bytes=_MAX_REMOTE_OUTPUT,
+            )
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
+            return result, None
+        if len(lines) != 1:
+            return result, None
+        try:
+            response = json.loads(lines[0])
+        except (TypeError, json.JSONDecodeError):
+            return result, None
+        if not isinstance(response, dict):
+            return result, None
+        return result, response
+    finally:
+        try:
+            spool.close()
+        except OSError:
+            pass
+        try:
+            spool_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def run_publish_remote_control_request(
+    target: PublishRemoteTarget,
+    header: dict[str, object],
     *,
     deadline: float,
     cancel_event: threading.Event | None,
@@ -1260,16 +1918,13 @@ def _run_remote_request(
     spool_path = Path(spool.name)
     spool.close()
     try:
-        if request == "transfer":
-            _make_spool(plan, spool_path, deadline, cancel_event, None)
-        else:
-            with spool_path.open("wb") as control:
-                _write_protocol_header(control, _header(request, plan))
-                control.flush()
-                os.fsync(control.fileno())
+        with spool_path.open("wb") as control:
+            _write_protocol_header(control, header)
+            control.flush()
+            os.fsync(control.fileno())
         with spool_path.open("rb") as input_handle:
             result = run_bounded_process(
-                _ssh_command(plan.target),
+                _ssh_command(target),
                 cwd=repository,
                 stdin_file=input_handle,
                 cancel_event=cancel_event,
@@ -1277,8 +1932,6 @@ def _run_remote_request(
                 max_output_bytes=_MAX_REMOTE_OUTPUT,
             )
         lines = [line for line in result.stdout.splitlines() if line.strip()]
-        if not lines:
-            return result, None
         if len(lines) != 1:
             return result, None
         try:
