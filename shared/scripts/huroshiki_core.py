@@ -233,9 +233,15 @@ from publish_transfer import (
     retry_discard_publish_transfer_plan,
 )
 from publish_activation import (
+    PublishActivatedGeneration,
+    PublishActivationCleanupError,
+    PublishActivationError,
+    PublishActivationUncertainError,
     PublishSemanticVerification,
     PublishSemanticVerificationError,
     PublishSemanticVerificationUncertainError,
+    activate_publish_generation,
+    retry_publish_activation_cleanup,
     verify_publish_generation,
 )
 

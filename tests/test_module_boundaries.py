@@ -77,6 +77,18 @@ class ModuleBoundaryTest(unittest.TestCase):
             huroshiki_core.verify_publish_generation,
             publish_activation.verify_publish_generation,
         )
+        self.assertIs(
+            huroshiki_core.PublishActivatedGeneration,
+            publish_activation.PublishActivatedGeneration,
+        )
+        self.assertIs(
+            huroshiki_core.activate_publish_generation,
+            publish_activation.activate_publish_generation,
+        )
+        self.assertIs(
+            huroshiki_core.retry_publish_activation_cleanup,
+            publish_activation.retry_publish_activation_cleanup,
+        )
 
 
 if __name__ == "__main__":

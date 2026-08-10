@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 import time
 import threading
+import re
 from typing import Callable
 from uuid import uuid4
 import tomllib
@@ -31,6 +33,28 @@ class PublishSemanticVerificationUncertainError(PublishSemanticVerificationError
     """Verification could not establish a bounded, trustworthy result."""
 
 
+class PublishActivationError(PublishTransferError):
+    """The requested generation was not activated."""
+
+    def __init__(
+        self,
+        message: str,
+        recovery_path: PurePosixPath | None = None,
+        operation_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.recovery_path = recovery_path
+        self.operation_id = operation_id
+
+
+class PublishActivationUncertainError(PublishActivationError):
+    """Activation outcome could not be classified safely."""
+
+
+class PublishActivationCleanupError(PublishActivationError):
+    """Activation temporary-entry cleanup is pending."""
+
+
 @dataclass(frozen=True)
 class PublishSemanticVerification:
     manifest_digest: str
@@ -39,10 +63,23 @@ class PublishSemanticVerification:
     pack_toml_sha256: str
     index_toml_sha256: str
     verified_file_count: int
+    manifest: PackPublishManifest | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class PublishActivatedGeneration:
+    manifest_digest: str
+    target_config_digest: str
+    generation_id: str
+    generation_path: PurePosixPath
+    current_path: PurePosixPath
+    previous_generation_id: str | None
+    reused: bool
 
 
 _VERIFY_TIMEOUT_SECONDS = 600.0
 _DESCRIPTOR_NAMES = frozenset({"pack.toml", "index.toml"})
+_GENERATION_ID_RE = re.compile(r"^v1-[0-9a-f]{64}$")
 
 
 def _deadline(value: float | None) -> float:
@@ -54,6 +91,13 @@ def _checkpoint(cancel_event: threading.Event | None, deadline: float) -> None:
         raise PublishSemanticVerificationError("Publish semantic verification was cancelled")
     if time.monotonic() >= deadline:
         raise PublishSemanticVerificationError("Publish semantic verification deadline exceeded")
+
+
+def _activation_checkpoint(cancel_event: threading.Event | None, deadline: float) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise PublishActivationError("Publish activation was cancelled")
+    if time.monotonic() >= deadline:
+        raise PublishActivationError("Publish activation deadline exceeded")
 
 
 def _emit(progress: Callable[[str], object] | None, phase: str) -> None:
@@ -142,9 +186,11 @@ def _verification_header(
     target: PublishRemoteTarget,
     operation_id: str,
     files: tuple[PublishFileEntry, ...],
+    request: str = "verify",
+    previous_generation_id: str | None = None,
 ) -> dict[str, object]:
     return build_publish_remote_header(
-        "verify",
+        request,
         operation_id=operation_id,
         manifest_digest=manifest.manifest_digest,
         source_snapshot_digest=manifest.source_snapshot_digest,
@@ -159,6 +205,11 @@ def _verification_header(
             "loader": manifest.loader,
             "loader_version": manifest.loader_version,
             "loader_names": sorted(packctl.LOADER_FLAGS),
+            **(
+                {"previous_generation_id": previous_generation_id}
+                if previous_generation_id is not None
+                else {}
+            ),
         },
     )
 
@@ -253,4 +304,420 @@ def verify_publish_generation(
         pack_digest,
         index_digest,
         len(files),
+        manifest,
+    )
+
+
+def _validate_activation_inputs(
+    staged: PublishStagedGeneration,
+    manifest: PackPublishManifest,
+    target: PublishRemoteTarget,
+    verification: PublishSemanticVerification,
+) -> tuple[tuple[PublishFileEntry, ...], str, str]:
+    try:
+        files = _validate_inputs(staged, manifest, target)
+    except PublishSemanticVerificationError as error:
+        raise PublishActivationError(str(error)) from error
+    pack_digest = next(entry.sha256 for entry in files if entry.relative_path.as_posix() == "pack.toml")
+    index_digest = next(entry.sha256 for entry in files if entry.relative_path.as_posix() == "index.toml")
+    if not isinstance(verification, PublishSemanticVerification):
+        raise PublishActivationError("activation requires semantic verification")
+    expected = {
+        "manifest_digest": manifest.manifest_digest,
+        "target_config_digest": target.config_digest,
+        "generation_id": staged.generation_id,
+        "pack_toml_sha256": pack_digest,
+        "index_toml_sha256": index_digest,
+    }
+    for key, value in expected.items():
+        if getattr(verification, key) != value:
+            raise PublishActivationError(f"verification token does not bind {key}")
+    return files, pack_digest, index_digest
+
+
+def _validate_activation_response(
+    response: dict[str, object],
+    *,
+    request: str,
+    status: str,
+    operation_id: str,
+    staged: PublishStagedGeneration,
+    manifest: PackPublishManifest,
+    target: PublishRemoteTarget,
+    pack_digest: str,
+    index_digest: str,
+) -> tuple[str | None, bool]:
+    expected = {
+        "ok": True,
+        "request": request,
+        "status": status,
+        "operation_id": operation_id,
+        "manifest_digest": manifest.manifest_digest,
+        "target_config_digest": target.config_digest,
+        "generation_id": staged.generation_id,
+    }
+    for key, value in expected.items():
+        if response.get(key) != value:
+            raise PublishActivationUncertainError(
+                f"remote activation response does not bind {key}"
+            )
+    previous = response.get("previous_generation_id")
+    if previous is not None and (
+        not isinstance(previous, str) or _GENERATION_ID_RE.fullmatch(previous) is None
+    ):
+        raise PublishActivationUncertainError(
+            "remote activation response contains an invalid previous generation"
+        )
+    current = response.get("current_generation_id")
+    if status in {"activated", "reused"}:
+        if (
+            response.get("pack_toml_sha256") != pack_digest
+            or response.get("index_toml_sha256") != index_digest
+            or current != staged.generation_id
+            or response.get("reused") is not (status == "reused")
+        ):
+            raise PublishActivationUncertainError(
+                "remote activation response semantic binding is invalid"
+            )
+    elif current is not None and (
+        not isinstance(current, str)
+        or _GENERATION_ID_RE.fullmatch(current) is None
+    ):
+        raise PublishActivationUncertainError(
+            "remote activation status contains an invalid current generation"
+        )
+    return previous, status == "reused"
+
+
+def _activation_header(
+    staged: PublishStagedGeneration,
+    manifest: PackPublishManifest,
+    target: PublishRemoteTarget,
+    operation_id: str,
+    files: tuple[PublishFileEntry, ...],
+    request: str,
+    previous_generation_id: str | None = None,
+) -> dict[str, object]:
+    return _verification_header(
+        staged,
+        manifest,
+        target,
+        operation_id,
+        files,
+        request=request,
+        previous_generation_id=previous_generation_id,
+    )
+
+
+def _activation_cleanup(
+    target: PublishRemoteTarget,
+    header: dict[str, object],
+    *,
+    deadline: float,
+    finalize_receipt: bool,
+    expected_status: str | None = None,
+) -> None:
+    try:
+        result, response = run_publish_remote_control_request(
+            target,
+            {
+                **header,
+                "request": "activation-cleanup",
+                "finalize_receipt": finalize_receipt,
+                "expected_activation_status": expected_status,
+            },
+            deadline=min(deadline, time.monotonic() + 30.0),
+            cancel_event=None,
+        )
+    except BaseException as error:
+        raise PublishActivationCleanupError(
+            "activation temporary cleanup could not be verified",
+            target.publication_root / (".huroshiki-activation-" + str(header["operation_id"]) + ".json"),
+            str(header["operation_id"]),
+        ) from error
+    lifecycle_failure = _lifecycle_failure(result)
+    if (
+        lifecycle_failure is not None
+        or not result.succeeded
+        or response is None
+        or response.get("ok") is not True
+        or response.get("request") != "activation-cleanup"
+        or response.get("status") != "cleaned"
+        or response.get("operation_id") != header["operation_id"]
+        or response.get("manifest_digest") != header["manifest_digest"]
+        or response.get("target_config_digest") != header["target_config_digest"]
+        or response.get("generation_id") != header["generation_id"]
+        or response.get("finalize_receipt") is not finalize_receipt
+        or response.get("expected_activation_status") != expected_status
+    ):
+        raise PublishActivationCleanupError(
+            lifecycle_failure or _response_error(response),
+            target.publication_root / (".huroshiki-activation-" + str(header["operation_id"]) + ".json"),
+            str(header["operation_id"]),
+        )
+
+
+def retry_publish_activation_cleanup(
+    staged: PublishStagedGeneration,
+    manifest: PackPublishManifest,
+    target: PublishRemoteTarget,
+    operation_id: str,
+    *,
+    deadline: float | None = None,
+    finalize_receipt: bool = False,
+    expected_status: str | None = None,
+) -> None:
+    """Retry cleanup after an activation outcome retained a recovery path.
+
+    This operation removes only the operation-owned temporary symlink.  It
+    never removes a generation or changes ``current``.  Receipt finalization
+    is opt-in and must only be requested after a separately bound outcome is
+    known.
+    """
+    try:
+        files = _validate_inputs(staged, manifest, target)
+    except PublishSemanticVerificationError as error:
+        raise PublishActivationError(str(error)) from error
+    if not isinstance(operation_id, str) or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
+        raise PublishActivationError("activation cleanup requires a valid operation ID")
+    if finalize_receipt and expected_status not in {"activated", "not_activated"}:
+        raise PublishActivationError("finalized activation cleanup requires a bound outcome")
+    if not finalize_receipt and expected_status is not None:
+        raise PublishActivationError("unfinalized activation cleanup cannot bind an outcome")
+    operation_deadline = _deadline(deadline)
+    if time.monotonic() >= operation_deadline:
+        raise PublishActivationCleanupError(
+            "activation cleanup deadline exceeded",
+            target.publication_root / (".huroshiki-activation-" + operation_id + ".json"),
+            operation_id,
+        )
+    header = _activation_header(
+        staged,
+        manifest,
+        target,
+        operation_id,
+        files,
+        "activation-cleanup",
+    )
+    _activation_cleanup(
+        target,
+        header,
+        deadline=operation_deadline,
+        finalize_receipt=finalize_receipt,
+        expected_status=expected_status,
+    )
+
+
+def activate_publish_generation(
+    staged: PublishStagedGeneration,
+    verification: PublishSemanticVerification,
+    target: PublishRemoteTarget,
+    *,
+    manifest: PackPublishManifest | None = None,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[[str], object] | None = None,
+) -> PublishActivatedGeneration:
+    if manifest is None and isinstance(verification, PublishSemanticVerification):
+        manifest = verification.manifest
+    if manifest is None:
+        raise PublishActivationError(
+            "activation requires the manifest used for semantic verification"
+        )
+    files, pack_digest, index_digest = _validate_activation_inputs(
+        staged,
+        manifest,
+        target,
+        verification,
+    )
+    operation_deadline = _deadline(deadline)
+    _activation_checkpoint(cancel_event, operation_deadline)
+    _emit(progress, "activating-generation")
+    operation_id = uuid4().hex
+    header = _activation_header(
+        staged,
+        manifest,
+        target,
+        operation_id,
+        files,
+        "activate",
+    )
+    result, response = run_publish_remote_control_request(
+        target,
+        header,
+        deadline=operation_deadline,
+        cancel_event=cancel_event,
+    )
+    lifecycle_failure = _lifecycle_failure(result)
+    if lifecycle_failure is not None:
+        raise PublishActivationUncertainError(
+            lifecycle_failure,
+            target.publication_root / (".huroshiki-activation-" + operation_id + ".json"),
+            operation_id,
+        )
+    if result.succeeded and response is not None and response.get("ok") is True:
+        status = response.get("status")
+        if status in {"activated", "reused"}:
+            previous, reused = _validate_activation_response(
+                response,
+                request="activate",
+                status=str(status),
+                operation_id=operation_id,
+                staged=staged,
+                manifest=manifest,
+                target=target,
+                pack_digest=pack_digest,
+                index_digest=index_digest,
+            )
+            _activation_cleanup(
+                target,
+                header,
+                deadline=operation_deadline,
+                finalize_receipt=True,
+                expected_status="activated",
+            )
+            _emit(progress, "activated")
+            return PublishActivatedGeneration(
+                manifest.manifest_digest,
+                target.config_digest,
+                staged.generation_id,
+                staged.generation_path,
+                target.publication_root / "current",
+                previous,
+                reused,
+            )
+
+    activation_failure = process_failure_message(result, label="Publish activation")
+    if response is not None and response.get("error") is not None:
+        activation_failure = str(response["error"])
+    status_header = _activation_header(
+        staged,
+        manifest,
+        target,
+        operation_id,
+        files,
+        "activation-status",
+    )
+    status_deadline = min(operation_deadline, time.monotonic() + 30.0)
+    try:
+        status_result, status_response = run_publish_remote_control_request(
+            target,
+            status_header,
+            deadline=status_deadline,
+            cancel_event=None,
+        )
+    except BaseException as error:
+        try:
+            _activation_cleanup(
+                target,
+                status_header,
+                deadline=operation_deadline,
+                finalize_receipt=False,
+            )
+        except PublishActivationCleanupError as cleanup_error:
+            raise PublishActivationUncertainError(
+                "activation status is unavailable and temporary cleanup is pending",
+                cleanup_error.recovery_path,
+                operation_id,
+            ) from cleanup_error
+        raise PublishActivationUncertainError(
+            f"{activation_failure or 'activation outcome is uncertain'}; activation status is unavailable",
+            target.publication_root / (".huroshiki-activation-" + operation_id + ".json"),
+            operation_id,
+        ) from error
+    status_lifecycle = _lifecycle_failure(status_result)
+    if status_lifecycle is not None:
+        raise PublishActivationUncertainError(
+            status_lifecycle,
+            target.publication_root / (".huroshiki-activation-" + operation_id + ".json"),
+            operation_id,
+        )
+    if status_result.succeeded and status_response is not None and status_response.get("ok") is True:
+        status = status_response.get("status")
+        if status == "activated":
+            previous, reused = _validate_activation_response(
+                status_response,
+                request="activation-status",
+                status="activated",
+                operation_id=operation_id,
+                staged=staged,
+                manifest=manifest,
+                target=target,
+                pack_digest=pack_digest,
+                index_digest=index_digest,
+            )
+            _activation_cleanup(
+                target,
+                status_header,
+                deadline=operation_deadline,
+                finalize_receipt=True,
+                expected_status="activated",
+            )
+            return PublishActivatedGeneration(
+                manifest.manifest_digest,
+                target.config_digest,
+                staged.generation_id,
+                staged.generation_path,
+                target.publication_root / "current",
+                previous,
+                reused,
+            )
+        if status in {"not_activated", "uncertain"}:
+            if status == "not_activated":
+                _validate_activation_response(
+                    status_response,
+                    request="activation-status",
+                    status="not_activated",
+                    operation_id=operation_id,
+                    staged=staged,
+                    manifest=manifest,
+                    target=target,
+                    pack_digest=pack_digest,
+                    index_digest=index_digest,
+                )
+                _activation_cleanup(
+                    target,
+                    status_header,
+                    deadline=operation_deadline,
+                    finalize_receipt=True,
+                    expected_status="not_activated",
+                )
+                raise PublishActivationError(
+                    activation_failure or "Publish generation was not activated"
+                )
+            try:
+                _activation_cleanup(
+                    target,
+                    status_header,
+                    deadline=operation_deadline,
+                    finalize_receipt=False,
+                )
+            except PublishActivationCleanupError as cleanup_error:
+                raise PublishActivationUncertainError(
+                    "Publish activation outcome is uncertain and temporary cleanup is pending",
+                    cleanup_error.recovery_path,
+                    operation_id,
+                ) from cleanup_error
+            raise PublishActivationUncertainError(
+                activation_failure or "Publish activation outcome is uncertain",
+                target.publication_root / (".huroshiki-activation-" + operation_id + ".json"),
+                operation_id=operation_id,
+            )
+    try:
+        _activation_cleanup(
+            target,
+            status_header,
+            deadline=operation_deadline,
+            finalize_receipt=False,
+        )
+    except PublishActivationCleanupError as cleanup_error:
+        raise PublishActivationUncertainError(
+            "Publish activation outcome is uncertain and temporary cleanup is pending",
+            cleanup_error.recovery_path,
+            operation_id,
+        ) from cleanup_error
+    raise PublishActivationUncertainError(
+        activation_failure or "Publish activation outcome is uncertain",
+        target.publication_root / (".huroshiki-activation-" + operation_id + ".json"),
+        operation_id=operation_id,
     )
