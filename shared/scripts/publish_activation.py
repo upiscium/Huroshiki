@@ -14,7 +14,11 @@ import tomllib
 import packctl
 from pack_publish import PackPublishError, PackPublishManifest, PublishFileEntry, validate_publish_manifest
 from process_runner import BoundedProcessResult, process_failure_message
-from publish_target import PublishRemoteTarget
+from publish_target import (
+    PublishRemoteTarget,
+    PublishTargetError,
+    publish_remote_target_from_legacy_settings,
+)
 from publish_transfer import (
     PublishStagedFile,
     PublishStagedGeneration,
@@ -167,6 +171,37 @@ def _validate_inputs(
     return manifest.files
 
 
+def _resolve_current_publish_target(
+    manifest: PackPublishManifest,
+    target: PublishRemoteTarget,
+) -> PublishRemoteTarget:
+    try:
+        settings = packctl.deployment_settings(manifest.pack_id)
+        return publish_remote_target_from_legacy_settings(
+            rsync_target=settings.rsync_target,
+            ssh_host=settings.ssh_host,
+            stack_dir=settings.stack_dir,
+            service=settings.service,
+            server_id=target.server_id,
+            remote_path=target.publication_root.as_posix(),
+        )
+    except (packctl.ConfigError, PublishTargetError) as error:
+        raise PublishTargetError(str(error)) from error
+
+
+def _check_current_publish_target(
+    manifest: PackPublishManifest,
+    target: PublishRemoteTarget,
+    error_type: type[PublishTransferError],
+) -> None:
+    try:
+        current = _resolve_current_publish_target(manifest, target)
+    except PublishTargetError as error:
+        raise error_type("current Publish target could not be resolved") from error
+    if current.config_digest != target.config_digest:
+        raise error_type("Publish target configuration is stale")
+
+
 def _header_files(files: tuple[PublishFileEntry, ...]) -> list[dict[str, object]]:
     return [
         {
@@ -268,6 +303,7 @@ def verify_publish_generation(
     files = _validate_inputs(staged, manifest, target)
     operation_deadline = _deadline(deadline)
     _checkpoint(cancel_event, operation_deadline)
+    _check_current_publish_target(manifest, target, PublishSemanticVerificationError)
     _emit(progress, "verifying-generation")
     operation_id = uuid4().hex
     header = _verification_header(staged, manifest, target, operation_id, files)
@@ -480,7 +516,7 @@ def retry_publish_activation_cleanup(
         raise PublishActivationError(str(error)) from error
     if not isinstance(operation_id, str) or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
         raise PublishActivationError("activation cleanup requires a valid operation ID")
-    if finalize_receipt and expected_status not in {"activated", "not_activated"}:
+    if finalize_receipt and expected_status not in {"activated", "reused", "not_activated"}:
         raise PublishActivationError("finalized activation cleanup requires a bound outcome")
     if not finalize_receipt and expected_status is not None:
         raise PublishActivationError("unfinalized activation cleanup cannot bind an outcome")
@@ -532,6 +568,7 @@ def activate_publish_generation(
     )
     operation_deadline = _deadline(deadline)
     _activation_checkpoint(cancel_event, operation_deadline)
+    _check_current_publish_target(manifest, target, PublishActivationError)
     _emit(progress, "activating-generation")
     operation_id = uuid4().hex
     header = _activation_header(
@@ -574,7 +611,7 @@ def activate_publish_generation(
                 header,
                 deadline=operation_deadline,
                 finalize_receipt=True,
-                expected_status="activated",
+                expected_status=str(status),
             )
             _emit(progress, "activated")
             return PublishActivatedGeneration(
@@ -634,11 +671,11 @@ def activate_publish_generation(
         )
     if status_result.succeeded and status_response is not None and status_response.get("ok") is True:
         status = status_response.get("status")
-        if status == "activated":
+        if status in {"activated", "reused"}:
             previous, reused = _validate_activation_response(
                 status_response,
                 request="activation-status",
-                status="activated",
+                status=str(status),
                 operation_id=operation_id,
                 staged=staged,
                 manifest=manifest,
@@ -651,7 +688,7 @@ def activate_publish_generation(
                 status_header,
                 deadline=operation_deadline,
                 finalize_receipt=True,
-                expected_status="activated",
+                expected_status=str(status),
             )
             return PublishActivatedGeneration(
                 manifest.manifest_digest,

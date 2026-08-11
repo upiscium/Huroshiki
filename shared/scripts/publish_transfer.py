@@ -875,7 +875,9 @@ def current_generation(root, generations):
 def activation_receipt_name(operation_id):
     return ".huroshiki-activation-" + operation_id + ".json"
 
-def write_activation_receipt(root, header, previous):
+def write_activation_receipt(root, header, previous, preexisting_expected):
+    if not isinstance(preexisting_expected, bool):
+        raise RuntimeError("activation receipt reuse state is invalid")
     payload = json.dumps(
         {
             "schema": "huroshiki-publish-activation-v1",
@@ -884,6 +886,7 @@ def write_activation_receipt(root, header, previous):
             "target_config_digest": header["target_config_digest"],
             "generation_id": header["generation_id"],
             "previous_generation_id": previous,
+            "preexisting_expected": preexisting_expected,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -929,7 +932,13 @@ def read_activation_receipt(root, header):
         not isinstance(previous, str) or re.fullmatch(r"v1-[0-9a-f]{64}", previous) is None
     ):
         raise RuntimeError("activation receipt contains an invalid previous generation")
-    return previous
+    preexisting_expected = receipt.get("preexisting_expected")
+    if not isinstance(preexisting_expected, bool):
+        raise RuntimeError("activation receipt contains an invalid reuse state")
+    return {
+        "previous_generation_id": previous,
+        "preexisting_expected": preexisting_expected,
+    }
 
 def remove_activation_receipt(root, header):
     read_activation_receipt(root, header)
@@ -952,9 +961,9 @@ def activation_response(header, status, *, pack_digest=None, index_digest=None, 
         response["pack_toml_sha256"] = pack_digest
     if index_digest is not None:
         response["index_toml_sha256"] = index_digest
-    if previous is not None or "previous_generation_id" in header:
+    if previous is not None or "previous_generation_id" in header or status == "reused":
         response["previous_generation_id"] = previous
-    if current is not None or status in {"activated", "not_activated", "uncertain"}:
+    if current is not None or status in {"activated", "reused", "not_activated", "uncertain"}:
         response["current_generation_id"] = current
     if reused is not None:
         response["reused"] = reused
@@ -1008,6 +1017,7 @@ def process_activate(header):
         _, _, pack_digest, index_digest = open_verified_generation(header, generations)
         current = current_generation(root, generations)
         if current == header["generation_id"]:
+            write_activation_receipt(root, header, None, True)
             return activation_response(
                 header,
                 "reused",
@@ -1023,7 +1033,7 @@ def process_activate(header):
             raise RuntimeError("activation temporary entry already exists")
         except FileNotFoundError:
             pass
-        write_activation_receipt(root, header, previous)
+        write_activation_receipt(root, header, previous, False)
         os.symlink(temp_target, temp_name, dir_fd=root)
         temp_created = True
         os.fsync(root)
@@ -1095,10 +1105,29 @@ def process_activation_status(header):
     try:
         generations = open_child_dir(root, "generations", create=False)
         try:
-            receipt_previous = read_activation_receipt(root, header)
+            receipt = read_activation_receipt(root, header)
             current = current_generation(root, generations)
         except BaseException:
             return activation_response(header, "uncertain", current=None)
+        if receipt is None:
+            return activation_response(header, "uncertain", current=current)
+        receipt_previous = receipt["previous_generation_id"]
+        if receipt["preexisting_expected"]:
+            if current != header["generation_id"]:
+                return activation_response(header, "uncertain", current=current)
+            try:
+                _, _, pack_digest, index_digest = open_verified_generation(header, generations)
+            except BaseException:
+                return activation_response(header, "uncertain", current=current)
+            return activation_response(
+                header,
+                "reused",
+                pack_digest=pack_digest,
+                index_digest=index_digest,
+                previous=None,
+                current=current,
+                reused=True,
+            )
         if current == header["generation_id"]:
             try:
                 _, _, pack_digest, index_digest = open_verified_generation(header, generations)
@@ -1150,20 +1179,31 @@ def process_activation_cleanup(header):
         if not isinstance(finalize_receipt, bool):
             raise RuntimeError("activation cleanup finalization flag is invalid")
         expected_status = header.get("expected_activation_status")
-        if finalize_receipt and expected_status not in {"activated", "not_activated"}:
+        if finalize_receipt and expected_status not in {"activated", "reused", "not_activated"}:
             raise RuntimeError("activation cleanup outcome binding is invalid")
         if not finalize_receipt and expected_status is not None:
             raise RuntimeError("activation cleanup outcome binding is unexpected")
-        receipt_previous = None
+        receipt = None
         if finalize_receipt:
-            receipt_previous = read_activation_receipt(root, header)
+            receipt = read_activation_receipt(root, header)
+            if receipt is None:
+                raise RuntimeError("activation cleanup requires a causal receipt")
             generations = open_child_dir(root, "generations", create=False)
             current = current_generation(root, generations)
-            if expected_status == "activated":
-                if current != header["generation_id"]:
+            if expected_status == "reused":
+                if (
+                    not receipt["preexisting_expected"]
+                    or current != header["generation_id"]
+                ):
+                    raise RuntimeError("activation cleanup outcome is not reused")
+                open_verified_generation(header, generations)
+            elif expected_status == "activated":
+                if receipt["preexisting_expected"] or current != header["generation_id"]:
                     raise RuntimeError("activation cleanup outcome is not activated")
                 open_verified_generation(header, generations)
-            elif current != receipt_previous:
+            elif receipt["preexisting_expected"]:
+                raise RuntimeError("activation cleanup outcome is not not-activated")
+            elif current != receipt["previous_generation_id"]:
                 raise RuntimeError("activation cleanup outcome is not not-activated")
         remove_activation_temp(
             root,
