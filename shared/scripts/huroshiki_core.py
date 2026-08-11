@@ -39,6 +39,7 @@ from dependency_equivalence import (
 )
 from pack_migration_roots import (
     PackRootRecord,
+    ROOT_MANIFEST_PATH,
     identify_pack_metadata_by_slug,
     read_pack_root_manifest,
     record_pack_root,
@@ -618,6 +619,109 @@ class UpdateCandidate:
     @property
     def file_count(self) -> int:
         return len(self.changes)
+
+
+_EXACT_MOD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_EXACT_DECIMAL_ID_RE = re.compile(r"^[0-9]+$")
+
+
+def _exact_positive_decimal(value: str, context: str) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or _EXACT_DECIMAL_ID_RE.fullmatch(value) is None
+        or value == "0"
+        or value.startswith("0")
+    ):
+        raise HuroshikiError(f"{context} must be a canonical positive decimal integer")
+    return value
+
+
+def _exact_provider_id(value: str, context: str) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or _EXACT_MOD_ID_RE.fullmatch(value) is None
+    ):
+        raise HuroshikiError(f"{context} must be a canonical provider ID")
+    return value
+
+
+@dataclass(frozen=True)
+class ExactModArtifactSelection:
+    provider: Literal["curseforge", "modrinth"]
+    project_id: str
+    artifact_id: str
+
+    def __post_init__(self) -> None:
+        if self.provider not in {"curseforge", "modrinth"}:
+            raise HuroshikiError(
+                "Exact MOD artifact selection supports only CurseForge or Modrinth"
+            )
+        if self.provider == "curseforge":
+            project_id = _exact_positive_decimal(
+                self.project_id, "CurseForge project ID"
+            )
+            artifact_id = _exact_positive_decimal(
+                self.artifact_id, "CurseForge file ID"
+            )
+        else:
+            project_id = _exact_provider_id(
+                self.project_id, "Modrinth project ID"
+            )
+            artifact_id = _exact_provider_id(
+                self.artifact_id, "Modrinth version ID"
+            )
+        object.__setattr__(self, "project_id", project_id)
+        object.__setattr__(self, "artifact_id", artifact_id)
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return self.provider, self.project_id
+
+    @property
+    def identity_label(self) -> str:
+        return f"{self.provider}:{self.project_id}"
+
+
+@dataclass(frozen=True)
+class ModVersionSelectionPreview:
+    identity: str
+    relative_path: Path
+    name: str
+    provider: str
+    old_version: str
+    old_artifact_id: str
+    new_version: str
+    new_artifact_id: str
+    changes: tuple[UpdateChange, ...]
+    added_dependencies: int
+    removed_dependencies: int
+    added_dependency_identities: tuple[str, ...] = ()
+    removed_dependency_identities: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ModVersionSelectionProgress:
+    phase: Literal[
+        "validating",
+        "checkpointing",
+        "resolving",
+        "verifying-root",
+        "verifying-dependencies",
+        "materializing",
+        "merging",
+        "complete",
+    ]
+    message: str = ""
+
+
+class ExactModVersionCancelled(HuroshikiError):
+    pass
+
+
+class ExactModVersionDeadlineExceeded(HuroshikiError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -1641,6 +1745,28 @@ class TransactionDiscardOperation:
             raise self.error
 
 
+class ExactModVersionOperation:
+    """Transaction-owned lifecycle for synchronous exact-selection workers."""
+
+    def __init__(
+        self,
+        cancel_event: threading.Event,
+        deadline: float,
+    ) -> None:
+        self.cancel_event = cancel_event
+        self.deadline = deadline
+        self.done = threading.Event()
+        self.cleanup_error: BaseException | None = None
+        self.termination_incomplete = False
+
+    def cancel(self, *, deadline: float | None = None) -> None:
+        del deadline
+        self.cancel_event.set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self.done.wait(timeout)
+
+
 @dataclass
 class PackTransaction:
     project_key: str
@@ -1656,12 +1782,31 @@ class PackTransaction:
     batches: list[TransactionBatch] = field(default_factory=list)
     update_candidates: tuple[UpdateCandidate, ...] = field(default_factory=tuple)
     selected_update_changes: tuple[UpdateChange, ...] = field(default_factory=tuple)
+    _exact_selection_prepared: bool = field(default=False, init=False, repr=False)
+    _exact_selection_digest: dict[Path, str] | None = field(
+        default=None, init=False, repr=False
+    )
+    _exact_selection: ExactModArtifactSelection | None = field(
+        default=None, init=False, repr=False
+    )
+    _exact_selection_manifest: bytes | None = field(
+        default=None, init=False, repr=False
+    )
+    _exact_selection_versions: tuple[str, str, str] | None = field(
+        default=None, init=False, repr=False
+    )
+    _exact_selection_checkpoint: Path | None = field(
+        default=None, init=False, repr=False
+    )
+    _exact_selection_failed_source: Path | None = field(
+        default=None, init=False, repr=False
+    )
     _equivalence_process_results: list[BoundedProcessResult] = field(
         default_factory=list, init=False, repr=False
     )
     active: bool = True
     _project_lock: packctl.ProjectLock | None = field(default=None, init=False, repr=False)
-    _operation: PackwizAddOperation | ResolvedAddOperation | None = field(
+    _operation: PackwizAddOperation | ResolvedAddOperation | ExactModVersionOperation | None = field(
         default=None, init=False, repr=False
     )
     _lock: threading.RLock = field(
@@ -1841,6 +1986,92 @@ class PackTransaction:
         if not self.active or not self.source.is_dir():
             raise HuroshikiError("This transaction is no longer active")
 
+    def _ensure_exact_selection_not_prepared(self) -> None:
+        if self._exact_selection_prepared:
+            raise HuroshikiError(
+                "An exact MOD version is prepared; apply or discard it before "
+                "staging another transaction change"
+            )
+
+    def _restore_exact_selection_checkpoint(self) -> None:
+        checkpoint = self._exact_selection_checkpoint
+        failed_source = self._exact_selection_failed_source
+        if checkpoint is None:
+            return
+        if not checkpoint.is_dir() or checkpoint.is_symlink():
+            raise HuroshikiError(
+                "Exact MOD selection checkpoint is missing; transaction state retained"
+            )
+        if failed_source is None:
+            raise HuroshikiError(
+                "Exact MOD selection rollback path is missing; transaction state retained"
+            )
+        if failed_source.exists():
+            raise HuroshikiError(
+                "Exact MOD selection rollback path already exists; transaction state retained"
+            )
+        if self.source.exists():
+            self.source.rename(failed_source)
+        checkpoint.rename(self.source)
+        self._exact_selection_prepared = False
+        self._exact_selection_digest = None
+        self._exact_selection = None
+        self._exact_selection_manifest = None
+        self._exact_selection_versions = None
+
+    def _validate_exact_selection_stage(self) -> None:
+        selection = self._exact_selection
+        expected_digest = self._exact_selection_digest
+        expected_manifest = self._exact_selection_manifest
+        expected_versions = self._exact_selection_versions
+        if (
+            selection is None
+            or expected_digest is None
+            or expected_versions is None
+        ):
+            raise HuroshikiError(
+                "Exact MOD selection state is incomplete; transaction retained"
+            )
+        ensure_safe_pack_source(self.source)
+        if tree_digest_snapshot(self.source) != expected_digest:
+            raise HuroshikiError(
+                "The exact MOD selection staging changed after preview; apply aborted"
+            )
+        if _exact_manifest_bytes(self.source) != expected_manifest:
+            raise HuroshikiError(
+                "The exact MOD root manifest changed after preview; apply aborted"
+            )
+        if packctl.project_versions(self.source) != expected_versions:
+            raise HuroshikiError(
+                "The exact MOD Minecraft or loader version changed after preview; "
+                "apply aborted"
+            )
+        records = _exact_metadata_records(self.source)
+        matches = records.get(selection.identity, ())
+        if len(matches) != 1:
+            raise HuroshikiError(
+                f"Exact MOD selection target is no longer unique: "
+                f"{selection.identity_label}"
+            )
+        relative, contents, _mod = matches[0]
+        try:
+            identity = parse_provider_metadata(relative, contents)
+        except Exception as error:
+            raise HuroshikiError(
+                f"Exact MOD selection target metadata is invalid after preview: {error}"
+            ) from error
+        if (
+            identity.provider != selection.provider
+            or identity.project_id != selection.project_id
+            or identity.file_id != selection.artifact_id
+        ):
+            raise HuroshikiError(
+                f"Exact MOD selection target changed after preview: "
+                f"{selection.identity_label} artifact "
+                f"{identity.file_id or '<missing>'}"
+            )
+        _exact_assert_root_manifest_identities(self.source, records)
+
     def _record_equivalence_process_result(
         self, result: BoundedProcessResult
     ) -> None:
@@ -1879,6 +2110,7 @@ class PackTransaction:
         side_from_flags(client, server)
         with self._lock:
             self.ensure_active()
+            self._ensure_exact_selection_not_prepared()
             if self._operation is not None:
                 raise HuroshikiError("Another Packwiz search is already running")
             operation = PackwizAddOperation(
@@ -1904,6 +2136,7 @@ class PackTransaction:
     ) -> ResolvedAddOperation:
         with self._lock:
             self.ensure_active()
+            self._ensure_exact_selection_not_prepared()
             if self._operation is not None:
                 raise HuroshikiError("Another add operation is already running")
             operation = ResolvedAddOperation(
@@ -1983,6 +2216,7 @@ class PackTransaction:
     def add(self, provider: str, query: str) -> subprocess.CompletedProcess[str]:
         """Compatibility path for synchronous add callers."""
         self.ensure_active()
+        self._ensure_exact_selection_not_prepared()
         provider, query = normalize_add_selector(provider, query)
         if provider == "url":
             operation = self.begin_add(
@@ -2028,6 +2262,7 @@ class PackTransaction:
     def add_mod_transactionally(self, provider: str, selector: str, side: str) -> int:
         """Run one synchronous add entirely in staging, then atomically apply it."""
         self.ensure_active()
+        self._ensure_exact_selection_not_prepared()
         kind, _ = split_project_key(self.project_key)
         if kind != "pack":
             raise HuroshikiError("Synchronous add can only modify MODPACK projects")
@@ -2362,6 +2597,7 @@ class PackTransaction:
     def set_side(self, relative_path: Path, client: bool, server: bool) -> None:
         with self._lock:
             self.ensure_active()
+            self._ensure_exact_selection_not_prepared()
             if self._operation is not None:
                 raise HuroshikiError("Wait for the active add operation to finish")
             side = side_from_flags(client, server)
@@ -2399,6 +2635,7 @@ class PackTransaction:
         """
         self.ensure_active()
         with self._lock:
+            self._ensure_exact_selection_not_prepared()
             if self._operation is not None:
                 raise HuroshikiError(
                     "Wait for the active add operation to finish"
@@ -2484,6 +2721,395 @@ class PackTransaction:
                     )
             self.batches = remaining_batches
 
+    def prepare_exact_mod_version(
+        self,
+        selection: ExactModArtifactSelection,
+        *,
+        cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
+        progress: Callable[[ModVersionSelectionProgress], None] | None = None,
+    ) -> ModVersionSelectionPreview:
+        operation_cancel = cancel_event or threading.Event()
+        operation_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS
+        )
+        operation = ExactModVersionOperation(operation_cancel, operation_deadline)
+        self._lifecycle_lock.acquire()
+        try:
+            with self._lock:
+                self.ensure_active()
+                if self._operation is not None:
+                    raise HuroshikiError(
+                        "Wait for the active transaction operation to finish"
+                    )
+                self._operation = operation
+            return self._prepare_exact_mod_version(
+                selection,
+                progress=progress,
+                operation_owner=operation,
+            )
+        finally:
+            with self._lock:
+                if self._operation is operation and operation.cleanup_error is None:
+                    self._operation = None
+                operation.done.set()
+            self._lifecycle_lock.release()
+
+    def _prepare_exact_mod_version(
+        self,
+        selection: ExactModArtifactSelection,
+        *,
+        progress: Callable[[ModVersionSelectionProgress], None] | None,
+        operation_owner: ExactModVersionOperation,
+    ) -> ModVersionSelectionPreview:
+        """Stage one exact provider artifact without publishing the real Pack."""
+        if not isinstance(selection, ExactModArtifactSelection):
+            raise HuroshikiError("Exact MOD artifact selection has an invalid type")
+        operation_cancel = operation_owner.cancel_event
+        operation_deadline = operation_owner.deadline
+
+        def checkpoint() -> None:
+            with self._lock:
+                owned = self.active and self._operation is operation_owner
+            if not owned:
+                raise ExactModVersionCancelled(
+                    "Exact MOD version selection lost transaction ownership"
+                )
+            if operation_cancel.is_set():
+                raise ExactModVersionCancelled(
+                    "Exact MOD version selection was cancelled"
+                )
+            if time.monotonic() >= operation_deadline:
+                raise ExactModVersionDeadlineExceeded(
+                    "Exact MOD version selection deadline exceeded"
+                )
+
+        def emit(
+            phase: Literal[
+                "validating",
+                "checkpointing",
+                "resolving",
+                "verifying-root",
+                "verifying-dependencies",
+                "materializing",
+                "merging",
+                "complete",
+            ],
+            message: str,
+        ) -> None:
+            if progress is not None:
+                progress(ModVersionSelectionProgress(phase, message))
+
+        self.ensure_active()
+        kind, project_id = split_project_key(self.project_key)
+        if kind != "pack":
+            raise HuroshikiError(
+                "Exact MOD artifact selection is available only for packs"
+            )
+        with self._lock:
+            self.ensure_active()
+            if self._operation is not None:
+                if self._operation is not operation_owner:
+                    raise HuroshikiError("Wait for the active transaction operation to finish")
+            if self._exact_selection_prepared:
+                raise HuroshikiError(
+                    "An exact MOD version is already prepared; apply or discard it"
+                )
+
+        emit("validating", f"Validating {selection.identity_label}")
+        checkpoint()
+        ensure_safe_pack_source(self.source, checkpoint=checkpoint)
+        baseline_records = _exact_metadata_records(self.source, checkpoint)
+        target_records = baseline_records.get(selection.identity, ())
+        if len(target_records) == 0:
+            raise HuroshikiError(
+                f"Exact MOD selection target is not installed: "
+                f"{selection.identity_label}"
+            )
+        if len(target_records) > 1:
+            raise HuroshikiError(
+                f"Exact MOD selection target has duplicate identity: "
+                f"{selection.identity_label}"
+            )
+        target_relative, target_contents, target_mod = target_records[0]
+        if target_mod.side not in packctl.VALID_SIDES:
+            raise HuroshikiError(
+                f"Exact MOD selection target has invalid side: {target_relative}"
+            )
+        try:
+            old_provider_identity = parse_provider_metadata(
+                target_relative, target_contents
+            )
+        except Exception as error:
+            raise HuroshikiError(
+                f"Exact MOD selection target metadata is invalid: {error}"
+            ) from error
+        if old_provider_identity.file_id is None:
+            raise HuroshikiError(
+                f"Exact MOD selection target has no artifact ID: "
+                f"{selection.identity_label}"
+            )
+        manifest_before = _exact_manifest_bytes(self.source)
+        root_records = (
+            read_pack_root_manifest(self.source)
+            if manifest_before is not None
+            else ()
+        )
+        root_by_identity = {
+            record.canonical_identity: record for record in root_records
+        }
+        root_record = root_by_identity.get(selection.identity_label)
+        selected_side = root_record.side if root_record is not None else target_mod.side
+        versions = packctl.project_versions(self.source)
+        operation_before = _file_content_snapshot(self.source, checkpoint)
+
+        operation_id = uuid4().hex
+        checkpoint_source = self.root / f"exact-selection-checkpoint-{operation_id}"
+        retained_checkpoint = (
+            self.root / f"retained-exact-selection-checkpoint-{operation_id}"
+        )
+        resolver_source = self.root / f"exact-selection-resolver-{operation_id}"
+        failed_source = self.root / f"failed-exact-selection-source-{operation_id}"
+        equivalence_workspace = self.root / f"exact-selection-equivalence-{operation_id}"
+        artifact_workspace = self.root / f"exact-selection-artifacts-{operation_id}"
+        checkpoint_created = False
+
+        def restore_checkpoint() -> None:
+            if not checkpoint_source.exists():
+                if checkpoint_created:
+                    raise HuroshikiError(
+                        "Exact MOD selection checkpoint is missing; transaction retained"
+                    )
+                return
+            if failed_source.exists():
+                raise HuroshikiError(
+                    "Exact MOD selection failed-source retention path already exists"
+                )
+            self.source.rename(failed_source)
+            try:
+                checkpoint_source.rename(self.source)
+            except BaseException as error:
+                raise HuroshikiError(
+                    "Could not restore exact pre-selection transaction source; "
+                    f"failed source retained at {failed_source}"
+                ) from error
+            restored = _file_content_snapshot(self.source)
+            if restored != operation_before:
+                raise HuroshikiError(
+                    "Restored exact pre-selection transaction source does not match "
+                    "the checkpoint"
+                )
+
+        try:
+            emit("checkpointing", "Creating exact-selection transaction checkpoint")
+            copy_transaction_source(
+                self.source,
+                checkpoint_source,
+                checkpoint=checkpoint,
+                retained_destination=retained_checkpoint,
+            )
+            checkpoint_created = True
+            checkpoint()
+            create_resolver_source(
+                resolver_source,
+                display_name=f"Resolve exact {selection.identity_label}",
+                minecraft=versions[0],
+                loader=versions[1],
+                loader_version=versions[2],
+            )
+            ensure_safe_pack_source(resolver_source, checkpoint=checkpoint)
+            resolver_before = _file_content_snapshot(resolver_source, checkpoint)
+            emit("resolving", f"Resolving {selection.identity_label} exactly")
+            closure = resolve_exact_mod_closure(
+                selection,
+                source=resolver_source,
+                cancel_event=operation_cancel,
+                deadline=operation_deadline,
+                checkpoint=checkpoint,
+                process_result_callback=self._record_equivalence_process_result,
+            )
+            emit("verifying-root", "Verifying exact root identity and artifact")
+            _verify_exact_root_metadata(selection, closure.metadata)
+            _exact_preserve_sides(
+                resolver_source,
+                selected_side,
+                checkpoint,
+            )
+            resolver_metadata = _read_resolver_metadata(
+                resolver_source,
+                checkpoint=checkpoint,
+            )
+            resolver_root = _verify_exact_root_metadata(selection, resolver_metadata)
+            if packctl.project_versions(resolver_source) != versions:
+                raise HuroshikiError(
+                    "Exact MOD resolution changed the Minecraft or loader version"
+                )
+            _exact_assert_root_manifest_identities(
+                resolver_source,
+                _exact_metadata_records(resolver_source, checkpoint),
+            )
+            emit(
+                "verifying-dependencies",
+                f"Verifying {len(resolver_metadata)} exact closure members",
+            )
+            emit("materializing", "Materializing exact closure artifacts")
+            _exact_verify_dependency_artifacts(
+                resolver_source,
+                resolver_metadata,
+                workspace=artifact_workspace,
+                minecraft=versions[0],
+                loader=versions[1],
+                loader_version=versions[2],
+                cancel_event=operation_cancel,
+                deadline=operation_deadline,
+                process_result_callback=self._record_equivalence_process_result,
+                checkpoint=checkpoint,
+            )
+            resolver_after = _file_content_snapshot(resolver_source, checkpoint)
+            resolver_changes = _content_changes(resolver_before, resolver_after)
+            new_root_data = tomllib.loads(resolver_root.contents.decode("utf-8"))
+            synthetic_candidate = UpdateCandidate(
+                key=selection.identity_label,
+                root=target_relative,
+                slug=target_mod.slug,
+                name=target_mod.name,
+                provider=selection.provider,
+                current_version=metadata_version(
+                    tomllib.loads(target_contents.decode("utf-8")),
+                    selection.provider,
+                ),
+                new_version=metadata_version(new_root_data, selection.provider),
+                new_file_id=selection.artifact_id,
+                status="update",
+                changes=resolver_changes,
+            )
+            emit("merging", "Merging the verified exact dependency closure")
+            merged_changes = _merge_update_closures(
+                (synthetic_candidate,),
+                source=self.source,
+                workspace=equivalence_workspace,
+                cancel_event=operation_cancel,
+                deadline=operation_deadline,
+                process_result_callback=self._record_equivalence_process_result,
+            )
+            checkpoint()
+            if _file_content_snapshot(self.source, checkpoint) != operation_before:
+                raise HuroshikiError(
+                    "Transaction source changed while exact MOD selection was prepared"
+                )
+            for change in merged_changes:
+                checkpoint()
+                _apply_update_change(self.source, change, use_after=True)
+            ensure_safe_pack_source(self.source, checkpoint=checkpoint)
+            _exact_run_refresh(
+                self.source,
+                cancel_event=operation_cancel,
+                deadline=operation_deadline,
+                checkpoint=checkpoint,
+                process_result_callback=self._record_equivalence_process_result,
+            )
+            ensure_safe_pack_source(self.source, checkpoint=checkpoint)
+            if packctl.project_versions(self.source) != versions:
+                raise HuroshikiError(
+                    "Exact MOD staging changed the Minecraft or loader version"
+                )
+            if _exact_manifest_bytes(self.source) != manifest_before:
+                raise HuroshikiError(
+                    "Exact MOD staging changed .huroshiki-roots.json"
+                )
+            final_records = _exact_metadata_records(self.source, checkpoint)
+            _exact_assert_root_manifest_identities(self.source, final_records)
+            final_root_records = final_records.get(selection.identity, ())
+            if len(final_root_records) != 1:
+                raise HuroshikiError(
+                    f"Exact MOD staging produced an invalid target identity: "
+                    f"{selection.identity_label}"
+                )
+            final_relative, final_contents, final_mod = final_root_records[0]
+            final_identity = _verify_exact_root_metadata(
+                selection,
+                tuple(
+                    ResolvedMetadata(
+                        selection.identity,
+                        final_relative,
+                        final_mod.filename,
+                        final_contents,
+                        selection.provider,
+                        selection.project_id,
+                    )
+                    for final_relative, final_contents, final_mod in final_root_records
+                ),
+            )
+            if final_mod.side != selected_side:
+                raise HuroshikiError("Exact MOD staging did not preserve the selected side")
+            final_after = _file_content_snapshot(self.source, checkpoint)
+            added = tuple(
+                sorted(
+                    f"{identity[0]}:{identity[1]}"
+                    for identity in final_records.keys() - baseline_records.keys()
+                    if identity != selection.identity
+                )
+            )
+            removed = tuple(
+                sorted(
+                    f"{identity[0]}:{identity[1]}"
+                    for identity in baseline_records.keys() - final_records.keys()
+                    if identity != selection.identity
+                )
+            )
+            preview = ModVersionSelectionPreview(
+                identity=selection.identity_label,
+                relative_path=final_relative,
+                name=final_mod.name,
+                provider=selection.provider,
+                old_version=metadata_version(
+                    tomllib.loads(target_contents.decode("utf-8")),
+                    selection.provider,
+                ),
+                old_artifact_id=old_provider_identity.file_id,
+                new_version=metadata_version(
+                    tomllib.loads(final_identity.contents.decode("utf-8")),
+                    selection.provider,
+                ),
+                new_artifact_id=selection.artifact_id,
+                changes=_content_changes(operation_before, final_after),
+                added_dependencies=len(added),
+                removed_dependencies=len(removed),
+                added_dependency_identities=added,
+                removed_dependency_identities=removed,
+            )
+            checkpoint()
+            self._exact_selection_prepared = True
+            self._exact_selection_digest = tree_digest_snapshot(
+                self.source,
+                checkpoint=checkpoint,
+            )
+            self._exact_selection = selection
+            self._exact_selection_manifest = manifest_before
+            self._exact_selection_versions = versions
+            self._exact_selection_checkpoint = checkpoint_source
+            self._exact_selection_failed_source = failed_source
+            emit("complete", "Exact MOD version selection staged")
+            return preview
+        except BaseException as error:
+            self._exact_selection_prepared = False
+            self._exact_selection_digest = None
+            self._exact_selection = None
+            self._exact_selection_manifest = None
+            self._exact_selection_versions = None
+            self._exact_selection_checkpoint = None
+            self._exact_selection_failed_source = None
+            try:
+                restore_checkpoint()
+            except BaseException as restore_error:
+                operation_owner.cleanup_error = restore_error
+                raise HuroshikiError(
+                    f"{error}; exact-selection rollback failed: {restore_error}"
+                ) from error
+            raise
+
     def prepare_updates(
         self,
         *,
@@ -2492,6 +3118,7 @@ class PackTransaction:
         on_progress: Callable[[UpdateProgress], None] | None = None,
     ) -> list[UpdateCandidate]:
         self.ensure_active()
+        self._ensure_exact_selection_not_prepared()
         kind, _ = split_project_key(self.project_key)
         if kind != "pack":
             raise HuroshikiError(
@@ -2541,6 +3168,7 @@ class PackTransaction:
         deadline: float | None = None,
     ) -> None:
         self.ensure_active()
+        self._ensure_exact_selection_not_prepared()
         selected = set(selected_paths)
         available = {
             candidate.root: candidate
@@ -2590,6 +3218,7 @@ class PackTransaction:
         deadline: float | None = None,
     ) -> int:
         self.ensure_active()
+        self._ensure_exact_selection_not_prepared()
         selected = set(slugs)
         kind, project_id = split_project_key(self.project_key)
         if kind == "template":
@@ -2657,11 +3286,23 @@ class PackTransaction:
         deadline: float | None = None,
     ) -> None:
         with self._lifecycle_lock:
-            self._apply(
-                refresh=refresh,
-                cancel_event=cancel_event,
-                deadline=deadline,
-            )
+            exact_prepared = self._exact_selection_prepared
+            try:
+                self._apply(
+                    refresh=refresh,
+                    cancel_event=cancel_event,
+                    deadline=deadline,
+                )
+            except BaseException as error:
+                if exact_prepared:
+                    try:
+                        self._restore_exact_selection_checkpoint()
+                    except BaseException as restore_error:
+                        raise HuroshikiError(
+                            f"{error}; exact MOD selection rollback failed: "
+                            f"{restore_error}"
+                        ) from error
+                raise
 
     def _apply(
         self,
@@ -2671,6 +3312,10 @@ class PackTransaction:
         deadline: float | None,
     ) -> None:
         self.ensure_active()
+        exact_prepared = self._exact_selection_prepared
+        if exact_prepared:
+            self._validate_exact_selection_stage()
+            refresh = False
         if self._equivalence_process_results:
             cleanup_deadline = time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS
             if deadline is not None:
@@ -2913,6 +3558,10 @@ class PackTransaction:
             return self._discard_error
 
     def _run_discard_operation(self, discard: TransactionDiscardOperation) -> None:
+        with self._lock:
+            operation = self._operation
+        if operation is not None and not operation.done.is_set():
+            operation.cancel(deadline=discard.deadline)
         with self._lifecycle_lock:
             self._run_discard_operation_locked(discard)
 
@@ -3046,6 +3695,32 @@ def build_add_command(provider: str, query: str) -> list[str]:
     if provider == "curseforge" and query.isdecimal():
         return ["packwiz", "curseforge", "add", "--addon-id", query]
     return ["packwiz", provider, "add", query]
+
+
+def build_exact_artifact_command(
+    selection: ExactModArtifactSelection,
+) -> list[str]:
+    if selection.provider == "curseforge":
+        return [
+            "packwiz",
+            "--yes",
+            "curseforge",
+            "add",
+            "--addon-id",
+            selection.project_id,
+            "--file-id",
+            selection.artifact_id,
+        ]
+    return [
+        "packwiz",
+        "--yes",
+        "modrinth",
+        "add",
+        "--project-id",
+        selection.project_id,
+        "--version-id",
+        selection.artifact_id,
+    ]
 
 
 def normalize_provider(provider: str) -> str:
@@ -4756,6 +5431,145 @@ def _content_changes(
     )
 
 
+def _exact_metadata_records(
+    source: Path,
+    checkpoint: Callable[[], None] | None = None,
+) -> dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]]:
+    records: dict[tuple[str, str], list[tuple[Path, bytes, ModInfo]]] = {}
+    for path in _checkpointed_paths(source, "*.pw.toml", checkpoint):
+        _run_checkpoint(checkpoint)
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(source)
+        contents = _read_file_bytes(path, checkpoint)
+        try:
+            mod = read_mod_data(relative, tomllib.loads(contents.decode("utf-8")))
+        except (UnicodeError, tomllib.TOMLDecodeError, ValueError) as error:
+            raise HuroshikiError(
+                f"Exact MOD selection metadata {relative} is invalid: {error}"
+            ) from error
+        identity = canonical_provider(mod.provider), mod.project_id
+        records.setdefault(identity, []).append((relative, contents, mod))
+    return {identity: tuple(items) for identity, items in records.items()}
+
+
+def _exact_manifest_bytes(source: Path) -> bytes | None:
+    path = safe_child(source, ROOT_MANIFEST_PATH)
+    if not path.exists():
+        return None
+    if not path.is_file() or path.is_symlink():
+        raise HuroshikiError("Exact MOD selection requires a regular root manifest")
+    return path.read_bytes()
+
+
+def _exact_assert_root_manifest_identities(
+    source: Path,
+    records: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
+) -> None:
+    manifest = safe_child(source, ROOT_MANIFEST_PATH)
+    if not manifest.is_file() or manifest.is_symlink():
+        return
+    for root in read_pack_root_manifest(source):
+        identity = tuple(root.canonical_identity.split(":", 1))
+        if len(records.get(identity, ())) != 1:
+            raise HuroshikiError(
+                f"Exact MOD selection removed or duplicated root "
+                f"{root.canonical_identity}"
+            )
+
+
+def _exact_preserve_sides(
+    source: Path,
+    selected_side: str,
+    checkpoint: Callable[[], None],
+) -> None:
+    records = _exact_metadata_records(source, checkpoint)
+    if selected_side not in packctl.VALID_SIDES:
+        raise HuroshikiError(f"Invalid exact MOD selection side: {selected_side}")
+    for identity, items in records.items():
+        desired_side = selected_side
+        if desired_side not in packctl.VALID_SIDES:
+            raise HuroshikiError(
+                f"Exact MOD selection encountered invalid side for "
+                f"{identity[0]}:{identity[1]}"
+            )
+        for relative, contents, _ in items:
+            checkpoint()
+            updated = _metadata_contents_with_side(contents, desired_side)
+            if updated != contents:
+                safe_child(source, relative).write_bytes(updated)
+
+
+def _exact_run_refresh(
+    source: Path,
+    *,
+    cancel_event: threading.Event,
+    deadline: float,
+    checkpoint: Callable[[], None],
+    process_result_callback: Callable[[BoundedProcessResult], None] | None,
+) -> None:
+    checkpoint()
+    process_kwargs: dict[str, object] = {
+        "cwd": source,
+        "cancel_event": cancel_event,
+        "deadline": min(
+            deadline,
+            time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+        ),
+    }
+    if process_result_callback is not None:
+        process_kwargs["result_callback"] = process_result_callback
+    result = run_resolver_process(["packwiz", "refresh"], **process_kwargs)
+    failure = _exact_process_failure(result, label="Exact Packwiz refresh")
+    if failure is not None:
+        raise HuroshikiError(failure)
+    checkpoint()
+
+
+def _exact_verify_dependency_artifacts(
+    source: Path,
+    metadata: Sequence[ResolvedMetadata],
+    *,
+    workspace: Path,
+    minecraft: str,
+    loader: str,
+    loader_version: str,
+    cancel_event: threading.Event,
+    deadline: float,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None,
+    checkpoint: Callable[[], None],
+) -> None:
+    workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+    context = EquivalenceContext(
+        minecraft,
+        loader,
+        loader_version,
+        _equivalence_snapshot_digest(source, checkpoint),
+        EQUIVALENCE_POLICY_VERSION,
+    )
+    for item in metadata:
+        checkpoint()
+        document = tomllib.loads(item.contents.decode("utf-8"))
+        mod = read_mod_data(item.relative_path, document)
+        candidate = DependencyCandidate(
+            f"{item.provider}:{item.project_id}",
+            str(item.relative_path),
+            item.filename,
+            item.contents,
+            mod.side,
+            "dependency",
+            False,
+        )
+        materialize_provider_artifact(
+            candidate,
+            context,
+            workspace=workspace,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            process_result_callback=process_result_callback,
+        )
+
+
 class LoaderMigrationCancelled(HuroshikiError):
     pass
 
@@ -5574,6 +6388,12 @@ def _merge_update_closures(
     deadline: float | None = None,
     process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> tuple[UpdateChange, ...]:
+    def checkpoint() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise HuroshikiError("Dependency closure merge was cancelled")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise HuroshikiError("Dependency closure merge deadline exceeded")
+
     selected = tuple(candidates)
     if not selected:
         return ()
@@ -5582,10 +6402,17 @@ def _merge_update_closures(
     other_operations: dict[str, UpdateChange] = {}
 
     if source is not None:
-        ensure_safe_pack_source(source)
-        for metadata_path in sorted(source.rglob("*.pw.toml")):
+        checkpoint()
+        ensure_safe_pack_source(source, checkpoint=checkpoint)
+        for metadata_path in _checkpointed_paths(source, "*.pw.toml", checkpoint):
+            checkpoint()
+            if not metadata_path.is_file() or metadata_path.is_symlink():
+                continue
             relative_path = metadata_path.relative_to(source)
-            record = _update_metadata_record(relative_path, metadata_path.read_bytes())
+            record = _update_metadata_record(
+                relative_path,
+                _read_file_bytes(metadata_path, checkpoint),
+            )
             previous = baseline_by_identity.get(record.identity)
             if previous is not None:
                 raise HuroshikiError(
@@ -5595,9 +6422,11 @@ def _merge_update_closures(
             baseline_by_identity[record.identity] = record
 
     for candidate in selected:
+        checkpoint()
         before_records: dict[tuple[str, str], _UpdateMetadata] = {}
         after_records: dict[tuple[str, str], _UpdateMetadata] = {}
         for change in candidate.changes:
+            checkpoint()
             if not change.relative_path.name.endswith(".pw.toml"):
                 if change.relative_path in PACKWIZ_GENERATED_PATHS:
                     continue
@@ -5665,6 +6494,7 @@ def _merge_update_closures(
             final_records.pop(identity, None)
 
     if source is not None:
+        checkpoint()
         root_manifest = source / ".huroshiki-roots.json"
         manifest_exists = root_manifest.is_file() and not root_manifest.is_symlink()
         explicit_roots = (
@@ -5706,7 +6536,7 @@ def _merge_update_closures(
                     minecraft,
                     loader,
                     loader_version,
-                    _equivalence_snapshot_digest(source),
+                    _equivalence_snapshot_digest(source, checkpoint),
                     EQUIVALENCE_POLICY_VERSION,
                 )
             left = final_records[left_identity]
@@ -6605,19 +7435,24 @@ def _metadata_contents_with_side(contents: bytes, side: str) -> bytes:
 def _read_resolver_metadata(
     source: Path,
     side: str | None = None,
+    checkpoint: Callable[[], None] | None = None,
 ) -> tuple[ResolvedMetadata, ...]:
     records: list[ResolvedMetadata] = []
     identities: dict[tuple[str, str], Path] = {}
     paths: dict[str, tuple[str, str]] = {}
     filenames: dict[str, tuple[str, str]] = {}
-    for path in sorted(source.rglob("*.pw.toml")):
+    for path in _checkpointed_paths(source, "*.pw.toml", checkpoint):
+        _run_checkpoint(checkpoint)
+        if not path.is_file() or path.is_symlink():
+            continue
         relative = path.relative_to(source)
         try:
             relative = portable_relative_path(relative)
             path_key = portable_relative_path_key(relative)
         except PortablePathError as error:
             raise HuroshikiError(f"Resolver metadata path {relative}: {error}") from error
-        mod = read_mod(source, relative)
+        contents = _read_file_bytes(path, checkpoint)
+        mod = read_mod_data(relative, tomllib.loads(contents.decode("utf-8")))
         provider = canonical_provider(mod.provider)
         identity = (provider, mod.project_id)
         if provider not in {"modrinth", "curseforge", "url"} or not mod.project_id:
@@ -6655,7 +7490,7 @@ def _read_resolver_metadata(
                 identity,
                 relative,
                 filename,
-                path.read_bytes(),
+                contents,
                 provider,
                 mod.project_id,
             )
@@ -6849,18 +7684,131 @@ def resolve_mod_closure(
         return ResolvedModClosure(root_identity, metadata)
 
 
+def _exact_process_failure(
+    result: ResolverProcessResult,
+    *,
+    label: str,
+) -> str | None:
+    if result.termination_incomplete:
+        return f"{label} process termination was incomplete"
+    if result.orphaned_descendants:
+        return f"{label} left background processes after completion"
+    if result.cancelled:
+        return f"{label} was cancelled"
+    if result.timed_out:
+        return f"{label} deadline exceeded"
+    if result.returncode != 0:
+        return f"{label} failed: {concise_process_error(result)}"
+    return None
+
+
+def _verify_exact_root_metadata(
+    selection: ExactModArtifactSelection,
+    metadata: Sequence[ResolvedMetadata],
+) -> ResolvedMetadata:
+    matches = [item for item in metadata if item.identity == selection.identity]
+    if len(matches) != 1:
+        raise HuroshikiError(
+            f"Exact resolver produced {len(matches)} roots for "
+            f"{selection.identity_label}"
+        )
+    root = matches[0]
+    try:
+        identity = parse_provider_metadata(root.relative_path, root.contents)
+    except Exception as error:
+        raise HuroshikiError(
+            f"Exact resolver produced invalid root metadata for "
+            f"{selection.identity_label}: {error}"
+        ) from error
+    if (
+        identity.provider != selection.provider
+        or identity.project_id != selection.project_id
+        or identity.file_id != selection.artifact_id
+    ):
+        actual = (
+            f"{identity.provider}:{identity.project_id}"
+            f" artifact {identity.file_id or '<missing>'}"
+        )
+        raise HuroshikiError(
+            f"Exact resolver selected {actual}; expected "
+            f"{selection.identity_label} artifact {selection.artifact_id}"
+        )
+    return root
+
+
+def resolve_exact_mod_closure(
+    selection: ExactModArtifactSelection,
+    *,
+    source: Path,
+    cancel_event: threading.Event,
+    deadline: float,
+    checkpoint: Callable[[], None],
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
+) -> ResolvedModClosure:
+    """Resolve one exact provider artifact in an operation-owned Packwiz source."""
+    checkpoint()
+    ensure_safe_pack_source(source, checkpoint=checkpoint)
+    command = build_exact_artifact_command(selection)
+    resolver_deadline = min(
+        deadline,
+        time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+    )
+    process_kwargs: dict[str, object] = {
+        "cwd": source,
+        "cancel_event": cancel_event,
+        "deadline": resolver_deadline,
+    }
+    if process_result_callback is not None:
+        process_kwargs["result_callback"] = process_result_callback
+    result = run_resolver_process(command, **process_kwargs)
+    failure = _exact_process_failure(result, label="Exact Packwiz resolution")
+    if failure is not None:
+        raise HuroshikiError(failure)
+    checkpoint()
+
+    refresh_deadline = min(
+        deadline,
+        time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+    )
+    refresh_kwargs: dict[str, object] = {
+        "cwd": source,
+        "cancel_event": cancel_event,
+        "deadline": refresh_deadline,
+    }
+    if process_result_callback is not None:
+        refresh_kwargs["result_callback"] = process_result_callback
+    refresh = run_resolver_process(
+        ["packwiz", "refresh"],
+        **refresh_kwargs,
+    )
+    failure = _exact_process_failure(refresh, label="Exact Packwiz refresh")
+    if failure is not None:
+        raise HuroshikiError(failure)
+    checkpoint()
+    ensure_safe_pack_source(source, checkpoint=checkpoint)
+    metadata = _read_resolver_metadata(source)
+    _verify_exact_root_metadata(selection, metadata)
+    return ResolvedModClosure(selection.identity, metadata)
+
+
 def _closure_metadata_semantics(contents: bytes) -> tuple[object, object, object]:
     document = tomllib.loads(contents.decode("utf-8"))
     return document.get("filename"), document.get("download"), document.get("update")
 
 
-def _equivalence_snapshot_digest(source: Path) -> str:
+def _equivalence_snapshot_digest(
+    source: Path,
+    checkpoint: Callable[[], None] | None = None,
+) -> str:
     digest = hashlib.sha256()
-    for path in sorted(source.rglob("*.pw.toml")):
+    for path in _checkpointed_paths(source, "*.pw.toml", checkpoint):
+        _run_checkpoint(checkpoint)
+        if not path.is_file() or path.is_symlink():
+            continue
         relative = portable_relative_path(path.relative_to(source))
         digest.update(str(relative).encode("utf-8"))
         digest.update(b"\0")
-        digest.update(path.read_bytes())
+        digest.update(_read_file_bytes(path, checkpoint))
         digest.update(b"\0")
     return digest.hexdigest()
 
