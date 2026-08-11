@@ -81,6 +81,12 @@ RSYNC_PROCESS_TIMEOUT_SECONDS = 120
 RSYNC_PREVIEW_OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 RSYNC_OUTPUT_MAX_BYTES = RSYNC_PREVIEW_OUTPUT_MAX_BYTES
 RSYNC_DIAGNOSTIC_MAX_CHARS = 4096
+PACKWIZ_OUTPUT_MAX_BYTES = 4 * 1024 * 1024
+_LOG_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_LOG_SECRET_OPTION_RE = re.compile(
+    r"^--(?:api[-_]?key|authorization|cookie|credential|header|password|secret|token)$",
+    re.IGNORECASE,
+)
 VALID_SIDES = {"client", "server", "both"}
 SIDE_ALIASES = {
     "b": "both",
@@ -1068,6 +1074,13 @@ class StateItem:
 
 
 @dataclass(frozen=True)
+class PackwizDiagnostic:
+    has_output: bool
+    log_path: Path | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class StateCleanupReport:
     items: tuple[StateItem, ...]
     selected: tuple[StateItem, ...]
@@ -1989,6 +2002,8 @@ def run_packwiz(
     cwd: Path,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
+    project_id: str | None = None,
+    operation: str = "packwiz",
 ) -> BoundedProcessResult:
     print("+", " ".join(shlex.quote(part) for part in command))
     process_deadline = time.monotonic() + PACKWIZ_PROCESS_TIMEOUT_SECONDS
@@ -1999,11 +2014,209 @@ def run_packwiz(
         cwd=cwd,
         cancel_event=cancel_event,
         deadline=process_deadline,
+        max_output_bytes=PACKWIZ_OUTPUT_MAX_BYTES,
     )
     failure = process_failure_message(result, label="Packwiz")
+    diagnostic = record_packwiz_diagnostic(
+        command,
+        result,
+        project_id=project_id,
+        operation=operation,
+    )
+    if diagnostic.has_output and failure is None:
+        if diagnostic.log_path is None:
+            print(
+                "Packwiz completed with diagnostics, but diagnostic log could not be written: "
+                f"{diagnostic.error}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Packwiz completed with diagnostics. Details: "
+                f"{relative_state_path(diagnostic.log_path)}",
+                file=sys.stderr,
+            )
     if failure is not None:
+        if diagnostic.log_path is not None:
+            failure = f"{failure}; Details: {relative_state_path(diagnostic.log_path)}"
+        elif diagnostic.error is not None:
+            failure = f"{failure}; diagnostic log could not be written: {diagnostic.error}"
         raise ConfigError(failure)
     return result
+
+
+def _safe_log_component(value: str | None, *, fallback: str) -> str:
+    if isinstance(value, str) and _LOG_COMPONENT_RE.fullmatch(value):
+        return value
+    return fallback
+
+
+def relative_state_path(path: Path) -> str:
+    try:
+        return path.relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _redacted_packwiz_command(command: Sequence[str]) -> tuple[str, ...]:
+    redacted: list[str] = []
+    redact_next = False
+    for raw_part in command:
+        part = str(raw_part)
+        if redact_next:
+            redacted.append("<redacted>")
+            redact_next = False
+            continue
+        if _LOG_SECRET_OPTION_RE.fullmatch(part):
+            redacted.append(part)
+            redact_next = True
+            continue
+        if "=" in part:
+            option, _, _value = part.partition("=")
+            if _LOG_SECRET_OPTION_RE.fullmatch(option):
+                redacted.append(f"{option}=<redacted>")
+                continue
+        parsed = urlparse(part)
+        try:
+            has_credentials = parsed.scheme and (
+                parsed.username is not None or parsed.password is not None
+            )
+            hostname = parsed.hostname
+        except ValueError:
+            has_credentials = False
+            hostname = None
+        if has_credentials:
+            redacted.append(f"{parsed.scheme}://<redacted>@{hostname or ''}")
+            continue
+        redacted.append(part)
+    return tuple(redacted)
+
+
+def _packwiz_process_log_text(
+    command: list[str],
+    result: BoundedProcessResult,
+    *,
+    operation: str,
+    project: str,
+) -> str:
+    output_note = (
+        "output truncated / supported limit exceeded"
+        if result.output_limit_exceeded
+        else "none"
+    )
+    return "\n".join(
+        (
+            "Huroshiki Packwiz Process Log",
+            f"operation: {operation}",
+            f"project: {project}",
+            f"command_argv: {json.dumps(_redacted_packwiz_command(command), ensure_ascii=False)}",
+            f"returncode: {result.returncode}",
+            f"cancelled: {str(result.cancelled).lower()}",
+            f"timed_out: {str(result.timed_out).lower()}",
+            f"orphaned_descendants: {str(result.orphaned_descendants).lower()}",
+            f"termination_incomplete: {str(result.termination_incomplete).lower()}",
+            f"output_limit_exceeded: {str(result.output_limit_exceeded).lower()}",
+            f"output_note: {output_note}",
+            "",
+            "--- stdout ---",
+            result.stdout,
+            "",
+            "--- stderr ---",
+            result.stderr,
+            "",
+        )
+    )
+
+
+def record_packwiz_diagnostic(
+    command: Sequence[str],
+    result: BoundedProcessResult,
+    *,
+    project_id: str | None = None,
+    operation: str = "packwiz",
+) -> PackwizDiagnostic:
+    has_output = bool(result.stdout or result.stderr)
+    if not has_output and result.succeeded:
+        return PackwizDiagnostic(False)
+    try:
+        log_path = _write_packwiz_diagnostic_log(
+            list(command),
+            result,
+            project_id=project_id,
+            operation=operation,
+        )
+    except Exception as error:
+        return PackwizDiagnostic(has_output, error=str(error))
+    return PackwizDiagnostic(has_output, log_path=log_path)
+
+
+def _write_packwiz_diagnostic_log(
+    command: list[str],
+    result: BoundedProcessResult,
+    *,
+    project_id: str | None,
+    operation: str,
+) -> Path:
+    project = _safe_log_component(project_id, fallback="global")
+    safe_operation = _safe_log_component(operation, fallback="packwiz")
+    logs_root = make_state_directory(
+        LOG_ROOT,
+        state_root=STATE_ROOT,
+        repository_root=ROOT,
+    )
+    project_root = make_state_directory(
+        logs_root / project,
+        state_root=STATE_ROOT,
+        repository_root=ROOT,
+    )
+    for directory in (logs_root, project_root):
+        metadata = directory.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise ConfigError("Packwiz diagnostic log directory is unsafe")
+        directory.chmod(0o700)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    payload = _packwiz_process_log_text(
+        command,
+        result,
+        operation=safe_operation,
+        project=project,
+    ).encode("utf-8")
+    directory_fd = os.open(
+        project_root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        for attempt in range(8):
+            name = f"{timestamp}-packwiz-{safe_operation}-{uuid4().hex}-{attempt}.log"
+            path = project_root / name
+            ensure_safe_state_path(path, state_root=STATE_ROOT, repository_root=ROOT)
+            try:
+                file_fd = os.open(
+                    name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+            except FileExistsError:
+                continue
+            try:
+                with os.fdopen(file_fd, "wb") as handle:
+                    file_fd = -1
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.fsync(directory_fd)
+                return path
+            finally:
+                if file_fd >= 0:
+                    os.close(file_fd)
+        raise ConfigError("Could not allocate an exclusive Packwiz diagnostic log")
+    finally:
+        os.close(directory_fd)
 
 
 def bounded_diagnostic(text: str, *, limit: int = RSYNC_DIAGNOSTIC_MAX_CHARS) -> str:
@@ -2111,6 +2324,7 @@ def set_side_and_refresh(
     *,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
+    project_id: str | None = None,
 ) -> None:
     snapshots = {
         item: item.read_bytes() if item.exists() else None
@@ -2123,6 +2337,8 @@ def set_side_and_refresh(
             cwd=source,
             cancel_event=cancel_event,
             deadline=deadline,
+            project_id=project_id,
+            operation="side-refresh",
         )
     except BaseException as error:
         rollback_errors: list[str] = []
@@ -2306,6 +2522,7 @@ def init_packwiz_project(
     loader_version: str,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
+    project_id: str | None = None,
 ) -> None:
     if loader not in LOADER_FLAGS:
         raise ConfigError(f"Unsupported loader: {loader}")
@@ -2333,6 +2550,8 @@ def init_packwiz_project(
         cwd=source,
         cancel_event=cancel_event,
         deadline=deadline,
+        project_id=project_id,
+        operation="init",
     )
     create_layout(root)
     (source / ".packwizignore").write_text(
@@ -2368,6 +2587,7 @@ def _new_pack(
             loader_version=args.loader_version,
             cancel_event=cancel_event,
             deadline=deadline,
+            project_id=args.pack,
         )
         pack_yaml = {
             "id": args.pack,
@@ -3315,7 +3535,7 @@ def cmd_side(args: argparse.Namespace) -> int:
             raise ConfigError("Metadata path escaped source/")
         if not target.is_file() or not target.name.endswith(".pw.toml"):
             raise ConfigError(f"Metadata file not found: {target}")
-        set_side_and_refresh(source, target, side)
+        set_side_and_refresh(source, target, side, project_id=args.pack)
     print(f"{args.pack}/{target.relative_to(source)}: side = {side}")
     return 0
 
@@ -4123,12 +4343,16 @@ def _build_pack(
             cwd=staged_dist / "client",
             cancel_event=cancel_event,
             deadline=operation_deadline,
+            project_id=pack_id,
+            operation="build-client-refresh",
         )
         run_packwiz(
             ["packwiz", "refresh"],
             cwd=staged_dist / "server",
             cancel_event=cancel_event,
             deadline=operation_deadline,
+            project_id=pack_id,
+            operation="build-server-refresh",
         )
 
         try:

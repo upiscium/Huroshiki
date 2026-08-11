@@ -45,7 +45,13 @@ class TemplateCreationTest(unittest.TestCase):
 
     @staticmethod
     def run_fake_resolver(
-        command, *, cwd, cancel_event, deadline, result_callback=None
+        command,
+        *,
+        cwd,
+        cancel_event,
+        deadline,
+        result_callback=None,
+        max_output_bytes=None,
     ):
         result = core.subprocess.run(command, cwd=cwd, check=False)
         resolved = core.ResolverProcessResult(
