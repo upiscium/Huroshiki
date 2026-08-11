@@ -8,6 +8,7 @@ import subprocess
 import shutil
 import sys
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -22,6 +23,20 @@ from process_runner import BoundedProcessResult
 
 
 class PublishSemanticVerificationTest(PackPublishManifestTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.current_settings = self._settings(self._target())
+        self.deployment_settings_patch = patch.object(
+            packctl,
+            "deployment_settings",
+            return_value=self.current_settings,
+        )
+        self.deployment_settings_patch.start()
+
+    def tearDown(self) -> None:
+        self.deployment_settings_patch.stop()
+        super().tearDown()
+
     def _target(self) -> publish_target.PublishRemoteTarget:
         return publish_target.publish_remote_target_from_legacy_settings(
             rsync_target=f"publisher@publish.example:{self.root / 'configured'}",
@@ -146,6 +161,41 @@ class PublishSemanticVerificationTest(PackPublishManifestTest):
         finally:
             transfer.discard_publish_transfer_plan(plan)
 
+    def test_verify_rejects_stale_effective_target_before_remote_request(self) -> None:
+        manifest, target, plan, staged = self._staged_generation()
+        stale_settings = replace(self.current_settings, ssh_host="other@game.example")
+        try:
+            with patch.object(packctl, "deployment_settings", return_value=stale_settings), patch.object(
+                transfer, "run_bounded_process"
+            ) as run:
+                with self.assertRaises(activation.PublishSemanticVerificationError):
+                    activation.verify_publish_generation(staged, manifest, target)
+            run.assert_not_called()
+        finally:
+            transfer.discard_publish_transfer_plan(plan)
+
+    def test_activate_rejects_stale_restart_target_before_remote_request(self) -> None:
+        manifest, target, plan, staged, verification = self._verified_generation()
+        stale_settings = replace(self.current_settings, stack_dir="/srv/other-minecraft")
+        current = Path(target.publication_root) / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.write_bytes(b"unchanged")
+        try:
+            with patch.object(packctl, "deployment_settings", return_value=stale_settings), patch.object(
+                transfer, "run_bounded_process"
+            ) as run:
+                with self.assertRaises(activation.PublishActivationError):
+                    activation.activate_publish_generation(
+                        staged,
+                        verification,
+                        target,
+                        manifest=manifest,
+                    )
+            run.assert_not_called()
+            self.assertEqual(current.read_bytes(), b"unchanged")
+        finally:
+            transfer.discard_publish_transfer_plan(plan)
+
     def test_activation_from_absent_current_is_atomic_and_bound(self) -> None:
         manifest, target, plan, staged, verification = self._verified_generation()
         try:
@@ -176,6 +226,111 @@ class PublishSemanticVerificationTest(PackPublishManifestTest):
             self.assertFalse(first.reused)
             self.assertTrue(second.reused)
             self.assertIsNone(second.previous_generation_id)
+        finally:
+            transfer.discard_publish_transfer_plan(plan)
+
+    def test_connection_loss_after_direct_reuse_recovers_reused_status(self) -> None:
+        manifest, target, plan, staged, verification = self._verified_generation()
+        current = Path(target.publication_root) / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(f"generations/{staged.generation_id}")
+        calls = 0
+        real_runner = self._fake_runner()
+
+        def run(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            result = real_runner(*args, **kwargs)
+            if calls == 1:
+                return BoundedProcessResult(0, "malformed response\n", "", False, False)
+            return result
+
+        try:
+            with patch.object(transfer, "run_bounded_process", side_effect=run):
+                activated = activation.activate_publish_generation(
+                    staged,
+                    verification,
+                    target,
+                    manifest=manifest,
+                )
+            self.assertTrue(activated.reused)
+            self.assertIsNone(activated.previous_generation_id)
+            self.assertEqual(calls, 3)
+            self.assertEqual(current.readlink().as_posix(), f"generations/{staged.generation_id}")
+            self.assertEqual(list(Path(target.publication_root).glob(".huroshiki-activation-*.json")), [])
+            self.assertEqual(list(Path(target.publication_root).glob(".huroshiki-current-*")), [])
+        finally:
+            transfer.discard_publish_transfer_plan(plan)
+
+    def test_activation_status_without_receipt_is_uncertain(self) -> None:
+        manifest, target, plan, staged = self._staged_generation()
+        operation_id = "c" * 32
+        files = activation._validate_inputs(staged, manifest, target)
+        header = activation._activation_header(
+            staged,
+            manifest,
+            target,
+            operation_id,
+            files,
+            "activation-status",
+        )
+        current = Path(target.publication_root) / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(f"generations/{staged.generation_id}")
+        try:
+            with patch.object(transfer, "run_bounded_process", side_effect=self._fake_runner()):
+                result, response = transfer.run_publish_remote_control_request(
+                    target,
+                    header,
+                    deadline=time.monotonic() + 30,
+                    cancel_event=None,
+                )
+            self.assertTrue(result.succeeded)
+            self.assertIsNotNone(response)
+            self.assertEqual(response["status"], "uncertain")
+        finally:
+            transfer.discard_publish_transfer_plan(plan)
+
+    def test_activation_status_invalid_receipt_reuse_state_is_uncertain(self) -> None:
+        manifest, target, plan, staged = self._staged_generation()
+        operation_id = "d" * 32
+        files = activation._validate_inputs(staged, manifest, target)
+        header = activation._activation_header(
+            staged,
+            manifest,
+            target,
+            operation_id,
+            files,
+            "activation-status",
+        )
+        current = Path(target.publication_root) / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(f"generations/{staged.generation_id}")
+        receipt = Path(target.publication_root) / f".huroshiki-activation-{operation_id}.json"
+        receipt.write_text(
+            json.dumps(
+                {
+                    "schema": "huroshiki-publish-activation-v1",
+                    "operation_id": operation_id,
+                    "manifest_digest": manifest.manifest_digest,
+                    "target_config_digest": target.config_digest,
+                    "generation_id": staged.generation_id,
+                    "previous_generation_id": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            with patch.object(transfer, "run_bounded_process", side_effect=self._fake_runner()):
+                result, response = transfer.run_publish_remote_control_request(
+                    target,
+                    header,
+                    deadline=time.monotonic() + 30,
+                    cancel_event=None,
+                )
+            self.assertTrue(result.succeeded)
+            self.assertIsNotNone(response)
+            self.assertEqual(response["status"], "uncertain")
         finally:
             transfer.discard_publish_transfer_plan(plan)
 
