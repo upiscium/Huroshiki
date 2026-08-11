@@ -920,6 +920,8 @@ def commit_pack_migration_root_selection_at(
                     cwd=provenance_source,
                     cancel_event=cancel_event,
                     deadline=effective_deadline,
+                    project_id=plan.target.target_id,
+                    operation="migration-provenance-refresh",
                 )
             provenance_scan = scan_pack_migration_source(
                 provenance_source, checkpoint=checkpoint
@@ -1162,6 +1164,7 @@ def _resolve_effective_root_set(
                         url_max_jar_size_bytes=plan.source_snapshot.url_max_jar_size_bytes,
                         url_allow_private_networks=plan.source_snapshot.url_allow_private_networks,
                         process_result_callback=plan._record_resolver_process_result,
+                        diagnostic_project_id=plan.target.target_id,
                     )
                 except Exception as error:
                     if _operation_failure(error):
@@ -1357,6 +1360,8 @@ def _resolve_effective_root_set(
                 deadline=effective_deadline,
                 label="Pack migration target refresh",
                 process_result_callback=plan._record_resolver_process_result,
+                project_id=plan.target.target_id,
+                operation="migration-refresh",
             )
             _progress(
                 progress,

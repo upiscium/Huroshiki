@@ -980,6 +980,7 @@ class _AddOperationLifecycle:
         self.resolver_process_result: BoundedProcessResult | None = None
         self.resolver_termination_result: ProcessTerminationResult | None = None
         self.resolver_termination_incomplete = False
+        self.packwiz_diagnostic_messages: list[str] = []
         self._checkpoint_complete = False
         self._pending_batch: TransactionBatch | None = None
         self._state: Literal["created", "running", "done"] = "created"
@@ -1090,6 +1091,9 @@ class _AddOperationLifecycle:
         if result.termination_incomplete:
             self.resolver_termination_incomplete = True
 
+    def _record_packwiz_diagnostic(self, message: str) -> None:
+        self.packwiz_diagnostic_messages.append(message)
+
     def _retry_resolver_cleanup(self, deadline: float | None) -> None:
         process = self.resolver_process_result
         if (
@@ -1190,6 +1194,8 @@ class ResolvedAddOperation(_AddOperationLifecycle):
                 deadline=self.deadline,
                 resolver_root=self.resolver_root,
                 process_result_callback=self._record_resolver_process_result,
+                diagnostic_project_id=self.transaction.project_key.partition(":")[2],
+                diagnostic_callback=self._record_packwiz_diagnostic,
             )
             self._checkpoint()
             with self.transaction._lock:
@@ -1213,13 +1219,18 @@ class ResolvedAddOperation(_AddOperationLifecycle):
                     query=self.selector,
                     changed_files=changed,
                 )
+                message = (
+                    f"Staged {self.provider}:{closure.root_identity[1]} and dependencies"
+                )
+                if self.packwiz_diagnostic_messages:
+                    message += " " + " ".join(self.packwiz_diagnostic_messages)
                 result = AddOperationResult(
                     0,
                     changed,
                     raw_log,
                     text_log,
                     event_log,
-                    f"Staged {self.provider}:{closure.root_identity[1]} and dependencies",
+                    message,
                 )
                 self._pending_batch = batch
                 self.transaction.batches.append(batch)
@@ -2008,6 +2019,7 @@ class PackTransaction:
                 loader_version=loader_version,
                 resolver_root=self.root / f"resolver-{uuid4().hex}",
                 process_result_callback=self._record_equivalence_process_result,
+                diagnostic_project_id=self.project_key.partition(":")[2],
             )
             changed = merge_metadata_closure(
                 self.source,
@@ -2060,6 +2072,7 @@ class PackTransaction:
                 loader_version=loader_version,
                 resolver_root=self.root / f"resolver-{uuid4().hex}",
                 process_result_callback=self._record_equivalence_process_result,
+                diagnostic_project_id=self.project_key.partition(":")[2],
             )
             try:
                 changed = merge_metadata_closure(
@@ -2529,6 +2542,7 @@ class PackTransaction:
             deadline=deadline,
             on_progress=on_progress,
             process_result_callback=self._record_equivalence_process_result,
+            diagnostic_project_id=self.project_key.partition(":")[2],
         )
         self.update_candidates = tuple(candidates)
         return candidates
@@ -2643,6 +2657,8 @@ class PackTransaction:
                 deadline=operation_deadline,
                 label=f"Packwiz remove {slug}",
                 process_result_callback=self._record_equivalence_process_result,
+                project_id=project_id,
+                operation="remove",
             )
             if removed_identity is not None:
                 remove_pack_root(self.source, removed_identity)
@@ -2738,6 +2754,8 @@ class PackTransaction:
                 deadline=operation_deadline,
                 label="Packwiz refresh",
                 process_result_callback=self._record_equivalence_process_result,
+                project_id=project_id,
+                operation="refresh",
             )
             ensure_safe_pack_source(self.source)
 
@@ -4810,6 +4828,11 @@ class LoaderMigrationOperation:
     def _run_packwiz(self, command: list[str], step: str) -> None:
         self._checkpoint()
         self.progress_queue.put(step)
+        operation = (
+            "loader-migrate"
+            if command[2:4] == ["migrate", "loader"]
+            else "refresh"
+        )
         result = run_resolver_process(
             command,
             cwd=self.transaction.source if self.transaction is not None else ROOT,
@@ -4819,18 +4842,39 @@ class LoaderMigrationOperation:
                 time.monotonic() + LOADER_MIGRATION_PROCESS_TIMEOUT_SECONDS,
             ),
         )
+        diagnostic = _record_packwiz_process_diagnostic(
+            command,
+            result,
+            project_id=self.project_key.partition(":")[2],
+            operation=operation,
+            callback=self.progress_queue.put,
+        )
+
         if result.termination_incomplete:
-            raise HuroshikiError(f"{step}: Packwiz process termination was incomplete")
+            raise HuroshikiError(
+                f"{step}: {_packwiz_diagnostic_detail('Packwiz process termination was incomplete', diagnostic)}"
+            )
         if result.orphaned_descendants:
-            raise HuroshikiError(f"{step}: Packwiz left background processes")
+            raise HuroshikiError(
+                f"{step}: {_packwiz_diagnostic_detail('Packwiz left background processes', diagnostic)}"
+            )
         if result.cancelled:
-            raise LoaderMigrationCancelled("Loader migration was cancelled")
+            raise LoaderMigrationCancelled(
+                _packwiz_diagnostic_detail("Loader migration was cancelled", diagnostic)
+            )
         if result.timed_out:
-            raise LoaderMigrationDeadlineExceeded(f"{step} timed out")
+            raise LoaderMigrationDeadlineExceeded(
+                _packwiz_diagnostic_detail(f"{step} timed out", diagnostic)
+            )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
             suffix = f": {detail}" if detail else ""
-            raise HuroshikiError(f"{step} failed with exit {result.returncode}{suffix}")
+            raise HuroshikiError(
+                _packwiz_diagnostic_detail(
+                    f"{step} failed with exit {result.returncode}{suffix}",
+                    diagnostic,
+                )
+            )
         self._checkpoint()
 
     def run(self) -> None:
@@ -5081,6 +5125,7 @@ def _prepare_update_candidates(
     deadline: float | None = None,
     on_progress: Callable[[UpdateProgress], None] | None = None,
     process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
+    diagnostic_project_id: str | None = None,
 ) -> list[UpdateCandidate]:
     effective_deadline = (
         deadline
@@ -5201,6 +5246,12 @@ def _prepare_update_candidates(
             ),
             result_callback=record_process_result,
         )
+        normalization_diagnostic = _record_packwiz_process_diagnostic(
+            ["packwiz", "refresh"],
+            normalization,
+            project_id=diagnostic_project_id,
+            operation="update-normalize",
+        )
         if normalization.cancelled:
             progress(UpdateProgress("cancelled", len(candidates), total))
             raise UpdatePreparationCancelled("Update preparation was cancelled")
@@ -5233,6 +5284,10 @@ def _prepare_update_candidates(
                 "operation_deadline"
                 if normalization_error == "Update preparation operation deadline exceeded"
                 else "resolver"
+            )
+            normalization_error = _packwiz_diagnostic_detail(
+                normalization_error,
+                normalization_diagnostic,
             )
             for relative_path, _, old_data, old_mod in eligible:
                 candidates.append(
@@ -5358,9 +5413,22 @@ def _prepare_update_candidates(
                     ),
                     result_callback=record_process_result,
                 )
+                resolver_diagnostic = _record_packwiz_process_diagnostic(
+                    ["packwiz", "--yes", "update", old_mod.slug],
+                    result,
+                    project_id=diagnostic_project_id,
+                    operation="update-resolve",
+                )
+
+                def resolver_error(message: str) -> str:
+                    return _packwiz_diagnostic_detail(message, resolver_diagnostic)
+
                 if result.cancelled:
                     raise UpdatePreparationCancelled(
-                        "Update preparation was cancelled"
+                        _packwiz_diagnostic_detail(
+                            "Update preparation was cancelled",
+                            resolver_diagnostic,
+                        )
                     )
                 if result.termination_incomplete:
                     candidates.append(
@@ -5368,7 +5436,9 @@ def _prepare_update_candidates(
                             relative_path,
                             old_mod,
                             old_data,
-                            "Packwiz resolver process termination was incomplete",
+                            resolver_error(
+                                "Packwiz resolver process termination was incomplete"
+                            ),
                         )
                     )
                     continue
@@ -5378,7 +5448,9 @@ def _prepare_update_candidates(
                             relative_path,
                             old_mod,
                             old_data,
-                            "Packwiz resolver left background processes after completion",
+                            resolver_error(
+                                "Packwiz resolver left background processes after completion"
+                            ),
                         )
                     )
                     continue
@@ -5389,7 +5461,7 @@ def _prepare_update_candidates(
                             relative_path,
                             old_mod,
                             old_data,
-                            (
+                            resolver_error(
                                 "Update preparation operation deadline exceeded"
                                 if operation_deadline
                                 else f"resolver deadline exceeded after "
@@ -5434,7 +5506,7 @@ def _prepare_update_candidates(
                             relative_path,
                             old_mod,
                             old_data,
-                            concise_process_error(result),
+                            resolver_error(concise_process_error(result)),
                             result.returncode,
                         )
                     )
@@ -6556,6 +6628,56 @@ def concise_process_error(
     return lines[-1][:240] if lines else f"exit code {result.returncode}"
 
 
+def _record_packwiz_process_diagnostic(
+    command: Sequence[str],
+    result: BoundedProcessResult,
+    *,
+    project_id: str | None = None,
+    operation: str = "packwiz",
+    callback: Callable[[str], None] | None = None,
+) -> packctl.PackwizDiagnostic:
+    diagnostic = packctl.record_packwiz_diagnostic(
+        command,
+        result,
+        project_id=project_id,
+        operation=operation,
+    )
+    if not diagnostic.has_output:
+        return diagnostic
+    if diagnostic.log_path is None:
+        notice = (
+            "Packwiz completed with diagnostics, but the diagnostic log "
+            f"could not be written: {diagnostic.error}"
+        )
+    else:
+        notice = (
+            "Packwiz completed with diagnostics. Details: "
+            f"{packctl.relative_state_path(diagnostic.log_path)}"
+        )
+    if callback is None:
+        print(notice, file=sys.stderr)
+    else:
+        callback(notice)
+    return diagnostic
+
+
+def _packwiz_diagnostic_detail(
+    message: str,
+    diagnostic: packctl.PackwizDiagnostic,
+) -> str:
+    if diagnostic.log_path is not None:
+        return (
+            f"{message}; Details: "
+            f"{packctl.relative_state_path(diagnostic.log_path)}"
+        )
+    if diagnostic.error is not None:
+        return (
+            f"{message}; diagnostic log could not be written: "
+            f"{diagnostic.error}"
+        )
+    return message
+
+
 def _run_noninteractive_packwiz(
     command: list[str],
     *,
@@ -6564,6 +6686,8 @@ def _run_noninteractive_packwiz(
     deadline: float,
     label: str,
     process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
+    project_id: str | None = None,
+    operation: str = "packwiz",
 ) -> ResolverProcessResult:
     process_deadline = min(
         deadline,
@@ -6576,9 +6700,15 @@ def _run_noninteractive_packwiz(
         deadline=process_deadline,
         result_callback=process_result_callback,
     )
+    diagnostic = _record_packwiz_process_diagnostic(
+        command,
+        result,
+        project_id=project_id,
+        operation=operation,
+    )
     failure = process_failure_message(result, label=label)
     if failure is not None:
-        raise HuroshikiError(failure)
+        raise HuroshikiError(_packwiz_diagnostic_detail(failure, diagnostic))
     return result
 
 
@@ -6709,6 +6839,8 @@ def resolve_mod_closure(
     url_max_jar_size_bytes: int | None = None,
     url_allow_private_networks: bool = False,
     process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
+    diagnostic_project_id: str | None = None,
+    diagnostic_callback: Callable[[str], None] | None = None,
 ) -> ResolvedModClosure:
     if cancel_event is not None and cancel_event.is_set():
         raise HuroshikiError("MOD resolution was cancelled")
@@ -6828,20 +6960,41 @@ def resolve_mod_closure(
                 deadline=resolver_deadline,
                 result_callback=process_result_callback,
             )
+        diagnostic = _record_packwiz_process_diagnostic(
+            command,
+            process,
+            project_id=diagnostic_project_id,
+            operation=f"resolve-{normalized_provider}",
+            callback=diagnostic_callback,
+        )
+
         if process.termination_incomplete:
             raise HuroshikiError(
-                "Packwiz resolver process termination was incomplete"
+                _packwiz_diagnostic_detail(
+                    "Packwiz resolver process termination was incomplete", diagnostic
+                )
             )
         if process.orphaned_descendants:
             raise HuroshikiError(
-                "Packwiz resolver left background processes after completion"
+                _packwiz_diagnostic_detail(
+                    "Packwiz resolver left background processes after completion",
+                    diagnostic,
+                )
             )
         if process.cancelled:
-            raise HuroshikiError("MOD resolution was cancelled")
+            raise HuroshikiError(
+                _packwiz_diagnostic_detail("MOD resolution was cancelled", diagnostic)
+            )
         if process.timed_out:
-            raise HuroshikiError("Packwiz resolver deadline exceeded")
+            raise HuroshikiError(
+                _packwiz_diagnostic_detail(
+                    "Packwiz resolver deadline exceeded", diagnostic
+                )
+            )
         if process.returncode != 0:
-            raise HuroshikiError(concise_process_error(process))
+            raise HuroshikiError(
+                _packwiz_diagnostic_detail(concise_process_error(process), diagnostic)
+            )
         metadata = _read_resolver_metadata(source)
         root_identity = resolved_root_identity(
             normalized_provider, project_id, metadata
@@ -8024,6 +8177,7 @@ def _run_template_import_refresh(
     cancel_event: threading.Event,
     deadline: float,
     process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
+    diagnostic_project_id: str | None = None,
 ) -> None:
     refresh = run_resolver_process(
         ["packwiz", "refresh"],
@@ -8035,6 +8189,12 @@ def _run_template_import_refresh(
         ),
         result_callback=process_result_callback,
     )
+    diagnostic = _record_packwiz_process_diagnostic(
+        ["packwiz", "refresh"],
+        refresh,
+        project_id=diagnostic_project_id,
+        operation="template-import-refresh",
+    )
     if (
         refresh.returncode != 0
         or refresh.cancelled
@@ -8042,7 +8202,11 @@ def _run_template_import_refresh(
         or refresh.orphaned_descendants
         or refresh.termination_incomplete
     ):
-        raise HuroshikiError("Template import Packwiz refresh failed")
+        raise HuroshikiError(
+            _packwiz_diagnostic_detail(
+                "Template import Packwiz refresh failed", diagnostic
+            )
+        )
 
 
 def _removed_identity_requirements(
@@ -8098,6 +8262,7 @@ def _apply_resolved_import_to_source(
     cancel_event: threading.Event,
     deadline: float,
     process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
+    diagnostic_project_id: str | None = None,
 ) -> None:
     checkpoint()
     _remove_import_candidates(source, removed)
@@ -8119,6 +8284,7 @@ def _apply_resolved_import_to_source(
         cancel_event=cancel_event,
         deadline=deadline,
         process_result_callback=process_result_callback,
+        diagnostic_project_id=diagnostic_project_id,
     )
     _assert_removed_identities_absent(source, removed)
     ensure_safe_pack_source(source, checkpoint=checkpoint)
@@ -8149,6 +8315,7 @@ def _preflight_import_closures(
             cancel_event=cancel_event,
             deadline=deadline,
             process_result_callback=transaction._record_equivalence_process_result,
+            diagnostic_project_id=transaction.project_key.partition(":")[2],
         )
     finally:
         if not transaction._equivalence_process_results:
@@ -8308,6 +8475,7 @@ class TemplateImportOperation:
                 process_result_callback=(
                     self.transaction._record_equivalence_process_result
                 ),
+                diagnostic_project_id=self.transaction.project_key.partition(":")[2],
             )
             if not self.session.templates_unchanged():
                 raise HuroshikiError("Template manifest changed during import")
@@ -8733,6 +8901,8 @@ def _create_pack_from_templates(
             deadline=deadline,
             label="Template creation Packwiz refresh",
             process_result_callback=record_process_result,
+            project_id=project_id,
+            operation="template-refresh",
         )
 
         return TemplateCreationReport(

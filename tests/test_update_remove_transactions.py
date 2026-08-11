@@ -1267,7 +1267,8 @@ url = "https://example.invalid/manual.jar"
 
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].status, "unavailable")
-        self.assertEqual(candidates[0].error, "network failed")
+        self.assertIsNotNone(candidates[0].error)
+        self.assertTrue(candidates[0].error.startswith("network failed; Details: "))
         self.assertEqual(
             (transaction.source / "mods" / "first.pw.toml").read_bytes(),
             original,
