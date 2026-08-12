@@ -219,6 +219,10 @@ def run_bounded_process(
         else:
             stdin_handle = stdin_file
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            return BoundedProcessResult(-signal.SIGTERM, "", "", True, False)
+        if deadline is not None and time.monotonic() >= deadline:
+            return BoundedProcessResult(-signal.SIGTERM, "", "", False, True)
         with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
             process = subprocess.Popen(
                 list(command),

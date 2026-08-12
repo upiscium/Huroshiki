@@ -74,6 +74,22 @@ class ProviderLookupHelperTest(unittest.TestCase):
             self.assertEqual(result["project_id"], "canonical")
         self.assertEqual(len(calls), 3)
 
+    def test_modrinth_project_reference_rejects_unsafe_whitespace_before_normalizing(
+        self,
+    ) -> None:
+        for selector in (
+            "mr:\u00a0sodium-extra",
+            "https://modrinth.com/mod/sodium-extra%C2%A0",
+            "https://modrinth.com/mod/sodium-extra%09",
+            "sodium-extra\x00",
+        ):
+            with self.subTest(selector=repr(selector)):
+                with self.assertRaisesRegex(
+                    provider_lookup.LookupError,
+                    "whitespace or control characters",
+                ):
+                    provider_lookup.modrinth_project_reference(selector)
+
     def test_modrinth_search_sends_filters_and_canonical_results(self) -> None:
         seen_url = ""
 
@@ -248,6 +264,19 @@ class ProviderLookupCoreTest(unittest.TestCase):
                 result = core.resolve_project_selector("modrinth", "slug")
         self.assertEqual(result.canonical_project_id, "canonical")
         self.assertEqual(result.display_label, "Title")
+
+    def test_core_selector_normalization_rejects_unsafe_prefix_whitespace(self) -> None:
+        with patch.object(core, "run_resolver_process") as resolver:
+            for selector in (
+                "mr:\u00a0slug",
+                "mr:slug\x00",
+                "\u00a0slug",
+                "https://modrinth.com/mod/slug%C2%A0",
+            ):
+                with self.subTest(selector=repr(selector)):
+                    with self.assertRaisesRegex(core.HuroshikiError, "unsafe"):
+                        core.resolve_project_selector("modrinth", selector)
+            resolver.assert_not_called()
 
     def test_search_validates_results_and_rejects_duplicates(self) -> None:
         payload = {

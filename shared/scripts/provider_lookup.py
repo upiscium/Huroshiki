@@ -29,9 +29,23 @@ def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _reject_unsafe_selector_characters(value: str) -> None:
+    if any(
+        ord(character) < 32
+        or ord(character) == 127
+        or (ord(character) > 127 and character.isspace())
+        for character in value
+    ):
+        raise LookupError(
+            "Invalid Modrinth project selector whitespace or control characters"
+        )
+
+
 def modrinth_project_reference(selector: str) -> str:
+    _reject_unsafe_selector_characters(selector)
     value = selector.strip()
     if value.lower().startswith("mr:"):
+        _reject_unsafe_selector_characters(value[3:])
         value = value[3:].strip()
     parsed = urlparse(value)
     if parsed.scheme or parsed.netloc:
@@ -45,7 +59,9 @@ def modrinth_project_reference(selector: str) -> str:
         parts = [part for part in parsed.path.split("/") if part]
         if len(parts) != 2 or parts[0] not in {"mod", "project"}:
             raise LookupError(f"Invalid Modrinth project URL: {selector!r}")
-        value = unquote(parts[1]).strip()
+        value = unquote(parts[1])
+        _reject_unsafe_selector_characters(value)
+        value = value.strip()
     if not value or any(character.isspace() for character in value):
         raise LookupError(f"Invalid Modrinth project selector: {selector!r}")
     return value

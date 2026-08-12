@@ -34,18 +34,25 @@ from dependency_equivalence import (
     EQUIVALENCE_POLICY_VERSION,
     EquivalenceContext,
     EquivalenceError,
+    MaterializedArtifact,
+    SemanticJarIdentity,
     Provenance,
     verify_equivalence,
 )
 from pack_migration_roots import (
     PackRootRecord,
+    PackMigrationRoot,
+    PackMigrationRootError,
     ROOT_MANIFEST_PATH,
+    extract_pack_migration_roots,
+    ensure_pack_root_manifest_ignored,
     identify_pack_metadata_by_slug,
     read_pack_root_manifest,
     record_pack_root,
     remove_pack_root,
     write_pack_root_manifest,
 )
+from pack_tree_policy import scan_pack_migration_source
 from provider_identity import parse_provider_metadata
 from provider_artifacts import materialize_provider_artifact
 
@@ -623,6 +630,54 @@ class UpdateCandidate:
 
 _EXACT_MOD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _EXACT_DECIMAL_ID_RE = re.compile(r"^[0-9]+$")
+_CANONICAL_MODRINTH_ID_TOKEN = object()
+
+
+class CanonicalModrinthId(str):
+    """Opaque ID branded from an authoritative Modrinth result."""
+
+    __slots__ = ()
+
+    def __new__(cls, value: str, _token: object) -> "CanonicalModrinthId":
+        if _token is not _CANONICAL_MODRINTH_ID_TOKEN:
+            raise TypeError("Canonical Modrinth IDs must be created with canonical_modrinth_id()")
+        return super().__new__(cls, value)
+
+
+def _validate_canonical_modrinth_id(value: str, context: str) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or _EXACT_MOD_ID_RE.fullmatch(value) is None
+    ):
+        raise HuroshikiError(f"{context} must be a canonical Modrinth ID")
+    return value
+
+
+def canonical_modrinth_id(value: str, context: str | None = None) -> CanonicalModrinthId:
+    """Brand an already-resolved Modrinth project or version ID.
+
+    This pure factory validates provider-output syntax only; it never resolves
+    selectors or performs network, process, or filesystem work.  Callers must
+    pass the provider's authoritative ``id`` field, not a slug, URL, or label.
+    """
+
+    return CanonicalModrinthId(
+        _validate_canonical_modrinth_id(
+            value,
+            context or "Modrinth ID",
+        ),
+        _CANONICAL_MODRINTH_ID_TOKEN,
+    )
+
+
+def _require_canonical_modrinth_id(
+    value: str | CanonicalModrinthId,
+    context: str,
+) -> CanonicalModrinthId:
+    if type(value) is not CanonicalModrinthId:
+        raise HuroshikiError(f"{context} must be a canonical Modrinth ID")
+    return value
 
 
 def _exact_positive_decimal(value: str, context: str) -> str:
@@ -637,21 +692,18 @@ def _exact_positive_decimal(value: str, context: str) -> str:
     return value
 
 
-def _exact_provider_id(value: str, context: str) -> str:
-    if (
-        not isinstance(value, str)
-        or value != value.strip()
-        or _EXACT_MOD_ID_RE.fullmatch(value) is None
-    ):
-        raise HuroshikiError(f"{context} must be a canonical provider ID")
-    return value
-
-
 @dataclass(frozen=True)
 class ExactModArtifactSelection:
+    """Exact provider artifact selected using authoritative immutable IDs.
+
+    Modrinth fields must be ``CanonicalModrinthId`` values produced by the
+    provider lookup/search boundary.  Raw selectors, URLs, slugs, and display
+    labels are intentionally not accepted here.
+    """
+
     provider: Literal["curseforge", "modrinth"]
-    project_id: str
-    artifact_id: str
+    project_id: str | CanonicalModrinthId
+    artifact_id: str | CanonicalModrinthId
 
     def __post_init__(self) -> None:
         if self.provider not in {"curseforge", "modrinth"}:
@@ -666,10 +718,10 @@ class ExactModArtifactSelection:
                 self.artifact_id, "CurseForge file ID"
             )
         else:
-            project_id = _exact_provider_id(
+            project_id = _require_canonical_modrinth_id(
                 self.project_id, "Modrinth project ID"
             )
-            artifact_id = _exact_provider_id(
+            artifact_id = _require_canonical_modrinth_id(
                 self.artifact_id, "Modrinth version ID"
             )
         object.__setattr__(self, "project_id", project_id)
@@ -699,6 +751,14 @@ class ModVersionSelectionPreview:
     removed_dependencies: int
     added_dependency_identities: tuple[str, ...] = ()
     removed_dependency_identities: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ExactArtifactVerification:
+    identity: tuple[str, str]
+    artifact_id: str
+    sha256: str
+    semantic_identity: SemanticJarIdentity
 
 
 @dataclass(frozen=True)
@@ -976,18 +1036,58 @@ class ResolvedModClosure:
 class ResolvedSelector:
     provider: str
     original: str
-    canonical_project_id: str | None
+    canonical_project_id: str | CanonicalModrinthId | None
     display_label: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.canonical_project_id is None:
+            return
+        if (
+            canonical_provider(self.provider) == "modrinth"
+            and type(self.canonical_project_id) is CanonicalModrinthId
+        ):
+            return
+        provider = canonical_provider(self.provider)
+        if provider == "modrinth":
+            object.__setattr__(
+                self,
+                "canonical_project_id",
+                canonical_modrinth_id(
+                    self.canonical_project_id,
+                    "Modrinth project ID",
+                ),
+            )
+        elif provider == "curseforge":
+            object.__setattr__(
+                self,
+                "canonical_project_id",
+                canonical_curseforge_project_id(self.canonical_project_id),
+            )
 
 
 @dataclass(frozen=True)
 class ProviderProject:
     provider: str
-    project_id: str
+    project_id: str | CanonicalModrinthId
     slug: str
     title: str
     description: str = ""
     author: str = ""
+
+    def __post_init__(self) -> None:
+        provider = canonical_provider(self.provider)
+        if provider == "modrinth":
+            object.__setattr__(
+                self,
+                "project_id",
+                canonical_modrinth_id(self.project_id, "Modrinth project ID"),
+            )
+        elif provider == "curseforge":
+            object.__setattr__(
+                self,
+                "project_id",
+                canonical_curseforge_project_id(self.project_id),
+            )
 
 
 @dataclass(frozen=True)
@@ -1786,6 +1886,12 @@ class PackTransaction:
     _exact_selection_digest: dict[Path, str] | None = field(
         default=None, init=False, repr=False
     )
+    _exact_selection_verification_digest: str | None = field(
+        default=None, init=False, repr=False
+    )
+    _exact_selection_verifications: tuple[ExactArtifactVerification, ...] | None = field(
+        default=None, init=False, repr=False
+    )
     _exact_selection: ExactModArtifactSelection | None = field(
         default=None, init=False, repr=False
     )
@@ -2015,6 +2121,8 @@ class PackTransaction:
         checkpoint.rename(self.source)
         self._exact_selection_prepared = False
         self._exact_selection_digest = None
+        self._exact_selection_verification_digest = None
+        self._exact_selection_verifications = None
         self._exact_selection = None
         self._exact_selection_manifest = None
         self._exact_selection_versions = None
@@ -2022,11 +2130,15 @@ class PackTransaction:
     def _validate_exact_selection_stage(self) -> None:
         selection = self._exact_selection
         expected_digest = self._exact_selection_digest
+        expected_verification_digest = self._exact_selection_verification_digest
+        expected_verifications = self._exact_selection_verifications
         expected_manifest = self._exact_selection_manifest
         expected_versions = self._exact_selection_versions
         if (
             selection is None
             or expected_digest is None
+            or expected_verification_digest is None
+            or expected_verifications is None
             or expected_versions is None
         ):
             raise HuroshikiError(
@@ -2071,6 +2183,10 @@ class PackTransaction:
                 f"{identity.file_id or '<missing>'}"
             )
         _exact_assert_root_manifest_identities(self.source, records)
+        if _exact_verification_binding_digest(expected_verifications, records) != expected_verification_digest:
+            raise HuroshikiError(
+                "Exact MOD semantic verification evidence changed after preview; apply aborted"
+            )
 
     def _record_equivalence_process_result(
         self, result: BoundedProcessResult
@@ -2851,17 +2967,26 @@ class PackTransaction:
                 f"Exact MOD selection target has no artifact ID: "
                 f"{selection.identity_label}"
             )
+        source_scan = scan_pack_migration_source(self.source, checkpoint=checkpoint)
+        try:
+            explicit_roots = extract_pack_migration_roots(
+                self.source,
+                expected_identity=source_scan.root_identity,
+                expected_snapshot_digest=source_scan.snapshot_digest,
+                checkpoint=checkpoint,
+            )
+        except PackMigrationRootError as error:
+            raise HuroshikiError(
+                f"Exact MOD selection requires authoritative root provenance: {error}"
+            ) from error
         manifest_before = _exact_manifest_bytes(self.source)
-        root_records = (
-            read_pack_root_manifest(self.source)
-            if manifest_before is not None
-            else ()
-        )
         root_by_identity = {
-            record.canonical_identity: record for record in root_records
+            root.canonical_identity: root for root in explicit_roots
         }
-        root_record = root_by_identity.get(selection.identity_label)
-        selected_side = root_record.side if root_record is not None else target_mod.side
+        selected_root = root_by_identity.get(selection.identity_label)
+        selected_side = (
+            selected_root.source_side if selected_root is not None else target_mod.side
+        )
         versions = packctl.project_versions(self.source)
         operation_before = _file_content_snapshot(self.source, checkpoint)
 
@@ -2873,7 +2998,6 @@ class PackTransaction:
         resolver_source = self.root / f"exact-selection-resolver-{operation_id}"
         failed_source = self.root / f"failed-exact-selection-source-{operation_id}"
         equivalence_workspace = self.root / f"exact-selection-equivalence-{operation_id}"
-        artifact_workspace = self.root / f"exact-selection-artifacts-{operation_id}"
         checkpoint_created = False
 
         def restore_checkpoint() -> None:
@@ -2914,85 +3038,201 @@ class PackTransaction:
             checkpoint()
             create_resolver_source(
                 resolver_source,
-                display_name=f"Resolve exact {selection.identity_label}",
+                display_name=f"Resolve exact Pack {project_id}",
                 minecraft=versions[0],
                 loader=versions[1],
                 loader_version=versions[2],
             )
             ensure_safe_pack_source(resolver_source, checkpoint=checkpoint)
-            resolver_before = _file_content_snapshot(resolver_source, checkpoint)
-            emit("resolving", f"Resolving {selection.identity_label} exactly")
-            closure = resolve_exact_mod_closure(
-                selection,
-                source=resolver_source,
-                cancel_event=operation_cancel,
-                deadline=operation_deadline,
-                checkpoint=checkpoint,
-                process_result_callback=self._record_equivalence_process_result,
-            )
-            emit("verifying-root", "Verifying exact root identity and artifact")
-            _verify_exact_root_metadata(selection, closure.metadata)
-            _exact_preserve_sides(
+            ensure_pack_root_manifest_ignored(resolver_source)
+            write_pack_root_manifest(resolver_source, ())
+            def resolve_root_closure(
+                root: PackMigrationRoot,
+                root_index: int,
+                *,
+                preseed_selections: Sequence[ExactModArtifactSelection] = (),
+            ) -> ResolvedModClosure:
+                checkpoint()
+                identity = (root.provider, root.project_id)
+                if root.provider == "url":
+                    root_metadata = _exact_metadata_from_root(root, baseline_records)
+                    return ResolvedModClosure(
+                        identity,
+                        (root_metadata,),
+                    )
+                artifact_id = (
+                    selection.artifact_id
+                    if identity == selection.identity
+                    else root.source_file_id
+                )
+                if artifact_id is None:
+                    raise HuroshikiError(
+                        f"Exact root {root.canonical_identity} has no artifact ID"
+                    )
+                root_project_id = (
+                    canonical_modrinth_id(root.project_id, "Modrinth project ID")
+                    if root.provider == "modrinth"
+                    else root.project_id
+                )
+                root_artifact_id = (
+                    canonical_modrinth_id(artifact_id, "Modrinth version ID")
+                    if root.provider == "modrinth"
+                    else artifact_id
+                )
+                root_selection = ExactModArtifactSelection(
+                    root.provider,
+                    root_project_id,
+                    root_artifact_id,
+                )
+                suffix = (
+                    str(root_index)
+                    if not preseed_selections
+                    else f"{root_index}-constrained"
+                )
+                root_resolver = self.root / f"exact-selection-root-{operation_id}-{suffix}"
+                create_resolver_source(
+                    root_resolver,
+                    display_name=f"Resolve {root.canonical_identity}",
+                    minecraft=versions[0],
+                    loader=versions[1],
+                    loader_version=versions[2],
+                )
+                closure = resolve_exact_mod_closure(
+                    root_selection,
+                    source=root_resolver,
+                    cancel_event=operation_cancel,
+                    deadline=operation_deadline,
+                    checkpoint=checkpoint,
+                    preseed_selections=preseed_selections,
+                    process_result_callback=self._record_equivalence_process_result,
+                )
+                _verify_exact_root_metadata(root_selection, closure.metadata)
+                return ResolvedModClosure(
+                    identity,
+                    closure.metadata,
+                )
+
+            root_closures: list[tuple[PackMigrationRoot, ResolvedModClosure]] = []
+            emit("resolving", f"Resolving all explicit roots for Pack {project_id}")
+            for root_index, root in enumerate(explicit_roots):
+                root_closures.append((root, resolve_root_closure(root, root_index)))
+                emit(
+                    "verifying-root",
+                    f"Verified root {root.canonical_identity} ({root_index + 1}/"
+                    f"{len(explicit_roots)})",
+                )
+
+            if selected_root is None:
+                if not any(
+                    item.identity == selection.identity
+                    for _root, closure in root_closures
+                    for item in closure.metadata
+                ):
+                    raise HuroshikiError(
+                        f"Exact dependency {selection.identity_label} is not required "
+                        "by any explicit root"
+                    )
+                owner_identities = {
+                    root.canonical_identity
+                    for root, closure in root_closures
+                    if any(item.identity == selection.identity for item in closure.metadata)
+                }
+                constrained_closures: list[tuple[PackMigrationRoot, ResolvedModClosure]] = []
+                for root_index, (root, closure) in enumerate(root_closures):
+                    checkpoint()
+                    if root.canonical_identity in owner_identities:
+                        constrained = resolve_root_closure(
+                            root,
+                            root_index,
+                            preseed_selections=(selection,),
+                        )
+                        _verify_exact_root_metadata(selection, constrained.metadata)
+                        closure = constrained
+                    constrained_closures.append((root, closure))
+                root_closures = constrained_closures
+
+            emit("merging", "Building the complete explicit-root dependency graph")
+            for root, closure in root_closures:
+                checkpoint()
+                merge_metadata_closure(
+                    resolver_source,
+                    closure,
+                    requested_side=root.source_side,
+                    preserve_resolved_dependency_sides=True,
+                    explicit_root_sides={
+                        (item.provider, item.project_id): item.source_side
+                        for item in explicit_roots
+                    },
+                    exact_selected_identity=selection.identity,
+                    exact_selected_side=selected_side,
+                    cancel_event=operation_cancel,
+                    deadline=operation_deadline,
+                    equivalence_workspace=equivalence_workspace,
+                    process_result_callback=self._record_equivalence_process_result,
+                )
+            _merge_exact_existing_dependency_sides(
                 resolver_source,
+                baseline_records,
+                selection.identity,
+                {
+                    (root.provider, root.project_id) for root in explicit_roots
+                },
+                checkpoint,
+            )
+            _preserve_exact_selected_side(
+                resolver_source,
+                selection,
                 selected_side,
                 checkpoint,
             )
-            resolver_metadata = _read_resolver_metadata(
-                resolver_source,
-                checkpoint=checkpoint,
+            expected_roots = tuple(
+                PackRootRecord(root.provider, root.project_id, root.source_side)
+                for root in explicit_roots
             )
-            resolver_root = _verify_exact_root_metadata(selection, resolver_metadata)
-            if packctl.project_versions(resolver_source) != versions:
+            actual_roots = read_pack_root_manifest(resolver_source)
+            if actual_roots != expected_roots:
                 raise HuroshikiError(
-                    "Exact MOD resolution changed the Minecraft or loader version"
+                    "Exact closure reconstruction changed explicit root provenance"
                 )
-            _exact_assert_root_manifest_identities(
-                resolver_source,
-                _exact_metadata_records(resolver_source, checkpoint),
-            )
+            desired_records = _exact_metadata_records(resolver_source, checkpoint)
+            _exact_assert_root_manifest_identities(resolver_source, desired_records)
+
+            if selected_root is None:
+                aggregate_target = desired_records.get(selection.identity, ())
+                if len(aggregate_target) != 1:
+                    raise HuroshikiError(
+                        f"Exact dependency {selection.identity_label} is not reachable "
+                        "from the explicit roots"
+                    )
+                target_entry = aggregate_target[0]
+                target_identity = parse_provider_metadata(target_entry[0], target_entry[1])
+                if target_identity.file_id != selection.artifact_id:
+                    raise HuroshikiError(
+                        f"Exact dependency {selection.identity_label} is required at "
+                        f"artifact {target_identity.file_id or '<missing>'}, not "
+                        f"{selection.artifact_id}"
+                    )
+
             emit(
-                "verifying-dependencies",
-                f"Verifying {len(resolver_metadata)} exact closure members",
+                "materializing",
+                f"Materializing and verifying {len(desired_records)} exact artifacts",
             )
-            emit("materializing", "Materializing exact closure artifacts")
-            _exact_verify_dependency_artifacts(
-                resolver_source,
-                resolver_metadata,
-                workspace=artifact_workspace,
-                minecraft=versions[0],
-                loader=versions[1],
-                loader_version=versions[2],
+            exact_verifications = _verify_exact_closure_artifacts(
+                baseline_records,
+                desired_records,
+                selection,
+                versions,
+                workspace=self.root / f"exact-selection-artifacts-{operation_id}",
+                context_source=self.source,
                 cancel_event=operation_cancel,
                 deadline=operation_deadline,
                 process_result_callback=self._record_equivalence_process_result,
                 checkpoint=checkpoint,
             )
-            resolver_after = _file_content_snapshot(resolver_source, checkpoint)
-            resolver_changes = _content_changes(resolver_before, resolver_after)
-            new_root_data = tomllib.loads(resolver_root.contents.decode("utf-8"))
-            synthetic_candidate = UpdateCandidate(
-                key=selection.identity_label,
-                root=target_relative,
-                slug=target_mod.slug,
-                name=target_mod.name,
-                provider=selection.provider,
-                current_version=metadata_version(
-                    tomllib.loads(target_contents.decode("utf-8")),
-                    selection.provider,
-                ),
-                new_version=metadata_version(new_root_data, selection.provider),
-                new_file_id=selection.artifact_id,
-                status="update",
-                changes=resolver_changes,
-            )
-            emit("merging", "Merging the verified exact dependency closure")
-            merged_changes = _merge_update_closures(
-                (synthetic_candidate,),
-                source=self.source,
-                workspace=equivalence_workspace,
-                cancel_event=operation_cancel,
-                deadline=operation_deadline,
-                process_result_callback=self._record_equivalence_process_result,
+
+            merged_changes = _exact_metadata_changes(
+                baseline_records,
+                desired_records,
             )
             checkpoint()
             if _file_content_snapshot(self.source, checkpoint) != operation_before:
@@ -3019,6 +3259,11 @@ class PackTransaction:
                 raise HuroshikiError(
                     "Exact MOD staging changed .huroshiki-roots.json"
                 )
+            _exact_assert_complete_metadata_graph(
+                self.source,
+                desired_records,
+                checkpoint,
+            )
             final_records = _exact_metadata_records(self.source, checkpoint)
             _exact_assert_root_manifest_identities(self.source, final_records)
             final_root_records = final_records.get(selection.identity, ())
@@ -3028,7 +3273,7 @@ class PackTransaction:
                     f"{selection.identity_label}"
                 )
             final_relative, final_contents, final_mod = final_root_records[0]
-            final_identity = _verify_exact_root_metadata(
+            _verify_exact_root_metadata(
                 selection,
                 tuple(
                     ResolvedMetadata(
@@ -3042,20 +3287,22 @@ class PackTransaction:
                     for final_relative, final_contents, final_mod in final_root_records
                 ),
             )
-            if final_mod.side != selected_side:
-                raise HuroshikiError("Exact MOD staging did not preserve the selected side")
+            if selected_root is not None and final_mod.side != selected_side:
+                raise HuroshikiError(
+                    "Exact MOD staging did not preserve the selected root side"
+                )
             final_after = _file_content_snapshot(self.source, checkpoint)
             added = tuple(
                 sorted(
                     f"{identity[0]}:{identity[1]}"
-                    for identity in final_records.keys() - baseline_records.keys()
+                    for identity in desired_records.keys() - baseline_records.keys()
                     if identity != selection.identity
                 )
             )
             removed = tuple(
                 sorted(
                     f"{identity[0]}:{identity[1]}"
-                    for identity in baseline_records.keys() - final_records.keys()
+                    for identity in baseline_records.keys() - desired_records.keys()
                     if identity != selection.identity
                 )
             )
@@ -3070,7 +3317,7 @@ class PackTransaction:
                 ),
                 old_artifact_id=old_provider_identity.file_id,
                 new_version=metadata_version(
-                    tomllib.loads(final_identity.contents.decode("utf-8")),
+                    tomllib.loads(final_contents.decode("utf-8")),
                     selection.provider,
                 ),
                 new_artifact_id=selection.artifact_id,
@@ -3086,6 +3333,10 @@ class PackTransaction:
                 self.source,
                 checkpoint=checkpoint,
             )
+            self._exact_selection_verification_digest = _exact_verification_digest(
+                exact_verifications
+            )
+            self._exact_selection_verifications = exact_verifications
             self._exact_selection = selection
             self._exact_selection_manifest = manifest_before
             self._exact_selection_versions = versions
@@ -3096,6 +3347,8 @@ class PackTransaction:
         except BaseException as error:
             self._exact_selection_prepared = False
             self._exact_selection_digest = None
+            self._exact_selection_verification_digest = None
+            self._exact_selection_verifications = None
             self._exact_selection = None
             self._exact_selection_manifest = None
             self._exact_selection_versions = None
@@ -3745,6 +3998,15 @@ def normalize_provider(provider: str) -> str:
 
 def normalize_add_selector(provider: str, query: str) -> tuple[str, str]:
     normalized_provider = normalize_provider(provider)
+    if any(
+        ord(character) < 32
+        or ord(character) == 127
+        or (ord(character) > 127 and character.isspace())
+        for character in query
+    ):
+        raise HuroshikiError(
+            "Project selector contains unsafe whitespace or control characters"
+        )
     selector = query.strip()
     if not selector:
         raise HuroshikiError("Search query is empty")
@@ -3766,6 +4028,19 @@ def normalize_add_selector(provider: str, query: str) -> tuple[str, str]:
 
     if not selector:
         raise HuroshikiError("Project selector is empty")
+    if normalized_provider == "modrinth":
+        parsed = urlparse(selector)
+        if parsed.scheme or parsed.netloc:
+            decoded_path = unquote(parsed.path)
+            if any(
+                ord(character) < 32
+                or ord(character) == 127
+                or (ord(character) > 127 and character.isspace())
+                for character in decoded_path
+            ):
+                raise HuroshikiError(
+                    "Project selector contains unsafe whitespace or control characters"
+                )
     if normalized_provider == "url":
         validate_public_url(selector)
     return normalized_provider, selector
@@ -3801,7 +4076,9 @@ def _provider_protocol_mapping(
     return record
 
 
-def _provider_protocol_project_id(provider: str, record: object) -> str:
+def _provider_protocol_project_id(
+    provider: str, record: object
+) -> str | CanonicalModrinthId:
     project_id = _provider_protocol_text(record, "project_id")
     if provider == "curseforge":
         try:
@@ -3810,7 +4087,7 @@ def _provider_protocol_project_id(provider: str, record: object) -> str:
             raise HuroshikiError(
                 "Provider lookup returned an invalid CurseForge project ID"
             ) from error
-    return project_id
+    return canonical_modrinth_id(project_id, "Modrinth project ID")
 
 
 def canonical_curseforge_project_id(value: str) -> str:
@@ -5453,6 +5730,392 @@ def _exact_metadata_records(
     return {identity: tuple(items) for identity, items in records.items()}
 
 
+def _exact_metadata_changes(
+    current: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
+    desired: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
+) -> tuple[UpdateChange, ...]:
+    changes: list[UpdateChange] = []
+    for identity in sorted(current.keys() - desired.keys()):
+        entries = current[identity]
+        if len(entries) != 1:
+            raise HuroshikiError(
+                f"Exact closure baseline has duplicate identity "
+                f"{identity[0]}:{identity[1]}"
+            )
+        relative, contents, _ = entries[0]
+        changes.append(UpdateChange(relative, contents, None))
+    for identity in sorted(desired):
+        entries = desired[identity]
+        if len(entries) != 1:
+            raise HuroshikiError(
+                f"Exact closure result has duplicate identity "
+                f"{identity[0]}:{identity[1]}"
+            )
+        desired_relative, desired_contents, _ = entries[0]
+        existing = current.get(identity, ())
+        if not existing:
+            changes.append(UpdateChange(desired_relative, None, desired_contents))
+            continue
+        if len(existing) != 1:
+            raise HuroshikiError(
+                f"Exact closure baseline has duplicate identity "
+                f"{identity[0]}:{identity[1]}"
+            )
+        current_relative, current_contents, _ = existing[0]
+        if current_relative != desired_relative:
+            changes.append(UpdateChange(current_relative, current_contents, None))
+            changes.append(UpdateChange(desired_relative, None, desired_contents))
+        elif current_contents != desired_contents:
+            changes.append(
+                UpdateChange(desired_relative, current_contents, desired_contents)
+            )
+    return tuple(sorted(changes, key=lambda item: item.relative_path))
+
+
+def _exact_assert_complete_metadata_graph(
+    source: Path,
+    desired: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
+    checkpoint: Callable[[], None],
+) -> None:
+    actual = _exact_metadata_records(source, checkpoint)
+    if actual.keys() != desired.keys():
+        missing = sorted(
+            f"{identity[0]}:{identity[1]}" for identity in desired.keys() - actual.keys()
+        )
+        extra = sorted(
+            f"{identity[0]}:{identity[1]}" for identity in actual.keys() - desired.keys()
+        )
+        raise HuroshikiError(
+            "Exact closure postcondition disagrees with the resulting graph: "
+            f"missing={missing or 'none'}, extra={extra or 'none'}"
+        )
+    for identity in sorted(desired):
+        checkpoint()
+        expected_entries = desired[identity]
+        actual_entries = actual[identity]
+        if len(expected_entries) != 1 or len(actual_entries) != 1:
+            raise HuroshikiError(
+                f"Exact closure postcondition has duplicate identity "
+                f"{identity[0]}:{identity[1]}"
+            )
+        expected_relative, expected_contents, expected_mod = expected_entries[0]
+        actual_relative, actual_contents, actual_mod = actual_entries[0]
+        if (
+            expected_relative != actual_relative
+            or expected_mod.filename != actual_mod.filename
+            or expected_mod.side != actual_mod.side
+            or _closure_metadata_semantics(expected_contents)
+            != _closure_metadata_semantics(actual_contents)
+        ):
+            raise HuroshikiError(
+                f"Exact closure postcondition disagrees for "
+                f"{identity[0]}:{identity[1]}"
+            )
+
+
+def _exact_metadata_from_root(
+    root: PackMigrationRoot,
+    baseline: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
+) -> ResolvedMetadata:
+    identity = (root.provider, root.project_id)
+    entries = baseline.get(identity, ())
+    if len(entries) != 1:
+        raise HuroshikiError(
+            f"Exact root metadata is not unique: {root.canonical_identity}"
+        )
+    relative, contents, mod = entries[0]
+    return ResolvedMetadata(
+        identity,
+        relative,
+        mod.filename,
+        contents,
+        root.provider,
+        root.project_id,
+    )
+
+
+def _verify_exact_closure_artifacts(
+    baseline: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
+    desired: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
+    selection: ExactModArtifactSelection,
+    versions: tuple[str, str, str],
+    *,
+    workspace: Path,
+    context_source: Path,
+    cancel_event: threading.Event,
+    deadline: float,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None,
+    checkpoint: Callable[[], None],
+) -> tuple[ExactArtifactVerification, ...]:
+    workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+    minecraft, loader, loader_version = versions
+    context = EquivalenceContext(
+        minecraft,
+        loader,
+        loader_version,
+        _equivalence_snapshot_digest(context_source, checkpoint),
+        EQUIVALENCE_POLICY_VERSION,
+    )
+    results: dict[tuple[str, str], ExactArtifactVerification] = {}
+    for identity in sorted(desired):
+        checkpoint()
+        entries = desired[identity]
+        if len(entries) != 1:
+            raise HuroshikiError(
+                f"Exact artifact metadata is not unique for {identity[0]}:{identity[1]}"
+            )
+        relative, contents, mod = entries[0]
+        if identity[0] not in {"modrinth", "curseforge"}:
+            raise HuroshikiError(
+                f"Exact selection cannot semantically verify URL artifact "
+                f"{identity[0]}:{identity[1]}"
+            )
+        provider_identity = parse_provider_metadata(relative, contents)
+        artifact_id = provider_identity.file_id
+        if artifact_id is None:
+            raise HuroshikiError(
+                f"Exact artifact metadata has no artifact ID for {identity[0]}:{identity[1]}"
+            )
+        candidate = _dependency_candidate(
+            identity=identity,
+            relative_path=relative,
+            filename=mod.filename,
+            contents=contents,
+            side=mod.side,
+            provenance="explicit" if identity == selection.identity else "dependency",
+            existing=identity in baseline,
+        )
+        try:
+            materialized = materialize_provider_artifact(
+                candidate,
+                context,
+                workspace=workspace,
+                cancel_event=cancel_event,
+                deadline=deadline,
+                process_result_callback=process_result_callback,
+            )
+        except Exception as error:
+            raise HuroshikiError(
+                f"Exact artifact materialization failed for {identity[0]}:{identity[1]}: {error}"
+            ) from error
+        if not isinstance(materialized, MaterializedArtifact):
+            raise HuroshikiError(
+                f"Exact artifact materialization returned invalid evidence for "
+                f"{identity[0]}:{identity[1]}"
+            )
+        semantic = materialized.semantic_identity
+        if semantic is None:
+            raise HuroshikiError(
+                f"Exact artifact has no resolved {loader} semantic identity: "
+                f"{identity[0]}:{identity[1]}"
+            )
+        if semantic.target_loader != loader.strip().lower():
+            raise HuroshikiError(
+                f"Exact artifact has incompatible loader metadata for "
+                f"{identity[0]}:{identity[1]}"
+            )
+        results[identity] = ExactArtifactVerification(
+            identity, artifact_id, materialized.sha256, semantic
+        )
+    selected = results.get(selection.identity)
+    if selected is None:
+        raise HuroshikiError(
+            f"Exact selected artifact has no semantic verification: "
+            f"{selection.identity_label}"
+        )
+    old_entries = baseline.get(selection.identity, ())
+    if len(old_entries) != 1:
+        raise HuroshikiError(
+            f"Exact selected artifact baseline is not unique: {selection.identity_label}"
+        )
+    old_relative, old_contents, old_mod = old_entries[0]
+    old_candidate = _dependency_candidate(
+        identity=selection.identity,
+        relative_path=old_relative,
+        filename=old_mod.filename,
+        contents=old_contents,
+        side=old_mod.side,
+        provenance="explicit" if selection.identity == selection.identity else "dependency",
+        existing=True,
+    )
+    try:
+        old_materialized = materialize_provider_artifact(
+            old_candidate,
+            context,
+            workspace=workspace,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            process_result_callback=process_result_callback,
+        )
+    except Exception as error:
+        raise HuroshikiError(
+            f"Could not verify semantic continuity for {selection.identity_label}: {error}"
+        ) from error
+    if old_materialized.semantic_identity is None:
+        raise HuroshikiError(
+            f"Installed artifact has no resolved semantic identity: {selection.identity_label}"
+        )
+    if old_materialized.semantic_identity.target_loader != loader.strip().lower():
+        raise HuroshikiError(
+            f"Installed artifact has incompatible loader metadata: "
+            f"{selection.identity_label}"
+        )
+    old_ids = {mod_id for mod_id, _version in old_materialized.semantic_identity.members}
+    new_ids = {mod_id for mod_id, _version in selected.semantic_identity.members}
+    if old_ids != new_ids:
+        raise HuroshikiError(
+            f"Exact artifact semantic MOD identity changed for {selection.identity_label}"
+        )
+    for identity, old_entries in baseline.items():
+        if identity == selection.identity or identity not in results:
+            continue
+        if len(old_entries) != 1:
+            raise HuroshikiError(
+                f"Exact artifact baseline is not unique for {identity[0]}:{identity[1]}"
+            )
+        old_relative, old_contents, old_mod = old_entries[0]
+        old_candidate = _dependency_candidate(
+            identity=identity,
+            relative_path=old_relative,
+            filename=old_mod.filename,
+            contents=old_contents,
+            side=old_mod.side,
+            provenance="dependency",
+            existing=True,
+        )
+        old_materialized = materialize_provider_artifact(
+            old_candidate,
+            context,
+            workspace=workspace,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            process_result_callback=process_result_callback,
+        )
+        if old_materialized.semantic_identity is None:
+            raise HuroshikiError(
+                f"Installed dependency has no resolved semantic identity: "
+                f"{identity[0]}:{identity[1]}"
+            )
+        if old_materialized.semantic_identity.target_loader != loader.strip().lower():
+            raise HuroshikiError(
+                f"Installed dependency has incompatible loader metadata: "
+                f"{identity[0]}:{identity[1]}"
+            )
+        if old_materialized.semantic_identity.members != results[identity].semantic_identity.members:
+            raise HuroshikiError(
+                f"Exact dependency semantic MOD identity changed for "
+                f"{identity[0]}:{identity[1]}"
+            )
+    return tuple(results[identity] for identity in sorted(results))
+
+
+def _exact_verification_digest(
+    verifications: Sequence[ExactArtifactVerification],
+) -> str:
+    payload = [
+        {
+            "identity": verification.identity,
+            "artifact_id": verification.artifact_id,
+            "sha256": verification.sha256,
+            "semantic": {
+                "members": verification.semantic_identity.members,
+                "loader": verification.semantic_identity.target_loader,
+            },
+        }
+        for verification in verifications
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _exact_verification_binding_digest(
+    verifications: Sequence[ExactArtifactVerification],
+    records: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
+) -> str:
+    payload = [
+        {
+            "identity": identity,
+            "artifact_id": parse_provider_metadata(relative, contents).file_id,
+            "sha256": next(
+                item.sha256 for item in verifications if item.identity == identity
+            ),
+            "semantic": next(
+                {
+                    "members": item.semantic_identity.members,
+                    "loader": item.semantic_identity.target_loader,
+                }
+                for item in verifications
+                if item.identity == identity
+            ),
+        }
+        for identity, entries in sorted(records.items())
+        for relative, contents, mod in entries
+        if identity[0] in {"modrinth", "curseforge"}
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _preserve_exact_selected_side(
+    source: Path,
+    selection: ExactModArtifactSelection,
+    selected_side: str,
+    checkpoint: Callable[[], None],
+) -> None:
+    records = _exact_metadata_records(source, checkpoint)
+    matching = records.get(selection.identity, ())
+    if len(matching) != 1:
+        raise HuroshikiError(
+            f"Exact selected identity {selection.identity_label} has "
+            f"{len(matching)} metadata records"
+        )
+    relative, contents, _ = matching[0]
+    updated = _metadata_contents_with_side(contents, selected_side)
+    if updated != contents:
+        safe_child(source, relative).write_bytes(updated)
+
+
+def _merge_exact_existing_dependency_sides(
+    source: Path,
+    baseline: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
+    selected_identity: tuple[str, str],
+    explicit_identities: set[tuple[str, str]],
+    checkpoint: Callable[[], None],
+) -> None:
+    """Union installed coverage for unchanged dependency identities."""
+    for identity, entries in _exact_metadata_records(source, checkpoint).items():
+        checkpoint()
+        if identity == selected_identity or identity in explicit_identities:
+            continue
+        if len(entries) != 1:
+            raise HuroshikiError(
+                f"Exact closure has duplicate identity {identity[0]}:{identity[1]}"
+            )
+        existing = baseline.get(identity, ())
+        if not existing:
+            continue
+        if len(existing) != 1:
+            raise HuroshikiError(
+                f"Exact closure baseline has duplicate identity "
+                f"{identity[0]}:{identity[1]}"
+            )
+        relative, contents, resolved_mod = entries[0]
+        existing_mod = existing[0][2]
+        if existing_mod.side_error is not None:
+            raise HuroshikiError(
+                f"Cannot preserve invalid existing side for "
+                f"{existing_mod.relative_path}: {existing_mod.side_error}"
+            )
+        updated = _metadata_contents_with_side(
+            contents,
+            union_side(existing_mod.side, resolved_mod.side),
+        )
+        if updated != contents:
+            safe_child(source, relative).write_bytes(updated)
+
+
 def _exact_manifest_bytes(source: Path) -> bytes | None:
     path = safe_child(source, ROOT_MANIFEST_PATH)
     if not path.exists():
@@ -5476,28 +6139,6 @@ def _exact_assert_root_manifest_identities(
                 f"Exact MOD selection removed or duplicated root "
                 f"{root.canonical_identity}"
             )
-
-
-def _exact_preserve_sides(
-    source: Path,
-    selected_side: str,
-    checkpoint: Callable[[], None],
-) -> None:
-    records = _exact_metadata_records(source, checkpoint)
-    if selected_side not in packctl.VALID_SIDES:
-        raise HuroshikiError(f"Invalid exact MOD selection side: {selected_side}")
-    for identity, items in records.items():
-        desired_side = selected_side
-        if desired_side not in packctl.VALID_SIDES:
-            raise HuroshikiError(
-                f"Exact MOD selection encountered invalid side for "
-                f"{identity[0]}:{identity[1]}"
-            )
-        for relative, contents, _ in items:
-            checkpoint()
-            updated = _metadata_contents_with_side(contents, desired_side)
-            if updated != contents:
-                safe_child(source, relative).write_bytes(updated)
 
 
 def _exact_run_refresh(
@@ -5524,50 +6165,6 @@ def _exact_run_refresh(
     if failure is not None:
         raise HuroshikiError(failure)
     checkpoint()
-
-
-def _exact_verify_dependency_artifacts(
-    source: Path,
-    metadata: Sequence[ResolvedMetadata],
-    *,
-    workspace: Path,
-    minecraft: str,
-    loader: str,
-    loader_version: str,
-    cancel_event: threading.Event,
-    deadline: float,
-    process_result_callback: Callable[[BoundedProcessResult], None] | None,
-    checkpoint: Callable[[], None],
-) -> None:
-    workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
-    context = EquivalenceContext(
-        minecraft,
-        loader,
-        loader_version,
-        _equivalence_snapshot_digest(source, checkpoint),
-        EQUIVALENCE_POLICY_VERSION,
-    )
-    for item in metadata:
-        checkpoint()
-        document = tomllib.loads(item.contents.decode("utf-8"))
-        mod = read_mod_data(item.relative_path, document)
-        candidate = DependencyCandidate(
-            f"{item.provider}:{item.project_id}",
-            str(item.relative_path),
-            item.filename,
-            item.contents,
-            mod.side,
-            "dependency",
-            False,
-        )
-        materialize_provider_artifact(
-            candidate,
-            context,
-            workspace=workspace,
-            cancel_event=cancel_event,
-            deadline=deadline,
-            process_result_callback=process_result_callback,
-        )
 
 
 class LoaderMigrationCancelled(HuroshikiError):
@@ -7743,29 +8340,31 @@ def resolve_exact_mod_closure(
     cancel_event: threading.Event,
     deadline: float,
     checkpoint: Callable[[], None],
+    preseed_selections: Sequence[ExactModArtifactSelection] = (),
     process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> ResolvedModClosure:
     """Resolve one exact provider artifact in an operation-owned Packwiz source."""
     checkpoint()
     ensure_safe_pack_source(source, checkpoint=checkpoint)
-    command = build_exact_artifact_command(selection)
-    resolver_deadline = min(
-        deadline,
-        time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
-    )
-    process_kwargs: dict[str, object] = {
-        "cwd": source,
-        "cancel_event": cancel_event,
-        "deadline": resolver_deadline,
-    }
-    if process_result_callback is not None:
-        process_kwargs["result_callback"] = process_result_callback
-    result = run_resolver_process(command, **process_kwargs)
-    failure = _exact_process_failure(result, label="Exact Packwiz resolution")
-    if failure is not None:
-        raise HuroshikiError(failure)
     checkpoint()
-
+    for exact_selection in tuple(preseed_selections) + (selection,):
+        command = build_exact_artifact_command(exact_selection)
+        resolver_deadline = min(
+            deadline,
+            time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
+        )
+        process_kwargs: dict[str, object] = {
+            "cwd": source,
+            "cancel_event": cancel_event,
+            "deadline": resolver_deadline,
+        }
+        if process_result_callback is not None:
+            process_kwargs["result_callback"] = process_result_callback
+        result = run_resolver_process(command, **process_kwargs)
+        failure = _exact_process_failure(result, label="Exact Packwiz resolution")
+        if failure is not None:
+            raise HuroshikiError(failure)
+        checkpoint()
     refresh_deadline = min(
         deadline,
         time.monotonic() + UPDATE_RESOLVER_TIMEOUT_SECONDS,
@@ -7842,6 +8441,19 @@ def _dependency_candidate(
     )
 
 
+def _resolved_metadata_side(item: ResolvedMetadata) -> str:
+    mod = read_mod_data(
+        item.relative_path,
+        tomllib.loads(item.contents.decode("utf-8")),
+    )
+    if mod.side_error is not None:
+        raise HuroshikiError(
+            f"Resolved metadata has invalid side for {item.relative_path}: "
+            f"{mod.side_error}"
+        )
+    return mod.side
+
+
 def _verify_dependency_collision(
     existing: DependencyCandidate,
     incoming: DependencyCandidate,
@@ -7879,13 +8491,24 @@ def merge_metadata_closure(
     closure: ResolvedModClosure,
     *,
     requested_side: str,
+    preserve_resolved_dependency_sides: bool = False,
+    explicit_root_sides: Mapping[tuple[str, str], str] | None = None,
+    exact_selected_identity: tuple[str, str] | None = None,
+    exact_selected_side: str | None = None,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
     equivalence_workspace: Path | None = None,
     process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> tuple[Path, ...]:
+    def checkpoint() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise HuroshikiError("MOD closure merge was cancelled")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise HuroshikiError("MOD closure merge deadline exceeded")
+
     side = packctl.normalize_side(requested_side)
-    ensure_safe_pack_source(staged_source)
+    checkpoint()
+    ensure_safe_pack_source(staged_source, checkpoint=checkpoint)
     if not any(item.identity == closure.root_identity for item in closure.metadata):
         raise HuroshikiError(
             f"Resolved closure does not contain requested root "
@@ -7893,7 +8516,8 @@ def merge_metadata_closure(
         )
     existing_mods = [
         read_mod(staged_source, path.relative_to(staged_source))
-        for path in sorted(staged_source.rglob("*.pw.toml"))
+        for path in _checkpointed_paths(staged_source, "*.pw.toml", checkpoint)
+        if path.is_file() and not path.is_symlink()
     ]
     root_manifest = staged_source / ".huroshiki-roots.json"
     manifest_exists = root_manifest.is_file() and not root_manifest.is_symlink()
@@ -7905,12 +8529,13 @@ def merge_metadata_closure(
         if manifest_exists
         else set()
     )
+    checkpoint()
     minecraft, loader, loader_version = packctl.project_versions(staged_source)
     context = EquivalenceContext(
         minecraft,
         loader,
         loader_version,
-        _equivalence_snapshot_digest(staged_source),
+        _equivalence_snapshot_digest(staged_source, checkpoint),
         EQUIVALENCE_POLICY_VERSION,
     )
     workspace = equivalence_workspace or (
@@ -7918,6 +8543,7 @@ def merge_metadata_closure(
     )
     incoming_records: dict[tuple[str, str], ResolvedMetadata] = {}
     for item in closure.metadata:
+        checkpoint()
         canonical_identity = (canonical_provider(item.provider), item.project_id)
         if item.identity != canonical_identity:
             raise HuroshikiError(
@@ -7935,6 +8561,7 @@ def merge_metadata_closure(
         incoming_filename_owners: dict[str, tuple[str, str]] = {}
         collision_pair: tuple[tuple[str, str], tuple[str, str]] | None = None
         for identity, item in sorted(incoming_records.items()):
+            checkpoint()
             owners = {
                 owner
                 for owner in (
@@ -7972,7 +8599,11 @@ def merge_metadata_closure(
             relative_path=left_item.relative_path,
             filename=left_item.filename,
             contents=left_item.contents,
-            side=side,
+            side=(
+                side
+                if left_identity == closure.root_identity
+                else _resolved_metadata_side(left_item)
+            ),
             provenance=_dependency_provenance(
                 existing=False,
                 explicit=left_identity == closure.root_identity,
@@ -7984,7 +8615,11 @@ def merge_metadata_closure(
             relative_path=right_item.relative_path,
             filename=right_item.filename,
             contents=right_item.contents,
-            side=side,
+            side=(
+                side
+                if right_identity == closure.root_identity
+                else _resolved_metadata_side(right_item)
+            ),
             provenance=_dependency_provenance(
                 existing=False,
                 explicit=right_identity == closure.root_identity,
@@ -8010,6 +8645,7 @@ def merge_metadata_closure(
     path_owners: dict[str, tuple[str, str]] = {}
     filename_owners: dict[str, tuple[str, str]] = {}
     for mod in existing_mods:
+        checkpoint()
         identity = (canonical_provider(mod.provider), mod.project_id)
         if identity in existing_by_identity:
             raise HuroshikiError(
@@ -8026,6 +8662,7 @@ def merge_metadata_closure(
     removals: list[Path] = []
     incoming_identities: set[tuple[str, str]] = set()
     for item in closure_metadata:
+        checkpoint()
         canonical_identity = (canonical_provider(item.provider), item.project_id)
         if item.identity != canonical_identity:
             raise HuroshikiError(
@@ -8033,6 +8670,15 @@ def merge_metadata_closure(
                 f"{item.identity!r} vs {canonical_identity!r}"
             )
         incoming_identities.add(item.identity)
+        item_side = side
+        if explicit_root_sides and item.identity in explicit_root_sides:
+            item_side = packctl.normalize_side(explicit_root_sides[item.identity])
+        elif preserve_resolved_dependency_sides and item.identity != closure.root_identity:
+            item_side = _resolved_metadata_side(item)
+        if exact_selected_identity is not None and item.identity == exact_selected_identity:
+            if exact_selected_side is None:
+                raise HuroshikiError("Exact selected side is unavailable")
+            item_side = packctl.normalize_side(exact_selected_side)
         path_key = portable_relative_path_key(item.relative_path)
         filename_key = portable_basename_key(item.filename)
         existing = existing_by_identity.get(item.identity)
@@ -8088,7 +8734,7 @@ def merge_metadata_closure(
                 relative_path=item.relative_path,
                 filename=item.filename,
                 contents=item.contents,
-                side=side,
+                side=item_side,
                 provenance=_dependency_provenance(
                     existing=False,
                     explicit=item.identity == closure.root_identity,
@@ -8104,7 +8750,7 @@ def merge_metadata_closure(
                 deadline=deadline,
                 process_result_callback=process_result_callback,
             )
-            assigned_side = union_side(collision.side, side)
+            assigned_side = union_side(collision.side, item_side)
             if evidence.selected_identity == existing_candidate.provider_identity:
                 updated = _metadata_contents_with_side(
                     collision_contents, assigned_side
@@ -8138,11 +8784,11 @@ def merge_metadata_closure(
                     f"Cannot preserve invalid existing side for {existing.relative_path}: "
                     f"{existing.side_error}"
                 )
-            assigned_side = union_side(existing.side, side)
+            assigned_side = union_side(existing.side, item_side)
         else:
             path_owners[path_key] = item.identity
             filename_owners[filename_key] = item.identity
-            assigned_side = side
+            assigned_side = item_side
         relative_path = existing.relative_path if existing is not None else item.relative_path
         path = safe_child(staged_source, relative_path)
         contents = (
@@ -8162,11 +8808,13 @@ def merge_metadata_closure(
 
     changed: list[Path] = []
     for relative_path in removals:
+        checkpoint()
         path = safe_child(staged_source, relative_path)
         if path.exists():
             path.unlink()
             changed.append(relative_path)
     for _item, _existing, relative_path, updated, _assigned_side in pending:
+        checkpoint()
         path = safe_child(staged_source, relative_path)
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
