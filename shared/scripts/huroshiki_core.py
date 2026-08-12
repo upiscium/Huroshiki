@@ -3122,34 +3122,55 @@ class PackTransaction:
                     f"{len(explicit_roots)})",
                 )
 
+            initial_reachability = _exact_closure_reachability(
+                root_closures, checkpoint
+            )
             if selected_root is None:
-                if not any(
-                    item.identity == selection.identity
-                    for _root, closure in root_closures
-                    for item in closure.metadata
-                ):
+                initial_owners = initial_reachability.get(selection.identity)
+                if not initial_owners:
                     raise HuroshikiError(
                         f"Exact dependency {selection.identity_label} is not required "
                         "by any explicit root"
                     )
-                owner_identities = {
-                    root.canonical_identity
-                    for root, closure in root_closures
-                    if any(item.identity == selection.identity for item in closure.metadata)
-                }
                 constrained_closures: list[tuple[PackMigrationRoot, ResolvedModClosure]] = []
                 for root_index, (root, closure) in enumerate(root_closures):
                     checkpoint()
-                    if root.canonical_identity in owner_identities:
+                    if root.canonical_identity in initial_owners:
                         constrained = resolve_root_closure(
                             root,
                             root_index,
                             preseed_selections=(selection,),
                         )
-                        _verify_exact_root_metadata(selection, constrained.metadata)
+                        try:
+                            _verify_exact_root_metadata(
+                                selection, constrained.metadata
+                            )
+                        except HuroshikiError as error:
+                            raise HuroshikiError(
+                                f"Exact dependency selection conflict for "
+                                f"{selection.identity_label}: {error}"
+                            ) from error
                         closure = constrained
                     constrained_closures.append((root, closure))
                 root_closures = constrained_closures
+                resulting_reachability = _exact_closure_reachability(
+                    root_closures, checkpoint
+                )
+                resulting_owners = resulting_reachability.get(selection.identity, {})
+                if set(resulting_owners) != set(initial_owners):
+                    raise HuroshikiError(
+                        f"Exact dependency selection changed ownership for "
+                        f"{selection.identity_label}"
+                    )
+                if any(
+                    artifact_id != selection.artifact_id
+                    for artifact_id in resulting_owners.values()
+                ):
+                    raise HuroshikiError(
+                        f"Exact dependency selection conflict for "
+                        f"{selection.identity_label}: not every owning root accepts "
+                        f"artifact {selection.artifact_id}"
+                    )
 
             emit("merging", "Building the complete explicit-root dependency graph")
             for root, closure in root_closures:
@@ -5728,6 +5749,67 @@ def _exact_metadata_records(
         identity = canonical_provider(mod.provider), mod.project_id
         records.setdefault(identity, []).append((relative, contents, mod))
     return {identity: tuple(items) for identity, items in records.items()}
+
+
+def _exact_closure_reachability(
+    root_closures: Sequence[tuple[PackMigrationRoot, ResolvedModClosure]],
+    checkpoint: Callable[[], None],
+) -> dict[tuple[str, str], dict[str, str | None]]:
+    """Map each resulting identity to the explicit roots that require it."""
+    owners: dict[tuple[str, str], dict[str, str | None]] = {}
+    for root, closure in root_closures:
+        checkpoint()
+        root_identity = (root.provider, root.project_id)
+        if closure.root_identity != root_identity:
+            raise HuroshikiError(
+                f"Exact closure root mismatch for {root.canonical_identity}"
+            )
+        seen: set[tuple[str, str]] = set()
+        for item in closure.metadata:
+            checkpoint()
+            if item.identity in seen:
+                raise HuroshikiError(
+                    f"Exact closure for {root.canonical_identity} contains duplicate "
+                    f"identity {item.provider}:{item.project_id}"
+                )
+            seen.add(item.identity)
+            try:
+                metadata_identity = parse_provider_metadata(
+                    item.relative_path, item.contents
+                )
+            except Exception as error:
+                raise HuroshikiError(
+                    f"Exact closure metadata is invalid for "
+                    f"{item.provider}:{item.project_id}: {error}"
+                ) from error
+            if (
+                metadata_identity.provider,
+                metadata_identity.project_id,
+            ) != item.identity:
+                raise HuroshikiError(
+                    f"Exact closure metadata identity mismatch for "
+                    f"{item.provider}:{item.project_id}"
+                )
+            owners.setdefault(item.identity, {})[root.canonical_identity] = (
+                metadata_identity.file_id
+            )
+        if root_identity not in seen:
+            raise HuroshikiError(
+                f"Exact closure does not contain explicit root "
+                f"{root.canonical_identity}"
+            )
+    for identity, requirements in owners.items():
+        checkpoint()
+        if len(set(requirements.values())) > 1:
+            details = ", ".join(
+                f"{owner}={artifact_id or '<missing>'}"
+                for owner, artifact_id in sorted(requirements.items())
+            )
+            raise HuroshikiError(
+                f"Shared dependency disagreement for {identity[0]}:{identity[1]}: "
+                f"{details}"
+            )
+    return owners
 
 
 def _exact_metadata_changes(

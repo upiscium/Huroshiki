@@ -775,6 +775,65 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         finally:
             transaction.discard()
 
+    def test_dependency_exact_selection_conflicting_owner_restores_all_bytes(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"), ("root-b", "b1", "both")),
+            (("dependency", "d1"),),
+        )
+        before = core._file_content_snapshot(transaction.source)
+        calls: dict[tuple[str, str], int] = {}
+
+        def resolve(selection, **_):
+            identity = selection.identity
+            calls[identity] = calls.get(identity, 0) + 1
+            if identity == ("modrinth", "root-a"):
+                artifact = "d2" if calls[identity] == 2 else "d1"
+                return self.graph_closure("root-a", "a1", ("dependency", artifact))
+            if identity == ("modrinth", "root-b"):
+                return self.graph_closure("root-b", "b1", ("dependency", "d1"))
+            raise AssertionError(identity)
+
+        try:
+            with patch.object(core, "resolve_exact_mod_closure", side_effect=resolve):
+                with self.assertRaisesRegex(
+                    core.HuroshikiError,
+                    "ownership|selection conflict|Shared dependency disagreement",
+                ):
+                    transaction.prepare_exact_mod_version(
+                        self.selection("modrinth", "dependency", "d2")
+                    )
+            self.assertEqual(core._file_content_snapshot(transaction.source), before)
+        finally:
+            transaction.discard()
+
+    def test_shared_dependency_conflict_restores_all_transaction_bytes(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"), ("root-b", "b1", "both")),
+            (("dependency", "d1"),),
+        )
+        before = core._file_content_snapshot(transaction.source)
+        closures = {
+            ("modrinth", "root-a", "a2"): self.graph_closure(
+                "root-a", "a2", ("dependency", "d2")
+            ),
+            ("modrinth", "root-b", "b1"): self.graph_closure(
+                "root-b", "b1", ("dependency", "d1")
+            ),
+        }
+
+        def resolve(selection, **_):
+            return closures[(selection.provider, selection.project_id, selection.artifact_id)]
+
+        try:
+            with patch.object(core, "resolve_exact_mod_closure", side_effect=resolve):
+                with self.assertRaisesRegex(core.HuroshikiError, "disagreement"):
+                    transaction.prepare_exact_mod_version(
+                        self.selection("modrinth", "root-a", "a2")
+                    )
+            self.assertEqual(core._file_content_snapshot(transaction.source), before)
+        finally:
+            transaction.discard()
+
     def test_dependency_exact_selection_succeeds_when_all_owners_resolve_selected_artifact(self) -> None:
         transaction = self.write_graph_pack(
             (("root", "r1", "both"),),
@@ -800,6 +859,38 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             self.assertEqual(preview.old_artifact_id, "d1")
             self.assertEqual(preview.new_artifact_id, "d2")
             self.assertEqual(preview.removed_dependencies, 0)
+        finally:
+            transaction.discard()
+
+    def test_resulting_closure_refresh_failure_restores_all_transaction_bytes(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root", "r1", "both"),),
+            (("dependency", "d1"),),
+        )
+        before = core._file_content_snapshot(transaction.source)
+        closure = self.graph_closure("root", "r2", ("replacement", "x1"))
+
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", return_value=closure
+            ), patch.object(
+                core,
+                "run_resolver_process",
+                return_value=core.ResolverProcessResult(
+                    7, "", "refresh failed", False, False
+                ),
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, "refresh"):
+                    transaction.prepare_exact_mod_version(
+                        self.selection("modrinth", "root", "r2")
+                    )
+            self.assertEqual(core._file_content_snapshot(transaction.source), before)
+            self.assertTrue(
+                transaction.source.joinpath("mods/dependency.pw.toml").exists()
+            )
+            self.assertFalse(
+                transaction.source.joinpath("mods/replacement.pw.toml").exists()
+            )
         finally:
             transaction.discard()
 
