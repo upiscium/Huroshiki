@@ -2336,7 +2336,8 @@ def init_packwiz_project(
     )
     create_layout(root)
     (source / ".packwizignore").write_text(
-        "*.log\n*.gitkeep\n/.huroshiki-roots.json\n/crash-reports/\n/logs/\n"
+        "*.log\n*.gitkeep\n/.huroshiki-roots.json\n"
+        "/.huroshiki-version-overrides.json\n/crash-reports/\n/logs/\n"
         "/saves/\n/screenshots/\n/world/\n",
         encoding="utf-8",
     )

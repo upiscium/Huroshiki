@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import huroshiki_core as core
 import packctl
+from mod_version_overrides import ModVersionOverride, read_mod_version_overrides, set_mod_version_override
 from dependency_equivalence import (
     LoaderDependencyRequirement,
     MaterializedArtifact,
@@ -2662,6 +2663,169 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             transaction.source.joinpath("mods/root.pw.toml").read_text(),
         )
         self.assertFalse(packctl.project_lock_is_active(self.key))
+
+    def test_exact_selection_stages_default_unlocked_override_in_transaction_source_only(self) -> None:
+        transaction = self.make_transaction("modrinth", "root")
+        real_before = core._file_content_snapshot(self.source)
+        overrides_before = read_mod_version_overrides(self.source)
+        self.assertEqual(overrides_before, ())
+        preview = transaction.prepare_exact_mod_version(
+            self.selection(
+                "modrinth", branded_project("root"), branded_version("v2")
+            )
+        )
+        self.assertEqual(preview.new_artifact_id, mr_version("v2"))
+        self.assertFalse((self.source / ".huroshiki-version-overrides.json").exists())
+        staged = read_mod_version_overrides(transaction.source)
+        self.assertEqual(staged, (ModVersionOverride("modrinth", mr_project("root"), mr_version("v2"), False),))
+        self.assertEqual(core._file_content_snapshot(self.source), real_before)
+
+        transaction.apply()
+        applied = read_mod_version_overrides(self.source)
+        self.assertEqual(
+            applied,
+            (ModVersionOverride("modrinth", mr_project("root"), mr_version("v2"), False),),
+        )
+
+    def test_exact_selection_preserves_existing_locked_override_reason(self) -> None:
+        set_mod_version_override(
+            self.source,
+            ModVersionOverride(
+                "modrinth",
+                mr_project("root"),
+                mr_version("old-artifact"),
+                True,
+                "Compatibility",
+            ),
+        )
+        transaction = self.make_transaction("modrinth", "root")
+        transaction.prepare_exact_mod_version(
+            self.selection(
+                "modrinth", branded_project("root"), branded_version("v2")
+            )
+        )
+        staged = read_mod_version_overrides(transaction.source)
+        self.assertEqual(
+            staged,
+            (
+                ModVersionOverride(
+                    "modrinth",
+                    mr_project("root"),
+                    mr_version("v2"),
+                    True,
+                    "Compatibility",
+                ),
+            ),
+        )
+        transaction.apply()
+        applied = read_mod_version_overrides(self.source)
+        self.assertEqual(
+            applied,
+            (
+                ModVersionOverride(
+                    "modrinth",
+                    mr_project("root"),
+                    mr_version("v2"),
+                    True,
+                    "Compatibility",
+                ),
+            ),
+        )
+
+    def test_exact_selection_preserves_existing_unlocked_override_state(self) -> None:
+        set_mod_version_override(
+            self.source,
+            ModVersionOverride(
+                "modrinth", mr_project("root"), mr_version("old-artifact"), False
+            ),
+        )
+        transaction = self.make_transaction("modrinth", "root")
+        transaction.prepare_exact_mod_version(
+            self.selection(
+                "modrinth", branded_project("root"), branded_version("v2")
+            )
+        )
+        staged = read_mod_version_overrides(transaction.source)
+        self.assertEqual(
+            staged,
+            (
+                ModVersionOverride(
+                    "modrinth",
+                    mr_project("root"),
+                    mr_version("v2"),
+                    False,
+                ),
+            ),
+        )
+        transaction.apply()
+        applied = read_mod_version_overrides(self.source)
+        self.assertEqual(
+            applied,
+            (
+                ModVersionOverride(
+                    "modrinth",
+                    mr_project("root"),
+                    mr_version("v2"),
+                    False,
+                ),
+            ),
+        )
+
+    def test_exact_selection_fails_when_other_override_is_orphaned_or_drifted(self) -> None:
+        for changed_artifact in (None, "d2"):
+            with self.subTest(artifact=changed_artifact):
+                transaction = self.write_graph_pack(
+                    (("root", "r1", "both"),),
+                    (("dependency", "d1"),),
+                )
+                set_mod_version_override(
+                    transaction.source,
+                    ModVersionOverride(
+                        "modrinth",
+                        mr_project("dependency"),
+                        mr_version("d1"),
+                        False,
+                    ),
+                )
+                set_mod_version_override(
+                    self.source,
+                    ModVersionOverride(
+                        "modrinth",
+                        mr_project("dependency"),
+                        mr_version("d1"),
+                        False,
+                    ),
+                )
+                transaction_before = core._file_content_snapshot(transaction.source)
+                real_before = core._file_content_snapshot(self.source)
+                closure = (
+                    self.graph_closure("root", "r2")
+                    if changed_artifact is None
+                    else self.graph_closure("root", "r2", ("dependency", changed_artifact))
+                )
+
+                try:
+                    with patch.object(core, "resolve_exact_mod_closure", return_value=closure):
+                        with self.assertRaisesRegex(
+                            core.HuroshikiError,
+                            "version override",
+                        ):
+                            transaction.prepare_exact_mod_version(
+                                self.selection(
+                                    "modrinth", branded_project("root"), branded_version("r2")
+                                )
+                            )
+                    self.assertEqual(
+                        core._file_content_snapshot(transaction.source),
+                        transaction_before,
+                    )
+                    self.assertEqual(core._file_content_snapshot(self.source), real_before)
+                    self.assertEqual(
+                        read_mod_version_overrides(transaction.source),
+                        read_mod_version_overrides(self.source),
+                    )
+                finally:
+                    transaction.discard()
 
 
 if __name__ == "__main__":
