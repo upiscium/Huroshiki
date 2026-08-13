@@ -82,7 +82,7 @@ class PackMigrationRootSelection:
     project_id: str
 
 
-def _read_relative_file(
+def read_pack_control_file(
     root: Path,
     scan: PackTreeScan,
     relative: Path,
@@ -99,6 +99,9 @@ def _read_relative_file(
     opened: list[int] = []
     descriptor = -1
     try:
+        opened_root = os.fstat(root_fd)
+        if (opened_root.st_dev, opened_root.st_ino) != scan.root_identity:
+            raise PackMigrationRootError("Pack control-file root was replaced")
         current = root_fd
         for part in relative.parts[:-1]:
             child = os.open(part, _DIRECTORY_FLAGS, dir_fd=current)
@@ -132,6 +135,9 @@ def _read_relative_file(
         for item in reversed(opened):
             os.close(item)
         os.close(root_fd)
+
+
+_read_relative_file = read_pack_control_file
 
 
 def _manifest_records(contents: bytes) -> tuple[PackRootRecord, ...]:
@@ -242,7 +248,7 @@ def write_pack_root_manifest(
         os.close(root_fd)
 
 
-def _atomic_write_relative(
+def write_pack_control_file(
     source_root: Path,
     relative: Path,
     contents: bytes,
@@ -321,6 +327,9 @@ def _atomic_write_relative(
         os.close(root_fd)
 
 
+_atomic_write_relative = write_pack_control_file
+
+
 def ensure_pack_root_manifest_ignored(source_root: Path) -> None:
     scan = scan_pack_migration_source(source_root, checkpoint=lambda: None)
     ignore_entry = next(
@@ -334,7 +343,7 @@ def ensure_pack_root_manifest_ignored(source_root: Path) -> None:
     contents = (
         b""
         if ignore_entry is None
-        else _read_relative_file(
+        else read_pack_control_file(
             source_root,
             scan,
             Path(".packwizignore"),
@@ -349,7 +358,7 @@ def ensure_pack_root_manifest_ignored(source_root: Path) -> None:
         return
     if text and not text.endswith("\n"):
         text += "\n"
-    _atomic_write_relative(
+    write_pack_control_file(
         source_root,
         Path(".packwizignore"),
         (text + "/.huroshiki-roots.json\n").encode("utf-8"),
@@ -366,7 +375,7 @@ def set_url_metadata_project_id(
     scan = scan_pack_migration_source(source_root, checkpoint=lambda: None)
     try:
         document = tomlkit.parse(
-            _read_relative_file(
+            read_pack_control_file(
                 source_root,
                 scan,
                 relative_path,
@@ -392,7 +401,7 @@ def set_url_metadata_project_id(
             f"URL metadata identity disagrees with selection: {relative_path}"
         )
     huroshiki["project-id"] = project_id
-    _atomic_write_relative(
+    write_pack_control_file(
         source_root,
         relative_path,
         tomlkit.dumps(document).encode("utf-8"),

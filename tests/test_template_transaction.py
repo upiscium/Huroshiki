@@ -58,7 +58,7 @@ mods: []
                     hash = "00"
                     url = "https://example.invalid/example.jar"
                     [update.modrinth]
-                    mod-id = "example-id"
+                    mod-id = "Examp001"
                     version = "version-id"
                     EOF
                     """
@@ -87,7 +87,7 @@ mods: []
                     "_run_provider_lookup",
                     return_value={
                         "provider": "modrinth",
-                        "project_id": "example-id",
+                        "project_id": "Examp001",
                         "slug": "example",
                         "title": "Example MOD",
                     },
@@ -118,7 +118,7 @@ mods: []
                 transaction.apply()
                 mods = core.list_mods(key)
                 self.assertEqual(len(mods), 1)
-                self.assertEqual(mods[0].project_id, "example-id")
+                self.assertEqual(mods[0].project_id, "Examp001")
                 self.assertTrue(mods[0].client)
                 self.assertFalse(mods[0].server)
                 self.assertFalse((template_root / "source").exists())

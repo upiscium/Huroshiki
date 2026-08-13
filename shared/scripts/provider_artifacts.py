@@ -22,6 +22,7 @@ from dependency_equivalence import (
     DependencyCandidate,
     EquivalenceContext,
     MaterializedArtifact,
+    parse_loader_dependency_requirements,
     parse_semantic_jar,
 )
 from portable_paths import portable_basename, portable_relative_path
@@ -521,9 +522,13 @@ def materialize_provider_artifact(
         raise ProviderArtifactError("materialized artifact hash does not match metadata")
     try:
         semantic = parse_semantic_jar(artifact, context.target_loader)
+        requirements = parse_loader_dependency_requirements(
+            artifact, context.target_loader
+        )
     except Exception:
         semantic = None
-    return MaterializedArtifact(artifact_sha256, semantic)
+        requirements = None
+    return MaterializedArtifact(artifact_sha256, semantic, requirements)
 
 
 materialize_artifact = materialize_provider_artifact

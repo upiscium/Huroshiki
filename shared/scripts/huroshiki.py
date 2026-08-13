@@ -144,6 +144,15 @@ class HuroshikiApp(App[None]):
         self.update_apply_workers: dict[
             str, tuple[threading.Thread, threading.Event, threading.Event | None]
         ] = {}
+        self.exact_version_workers: dict[
+            str,
+            tuple[
+                threading.Thread,
+                threading.Event,
+                threading.Event,
+                Callable[[], core.PackTransaction | None],
+            ],
+        ] = {}
         self._shutting_down = False
         self.content_workers: dict[str, ContentWorker[object]] = {}
         self.content_plans: dict[str, core.ContentChangePlan] = {}
@@ -184,6 +193,10 @@ class HuroshikiApp(App[None]):
         ):
             if cancel_event is not None:
                 cancel_event.set()
+        for _thread, _done, cancel_event, _transaction in tuple(
+            self.exact_version_workers.values()
+        ):
+            cancel_event.set()
         unfinished_update_workers: set[str] = set()
         for project_key, (_thread, done, _cancel_event) in tuple(
             self.update_apply_workers.items()
@@ -194,6 +207,26 @@ class HuroshikiApp(App[None]):
                     f"Update apply worker did not stop before shutdown for {project_key}",
                     file=sys.stderr,
                 )
+        for project_key, (_thread, done, _cancel_event, transaction_getter) in tuple(
+            self.exact_version_workers.items()
+        ):
+            if not done.wait(max(0.0, deadline - time.monotonic())):
+                unfinished_update_workers.add(project_key)
+                print(
+                    f"Exact version worker did not stop before shutdown for {project_key}",
+                    file=sys.stderr,
+                )
+                continue
+            transaction = transaction_getter()
+            if transaction is not None and transaction.active:
+                try:
+                    transaction.discard(deadline=deadline)
+                except BaseException as error:
+                    print(
+                        f"Failed to discard exact version transaction for "
+                        f"{project_key}: {error}",
+                        file=sys.stderr,
+                    )
         for worker in tuple(self.content_workers.values()):
             worker.cancel()
         unfinished_content_workers: set[str] = set()
@@ -309,6 +342,12 @@ class HuroshikiApp(App[None]):
             return
         self.selected_project = project_key
         self.switch_screen(InstalledModsScreen(project_key))
+
+    def open_mod_details(self, project_key: str, mod: core.ModInfo) -> None:
+        if not self.project_is_usable(project_key):
+            return
+        self.selected_project = project_key
+        self.switch_screen(InstalledModDetailsScreen(project_key, mod))
 
     def open_update(self, project_key: str) -> None:
         if not self.project_is_usable(project_key):
@@ -5616,7 +5655,7 @@ class InstalledModsScreen(ProjectChildScreen, FilterListScreen):
     BINDINGS = FilterListScreen.BINDINGS
     help_text = (
         "Tab: focus  Enter: filter  j/k: move  Space: select  Ctrl+c/Ctrl+s: toggle side  "
-        "b: both  d: delete  Ctrl+L: clear filter  i: install  u: update  "
+        "b: both  d: delete  Enter: details  Ctrl+L: clear filter  i: install  u: update  "
         "m: help  q: project"
     )
     filter_input_id = "installed-search"
@@ -5820,6 +5859,10 @@ class InstalledModsScreen(ProjectChildScreen, FilterListScreen):
             self.move_table(table, len(self.visible_mods), -1)
         elif focused is table and key == "space":
             self.toggle_selected()
+        elif focused is table and key == "enter":
+            mod = self.current_mod()
+            if mod is not None:
+                self.app.open_mod_details(self.project_key, mod)
         elif focused is table and key == "b":
             self.set_side(True, True)
         elif key == "d":
@@ -5843,6 +5886,431 @@ class InstalledModsScreen(ProjectChildScreen, FilterListScreen):
         else:
             return
         event.stop()
+
+
+class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
+    help_text = "v: Select version  a: Apply preview  q / Esc: Installed MODs"
+
+    def __init__(self, project_key: str, mod: core.ModInfo) -> None:
+        super().__init__()
+        self.project_key = project_key
+        self.mod = mod
+        self.screen_title = f"{mod.name} / Installed MOD details"
+        self.provenance = "Loading..."
+        self.provenance_thread: threading.Thread | None = None
+        self.provenance_done = threading.Event()
+        self.provenance_error: BaseException | None = None
+        self.provenance_timer: Timer | None = None
+        self.cancel_event = threading.Event()
+        self.deadline: float | None = None
+        self.transaction: core.PackTransaction | None = None
+        self.preview: core.ModVersionSelectionPreview | None = None
+        self.prepare_thread: threading.Thread | None = None
+        self.prepare_done = threading.Event()
+        self.prepare_error: BaseException | None = None
+        self.prepare_timer: Timer | None = None
+        self.progress: list[core.ModVersionSelectionProgress] = []
+        self.progress_lock = threading.Lock()
+        self.apply_thread: threading.Thread | None = None
+        self.apply_done = threading.Event()
+        self.apply_error: BaseException | None = None
+        self.apply_timer: Timer | None = None
+        self.discard_operation: core.TransactionDiscardOperation | None = None
+        self.discard_timer: Timer | None = None
+        self.pending_destination: Callable[[], None] | None = None
+        self.discard_completion_message: str | None = None
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        yield Static(
+            "\n".join(
+                (
+                    f"Provider: {core.canonical_provider(self.mod.provider)}",
+                    f"Canonical project ID: {self.mod.project_id}",
+                    f"Role: {self.provenance}",
+                    f"Side: {self.mod.side}",
+                    f"Metadata: {self.mod.relative_path}",
+                )
+            ),
+            id="mod-version-details",
+            markup=False,
+        )
+        yield Static("Select version: enter an exact provider artifact ID", id="mod-version-prompt")
+        yield Input(placeholder="Exact file/version ID", id="mod-version-artifact")
+        yield Static("Idle", id="mod-version-status", markup=False)
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#mod-version-artifact", Input).focus()
+        self.provenance_thread = threading.Thread(
+            target=self._run_provenance,
+            name=f"huroshiki-mod-provenance-{self.project_key}",
+            daemon=False,
+        )
+        self.provenance_thread.start()
+        self.provenance_timer = self.set_interval(0.05, self._poll_provenance)
+
+    def _run_provenance(self) -> None:
+        try:
+            self.provenance = core.installed_mod_provenance(self.project_key, self.mod)
+        except BaseException as error:
+            self.provenance_error = error
+        finally:
+            self.provenance_done.set()
+
+    def _poll_provenance(self) -> None:
+        if not self.provenance_done.is_set():
+            return
+        if self.provenance_timer is not None:
+            self.provenance_timer.stop()
+            self.provenance_timer = None
+        self.provenance_thread = None
+        if self.provenance_error is not None:
+            self.app.notify(str(self.provenance_error), severity="error")
+            role = "Unavailable"
+        else:
+            role = self.provenance
+        self.query_one("#mod-version-details", Static).update(
+            "\n".join(
+                (
+                    f"Provider: {core.canonical_provider(self.mod.provider)}",
+                    f"Canonical project ID: {self.mod.project_id}",
+                    f"Role: {role}",
+                    f"Side: {self.mod.side}",
+                    f"Metadata: {self.mod.relative_path}",
+                )
+            )
+        )
+
+    def _selection(self, artifact_id: str) -> core.ExactModArtifactSelection:
+        provider = core.canonical_provider(self.mod.provider)
+        if provider == "modrinth":
+            project_id = core.canonical_modrinth_id(
+                self.mod.project_id, "Installed Modrinth project ID"
+            )
+            version_id = core.canonical_modrinth_id(
+                artifact_id, "Modrinth version ID"
+            )
+            return core.ExactModArtifactSelection(provider, project_id, version_id)
+        if provider == "curseforge":
+            return core.ExactModArtifactSelection(
+                provider, self.mod.project_id, artifact_id
+            )
+        raise core.HuroshikiError(
+            "Exact version selection is available only for Modrinth or CurseForge MODs"
+        )
+
+    @on(Input.Submitted, "#mod-version-artifact")
+    def submit_artifact(self, event: Input.Submitted) -> None:
+        self.start_prepare(event.value.strip())
+
+    def start_prepare(self, artifact_id: str) -> None:
+        if self.prepare_thread is not None or self.apply_thread is not None:
+            self.app.notify("Exact version operation is already running", severity="warning")
+            return
+        if self.transaction is not None:
+            self.app.notify("Apply or cancel the current preview first", severity="warning")
+            return
+        try:
+            selection = self._selection(artifact_id)
+        except BaseException as error:
+            self.app.notify(str(error), severity="error")
+            return
+        self.cancel_event = threading.Event()
+        self.deadline = time.monotonic() + core.UPDATE_OPERATION_TIMEOUT_SECONDS
+        self.prepare_done.clear()
+        self.prepare_error = None
+        self.preview = None
+        self.query_one("#mod-version-status", Static).update("Creating transaction...")
+        self.prepare_thread = threading.Thread(
+            target=self._run_prepare,
+            args=(selection,),
+            name=f"huroshiki-exact-version-{self.project_key}",
+            daemon=False,
+        )
+        self.app.exact_version_workers[self.project_key] = (
+            self.prepare_thread,
+            self.prepare_done,
+            self.cancel_event,
+            lambda: self.transaction,
+        )
+        try:
+            self.prepare_thread.start()
+        except BaseException as error:
+            self.app.exact_version_workers.pop(self.project_key, None)
+            self.prepare_thread = None
+            self.prepare_error = error
+            self.prepare_done.set()
+            self.app.notify(str(error), severity="error")
+            return
+        self.prepare_timer = self.set_interval(0.05, self._poll_prepare)
+
+    def _checkpoint(self) -> None:
+        if self.cancel_event.is_set():
+            raise core.ExactModVersionCancelled("Exact MOD version selection was cancelled")
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise core.ExactModVersionDeadlineExceeded(
+                "Exact MOD version selection deadline exceeded"
+            )
+
+    def _record_progress(self, progress: core.ModVersionSelectionProgress) -> None:
+        with self.progress_lock:
+            self.progress.append(progress)
+
+    def _run_prepare(self, selection: core.ExactModArtifactSelection) -> None:
+        try:
+            transaction = core.PackTransaction.create(
+                self.project_key, checkpoint=self._checkpoint
+            )
+            self.transaction = transaction
+            self.preview = transaction.prepare_exact_mod_version(
+                selection,
+                cancel_event=self.cancel_event,
+                deadline=self.deadline,
+                progress=self._record_progress,
+            )
+        except BaseException as error:
+            self.prepare_error = error
+        finally:
+            transaction = self.transaction
+            if (
+                self.app._shutting_down
+                and transaction is not None
+                and transaction.active
+            ):
+                try:
+                    transaction.discard(
+                        deadline=(
+                            time.monotonic()
+                            + core.TRANSACTION_DISCARD_TIMEOUT_SECONDS
+                        )
+                    )
+                except BaseException as cleanup_error:
+                    if self.prepare_error is None:
+                        self.prepare_error = cleanup_error
+            self.prepare_done.set()
+
+    def _poll_prepare(self) -> None:
+        with self.progress_lock:
+            progress = tuple(self.progress)
+            self.progress.clear()
+        if progress:
+            latest = progress[-1]
+            self.query_one("#mod-version-status", Static).update(latest.message)
+        if not self.prepare_done.is_set():
+            return
+        if self.prepare_timer is not None:
+            self.prepare_timer.stop()
+            self.prepare_timer = None
+        self.prepare_thread = None
+        self.app.exact_version_workers.pop(self.project_key, None)
+        if self.transaction is not None and self.transaction.active:
+            self.app.transactions[self.project_key] = self.transaction
+        if self.prepare_error is not None:
+            self.query_one("#mod-version-status", Static).update(str(self.prepare_error))
+            self.app.notify(str(self.prepare_error), severity="error")
+            if self.transaction is not None:
+                self._begin_discard(self.pending_destination)
+            elif self.pending_destination is not None:
+                destination = self.pending_destination
+                self.pending_destination = None
+                destination()
+            return
+        assert self.preview is not None
+        preview = self.preview
+        lines = [
+            f"Identity: {preview.identity}",
+            f"Version: {preview.old_version} -> {preview.new_version}",
+            f"Artifact ID: {preview.old_artifact_id} -> {preview.new_artifact_id}",
+            *(
+                [
+                    f"User selection intent: {preview.override_identity} -> "
+                    f"{preview.override_artifact_id} "
+                    f"({'locked' if preview.override_locked else 'unlocked'})"
+                ]
+                if preview.override_identity is not None
+                else []
+            ),
+            f"Added dependencies: {preview.added_dependencies}",
+            *(f"  + {identity}" for identity in preview.added_dependency_identities),
+            f"Removed dependencies: {preview.removed_dependencies}",
+            *(f"  - {identity}" for identity in preview.removed_dependency_identities),
+            "Changed files:",
+            *(f"  {change.relative_path}" for change in preview.changes),
+            "",
+            "Press a to Apply, or q/Esc to Cancel.",
+        ]
+        self.query_one("#mod-version-status", Static).update("\n".join(lines))
+        self.focus()
+        if self.pending_destination is not None:
+            self._begin_discard(self.pending_destination)
+
+    def apply_preview(self) -> None:
+        if self.preview is None or self.transaction is None:
+            self.app.notify("Prepare an exact version preview first", severity="warning")
+            return
+        if self.apply_thread is not None:
+            return
+        self.apply_done.clear()
+        self.apply_error = None
+        self.cancel_event = threading.Event()
+        self.deadline = time.monotonic() + core.UPDATE_OPERATION_TIMEOUT_SECONDS
+        self.query_one("#mod-version-status", Static).update("Applying verified preview...")
+        self.apply_thread = threading.Thread(
+            target=self._run_apply,
+            name=f"huroshiki-exact-version-apply-{self.project_key}",
+            daemon=False,
+        )
+        self.app.update_apply_workers[self.project_key] = (
+            self.apply_thread,
+            self.apply_done,
+            self.cancel_event,
+        )
+        try:
+            self.apply_thread.start()
+        except BaseException as error:
+            self.app.update_apply_workers.pop(self.project_key, None)
+            self.apply_thread = None
+            self.apply_error = error
+            self.apply_done.set()
+            self.preview = None
+            self.discard_completion_message = (
+                f"{error}\nPreview invalidated; enter another artifact ID."
+            )
+            self.query_one("#mod-version-status", Static).update(str(error))
+            self.app.notify(str(error), severity="error")
+            self._begin_discard(self.pending_destination)
+            return
+        self.apply_timer = self.set_interval(0.05, self._poll_apply)
+
+    def _run_apply(self) -> None:
+        try:
+            assert self.transaction is not None
+            self.transaction.apply(
+                cancel_event=self.cancel_event,
+                deadline=self.deadline,
+            )
+        except BaseException as error:
+            self.apply_error = error
+        finally:
+            self.apply_done.set()
+
+    def _poll_apply(self) -> None:
+        if not self.apply_done.is_set():
+            return
+        if self.apply_timer is not None:
+            self.apply_timer.stop()
+            self.apply_timer = None
+        self.app.update_apply_workers.pop(self.project_key, None)
+        self.apply_thread = None
+        if self.apply_error is not None:
+            error = self.apply_error
+            self.preview = None
+            self.discard_completion_message = (
+                f"{error}\nPreview invalidated; enter another artifact ID."
+            )
+            self.query_one("#mod-version-status", Static).update(str(error))
+            self.app.notify(str(error), severity="error")
+            self._begin_discard(self.pending_destination)
+            return
+        transaction = self.transaction
+        if self.app.transactions.get(self.project_key) is transaction:
+            self.app.transactions.pop(self.project_key, None)
+        self.transaction = None
+        self.app.notify("Exact MOD version applied")
+        self.app.open_list(self.project_key)
+
+    def cancel_and_navigate(self, destination: Callable[[], None]) -> None:
+        self.pending_destination = destination
+        if self.prepare_thread is not None or self.apply_thread is not None:
+            self.cancel_event.set()
+            self.query_one("#mod-version-status", Static).update(
+                "Cancelling exact version operation..."
+            )
+            return
+        self._begin_discard(destination)
+
+    def _begin_discard(self, destination: Callable[[], None] | None) -> None:
+        if self.discard_operation is not None:
+            return
+        transaction = self.transaction
+        if transaction is None:
+            self.pending_destination = None
+            if destination is not None:
+                destination()
+            return
+        try:
+            operation = transaction.begin_discard()
+            operation.start()
+        except BaseException as error:
+            self.app.notify(str(error), severity="error")
+            return
+        self.discard_operation = operation
+        self.pending_destination = destination
+        self.query_one("#mod-version-status", Static).update(
+            "Discarding exact version transaction..."
+        )
+        self.discard_timer = self.set_interval(0.05, self._poll_discard)
+
+    def _poll_discard(self) -> None:
+        operation = self.discard_operation
+        if operation is None or not operation.done.is_set():
+            return
+        if self.discard_timer is not None:
+            self.discard_timer.stop()
+            self.discard_timer = None
+        self.discard_operation = None
+        try:
+            operation.raise_for_error()
+        except BaseException as error:
+            self.query_one("#mod-version-status", Static).update(str(error))
+            self.app.notify(str(error), severity="error")
+            return
+        transaction = self.transaction
+        if self.app.transactions.get(self.project_key) is transaction:
+            self.app.transactions.pop(self.project_key, None)
+        self.transaction = None
+        self.preview = None
+        destination = self.pending_destination
+        self.pending_destination = None
+        if destination is not None:
+            self.discard_completion_message = None
+            destination()
+        else:
+            message = self.discard_completion_message or (
+                "Exact version operation cancelled; enter another artifact ID."
+            )
+            self.discard_completion_message = None
+            self.query_one("#mod-version-status", Static).update(message)
+            self.query_one("#mod-version-artifact", Input).focus()
+
+    def on_key(self, event: events.Key) -> None:
+        if isinstance(self.focused, Input):
+            if event.key == "escape":
+                self.cancel_and_navigate(lambda: self.app.open_list(self.project_key))
+                event.stop()
+            return
+        if event.key == "v":
+            self.query_one("#mod-version-artifact", Input).focus()
+        elif event.key == "a":
+            self.apply_preview()
+        elif event.key in {"q", "escape", "p"}:
+            self.cancel_and_navigate(lambda: self.app.open_list(self.project_key))
+        else:
+            return
+        event.stop()
+
+    def on_unmount(self) -> None:
+        if self.provenance_timer is not None:
+            self.provenance_timer.stop()
+        if self.prepare_timer is not None:
+            self.prepare_timer.stop()
+        if self.apply_timer is not None:
+            self.apply_timer.stop()
+        if self.discard_timer is not None:
+            self.discard_timer.stop()
+        if self.prepare_thread is not None or self.apply_thread is not None:
+            self.cancel_event.set()
 
 
 class UpdateScreen(ProjectChildScreen, BaseScreen):
