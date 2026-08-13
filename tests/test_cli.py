@@ -43,6 +43,9 @@ def preview(identity: str, old_id: str, new_id: str):
         1,
         (f"{provider}:Added001", f"{provider}:Added002"),
         (f"{provider}:Remov001",),
+        identity,
+        new_id,
+        False,
     )
 
 
@@ -74,6 +77,10 @@ class ExactVersionCliTest(unittest.TestCase):
                 self.assertEqual(selection.identity_label, identity)
                 self.assertIn("Added dependencies: 2", output)
                 self.assertIn("Removed dependencies: 1", output)
+                self.assertIn(
+                    f"User selection intent: {identity} -> {artifact_id} (unlocked)",
+                    output,
+                )
 
     def test_apply_publishes_only_after_verified_preview(self) -> None:
         result, transaction, _output = self.run_case(

@@ -48,6 +48,21 @@ class ModVersionOverrideStatus:
     installed_artifact_id: str | None
 
 
+def _canonical_override(entry: ModVersionOverride) -> ModVersionOverride:
+    if not isinstance(entry, ModVersionOverride):
+        raise ModVersionOverrideError("Version override has an invalid model type")
+    selection = _selection(entry.provider, entry.project_id, entry.artifact_id)
+    if type(entry.locked) is not bool:
+        raise ModVersionOverrideError("Version override locked must be a boolean")
+    return ModVersionOverride(
+        selection.provider,
+        str(selection.project_id),
+        str(selection.artifact_id),
+        entry.locked,
+        _reason(entry.reason),
+    )
+
+
 def _selection(
     provider: object,
     project_id: object,
@@ -145,21 +160,24 @@ def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def serialize_mod_version_overrides(entries: tuple[ModVersionOverride, ...]) -> bytes:
     ordered: dict[str, dict[str, object]] = {}
-    for entry in sorted(entries, key=lambda item: item.canonical_identity):
-        selection = _selection(entry.provider, entry.project_id, entry.artifact_id)
-        identity = selection.identity_label
+    canonical = tuple(_canonical_override(entry) for entry in entries)
+    for entry in sorted(canonical, key=lambda item: item.canonical_identity):
+        identity = entry.canonical_identity
         if identity in ordered:
             raise ModVersionOverrideError(f"Duplicate version override identity: {identity}")
         item: dict[str, object] = {
-            "artifact_id": str(selection.artifact_id),
+            "artifact_id": entry.artifact_id,
             "selection": "user",
             "locked": entry.locked,
         }
-        reason = _reason(entry.reason)
-        if reason is not None:
-            item["reason"] = reason
+        if entry.reason is not None:
+            item["reason"] = entry.reason
         ordered[identity] = item
-    return (json.dumps({"schema": 1, "mods": ordered}, indent=2) + "\n").encode("utf-8")
+    contents = (json.dumps({"schema": 1, "mods": ordered}, indent=2) + "\n").encode(
+        "utf-8"
+    )
+    parse_mod_version_overrides(contents)
+    return contents
 
 
 def read_mod_version_overrides(source: Path) -> tuple[ModVersionOverride, ...]:
@@ -261,3 +279,21 @@ def ensure_mod_version_overrides_ignored(source: Path) -> None:
         )
     except PackMigrationRootError as error:
         raise ModVersionOverrideError(str(error)) from error
+
+
+def require_mod_version_overrides_ignored(source: Path) -> None:
+    try:
+        scan = scan_pack_migration_source(source, checkpoint=lambda: None)
+        contents = read_pack_control_file(
+            source, scan, Path(".packwizignore"), max_bytes=1024 * 1024
+        )
+        lines = {line.strip() for line in contents.decode("utf-8").splitlines()}
+    except (PackMigrationRootError, UnicodeError) as error:
+        raise ModVersionOverrideError(
+            "Version override manifest requires a valid .packwizignore"
+        ) from error
+    required = {"/.huroshiki-roots.json", VERSION_OVERRIDE_IGNORE_ENTRY}
+    if not required <= lines:
+        raise ModVersionOverrideError(
+            "Version override manifest is not canonically excluded by .packwizignore"
+        )

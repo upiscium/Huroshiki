@@ -44,6 +44,29 @@ class ModVersionOverrideManifestTest(unittest.TestCase):
         self.assertEqual(contents, serialize_mod_version_overrides(entries))
         self.assertLess(contents.index(b"curseforge:309927"), contents.index(b"modrinth:Ab12Cd34"))
 
+    def test_writer_rejects_every_noncanonical_model(self) -> None:
+        for entry, pattern in (
+            (ModVersionOverride("curseforge", "1", "2", 1), "boolean"),
+            (ModVersionOverride("curseforge", "1", "2", "true"), "boolean"),
+            (ModVersionOverride("url", "one", "two"), "provider"),
+            (ModVersionOverride("curseforge", "slug", "2"), "positive decimal"),
+            (ModVersionOverride("curseforge", "1", "0"), "positive decimal"),
+            (ModVersionOverride("modrinth", "short", "Ef56Gh78"), "8-character"),
+            (ModVersionOverride("curseforge", "1", "2", False, "bad\nreason"), "control"),
+        ):
+            with self.subTest(entry=entry), self.assertRaisesRegex(
+                ModVersionOverrideError, pattern
+            ):
+                serialize_mod_version_overrides((entry,))
+
+    def test_every_successful_serialization_parses(self) -> None:
+        entries = (
+            ModVersionOverride("curseforge", "1", "2", False),
+            ModVersionOverride("modrinth", "Ab12Cd34", "Ef56Gh78", True, "Reason"),
+        )
+        serialized = serialize_mod_version_overrides(entries)
+        self.assertEqual(parse_mod_version_overrides(serialized).entries, entries)
+
     def test_strict_schema_and_entry_validation(self) -> None:
         valid = {
             "schema": 1,
@@ -191,6 +214,54 @@ class ModVersionOverrideCoreTest(unittest.TestCase):
         unpinned = transaction.set_mod_version_pin("curseforge:1", locked=False)
         self.assertFalse(unpinned.locked)
         self.assertEqual(unpinned.reason, "Compatibility")
+
+    def test_pin_is_blocked_by_active_transaction_operation(self) -> None:
+        write_mod_version_overrides(
+            self.source, (ModVersionOverride("curseforge", "1", "2"),)
+        )
+        transaction = self.transaction()
+        transaction._operation = object()
+        before = (self.source / ".huroshiki-version-overrides.json").read_bytes()
+        with self.assertRaisesRegex(core.HuroshikiError, "active transaction operation"):
+            transaction.set_mod_version_pin("curseforge:1")
+        self.assertEqual(
+            (self.source / ".huroshiki-version-overrides.json").read_bytes(), before
+        )
+
+    def test_pin_write_failure_is_normalized_and_preserves_manifest(self) -> None:
+        write_mod_version_overrides(
+            self.source, (ModVersionOverride("curseforge", "1", "2"),)
+        )
+        transaction = self.transaction()
+        before = (self.source / ".huroshiki-version-overrides.json").read_bytes()
+        with patch(
+            "pack_migration_roots.packctl.renameat2",
+            side_effect=OSError("injected write failure"),
+        ), self.assertRaisesRegex(core.HuroshikiError, "injected write failure"):
+            transaction.set_mod_version_pin("curseforge:1")
+        self.assertEqual(
+            (self.source / ".huroshiki-version-overrides.json").read_bytes(), before
+        )
+
+    def test_pin_requires_canonical_ignore_without_partial_mutation(self) -> None:
+        write_mod_version_overrides(
+            self.source, (ModVersionOverride("curseforge", "1", "2"),)
+        )
+        self.source.joinpath(".packwizignore").write_text(
+            "/.huroshiki-roots.json\n", encoding="utf-8"
+        )
+        transaction = self.transaction()
+        manifest_before = self.source.joinpath(
+            ".huroshiki-version-overrides.json"
+        ).read_bytes()
+        ignore_before = self.source.joinpath(".packwizignore").read_bytes()
+        with self.assertRaisesRegex(core.HuroshikiError, "canonically excluded"):
+            transaction.set_mod_version_pin("curseforge:1")
+        self.assertEqual(
+            self.source.joinpath(".huroshiki-version-overrides.json").read_bytes(),
+            manifest_before,
+        )
+        self.assertEqual(self.source.joinpath(".packwizignore").read_bytes(), ignore_before)
 
 
 if __name__ == "__main__":

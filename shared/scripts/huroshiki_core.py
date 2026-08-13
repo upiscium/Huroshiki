@@ -64,6 +64,7 @@ from mod_version_overrides import (
     ensure_mod_version_overrides_ignored,
     get_mod_version_override,
     read_mod_version_overrides,
+    require_mod_version_overrides_ignored,
     set_mod_version_override,
 )
 
@@ -762,6 +763,9 @@ class ModVersionSelectionPreview:
     removed_dependencies: int
     added_dependency_identities: tuple[str, ...] = ()
     removed_dependency_identities: tuple[str, ...] = ()
+    override_identity: str | None = None
+    override_artifact_id: str | None = None
+    override_locked: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -2126,37 +2130,40 @@ class PackTransaction:
         reason: str | None = None,
     ) -> ModVersionOverride:
         """Change lock state for an existing user-selected exact artifact."""
-        self.ensure_active()
-        self._ensure_exact_selection_not_prepared()
-        kind, _project_id = split_project_key(self.project_key)
-        if kind != "pack":
-            raise HuroshikiError("MOD version pins are available only for packs")
-        if type(locked) is not bool:
-            raise HuroshikiError("MOD version pin state must be a boolean")
-        try:
-            existing = get_mod_version_override(self.source, identity)
-        except ModVersionOverrideError as error:
-            raise HuroshikiError(str(error)) from error
-        if existing is None:
-            raise HuroshikiError(
-                f"Cannot change pin state without an existing user selection: {identity}"
-            )
-        records = _exact_metadata_records(self.source)
-        _validate_mod_version_override_records(self.source, records)
-        updated = ModVersionOverride(
-            existing.provider,
-            existing.project_id,
-            existing.artifact_id,
-            locked,
-            existing.reason if reason is None else reason,
-        )
-        try:
-            ensure_mod_version_overrides_ignored(self.source)
-            set_mod_version_override(self.source, updated)
-        except ModVersionOverrideError as error:
-            raise HuroshikiError(str(error)) from error
-        self._version_override_mutated = True
-        return updated
+        with self._lock:
+            self.ensure_active()
+            self._ensure_exact_selection_not_prepared()
+            if self._operation is not None:
+                raise HuroshikiError("Wait for the active transaction operation to finish")
+            kind, _project_id = split_project_key(self.project_key)
+            if kind != "pack":
+                raise HuroshikiError("MOD version pins are available only for packs")
+            if type(locked) is not bool:
+                raise HuroshikiError("MOD version pin state must be a boolean")
+            try:
+                existing = get_mod_version_override(self.source, identity)
+                if existing is None:
+                    raise HuroshikiError(
+                        "Cannot change pin state without an existing user selection: "
+                        f"{identity}"
+                    )
+                records = _exact_metadata_records(self.source)
+                _validate_mod_version_override_records(self.source, records)
+                updated = ModVersionOverride(
+                    existing.provider,
+                    existing.project_id,
+                    existing.artifact_id,
+                    locked,
+                    existing.reason if reason is None else reason,
+                )
+                require_mod_version_overrides_ignored(self.source)
+                set_mod_version_override(self.source, updated)
+            except HuroshikiError:
+                raise
+            except (ModVersionOverrideError, OSError) as error:
+                raise HuroshikiError(str(error)) from error
+            self._version_override_mutated = True
+            return updated
 
     def _restore_exact_selection_checkpoint(self) -> None:
         checkpoint = self._exact_selection_checkpoint
@@ -3378,7 +3385,7 @@ class PackTransaction:
             try:
                 ensure_mod_version_overrides_ignored(self.source)
                 set_mod_version_override(self.source, selected_override)
-            except ModVersionOverrideError as error:
+            except (ModVersionOverrideError, OSError) as error:
                 raise HuroshikiError(str(error)) from error
             ensure_safe_pack_source(self.source, checkpoint=checkpoint)
             _exact_run_refresh(
@@ -3472,6 +3479,9 @@ class PackTransaction:
                 removed_dependencies=len(removed),
                 added_dependency_identities=added,
                 removed_dependency_identities=removed,
+                override_identity=selected_override.canonical_identity,
+                override_artifact_id=selected_override.artifact_id,
+                override_locked=selected_override.locked,
             )
             checkpoint()
             self._exact_selection_prepared = True
