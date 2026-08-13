@@ -83,6 +83,7 @@ class PublicCliTest(unittest.TestCase):
             "show-deployment",
             "set-deployment",
             "loader-version",
+            "version",
             "show-url-policy",
             "set-url-policy",
             "show-template-loader-version",
@@ -112,6 +113,95 @@ class PublicCliTest(unittest.TestCase):
             packctl.parser().parse_args(["show-template-loader-version", "demo"]).func,
             packctl.cmd_show_template_loader_version,
         )
+        self.assertIs(
+            packctl.parser()
+            .parse_args(
+                ["version", "demo", "modrinth:A1b2C3d4", "--version-id", "E5f6G7h8"]
+            )
+            .func,
+            packctl.cmd_version,
+        )
+
+    def test_exact_version_preview_discards_and_apply_publishes(self) -> None:
+        import huroshiki_core as core
+
+        preview = core.ModVersionSelectionPreview(
+            identity="modrinth:A1b2C3d4",
+            relative_path=Path("mods/example.pw.toml"),
+            name="Example",
+            provider="modrinth",
+            old_version="1.0",
+            old_artifact_id="OldVer01",
+            new_version="2.0",
+            new_artifact_id="E5f6G7h8",
+            changes=(core.UpdateChange(Path("mods/example.pw.toml"), b"old", b"new"),),
+            added_dependencies=1,
+            removed_dependencies=1,
+            added_dependency_identities=("modrinth:Added001",),
+            removed_dependency_identities=("modrinth:Remov001",),
+        )
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                transaction = MagicMock()
+                transaction.active = True
+                transaction.prepare_exact_mod_version.return_value = preview
+                transaction.apply.side_effect = lambda: setattr(transaction, "active", False)
+                transaction.discard.side_effect = lambda: setattr(transaction, "active", False)
+                args = type(
+                    "Args",
+                    (),
+                    {
+                        "pack": "demo",
+                        "identity": "modrinth:A1b2C3d4",
+                        "artifact_id": None,
+                        "file_id": None,
+                        "version_id": "E5f6G7h8",
+                        "apply": apply,
+                    },
+                )()
+                output = StringIO()
+                with patch.object(
+                    core.PackTransaction, "create", return_value=transaction
+                ), redirect_stdout(output):
+                    self.assertEqual(packctl.cmd_version(args), 0)
+                selection = transaction.prepare_exact_mod_version.call_args.args[0]
+                self.assertEqual(selection.identity, ("modrinth", "A1b2C3d4"))
+                self.assertEqual(selection.artifact_id, "E5f6G7h8")
+                if apply:
+                    transaction.apply.assert_called_once_with()
+                else:
+                    transaction.apply.assert_not_called()
+                    transaction.discard.assert_called_once_with()
+                text = output.getvalue()
+                self.assertIn("Identity: modrinth:A1b2C3d4", text)
+                self.assertIn("Artifact ID: OldVer01 -> E5f6G7h8", text)
+                self.assertIn("Added dependencies: 1", text)
+                self.assertIn("modrinth:Added001", text)
+                self.assertIn("mods/example.pw.toml", text)
+
+    def test_exact_version_rejects_invalid_identity_and_aliases(self) -> None:
+        cases = (
+            ("modrinth:sodium", None, None, "E5f6G7h8"),
+            ("modrinth:A1b2C3d4", None, "123", None),
+            ("curseforge:309927", None, None, "E5f6G7h8"),
+            ("curseforge:0", "1", None, None),
+        )
+        for identity, artifact, file_id, version_id in cases:
+            with self.subTest(identity=identity):
+                args = type(
+                    "Args",
+                    (),
+                    {
+                        "pack": "demo",
+                        "identity": identity,
+                        "artifact_id": artifact,
+                        "file_id": file_id,
+                        "version_id": version_id,
+                        "apply": False,
+                    },
+                )()
+                with self.assertRaises(packctl.ConfigError):
+                    packctl.cmd_version(args)
 
     def test_parse_bool_flag_forms_for_url_policy(self) -> None:
         self.assertTrue(packctl._normalize_bool_flag("yes"))

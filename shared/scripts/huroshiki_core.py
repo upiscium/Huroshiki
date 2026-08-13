@@ -7751,6 +7751,24 @@ def list_mods_from_source(source: Path) -> list[ModInfo]:
     ]
 
 
+def installed_mod_provenance(project_key_value: str, mod: ModInfo) -> str:
+    """Return the authoritative root-manifest role for one installed Pack MOD."""
+
+    kind, _project_id = split_project_key(project_key_value)
+    if kind != "pack":
+        return "Recipe entry"
+    provider = canonical_provider(mod.provider)
+    if provider not in {"modrinth", "curseforge", "url"} or not mod.project_id:
+        return "Dependency"
+    identity = f"{provider}:{mod.project_id}"
+    roots = read_pack_root_manifest(project_source(project_key_value))
+    return (
+        "Explicit root"
+        if any(root.canonical_identity == identity for root in roots)
+        else "Dependency"
+    )
+
+
 def filter_mods(mods: Iterable[ModInfo], query: str) -> list[ModInfo]:
     needle = query.strip().casefold()
     if not needle:
