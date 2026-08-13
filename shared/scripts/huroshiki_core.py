@@ -57,6 +57,16 @@ from pack_migration_roots import (
 from pack_tree_policy import scan_pack_migration_source
 from provider_identity import parse_provider_metadata
 from provider_artifacts import materialize_provider_artifact
+from mod_version_overrides import (
+    ModVersionOverride,
+    ModVersionOverrideError,
+    ModVersionOverrideStatus,
+    ensure_mod_version_overrides_ignored,
+    get_mod_version_override,
+    read_mod_version_overrides,
+    require_mod_version_overrides_ignored,
+    set_mod_version_override,
+)
 
 if TYPE_CHECKING:
     from pack_migration_conflicts import (
@@ -753,6 +763,9 @@ class ModVersionSelectionPreview:
     removed_dependencies: int
     added_dependency_identities: tuple[str, ...] = ()
     removed_dependency_identities: tuple[str, ...] = ()
+    override_identity: str | None = None
+    override_artifact_id: str | None = None
+    override_locked: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -1916,6 +1929,7 @@ class PackTransaction:
     _exact_selection_failed_source: Path | None = field(
         default=None, init=False, repr=False
     )
+    _version_override_mutated: bool = field(default=False, init=False, repr=False)
     _equivalence_process_results: list[BoundedProcessResult] = field(
         default_factory=list, init=False, repr=False
     )
@@ -2108,6 +2122,49 @@ class PackTransaction:
                 "staging another transaction change"
             )
 
+    def set_mod_version_pin(
+        self,
+        identity: str,
+        *,
+        locked: bool = True,
+        reason: str | None = None,
+    ) -> ModVersionOverride:
+        """Change lock state for an existing user-selected exact artifact."""
+        with self._lock:
+            self.ensure_active()
+            self._ensure_exact_selection_not_prepared()
+            if self._operation is not None:
+                raise HuroshikiError("Wait for the active transaction operation to finish")
+            kind, _project_id = split_project_key(self.project_key)
+            if kind != "pack":
+                raise HuroshikiError("MOD version pins are available only for packs")
+            if type(locked) is not bool:
+                raise HuroshikiError("MOD version pin state must be a boolean")
+            try:
+                existing = get_mod_version_override(self.source, identity)
+                if existing is None:
+                    raise HuroshikiError(
+                        "Cannot change pin state without an existing user selection: "
+                        f"{identity}"
+                    )
+                records = _exact_metadata_records(self.source)
+                _validate_mod_version_override_records(self.source, records)
+                updated = ModVersionOverride(
+                    existing.provider,
+                    existing.project_id,
+                    existing.artifact_id,
+                    locked,
+                    existing.reason if reason is None else reason,
+                )
+                require_mod_version_overrides_ignored(self.source)
+                set_mod_version_override(self.source, updated)
+            except HuroshikiError:
+                raise
+            except (ModVersionOverrideError, OSError) as error:
+                raise HuroshikiError(str(error)) from error
+            self._version_override_mutated = True
+            return updated
+
     def _restore_exact_selection_checkpoint(self) -> None:
         checkpoint = self._exact_selection_checkpoint
         failed_source = self._exact_selection_failed_source
@@ -2192,6 +2249,7 @@ class PackTransaction:
                 f"{identity.file_id or '<missing>'}"
             )
         _exact_assert_root_manifest_identities(self.source, records)
+        _validate_mod_version_override_records(self.source, records)
         if _exact_verification_binding_digest(expected_verifications, records) != expected_verification_digest:
             raise HuroshikiError(
                 "Exact MOD semantic verification evidence changed after preview; apply aborted"
@@ -2951,7 +3009,16 @@ class PackTransaction:
         emit("validating", f"Validating {selection.identity_label}")
         checkpoint()
         ensure_safe_pack_source(self.source, checkpoint=checkpoint)
+        try:
+            overrides_before = read_mod_version_overrides(self.source)
+        except ModVersionOverrideError as error:
+            raise HuroshikiError(str(error)) from error
         baseline_records = _exact_metadata_records(self.source, checkpoint)
+        _validate_mod_version_override_records(
+            self.source,
+            baseline_records,
+            overrides=overrides_before,
+        )
         target_records = baseline_records.get(selection.identity, ())
         if len(target_records) == 0:
             raise HuroshikiError(
@@ -3228,6 +3295,23 @@ class PackTransaction:
                 )
             desired_records = _exact_metadata_records(resolver_source, checkpoint)
             _exact_assert_root_manifest_identities(resolver_source, desired_records)
+            for override in overrides_before:
+                if override.canonical_identity == selection.identity_label:
+                    continue
+                records = desired_records.get(
+                    (override.provider, override.project_id), ()
+                )
+                if len(records) != 1:
+                    raise HuroshikiError(
+                        "Exact MOD selection result would orphan/stale an existing "
+                        f"version override: {override.canonical_identity}"
+                    )
+                metadata = parse_provider_metadata(records[0][0], records[0][1])
+                if metadata.file_id != override.artifact_id:
+                    raise HuroshikiError(
+                        "Exact MOD selection result would drift an existing version "
+                        f"override: {override.canonical_identity}"
+                    )
 
             if selected_root is None:
                 aggregate_target = desired_records.get(selection.identity, ())
@@ -3283,6 +3367,26 @@ class PackTransaction:
             for change in merged_changes:
                 checkpoint()
                 _apply_update_change(self.source, change, use_after=True)
+            existing_override = next(
+                (
+                    item
+                    for item in overrides_before
+                    if item.canonical_identity == selection.identity_label
+                ),
+                None,
+            )
+            selected_override = ModVersionOverride(
+                selection.provider,
+                str(selection.project_id),
+                str(selection.artifact_id),
+                existing_override.locked if existing_override is not None else False,
+                existing_override.reason if existing_override is not None else None,
+            )
+            try:
+                ensure_mod_version_overrides_ignored(self.source)
+                set_mod_version_override(self.source, selected_override)
+            except (ModVersionOverrideError, OSError) as error:
+                raise HuroshikiError(str(error)) from error
             ensure_safe_pack_source(self.source, checkpoint=checkpoint)
             _exact_run_refresh(
                 self.source,
@@ -3362,11 +3466,22 @@ class PackTransaction:
                     selection.provider,
                 ),
                 new_artifact_id=selection.artifact_id,
-                changes=_content_changes(operation_before, final_after),
+                changes=tuple(
+                    change
+                    for change in _content_changes(operation_before, final_after)
+                    if change.relative_path
+                    not in {
+                        Path(".packwizignore"),
+                        Path(".huroshiki-version-overrides.json"),
+                    }
+                ),
                 added_dependencies=len(added),
                 removed_dependencies=len(removed),
                 added_dependency_identities=added,
                 removed_dependency_identities=removed,
+                override_identity=selected_override.canonical_identity,
+                override_artifact_id=selected_override.artifact_id,
+                override_locked=selected_override.locked,
             )
             checkpoint()
             self._exact_selection_prepared = True
@@ -3568,6 +3683,18 @@ class PackTransaction:
             manifest = self.source / ".huroshiki-roots.json"
             if manifest.is_file() and not manifest.is_symlink():
                 removed_identity = identify_pack_metadata_by_slug(self.source, slug)
+            if removed_identity is not None:
+                try:
+                    override = get_mod_version_override(
+                        self.source, removed_identity
+                    )
+                except ModVersionOverrideError as error:
+                    raise HuroshikiError(str(error)) from error
+                if override is not None:
+                    raise HuroshikiError(
+                        "Removing this MOD would orphan an existing version override: "
+                        f"{removed_identity}"
+                    )
             _run_noninteractive_packwiz(
                 ["packwiz", "remove", slug],
                 cwd=self.source,
@@ -3688,6 +3815,10 @@ class PackTransaction:
                 process_result_callback=self._record_equivalence_process_result,
             )
             ensure_safe_pack_source(self.source)
+        if self._version_override_mutated:
+            _validate_mod_version_override_records(
+                self.source, _exact_metadata_records(self.source)
+            )
 
         real_root = project_root(self.project_key)
         real_source = real_root / "source"
@@ -6437,6 +6568,62 @@ def _exact_verification_binding_digest(
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _validate_mod_version_override_records(
+    source: Path,
+    records: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
+    *,
+    overrides: tuple[ModVersionOverride, ...] | None = None,
+) -> tuple[ModVersionOverride, ...]:
+    if overrides is None:
+        try:
+            overrides = read_mod_version_overrides(source)
+        except ModVersionOverrideError as error:
+            raise HuroshikiError(str(error)) from error
+    for override in overrides:
+        matching = records.get((override.provider, override.project_id), ())
+        if len(matching) != 1:
+            raise HuroshikiError(
+                f"Version override identity is missing or ambiguous: "
+                f"{override.canonical_identity}"
+            )
+        metadata = parse_provider_metadata(matching[0][0], matching[0][1])
+        if metadata.file_id != override.artifact_id:
+            raise HuroshikiError(
+                f"Version override artifact drifted: {override.canonical_identity} "
+                f"expected {override.artifact_id}, found {metadata.file_id or '<missing>'}"
+            )
+    return overrides
+
+
+def inspect_mod_version_overrides(source: Path) -> tuple[ModVersionOverrideStatus, ...]:
+    records = _exact_metadata_records(source)
+    try:
+        overrides = read_mod_version_overrides(source)
+    except ModVersionOverrideError as error:
+        raise HuroshikiError(str(error)) from error
+    statuses: list[ModVersionOverrideStatus] = []
+    for override in overrides:
+        matching = records.get((override.provider, override.project_id), ())
+        if len(matching) > 1:
+            raise HuroshikiError(
+                f"Version override identity is ambiguous: {override.canonical_identity}"
+            )
+        installed = (
+            None
+            if not matching
+            else parse_provider_metadata(matching[0][0], matching[0][1]).file_id
+        )
+        status: Literal["active", "drifted", "stale"] = (
+            "stale"
+            if installed is None
+            else "active"
+            if installed == override.artifact_id
+            else "drifted"
+        )
+        statuses.append(ModVersionOverrideStatus(override, status, installed))
+    return tuple(statuses)
 
 
 def _preserve_exact_selected_side(

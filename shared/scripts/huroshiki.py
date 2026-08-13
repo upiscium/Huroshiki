@@ -6122,6 +6122,15 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             f"Identity: {preview.identity}",
             f"Version: {preview.old_version} -> {preview.new_version}",
             f"Artifact ID: {preview.old_artifact_id} -> {preview.new_artifact_id}",
+            *(
+                [
+                    f"User selection intent: {preview.override_identity} -> "
+                    f"{preview.override_artifact_id} "
+                    f"({'locked' if preview.override_locked else 'unlocked'})"
+                ]
+                if preview.override_identity is not None
+                else []
+            ),
             f"Added dependencies: {preview.added_dependencies}",
             *(f"  + {identity}" for identity in preview.added_dependency_identities),
             f"Removed dependencies: {preview.removed_dependencies}",

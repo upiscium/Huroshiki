@@ -2336,7 +2336,8 @@ def init_packwiz_project(
     )
     create_layout(root)
     (source / ".packwizignore").write_text(
-        "*.log\n*.gitkeep\n/.huroshiki-roots.json\n/crash-reports/\n/logs/\n"
+        "*.log\n*.gitkeep\n/.huroshiki-roots.json\n"
+        "/.huroshiki-version-overrides.json\n/crash-reports/\n/logs/\n"
         "/saves/\n/screenshots/\n/world/\n",
         encoding="utf-8",
     )
@@ -3031,6 +3032,12 @@ def _print_exact_mod_version_preview(preview: Any) -> None:
     print(f"Identity: {preview.identity}")
     print(f"Version: {preview.old_version} -> {preview.new_version}")
     print(f"Artifact ID: {preview.old_artifact_id} -> {preview.new_artifact_id}")
+    if preview.override_identity is not None:
+        lock_state = "locked" if preview.override_locked else "unlocked"
+        print(
+            f"User selection intent: {preview.override_identity} -> "
+            f"{preview.override_artifact_id} ({lock_state})"
+        )
     print(f"Added dependencies: {preview.added_dependencies}")
     for identity in preview.added_dependency_identities:
         print(f"  + {identity}")

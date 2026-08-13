@@ -57,6 +57,9 @@ def preview() -> core.ModVersionSelectionPreview:
         0,
         ("modrinth:Added001",),
         (),
+        "modrinth:A1b2C3d4",
+        "E5f6G7h8",
+        False,
     )
 
 
