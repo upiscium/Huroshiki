@@ -5918,6 +5918,7 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
         self.discard_operation: core.TransactionDiscardOperation | None = None
         self.discard_timer: Timer | None = None
         self.pending_destination: Callable[[], None] | None = None
+        self.discard_completion_message: str | None = None
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -6143,18 +6144,34 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             return
         self.apply_done.clear()
         self.apply_error = None
+        self.cancel_event = threading.Event()
+        self.deadline = time.monotonic() + core.UPDATE_OPERATION_TIMEOUT_SECONDS
         self.query_one("#mod-version-status", Static).update("Applying verified preview...")
         self.apply_thread = threading.Thread(
             target=self._run_apply,
             name=f"huroshiki-exact-version-apply-{self.project_key}",
             daemon=False,
         )
-        self.apply_thread.start()
         self.app.update_apply_workers[self.project_key] = (
             self.apply_thread,
             self.apply_done,
             self.cancel_event,
         )
+        try:
+            self.apply_thread.start()
+        except BaseException as error:
+            self.app.update_apply_workers.pop(self.project_key, None)
+            self.apply_thread = None
+            self.apply_error = error
+            self.apply_done.set()
+            self.preview = None
+            self.discard_completion_message = (
+                f"{error}\nPreview invalidated; enter another artifact ID."
+            )
+            self.query_one("#mod-version-status", Static).update(str(error))
+            self.app.notify(str(error), severity="error")
+            self._begin_discard(self.pending_destination)
+            return
         self.apply_timer = self.set_interval(0.05, self._poll_apply)
 
     def _run_apply(self) -> None:
@@ -6178,10 +6195,14 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
         self.app.update_apply_workers.pop(self.project_key, None)
         self.apply_thread = None
         if self.apply_error is not None:
-            self.query_one("#mod-version-status", Static).update(str(self.apply_error))
-            self.app.notify(str(self.apply_error), severity="error")
-            if self.pending_destination is not None:
-                self._begin_discard(self.pending_destination)
+            error = self.apply_error
+            self.preview = None
+            self.discard_completion_message = (
+                f"{error}\nPreview invalidated; enter another artifact ID."
+            )
+            self.query_one("#mod-version-status", Static).update(str(error))
+            self.app.notify(str(error), severity="error")
+            self._begin_discard(self.pending_destination)
             return
         transaction = self.transaction
         if self.app.transactions.get(self.project_key) is transaction:
@@ -6244,11 +6265,15 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
         destination = self.pending_destination
         self.pending_destination = None
         if destination is not None:
+            self.discard_completion_message = None
             destination()
         else:
-            self.query_one("#mod-version-status", Static).update(
+            message = self.discard_completion_message or (
                 "Exact version operation cancelled; enter another artifact ID."
             )
+            self.discard_completion_message = None
+            self.query_one("#mod-version-status", Static).update(message)
+            self.query_one("#mod-version-artifact", Input).focus()
 
     def on_key(self, event: events.Key) -> None:
         if isinstance(self.focused, Input):

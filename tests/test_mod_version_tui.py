@@ -60,6 +60,16 @@ def preview() -> core.ModVersionSelectionPreview:
     )
 
 
+def completed_discard(transaction, error: BaseException | None = None):
+    operation = MagicMock()
+    operation.transaction = transaction
+    operation.done = threading.Event()
+    operation.done.set()
+    if error is not None:
+        operation.raise_for_error.side_effect = error
+    return operation
+
+
 class InstalledModVersionTuiTest(unittest.IsolatedAsyncioTestCase):
     async def test_details_exposes_role_and_exact_version_input(self) -> None:
         with patch.object(core, "project_config", return_value={}), patch.object(
@@ -243,6 +253,203 @@ class InstalledModVersionTuiTest(unittest.IsolatedAsyncioTestCase):
                             ).render()
                         ),
                     )
+
+    async def test_apply_failure_invalidates_preview_and_returns_to_input(self) -> None:
+        transaction = MagicMock()
+        transaction.active = True
+        transaction.prepare_exact_mod_version.return_value = preview()
+        transaction.apply.side_effect = core.HuroshikiError("apply verification failed")
+        transaction.begin_discard.return_value = completed_discard(transaction)
+        with patch.object(core, "project_config", return_value={}), patch.object(
+            core, "installed_mod_provenance", return_value="Explicit root"
+        ), patch.object(core.PackTransaction, "create", return_value=transaction):
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                screen = app.screen
+                artifact = screen.query_one("#mod-version-artifact", huroshiki.Input)
+                artifact.value = "E5f6G7h8"
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+                self.assertIsNotNone(screen.preview)
+
+                screen.apply_preview()
+                await pilot.pause(0.3)
+
+                transaction.apply.assert_called_once()
+                self.assertIsNone(screen.preview)
+                self.assertIsNone(screen.transaction)
+                self.assertNotIn("pack:demo", app.transactions)
+                self.assertIn(
+                    "apply verification failed",
+                    str(
+                        screen.query_one(
+                            "#mod-version-status", huroshiki.Static
+                        ).render()
+                    ),
+                )
+                screen.apply_preview()
+                transaction.apply.assert_called_once()
+                artifact.value = "E5f6G7h8"
+
+    async def test_apply_failure_incomplete_discard_retains_only_cleanup_ownership(self) -> None:
+        transaction = MagicMock()
+        transaction.active = True
+        transaction.prepare_exact_mod_version.return_value = preview()
+        transaction.apply.side_effect = core.HuroshikiError("apply failed")
+        transaction.begin_discard.return_value = completed_discard(
+            transaction,
+            core.TransactionDiscardIntegrityError("cleanup incomplete"),
+        )
+        with patch.object(core, "project_config", return_value={}), patch.object(
+            core, "installed_mod_provenance", return_value="Dependency"
+        ), patch.object(core.PackTransaction, "create", return_value=transaction):
+            app = _VersionApp(mod_info())
+            with patch.object(app, "open_list") as open_list:
+                async with app.run_test() as pilot:
+                    screen = app.screen
+                    artifact = screen.query_one("#mod-version-artifact", huroshiki.Input)
+                    artifact.value = "E5f6G7h8"
+                    await pilot.press("enter")
+                    await pilot.pause(0.2)
+
+                    screen.apply_preview()
+                    await pilot.pause(0.3)
+
+                    self.assertIsNone(screen.preview)
+                    self.assertIs(screen.transaction, transaction)
+                    self.assertIs(app.transactions["pack:demo"], transaction)
+                    self.assertIn(
+                        "cleanup incomplete",
+                        str(
+                            screen.query_one(
+                                "#mod-version-status", huroshiki.Static
+                            ).render()
+                        ),
+                    )
+                    open_list.assert_not_called()
+                    screen.apply_preview()
+                    transaction.apply.assert_called_once()
+
+    async def test_preview_review_time_does_not_consume_apply_deadline(self) -> None:
+        transaction = MagicMock()
+        transaction.active = True
+        transaction.prepare_exact_mod_version.return_value = preview()
+        transaction.apply.side_effect = lambda **_: setattr(transaction, "active", False)
+        with patch.object(core, "project_config", return_value={}), patch.object(
+            core, "installed_mod_provenance", return_value="Explicit root"
+        ), patch.object(core.PackTransaction, "create", return_value=transaction):
+            app = _VersionApp(mod_info())
+            with patch.object(app, "open_list"):
+                async with app.run_test() as pilot:
+                    screen = app.screen
+                    artifact = screen.query_one("#mod-version-artifact", huroshiki.Input)
+                    artifact.value = "E5f6G7h8"
+                    await pilot.press("enter")
+                    await pilot.pause(0.2)
+                    prepare_deadline = screen.deadline
+                    prepare_event = screen.cancel_event
+                    assert prepare_deadline is not None
+
+                    advanced = prepare_deadline + 60.0
+                    with patch.object(huroshiki.time, "monotonic", return_value=advanced):
+                        screen.apply_preview()
+                    await pilot.pause(0.2)
+
+                    apply_call = transaction.apply.call_args
+                    self.assertIsNot(
+                        apply_call.kwargs["cancel_event"], prepare_event
+                    )
+                    self.assertGreater(apply_call.kwargs["deadline"], advanced)
+                    self.assertNotEqual(
+                        apply_call.kwargs["deadline"], prepare_deadline
+                    )
+
+    async def test_cancel_during_apply_uses_fresh_event_and_waits_for_cleanup(self) -> None:
+        transaction = MagicMock()
+        transaction.active = True
+        transaction.prepare_exact_mod_version.return_value = preview()
+        transaction.begin_discard.return_value = completed_discard(transaction)
+        apply_started = threading.Event()
+        apply_stopped = threading.Event()
+        apply_events: list[threading.Event] = []
+
+        def apply(*, cancel_event, **_kwargs):
+            apply_events.append(cancel_event)
+            apply_started.set()
+            cancel_event.wait(2)
+            apply_stopped.set()
+            raise core.ExactModVersionCancelled("apply cancelled")
+
+        transaction.apply.side_effect = apply
+        with patch.object(core, "project_config", return_value={}), patch.object(
+            core, "installed_mod_provenance", return_value="Explicit root"
+        ), patch.object(core.PackTransaction, "create", return_value=transaction):
+            app = _VersionApp(mod_info())
+            with patch.object(app, "open_list") as open_list:
+                async with app.run_test() as pilot:
+                    screen = app.screen
+                    artifact = screen.query_one("#mod-version-artifact", huroshiki.Input)
+                    artifact.value = "E5f6G7h8"
+                    await pilot.press("enter")
+                    await pilot.pause(0.2)
+                    prepare_event = screen.cancel_event
+
+                    screen.apply_preview()
+                    self.assertTrue(apply_started.wait(1))
+                    self.assertIsNot(apply_events[0], prepare_event)
+                    screen.cancel_and_navigate(lambda: app.open_list("pack:demo"))
+                    self.assertTrue(apply_events[0].is_set())
+                    open_list.assert_not_called()
+                    await pilot.pause(0.3)
+
+                    self.assertTrue(apply_stopped.is_set())
+                    open_list.assert_called_once_with("pack:demo")
+
+    async def test_apply_worker_start_failure_invalidates_and_discards(self) -> None:
+        transaction = MagicMock()
+        transaction.active = True
+        transaction.prepare_exact_mod_version.return_value = preview()
+        transaction.begin_discard.return_value = completed_discard(transaction)
+        with patch.object(core, "project_config", return_value={}), patch.object(
+            core, "installed_mod_provenance", return_value="Explicit root"
+        ), patch.object(core.PackTransaction, "create", return_value=transaction):
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                screen = app.screen
+                artifact = screen.query_one("#mod-version-artifact", huroshiki.Input)
+                artifact.value = "E5f6G7h8"
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+
+                worker_registered_before_start = False
+
+                def fail_start():
+                    nonlocal worker_registered_before_start
+                    worker_registered_before_start = (
+                        app.update_apply_workers.get("pack:demo", (None,))[0]
+                        is screen.apply_thread
+                    )
+                    raise RuntimeError("start failed")
+
+                with patch.object(
+                    threading.Thread, "start", side_effect=fail_start
+                ):
+                    screen.apply_preview()
+                await pilot.pause(0.2)
+
+                self.assertTrue(worker_registered_before_start)
+                self.assertNotIn("pack:demo", app.update_apply_workers)
+                self.assertIsNone(screen.preview)
+                self.assertIsNone(screen.transaction)
+                transaction.apply.assert_not_called()
+                self.assertIn(
+                    "start failed",
+                    str(
+                        screen.query_one(
+                            "#mod-version-status", huroshiki.Static
+                        ).render()
+                    ),
+                )
 
 
 class InstalledModProvenanceTest(unittest.TestCase):
