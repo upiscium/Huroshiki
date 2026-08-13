@@ -16,6 +16,18 @@ import provider_artifacts
 from process_runner import BoundedProcessResult
 
 
+MODRINTH_IDS = {
+    "example": "Examp001",
+    "root": "Root0001",
+    "dependency": "Depn0001",
+    "canonical": "Canon001",
+}
+
+
+def modrinth_id(value: str) -> str:
+    return MODRINTH_IDS.get(value, value)
+
+
 def metadata(name: str, project_id: str, side: str = "both") -> str:
     return f'''name = "{name}"
 filename = "{project_id}.jar"
@@ -110,6 +122,14 @@ class AddTransactionTest(unittest.TestCase):
         command, *, cwd, cancel_event, deadline, result_callback=None
     ):
         result = core.subprocess.run(command, cwd=cwd, check=False)
+        if "--project-id" in command:
+            for path in cwd.glob("mods/*.pw.toml"):
+                text = path.read_text(encoding="utf-8")
+                for selector, canonical_id in MODRINTH_IDS.items():
+                    text = text.replace(
+                        f'mod-id = "{selector}"', f'mod-id = "{canonical_id}"'
+                    )
+                path.write_text(text, encoding="utf-8")
         resolved = core.ResolverProcessResult(
             result.returncode,
             result.stdout or "",
@@ -127,12 +147,12 @@ class AddTransactionTest(unittest.TestCase):
         reference = packctl.modrinth_project_reference(selector)
         return {
             "provider": "modrinth",
-            "project_id": reference,
+            "project_id": modrinth_id(reference),
             "slug": reference,
             "title": reference,
         }
 
-    def install_files(self, cwd: Path, root_id: str = "example") -> None:
+    def install_files(self, cwd: Path, root_id: str = "Examp001") -> None:
         (cwd / "mods/root.pw.toml").write_text(
             metadata("Root", root_id), encoding="utf-8"
         )
@@ -188,8 +208,8 @@ class AddTransactionTest(unittest.TestCase):
             self.assertEqual(self.snapshot(), original)
             self.assertNotEqual(cwd, self.source)
             command_directories.append(cwd)
-            if "add" in command and command[-1] == "example":
-                self.install_files(cwd)
+            if "add" in command and command[-1] == MODRINTH_IDS["example"]:
+                self.install_files(cwd, MODRINTH_IDS["example"])
             elif command == ["packwiz", "refresh"]:
                 (cwd / "index.toml").write_bytes(b"refreshed index\n")
             return self.completed(command)
@@ -433,7 +453,7 @@ class AddTransactionTest(unittest.TestCase):
         self.assertEqual(closure.metadata[0].identity, closure.root_identity)
 
     def test_modrinth_selectors_resolve_to_canonical_root_identity(self) -> None:
-        canonical_id = "Canonical1"
+        canonical_id = "Canon001"
         selectors = (
             canonical_id,
             "sodium-extra",
@@ -1307,7 +1327,7 @@ class AddTransactionTest(unittest.TestCase):
             operation = transaction.begin_resolved_add(
                 provider="modrinth",
                 selector="Sodium Extra",
-                canonical_project_id="canonical",
+                canonical_project_id="Canon001",
                 side="client",
             )
 
@@ -1374,7 +1394,7 @@ class AddTransactionTest(unittest.TestCase):
                 resolved_operation = transaction.begin_resolved_add(
                     provider="modrinth",
                     selector="root",
-                    canonical_project_id="root",
+                    canonical_project_id="Root0001",
                     side="both",
                 )
                 copy.assert_not_called()
@@ -1436,7 +1456,7 @@ class AddTransactionTest(unittest.TestCase):
                         transaction.begin_resolved_add(
                             provider="modrinth",
                             selector="root",
-                            canonical_project_id="root",
+                            canonical_project_id="Root0001",
                             side="both",
                         )
                         if resolved
@@ -1568,7 +1588,7 @@ class AddTransactionTest(unittest.TestCase):
             operation = transaction.begin_resolved_add(
                 provider="modrinth",
                 selector="root",
-                canonical_project_id="root",
+                canonical_project_id="Root0001",
                 side="both",
                 deadline=deadline,
             )
@@ -1592,7 +1612,7 @@ class AddTransactionTest(unittest.TestCase):
             operation = transaction.begin_resolved_add(
                 provider="modrinth",
                 selector="root",
-                canonical_project_id="root",
+                canonical_project_id="Root0001",
                 side="both",
                 deadline=first,
             )
@@ -1603,7 +1623,7 @@ class AddTransactionTest(unittest.TestCase):
             second = transaction.begin_resolved_add(
                 provider="modrinth",
                 selector="root",
-                canonical_project_id="root",
+                canonical_project_id="Root0001",
                 side="both",
                 deadline=first,
             )

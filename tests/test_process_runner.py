@@ -94,6 +94,49 @@ class ProcessRunnerInputTest(unittest.TestCase):
         self.assertEqual(stdin.read_calls, 0)
         self.assertEqual(stdin.seek_calls, 0)
 
+    def test_deadline_is_rechecked_after_stdin_preparation(self) -> None:
+        monotonic_values = iter((0.0, 2.0))
+        with patch.object(
+            runner.time, "monotonic", side_effect=monotonic_values
+        ), patch.object(runner.subprocess, "Popen") as popen:
+            result = runner.run_bounded_process(
+                [sys.executable, "-c", "pass"],
+                cwd=self.cwd,
+                deadline=1.0,
+                stdin=b"json-payload",
+            )
+
+        popen.assert_not_called()
+        self.assertTrue(result.timed_out)
+
+    def test_cancel_is_rechecked_after_stdin_preparation(self) -> None:
+        cancel = threading.Event()
+        real_temporary_file = runner.tempfile.TemporaryFile
+
+        class CancelAfterWrite(io.BytesIO):
+            def write(self, payload):  # type: ignore[override]
+                result = super().write(payload)
+                cancel.set()
+                return result
+
+        def temporary_file(*args, **kwargs):
+            if kwargs.get("mode") == "w+b":
+                return CancelAfterWrite()
+            return real_temporary_file(*args, **kwargs)
+
+        with patch.object(
+            runner.tempfile, "TemporaryFile", side_effect=temporary_file
+        ), patch.object(runner.subprocess, "Popen") as popen:
+            result = runner.run_bounded_process(
+                [sys.executable, "-c", "pass"],
+                cwd=self.cwd,
+                cancel_event=cancel,
+                stdin=b"json-payload",
+            )
+
+        popen.assert_not_called()
+        self.assertTrue(result.cancelled)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,7 +25,14 @@ class ProviderArtifactTest(unittest.TestCase):
         payload = self.workspace / "payload.jar"
         with zipfile.ZipFile(payload, "w") as archive:
             archive.writestr(
-                "fabric.mod.json", json.dumps({"id": "demo", "version": "1"})
+                "fabric.mod.json",
+                json.dumps(
+                    {
+                        "id": "demo",
+                        "version": "1",
+                        "depends": {"dependency": ">=2.0"},
+                    }
+                ),
             )
         self.payload = payload.read_bytes()
         digest = hashlib.sha256(self.payload).hexdigest()
@@ -113,6 +120,18 @@ class ProviderArtifactTest(unittest.TestCase):
                 deadline=self.deadline,
             )
         return result, calls
+
+    def test_materialization_returns_loader_dependency_requirements(self) -> None:
+        result, _calls = self._run()
+        self.assertIsNotNone(result.dependency_requirements)
+        assert result.dependency_requirements is not None
+        self.assertEqual(
+            [
+                (item.mod_id, item.version_range)
+                for item in result.dependency_requirements
+            ],
+            [("dependency", ">=2.0")],
+        )
 
     def test_mode_metadata_curseforge_is_supported_without_download_url(self) -> None:
         candidate = DependencyCandidate(

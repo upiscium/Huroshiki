@@ -91,7 +91,7 @@ class InstallControlsTest(unittest.IsolatedAsyncioTestCase):
                 screen = app.screen
                 screen.search_results = [
                     huroshiki.core.InstallSearchResult(
-                        "modrinth", "canonical", "Example MOD", "Details"
+                        "modrinth", "Canon001", "Example MOD", "Details"
                     )
                 ]
                 screen.refresh_search_results()
