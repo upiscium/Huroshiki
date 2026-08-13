@@ -2927,6 +2927,11 @@ class PackTransaction:
             if progress is not None:
                 progress(ModVersionSelectionProgress(phase, message))
 
+        def record_process_result(result: BoundedProcessResult) -> None:
+            if result.termination_incomplete or result.orphaned_descendants:
+                operation_owner.termination_incomplete = True
+            self._record_equivalence_process_result(result)
+
         self.ensure_active()
         kind, project_id = split_project_key(self.project_key)
         if kind != "pack":
@@ -3113,7 +3118,7 @@ class PackTransaction:
                     deadline=operation_deadline,
                     checkpoint=checkpoint,
                     preseed_selections=preseed_selections,
-                    process_result_callback=self._record_equivalence_process_result,
+                    process_result_callback=record_process_result,
                 )
                 _verify_exact_root_metadata(root_selection, closure.metadata)
                 return ResolvedModClosure(
@@ -3195,7 +3200,7 @@ class PackTransaction:
                     cancel_event=operation_cancel,
                     deadline=operation_deadline,
                     equivalence_workspace=equivalence_workspace,
-                    process_result_callback=self._record_equivalence_process_result,
+                    process_result_callback=record_process_result,
                 )
             _merge_exact_existing_dependency_sides(
                 resolver_source,
@@ -3253,7 +3258,7 @@ class PackTransaction:
                 context_source=self.source,
                 cancel_event=operation_cancel,
                 deadline=operation_deadline,
-                process_result_callback=self._record_equivalence_process_result,
+                process_result_callback=record_process_result,
                 selected_dependency_roots=selected_dependency_roots,
                 explicit_root_identities={
                     (root.provider, root.project_id) for root in explicit_roots
@@ -3284,7 +3289,7 @@ class PackTransaction:
                 cancel_event=operation_cancel,
                 deadline=operation_deadline,
                 checkpoint=checkpoint,
-                process_result_callback=self._record_equivalence_process_result,
+                process_result_callback=record_process_result,
             )
             ensure_safe_pack_source(self.source, checkpoint=checkpoint)
             if packctl.project_versions(self.source) != versions:
@@ -3397,6 +3402,15 @@ class PackTransaction:
                 raise HuroshikiError(
                     f"{error}; exact-selection rollback failed: {restore_error}"
                 ) from error
+            if not operation_owner.termination_incomplete:
+                if operation_cancel.is_set():
+                    raise ExactModVersionCancelled(
+                        "Exact MOD version selection was cancelled"
+                    ) from error
+                if time.monotonic() >= operation_deadline:
+                    raise ExactModVersionDeadlineExceeded(
+                        "Exact MOD version selection deadline exceeded"
+                    ) from error
             raise
 
     def prepare_updates(

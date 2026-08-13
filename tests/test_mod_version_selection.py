@@ -773,6 +773,78 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         finally:
             transaction.discard()
 
+    def test_resolved_add_then_exact_selection_applies_selected_artifact(self) -> None:
+        for path in self.source.joinpath("mods").iterdir():
+            path.unlink()
+        self.source.joinpath(".packwizignore").write_text(
+            "/.huroshiki-roots.json\n", encoding="utf-8"
+        )
+        core.write_pack_root_manifest(self.source, ())
+        real_before = core._file_content_snapshot(self.source)
+        transaction = core.PackTransaction.create(self.key)
+        try:
+            add = transaction.begin_resolved_add(
+                provider="modrinth",
+                selector="introduced",
+                canonical_project_id=mr_project("introduced"),
+                side="client",
+            )
+            with patch.object(
+                core,
+                "resolve_mod_closure",
+                return_value=self.graph_closure("introduced", "x1"),
+            ):
+                result = add.run()
+            self.assertTrue(result.success, result.message)
+            self.assertIn(
+                f'version = "{mr_version("x1")}"',
+                transaction.source.joinpath("mods/introduced.pw.toml").read_text(),
+            )
+            self.assertEqual(
+                core.read_pack_root_manifest(transaction.source),
+                (
+                    core.PackRootRecord(
+                        "modrinth", mr_project("introduced"), "client"
+                    ),
+                ),
+            )
+            self.assertEqual(core._file_content_snapshot(self.source), real_before)
+
+            with patch.object(
+                core,
+                "resolve_exact_mod_closure",
+                return_value=self.graph_closure("introduced", "x2"),
+            ):
+                preview = transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth",
+                        branded_project("introduced"),
+                        branded_version("x2"),
+                    )
+                )
+            self.assertEqual(preview.new_artifact_id, mr_version("x2"))
+            self.assertIn(
+                f'version = "{mr_version("x2")}"',
+                transaction.source.joinpath("mods/introduced.pw.toml").read_text(),
+            )
+            self.assertEqual(core._file_content_snapshot(self.source), real_before)
+
+            transaction.apply()
+            self.assertIn(
+                f'version = "{mr_version("x2")}"',
+                self.source.joinpath("mods/introduced.pw.toml").read_text(),
+            )
+            self.assertEqual(
+                core.read_pack_root_manifest(self.source),
+                (
+                    core.PackRootRecord(
+                        "modrinth", mr_project("introduced"), "client"
+                    ),
+                ),
+            )
+        finally:
+            transaction.discard()
+
     def test_exact_selection_can_target_a_mod_staged_by_an_earlier_add(self) -> None:
         transaction = self.write_graph_pack(
             (("root", "r1", "both"),),
@@ -1954,6 +2026,66 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         finally:
             transaction.discard()
 
+    def test_preview_dependency_identity_order_is_deterministic(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root", "r1", "both"),),
+            (("dependency", "d1"), ("child", "v1")),
+        )
+        closure = self.graph_closure(
+            "root",
+            "r2",
+            ("replacement", "x1"),
+            ("introduced", "x2"),
+        )
+        materialize = self.dependency_graph_materializer(
+            {
+                "root": (("introduced", ">=1"), ("replacement", ">=1")),
+                "replacement": (),
+                "introduced": (),
+            },
+            {},
+        )
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", return_value=closure
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
+                preview = transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth", branded_project("root"), branded_version("r2")
+                    )
+                )
+            self.assertEqual(
+                preview.added_dependency_identities,
+                ("modrinth:Intro001", "modrinth:Repla001"),
+            )
+            self.assertEqual(
+                preview.removed_dependency_identities,
+                ("modrinth:Child001", "modrinth:Depen001"),
+            )
+            self.assertEqual(
+                preview.added_dependencies,
+                len(preview.added_dependency_identities),
+            )
+            self.assertEqual(
+                preview.removed_dependencies,
+                len(preview.removed_dependency_identities),
+            )
+            self.assertEqual(
+                {change.relative_path for change in preview.changes},
+                {
+                    Path("index.toml"),
+                    Path("mods/child.pw.toml"),
+                    Path("mods/dependency.pw.toml"),
+                    Path("mods/introduced.pw.toml"),
+                    Path("mods/replacement.pw.toml"),
+                    Path("mods/root.pw.toml"),
+                },
+            )
+        finally:
+            transaction.discard()
+
     def test_failed_exact_selection_preserves_earlier_staged_change(self) -> None:
         transaction = self.write_graph_pack(
             (("root", "r1", "both"),),
@@ -2198,6 +2330,272 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 f'version = "{mr_version("old-artifact")}"',
                 self.source.joinpath("mods/root.pw.toml").read_text(),
             )
+        finally:
+            transaction.discard()
+
+    def test_successful_exact_prepare_then_discard_never_publishes(self) -> None:
+        transaction = self.make_transaction("modrinth", "root")
+        real_before = core._file_content_snapshot(self.source)
+        with patch.object(
+            core, "materialize_provider_artifact", side_effect=self.materialize
+        ):
+            transaction.prepare_exact_mod_version(
+                self.selection(
+                    "modrinth", branded_project("root"), branded_version("v2")
+                )
+            )
+        self.assertIn(
+            f'version = "{mr_version("v2")}"',
+            transaction.source.joinpath("mods/root.pw.toml").read_text(),
+        )
+        self.assertEqual(core._file_content_snapshot(self.source), real_before)
+
+        transaction.discard()
+
+        self.assertEqual(core._file_content_snapshot(self.source), real_before)
+        self.assertFalse(transaction.active)
+        self.assertFalse(packctl.project_lock_is_active(self.key))
+        with self.assertRaisesRegex(core.HuroshikiError, "no longer active"):
+            transaction.apply()
+        with self.assertRaisesRegex(core.HuroshikiError, "no longer active"):
+            transaction.prepare_exact_mod_version(
+                self.selection(
+                    "modrinth", branded_project("root"), branded_version("v2")
+                )
+            )
+
+    def test_caller_cancellation_during_exact_resolver_restores_staging(self) -> None:
+        transaction = self.make_transaction("modrinth", "root")
+        staged = transaction.source.joinpath("prior-staged.txt")
+        staged.write_bytes(b"prior staged bytes\n")
+        transaction_before = core._file_content_snapshot(transaction.source)
+        real_before = core._file_content_snapshot(self.source)
+        started = threading.Event()
+        cancel_event = threading.Event()
+        worker_error: list[BaseException] = []
+
+        def resolver(command, *, cancel_event, result_callback=None, **_kwargs):
+            self.assertIn("--version-id", command)
+            started.set()
+            self.assertTrue(cancel_event.wait(2))
+            result = core.ResolverProcessResult(-15, "", "", True, False)
+            if result_callback is not None:
+                result_callback(result)
+            return result
+
+        def prepare() -> None:
+            try:
+                transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth", branded_project("root"), branded_version("v2")
+                    ),
+                    cancel_event=cancel_event,
+                )
+            except BaseException as error:
+                worker_error.append(error)
+
+        try:
+            with patch.object(core, "run_resolver_process", side_effect=resolver):
+                worker = threading.Thread(target=prepare, name="exact-caller-cancel")
+                worker.start()
+                self.assertTrue(started.wait(1))
+                cancel_event.set()
+                worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(worker_error), 1)
+            self.assertIsInstance(worker_error[0], core.ExactModVersionCancelled)
+            self.assertEqual(
+                core._file_content_snapshot(transaction.source), transaction_before
+            )
+            self.assertEqual(staged.read_bytes(), b"prior staged bytes\n")
+            self.assertEqual(core._file_content_snapshot(self.source), real_before)
+            self.assertTrue(transaction.active)
+            self.assertTrue(packctl.project_lock_is_active(self.key))
+            self.assertIsNone(transaction._operation)
+        finally:
+            transaction.discard()
+        self.assertFalse(packctl.project_lock_is_active(self.key))
+
+    def test_deadline_expires_after_exact_resolver_starts(self) -> None:
+        transaction = self.make_transaction("modrinth", "root")
+        staged = transaction.source.joinpath("prior-staged.txt")
+        staged.write_bytes(b"deadline baseline\n")
+        transaction_before = core._file_content_snapshot(transaction.source)
+        real_before = core._file_content_snapshot(self.source)
+        started = threading.Event()
+
+        def resolver(command, *, deadline, result_callback=None, **_kwargs):
+            self.assertIn("--version-id", command)
+            started.set()
+            while time.monotonic() < deadline:
+                time.sleep(0.001)
+            result = core.ResolverProcessResult(-15, "", "", False, True)
+            if result_callback is not None:
+                result_callback(result)
+            return result
+
+        try:
+            with patch.object(core, "run_resolver_process", side_effect=resolver):
+                with self.assertRaisesRegex(
+                    core.ExactModVersionDeadlineExceeded, "deadline exceeded"
+                ):
+                    transaction.prepare_exact_mod_version(
+                        self.selection(
+                            "modrinth", branded_project("root"), branded_version("v2")
+                        ),
+                        deadline=time.monotonic() + 0.2,
+                    )
+            self.assertTrue(started.is_set())
+            self.assertEqual(
+                core._file_content_snapshot(transaction.source), transaction_before
+            )
+            self.assertEqual(core._file_content_snapshot(self.source), real_before)
+            self.assertTrue(transaction.active)
+            self.assertTrue(packctl.project_lock_is_active(self.key))
+        finally:
+            transaction.discard()
+        self.assertFalse(packctl.project_lock_is_active(self.key))
+
+    def test_caller_cancellation_during_materialization_restores_staging(self) -> None:
+        transaction = self.make_transaction("modrinth", "root")
+        staged = transaction.source.joinpath("prior-staged.txt")
+        staged.write_bytes(b"materialization baseline\n")
+        transaction_before = core._file_content_snapshot(transaction.source)
+        real_before = core._file_content_snapshot(self.source)
+        started = threading.Event()
+        cancel_event = threading.Event()
+        worker_error: list[BaseException] = []
+
+        def materialize(*_args, cancel_event, **_kwargs):
+            started.set()
+            self.assertTrue(cancel_event.wait(2))
+            raise core.HuroshikiError("Artifact materialization was cancelled")
+
+        def prepare() -> None:
+            try:
+                transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth", branded_project("root"), branded_version("v2")
+                    ),
+                    cancel_event=cancel_event,
+                )
+            except BaseException as error:
+                worker_error.append(error)
+
+        try:
+            with patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
+                worker = threading.Thread(
+                    target=prepare, name="exact-materialization-cancel"
+                )
+                worker.start()
+                self.assertTrue(started.wait(1))
+                cancel_event.set()
+                worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(worker_error), 1)
+            self.assertIsInstance(worker_error[0], core.ExactModVersionCancelled)
+            self.assertEqual(
+                core._file_content_snapshot(transaction.source), transaction_before
+            )
+            self.assertEqual(core._file_content_snapshot(self.source), real_before)
+        finally:
+            transaction.discard()
+
+    def test_incomplete_exact_resolver_cleanup_is_retained_for_discard_retry(self) -> None:
+        transaction = self.make_transaction("modrinth", "root")
+        transaction_before = core._file_content_snapshot(transaction.source)
+        real_before = core._file_content_snapshot(self.source)
+        process_result = core.ResolverProcessResult(
+            7,
+            "",
+            "ordinary resolver failure",
+            True,
+            True,
+            False,
+            True,
+            process_group=12345,
+        )
+
+        def resolver(*_args, result_callback=None, **_kwargs):
+            if result_callback is not None:
+                result_callback(process_result)
+            return process_result
+
+        with patch.object(core, "run_resolver_process", side_effect=resolver):
+            with self.assertRaisesRegex(
+                core.HuroshikiError, "termination was incomplete"
+            ):
+                transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth", branded_project("root"), branded_version("v2")
+                    )
+                )
+        self.assertEqual(core._file_content_snapshot(transaction.source), transaction_before)
+        self.assertEqual(core._file_content_snapshot(self.source), real_before)
+        self.assertEqual(transaction._equivalence_process_results, [process_result])
+        self.assertTrue(transaction.root.exists())
+
+        incomplete = core.ProcessTerminationResult(False, False, True)
+        with patch.object(
+            core, "stop_resolver_process_group", return_value=incomplete
+        ) as stop:
+            with self.assertRaisesRegex(
+                core.TransactionDiscardIntegrityError, "cleanup was incomplete"
+            ):
+                transaction.discard(deadline=time.monotonic() + 1)
+        stop.assert_called_once()
+        self.assertTrue(transaction.root.exists())
+        self.assertTrue(packctl.project_lock_is_active(self.key))
+        self.assertEqual(transaction._equivalence_process_results, [process_result])
+
+        complete = core.ProcessTerminationResult(True, True, True)
+        with patch.object(
+            core, "stop_resolver_process_group", return_value=complete
+        ) as stop:
+            transaction.discard(deadline=time.monotonic() + 1)
+        stop.assert_called_once()
+        self.assertEqual(transaction._equivalence_process_results, [])
+        self.assertFalse(packctl.project_lock_is_active(self.key))
+
+    def test_orphaned_exact_resolver_integrity_outranks_cancellation(self) -> None:
+        transaction = self.make_transaction("modrinth", "root")
+        transaction_before = core._file_content_snapshot(transaction.source)
+        real_before = core._file_content_snapshot(self.source)
+        cancel_event = threading.Event()
+
+        def resolver(*_args, result_callback=None, **_kwargs):
+            cancel_event.set()
+            result = core.ResolverProcessResult(
+                7,
+                "",
+                "ordinary resolver failure",
+                True,
+                True,
+                True,
+                False,
+            )
+            if result_callback is not None:
+                result_callback(result)
+            return result
+
+        try:
+            with patch.object(core, "run_resolver_process", side_effect=resolver):
+                with self.assertRaisesRegex(
+                    core.HuroshikiError, "left background processes"
+                ) as raised:
+                    transaction.prepare_exact_mod_version(
+                        self.selection(
+                            "modrinth", branded_project("root"), branded_version("v2")
+                        ),
+                        cancel_event=cancel_event,
+                    )
+            self.assertNotIsInstance(raised.exception, core.ExactModVersionCancelled)
+            self.assertEqual(
+                core._file_content_snapshot(transaction.source), transaction_before
+            )
+            self.assertEqual(core._file_content_snapshot(self.source), real_before)
         finally:
             transaction.discard()
 
