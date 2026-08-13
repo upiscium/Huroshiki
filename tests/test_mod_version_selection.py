@@ -215,7 +215,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             if artifact_id in {"1", "d1", "old-artifact", "987655"}
             else "2.0"
         )
-        requirements = None
+        requirements = ()
         if project_id in {"root", "root-a", "root-b"} and (
             "dependency" in document or project_id == "root"
         ):
@@ -225,7 +225,12 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         return MaterializedArtifact(
             "b" * 64,
             SemanticJarIdentity(
-                (("root" if project_id == "root" else project_id, version),),
+                ((
+                    "dependency"
+                    if candidate.filename == "dependency.jar"
+                    else "root" if project_id == "root" else project_id,
+                    version,
+                ),),
                 "fabric",
             ),
             requirements,
@@ -613,7 +618,10 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             return closures[(selection.provider, selection.project_id, selection.artifact_id)]
 
         try:
-            with patch.object(core, "resolve_exact_mod_closure", side_effect=resolve):
+            materialize = self.dependency_graph_materializer({"root": ()}, {})
+            with patch.object(core, "resolve_exact_mod_closure", side_effect=resolve), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
                 preview = transaction.prepare_exact_mod_version(
                     self.selection("modrinth", "root", "r2")
                 )
@@ -633,7 +641,10 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         )
         closure = self.graph_closure("root", "r2", ("dependency", "d1"))
         try:
-            with patch.object(core, "resolve_exact_mod_closure", return_value=closure):
+            materialize = self.dependency_graph_materializer({"root": (("dependency", ">=1"),)}, {})
+            with patch.object(core, "resolve_exact_mod_closure", return_value=closure), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
                 preview = transaction.prepare_exact_mod_version(
                     self.selection("modrinth", "root", "r2")
                 )
@@ -950,6 +961,234 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         finally:
             transaction.discard()
 
+    def test_root_selection_validates_resulting_dependency_constraint(self) -> None:
+        def run(version: str, succeeds: bool) -> None:
+            transaction = self.write_graph_pack(
+                (("root-a", "a1", "both"),),
+                (("dependency", "d1"),),
+            )
+            before = core._file_content_snapshot(transaction.source)
+            real_before = core._file_content_snapshot(self.source)
+            closure = self.graph_closure("root-a", "a2", ("dependency", "d2"))
+            materialize = self.dependency_graph_materializer(
+                {"root-a": (("dependency", ">=2"),)},
+                {"d1": "1.0", "d2": version},
+            )
+            try:
+                with patch.object(
+                    core, "resolve_exact_mod_closure", return_value=closure
+                ), patch.object(
+                    core, "materialize_provider_artifact", side_effect=materialize
+                ):
+                    if succeeds:
+                        preview = transaction.prepare_exact_mod_version(
+                            self.selection("modrinth", "root-a", "a2")
+                        )
+                        self.assertEqual(preview.new_artifact_id, "a2")
+                    else:
+                        with self.assertRaisesRegex(
+                            core.HuroshikiError, "graph conflict"
+                        ):
+                            transaction.prepare_exact_mod_version(
+                                self.selection("modrinth", "root-a", "a2")
+                            )
+                        self.assertEqual(
+                            core._file_content_snapshot(transaction.source), before
+                        )
+                        self.assertEqual(
+                            core._file_content_snapshot(self.source), real_before
+                        )
+            finally:
+                transaction.discard()
+
+        run("2.5", True)
+        run("1.5", False)
+
+    def test_selected_dependency_outgoing_child_is_fully_validated(self) -> None:
+        def run(version: str, succeeds: bool) -> None:
+            transaction = self.write_graph_pack(
+                (("root-a", "a1", "both"),),
+                (("dependency", "d1"), ("child", "e1")),
+            )
+            closure = self.graph_closure(
+                "root-a", "a1", ("dependency", "d2"), ("child", "e2")
+            )
+            materialize = self.dependency_graph_materializer(
+                {
+                    "root-a": (("dependency", ">=1"),),
+                    "dependency": (("child", ">=2"),),
+                },
+                {"d1": "1.0", "d2": "2.0", "e1": "1.0", "e2": version},
+            )
+            try:
+                with patch.object(
+                    core, "resolve_exact_mod_closure", return_value=closure
+                ), patch.object(
+                    core, "materialize_provider_artifact", side_effect=materialize
+                ):
+                    if succeeds:
+                        preview = transaction.prepare_exact_mod_version(
+                            self.selection("modrinth", "dependency", "d2")
+                        )
+                        self.assertEqual(preview.new_artifact_id, "d2")
+                    else:
+                        with self.assertRaisesRegex(
+                            core.HuroshikiError, "graph conflict"
+                        ):
+                            transaction.prepare_exact_mod_version(
+                                self.selection("modrinth", "dependency", "d2")
+                            )
+            finally:
+                transaction.discard()
+
+        run("2.5", True)
+        run("1.5", False)
+
+    def test_exact_selection_validates_minecraft_runtime_constraint(self) -> None:
+        def run(requirement: str, succeeds: bool) -> None:
+            transaction = self.write_graph_pack((("root-a", "a1", "both"),), ())
+            closure = self.graph_closure("root-a", "a2")
+            materialize = self.dependency_graph_materializer(
+                {"root-a": (("minecraft", requirement),)},
+                {},
+            )
+            try:
+                with patch.object(
+                    core, "resolve_exact_mod_closure", return_value=closure
+                ), patch.object(
+                    core, "materialize_provider_artifact", side_effect=materialize
+                ):
+                    if succeeds:
+                        transaction.prepare_exact_mod_version(
+                            self.selection("modrinth", "root-a", "a2")
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            core.HuroshikiError, "runtime compatibility conflict"
+                        ):
+                            transaction.prepare_exact_mod_version(
+                                self.selection("modrinth", "root-a", "a2")
+                            )
+            finally:
+                transaction.discard()
+
+        run(">=1.21 <1.22", True)
+        run(">=1.22", False)
+
+    def test_exact_selection_validates_fabric_loader_runtime_constraint(self) -> None:
+        transaction = self.write_graph_pack((("root-a", "a1", "both"),), ())
+        closure = self.graph_closure("root-a", "a2")
+        materialize = self.dependency_graph_materializer(
+            {"root-a": (("fabricloader", ">=0.17"),)},
+            {},
+        )
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", return_value=closure
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
+                with self.assertRaisesRegex(
+                    core.HuroshikiError, "runtime compatibility conflict"
+                ):
+                    transaction.prepare_exact_mod_version(
+                        self.selection("modrinth", "root-a", "a2")
+                    )
+        finally:
+            transaction.discard()
+
+    def test_quilt_required_mod_and_runtime_constraints_are_validated(self) -> None:
+        self.source.joinpath("pack.toml").write_text(
+            '[versions]\nminecraft = "1.21.1"\nquilt = "0.26.0"\n',
+            encoding="utf-8",
+        )
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"),),
+            (("dependency", "d1"),),
+        )
+        closure = self.graph_closure("root-a", "a2", ("dependency", "d2"))
+
+        def materialize(candidate, *_args, **_kwargs):
+            _provider, project_id = candidate.provider_identity.split(":", 1)
+            artifact_id = core.parse_provider_metadata(
+                Path(candidate.relative_metadata_path), candidate.contents
+            ).file_id
+            version = "2.0" if artifact_id == "d2" else "1.0"
+            requirements = (
+                (
+                    LoaderDependencyRequirement("dependency", ">=2"),
+                    LoaderDependencyRequirement("quilt_loader", ">=0.27"),
+                )
+                if project_id == "root-a"
+                else ()
+            )
+            return MaterializedArtifact(
+                "b" * 64,
+                SemanticJarIdentity(((project_id, version),), "quilt"),
+                requirements,
+            )
+
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", return_value=closure
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
+                with self.assertRaisesRegex(
+                    core.HuroshikiError, "runtime compatibility conflict"
+                ):
+                    transaction.prepare_exact_mod_version(
+                        self.selection("modrinth", "root-a", "a2")
+                    )
+        finally:
+            transaction.discard()
+
+    def test_quilt_required_mod_constraint_fails_closed(self) -> None:
+        self.source.joinpath("pack.toml").write_text(
+            '[versions]\nminecraft = "1.21.1"\nquilt = "0.26.0"\n',
+            encoding="utf-8",
+        )
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"),),
+            (("dependency", "d1"),),
+        )
+        closure = self.graph_closure("root-a", "a2", ("dependency", "d2"))
+
+        def materialize(candidate, *_args, **_kwargs):
+            _provider, project_id = candidate.provider_identity.split(":", 1)
+            artifact_id = core.parse_provider_metadata(
+                Path(candidate.relative_metadata_path), candidate.contents
+            ).file_id
+            version = "2.0" if artifact_id == "d2" else "1.0"
+            requirements = (
+                (
+                    LoaderDependencyRequirement("dependency", ">=3"),
+                    LoaderDependencyRequirement("quilt_loader", ">=0.26"),
+                )
+                if project_id == "root-a"
+                else ()
+            )
+            return MaterializedArtifact(
+                "b" * 64,
+                SemanticJarIdentity(((project_id, version),), "quilt"),
+                requirements,
+            )
+
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", return_value=closure
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, "graph conflict"):
+                    transaction.prepare_exact_mod_version(
+                        self.selection("modrinth", "root-a", "a2")
+                    )
+        finally:
+            transaction.discard()
+
+
+
     def test_transitive_dependency_exact_selection_uses_direct_parent_edge(self) -> None:
         transaction = self.write_graph_pack(
             (("root-a", "a1", "both"),),
@@ -1003,7 +1242,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ), patch.object(
                 core, "materialize_provider_artifact", side_effect=materialize
             ):
-                with self.assertRaisesRegex(core.HuroshikiError, "selection conflict"):
+                with self.assertRaisesRegex(core.HuroshikiError, "graph conflict"):
                     transaction.prepare_exact_mod_version(
                         self.selection("modrinth", "dependency", "d2")
                     )
@@ -1056,7 +1295,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                         self.assertEqual(preview.new_artifact_id, "d2")
                     else:
                         with self.assertRaisesRegex(
-                            core.HuroshikiError, "selection conflict"
+                            core.HuroshikiError, "graph conflict"
                         ):
                             transaction.prepare_exact_mod_version(
                                 self.selection("modrinth", "dependency", "d2")
@@ -1166,7 +1405,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             requirements = (
                 (LoaderDependencyRequirement("dependency", "<2.0"),)
                 if project_id == "root"
-                else None
+                else ()
             )
             return MaterializedArtifact(
                 "b" * 64,
@@ -1180,7 +1419,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ), patch.object(
                 core, "materialize_provider_artifact", side_effect=materialize
             ):
-                with self.assertRaisesRegex(core.HuroshikiError, "selection conflict"):
+                with self.assertRaisesRegex(core.HuroshikiError, "graph conflict"):
                     transaction.prepare_exact_mod_version(
                         self.selection("modrinth", "dependency", "d2")
                     )
@@ -1270,8 +1509,11 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         closure = self.graph_closure("root", "r2", ("replacement", "x1"))
 
         try:
+            materialize = self.dependency_graph_materializer({"root": (("replacement", ">=1"),)}, {})
             with patch.object(
                 core, "resolve_exact_mod_closure", return_value=closure
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
             ), patch.object(
                 core,
                 "run_resolver_process",
@@ -1424,9 +1666,13 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             with patch.object(
                 core,
                 "materialize_provider_artifact",
-                return_value=MaterializedArtifact(
+                side_effect=lambda candidate, *_args, **_kwargs: MaterializedArtifact(
                     "b" * 64,
-                    SemanticJarIdentity((("root", "2.0"),), "fabric"),
+                    SemanticJarIdentity(((
+                        "dependency" if candidate.filename == "dependency.jar" else "root",
+                        "2.0",
+                    ),), "fabric"),
+                    (),
                 ),
             ):
                 preview = transaction.prepare_exact_mod_version(
@@ -1443,10 +1689,13 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ".huroshiki-roots.json"
         ).read_bytes()
         try:
+            materialize = self.dependency_graph_materializer({"root": ()}, {})
             with patch.object(
                 core,
                 "resolve_exact_mod_closure",
                 return_value=self.graph_closure("root", "r2"),
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
             ):
                 preview = transaction.prepare_exact_mod_version(
                     self.selection("modrinth", "root", "r2")

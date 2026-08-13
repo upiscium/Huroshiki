@@ -776,7 +776,12 @@ class ExactDependencyEdge:
 class ExactDependencyGraph:
     semantic_bindings: tuple[tuple[str, tuple[str, str]], ...]
     edges: tuple[ExactDependencyEdge, ...]
-    selected_root_reachability: frozenset[tuple[str, str]]
+    root_reachability: tuple[
+        tuple[tuple[str, str], frozenset[tuple[str, str]]], ...
+    ]
+
+    def reachable_roots(self, identity: tuple[str, str]) -> frozenset[tuple[str, str]]:
+        return dict(self.root_reachability).get(identity, frozenset())
 
 
 @dataclass(frozen=True)
@@ -6142,30 +6147,36 @@ def _verify_exact_closure_artifacts(
                 f"Exact dependency semantic MOD identity changed for "
                 f"{identity[0]}:{identity[1]}"
             )
+    verifications = tuple(results[identity] for identity in sorted(results))
+    graph = _build_exact_dependency_graph(
+        verifications, explicit_root_identities, checkpoint
+    )
+    _validate_exact_dependency_graph(
+        graph,
+        verifications,
+        minecraft=minecraft,
+        loader=loader,
+        loader_version=loader_version,
+        checkpoint=checkpoint,
+    )
     if selected_dependency_roots is not None:
-        _build_exact_dependency_graph(
-            tuple(results[identity] for identity in sorted(results)),
-            selection.identity,
-            explicit_root_identities,
-            selected_dependency_roots,
-            checkpoint,
+        _assert_exact_selected_dependency_reachability(
+            graph, selection.identity, selected_dependency_roots
         )
-    return tuple(results[identity] for identity in sorted(results))
+    return verifications
 
 
 _EXACT_RUNTIME_MOD_IDS = frozenset(
-    {"minecraft", "java", "fabricloader", "forge", "neoforge"}
+    {"minecraft", "java", "fabricloader", "quilt_loader", "forge", "neoforge"}
 )
 
 
 def _build_exact_dependency_graph(
     verifications: Sequence[ExactArtifactVerification],
-    selected_identity: tuple[str, str],
     explicit_root_identities: set[tuple[str, str]],
-    expected_selected_roots: set[tuple[str, str]],
     checkpoint: Callable[[], None],
 ) -> ExactDependencyGraph:
-    """Build and validate required edges from materialized loader metadata."""
+    """Build immutable required-edge evidence from materialized loader metadata."""
     artifacts = {item.identity: item for item in verifications}
     bindings: dict[str, tuple[str, str]] = {}
     for artifact in verifications:
@@ -6225,8 +6236,6 @@ def _build_exact_dependency_graph(
                 continue
             seen.add(identity)
             reached_by.setdefault(identity, set()).add(root_identity)
-            if identity == selected_identity:
-                continue
             artifact = artifacts[identity]
             if artifact.dependency_requirements is None:
                 raise HuroshikiError(
@@ -6237,49 +6246,6 @@ def _build_exact_dependency_graph(
                 edge.child_identity for edge in edges_by_parent.get(identity, ())
             )
 
-    selected_roots = reached_by.get(selected_identity, set())
-    if selected_roots != expected_selected_roots:
-        raise HuroshikiError(
-            "Exact dependency required-edge reachability changed: "
-            f"expected={sorted(expected_selected_roots)}, actual={sorted(selected_roots)}"
-        )
-
-    reachable_identities = set(reached_by)
-    incoming = [
-        edge
-        for edge in edges
-        if edge.child_identity == selected_identity
-        and edge.parent_identity in reachable_identities
-    ]
-    if not incoming:
-        raise HuroshikiError(
-            f"Exact dependency {selected_identity[0]}:{selected_identity[1]} has no "
-            "reachable machine-readable required edge"
-        )
-    for edge in edges:
-        checkpoint()
-        if edge.parent_identity not in reachable_identities:
-            continue
-        child = artifacts[edge.child_identity]
-        child_versions = dict(child.semantic_identity.members)
-        version = child_versions[edge.required_mod_id]
-        accepted = version_satisfies_requirement(version, edge.version_range)
-        parent_label = f"{edge.parent_identity[0]}:{edge.parent_identity[1]}"
-        if accepted is None:
-            raise HuroshikiError(
-                f"Exact dependency graph compatibility is unverifiable for {parent_label} "
-                f"requirement {edge.required_mod_id} {edge.version_range}"
-            )
-        if not accepted:
-            if edge.child_identity == selected_identity:
-                raise HuroshikiError(
-                    f"Exact dependency selection conflict: {parent_label} requires "
-                    f"{edge.required_mod_id} {edge.version_range}, selected {version}"
-                )
-            raise HuroshikiError(
-                f"Exact dependency graph conflict: {parent_label} requires "
-                f"{edge.required_mod_id} {edge.version_range}, found {version}"
-            )
     return ExactDependencyGraph(
         tuple(sorted(bindings.items())),
         tuple(sorted(edges, key=lambda item: (
@@ -6288,11 +6254,123 @@ def _build_exact_dependency_graph(
             item.required_mod_id,
             item.version_range,
         ))),
-        frozenset(selected_roots),
+        tuple(
+            (identity, frozenset(roots))
+            for identity, roots in sorted(reached_by.items())
+        ),
     )
 
 
+
+def _validate_exact_runtime_compatibility(
+    verification: ExactArtifactVerification,
+    *,
+    minecraft: str,
+    loader: str,
+    loader_version: str,
+) -> None:
+    requirements = verification.dependency_requirements
+    if requirements is None:
+        raise HuroshikiError(
+            f"Exact dependency graph evidence is unavailable for "
+            f"{verification.identity[0]}:{verification.identity[1]}"
+        )
+    loader_id = loader.strip().lower()
+    runtime_versions = {"minecraft": minecraft}
+    if loader_id == "fabric":
+        runtime_versions["fabricloader"] = loader_version
+    elif loader_id == "quilt":
+        runtime_versions["quilt_loader"] = loader_version
+    elif loader_id in {"forge", "neoforge"}:
+        runtime_versions[loader_id] = loader_version
+
+    for requirement in requirements:
+        if requirement.mod_id not in _EXACT_RUNTIME_MOD_IDS:
+            continue
+        if requirement.mod_id == "java":
+            continue
+        version = runtime_versions.get(requirement.mod_id)
+        if version is None:
+            raise HuroshikiError(
+                f"Exact runtime requirement {requirement.mod_id} does not match "
+                f"the fixed Pack loader {loader_id}"
+            )
+        accepted = version_satisfies_requirement(version, requirement.version_range)
+        label = f"{verification.identity[0]}:{verification.identity[1]}"
+        if accepted is None:
+            raise HuroshikiError(
+                f"Exact runtime compatibility is unverifiable for {label}: "
+                f"{requirement.mod_id} {requirement.version_range}"
+            )
+        if not accepted:
+            raise HuroshikiError(
+                f"Exact runtime compatibility conflict: {label} requires "
+                f"{requirement.mod_id} {requirement.version_range}, fixed {version}"
+            )
+
+
+def _validate_exact_dependency_graph(
+    graph: ExactDependencyGraph,
+    verifications: Sequence[ExactArtifactVerification],
+    *,
+    minecraft: str,
+    loader: str,
+    loader_version: str,
+    checkpoint: Callable[[], None],
+) -> None:
+    artifacts = {item.identity: item for item in verifications}
+    reachable = {identity for identity, _roots in graph.root_reachability}
+    for identity in sorted(reachable):
+        checkpoint()
+        verification = artifacts[identity]
+        _validate_exact_runtime_compatibility(
+            verification,
+            minecraft=minecraft,
+            loader=loader,
+            loader_version=loader_version,
+        )
+    for edge in graph.edges:
+        checkpoint()
+        if edge.parent_identity not in reachable:
+            continue
+        child = artifacts[edge.child_identity]
+        version = dict(child.semantic_identity.members)[edge.required_mod_id]
+        accepted = version_satisfies_requirement(version, edge.version_range)
+        parent_label = f"{edge.parent_identity[0]}:{edge.parent_identity[1]}"
+        if accepted is None:
+            raise HuroshikiError(
+                f"Exact dependency graph compatibility is unverifiable for {parent_label} "
+                f"requirement {edge.required_mod_id} {edge.version_range}"
+            )
+        if not accepted:
+            raise HuroshikiError(
+                f"Exact dependency graph conflict: {parent_label} requires "
+                f"{edge.required_mod_id} {edge.version_range}, found {version}"
+            )
+
+
+def _assert_exact_selected_dependency_reachability(
+    graph: ExactDependencyGraph,
+    selected_identity: tuple[str, str],
+    expected_selected_roots: set[tuple[str, str]],
+) -> None:
+    selected_roots = graph.reachable_roots(selected_identity)
+    if selected_roots != expected_selected_roots:
+        raise HuroshikiError(
+            "Exact dependency required-edge reachability changed: "
+            f"expected={sorted(expected_selected_roots)}, actual={sorted(selected_roots)}"
+        )
+    reachable = {identity for identity, _roots in graph.root_reachability}
+    if not any(
+        edge.child_identity == selected_identity and edge.parent_identity in reachable
+        for edge in graph.edges
+    ):
+        raise HuroshikiError(
+            f"Exact dependency {selected_identity[0]}:{selected_identity[1]} has no "
+            "reachable machine-readable required edge"
+        )
 def _exact_verification_digest(
+
     verifications: Sequence[ExactArtifactVerification],
 ) -> str:
     payload = [

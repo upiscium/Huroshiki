@@ -17,6 +17,7 @@ from dependency_equivalence import (
     SemanticJarIdentity,
     declared_download_hash,
     parse_loader_dependency_requirements,
+    parse_semantic_jar,
     select_winner,
     version_satisfies_requirement,
     verify_equivalence,
@@ -244,6 +245,52 @@ class DependencyEquivalenceTest(unittest.TestCase):
                 parse_loader_dependency_requirements(neoforge, "neoforge"),
                 (LoaderDependencyRequirement("dependency", "[2.0,3.0)"),),
             )
+
+    def test_quilt_semantic_and_required_dependency_requirements_are_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "quilt.jar"
+            with zipfile.ZipFile(artifact, "w") as jar:
+                jar.writestr(
+                    "quilt.mod.json",
+                    json.dumps(
+                        {
+                            "quilt_loader": {
+                                "id": "owner",
+                                "version": "1.0",
+                                "depends": [
+                                    {"id": "dependency", "versions": ">=2"},
+                                    {"id": "minecraft", "versions": ">=1.21"},
+                                    {"id": "quilt_loader", "versions": ">=0.26"},
+                                    {
+                                        "id": "optional-mod",
+                                        "versions": ">=1",
+                                        "optional": True,
+                                    },
+                                ],
+                            }
+                        }
+                    ),
+                )
+
+            self.assertEqual(
+                parse_semantic_jar(artifact, "quilt"),
+                SemanticJarIdentity((("owner", "1.0"),), "quilt"),
+            )
+            self.assertEqual(
+                parse_loader_dependency_requirements(artifact, "quilt"),
+                (
+                    LoaderDependencyRequirement("dependency", ">=2"),
+                    LoaderDependencyRequirement("minecraft", ">=1.21"),
+                    LoaderDependencyRequirement("quilt_loader", ">=0.26"),
+                ),
+            )
+
+    def test_quilt_ambiguous_dependency_constraint_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "quilt.jar"
+            with zipfile.ZipFile(artifact, "w") as jar:
+                jar.writestr("quilt.mod.json", json.dumps({"quilt_loader": {"id": "owner", "version": "1", "depends": [{"id": "dependency", "versions": [">=2"]}]}}))
+            self.assertIsNone(parse_loader_dependency_requirements(artifact, "quilt"))
 
     def test_dependency_version_ranges_fail_closed_when_ambiguous(self) -> None:
         for requirement in (">=2.0 <3.0", "[2.0,3.0)"):

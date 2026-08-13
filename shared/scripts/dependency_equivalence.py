@@ -338,6 +338,7 @@ def parse_loader_dependency_requirements(
         "neoforge": "META-INF/neoforge.mods.toml",
         "forge": "META-INF/mods.toml",
         "fabric": "fabric.mod.json",
+        "quilt": "quilt.mod.json",
     }
     descriptor = descriptors.get(loader)
     if descriptor is None:
@@ -352,15 +353,46 @@ def parse_loader_dependency_requirements(
         if len(raw) > 1024 * 1024:
             return None
         requirements: list[LoaderDependencyRequirement] = []
-        if loader == "fabric":
+        if loader in {"fabric", "quilt"}:
             document = json.loads(raw.decode("utf-8"))
-            depends = document.get("depends") if isinstance(document, dict) else None
-            if not isinstance(depends, dict):
-                return ()
-            for mod_id, value in depends.items():
-                if not isinstance(mod_id, str) or not isinstance(value, str):
+            if not isinstance(document, dict):
+                return None
+            if loader == "fabric":
+                depends = document.get("depends")
+                if depends is None:
+                    return ()
+                if not isinstance(depends, dict):
                     return None
-                requirements.append(LoaderDependencyRequirement(mod_id, value))
+                for mod_id, value in depends.items():
+                    if not isinstance(mod_id, str) or not isinstance(value, str):
+                        return None
+                    requirements.append(LoaderDependencyRequirement(mod_id, value))
+            else:
+                quilt = document.get("quilt_loader")
+                if not isinstance(quilt, dict):
+                    return None
+                depends = quilt.get("depends")
+                if depends is None:
+                    return ()
+                if not isinstance(depends, list):
+                    return None
+                for record in depends:
+                    if not isinstance(record, dict):
+                        return None
+                    optional = record.get("optional", False)
+                    if not isinstance(optional, bool):
+                        return None
+                    if optional:
+                        continue
+                    if "unless" in record:
+                        return None
+                    mod_id = record.get("id")
+                    version_range = record.get("versions")
+                    if not isinstance(mod_id, str) or not isinstance(version_range, str):
+                        return None
+                    requirements.append(
+                        LoaderDependencyRequirement(mod_id, version_range)
+                    )
         else:
             document = tomllib.loads(raw.decode("utf-8"))
             dependencies = document.get("dependencies", {})
