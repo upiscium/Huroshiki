@@ -16,6 +16,78 @@ from dependency_equivalence import (
 )
 
 
+MR_PROJECT_IDS = {
+    "root": "ProjA001",
+    "root-a": "ProjA002",
+    "root-b": "ProjB002",
+    "root-c": "ProjC002",
+    "dependency": "Depen001",
+    "intermediate-b": "InterB01",
+    "intermediate-e": "InterE01",
+    "child": "Child001",
+    "replacement": "Repla001",
+    "introduced": "Intro001",
+    "missing": "Miss0001",
+    "staged": "Stage001",
+    "different-project": "DiffP001",
+    "sodium": "Sodium01",
+}
+MR_VERSION_IDS = {
+    "r1": "VersR001",
+    "r2": "VersR002",
+    "a1": "VersA001",
+    "a2": "VersA002",
+    "b1": "VersB001",
+    "c1": "VersC001",
+    "d1": "VersD001",
+    "d2": "VersD002",
+    "e1": "VersE001",
+    "e2": "VersE002",
+    "x1": "VersX001",
+    "x2": "VersX002",
+    "v1": "VersV001",
+    "v2": "VersV002",
+    "s1": "StageV01",
+    "old-artifact": "OldVer01",
+    "different-version": "DiffV001",
+    "tampered": "Tamper01",
+    "dependency-artifact": "DepArt01",
+    "dependency-new": "DepNew01",
+}
+
+
+def mr_project(value: str) -> str:
+    return MR_PROJECT_IDS.get(value, value)
+
+
+def mr_version(value: str) -> str:
+    return MR_VERSION_IDS.get(value, value)
+
+
+def mr_project_key(value: str) -> str:
+    return next((key for key, item in MR_PROJECT_IDS.items() if item == value), value)
+
+
+def mr_version_key(value: str) -> str:
+    return next((key for key, item in MR_VERSION_IDS.items() if item == value), value)
+
+
+def branded_project(key: str) -> core.CanonicalModrinthId:
+    return core.canonical_modrinth_id(MR_PROJECT_IDS[key])
+
+
+def selection_fixture_key(selection) -> tuple[str, str, str]:
+    return (
+        selection.provider,
+        mr_project_key(selection.project_id),
+        mr_version_key(selection.artifact_id),
+    )
+
+
+def branded_version(key: str) -> core.CanonicalModrinthId:
+    return core.canonical_modrinth_id(MR_VERSION_IDS[key])
+
+
 class ExactModVersionSelectionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -75,12 +147,15 @@ class ExactModVersionSelectionTest(unittest.TestCase):
     @staticmethod
     def selection(
         provider: str,
-        project_id: str,
-        artifact_id: str,
+        project_id: str | core.CanonicalModrinthId,
+        artifact_id: str | core.CanonicalModrinthId,
     ) -> core.ExactModArtifactSelection:
         if provider == "modrinth":
-            project_id = core.canonical_modrinth_id(project_id)
-            artifact_id = core.canonical_modrinth_id(artifact_id)
+            if (
+                type(project_id) is not core.CanonicalModrinthId
+                or type(artifact_id) is not core.CanonicalModrinthId
+            ):
+                raise AssertionError("Modrinth test selections require branded opaque IDs")
         return core.ExactModArtifactSelection(provider, project_id, artifact_id)
 
     def tearDown(self) -> None:
@@ -100,6 +175,8 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         filename = filename or f"{project_id}.jar"
         digest = "a" * 64
         if provider == "modrinth":
+            project_id = mr_project(project_id)
+            artifact_id = mr_version(artifact_id)
             update = (
                 "[update.modrinth]\n"
                 f'mod-id = "{project_id}"\n'
@@ -207,9 +284,11 @@ class ExactModVersionSelectionTest(unittest.TestCase):
     def materialize(self, candidate, *_args, **_kwargs):
         _provider, project_id = candidate.provider_identity.split(":", 1)
         document = candidate.contents.decode("utf-8")
+        project_id = mr_project_key(project_id)
         artifact_id = core.parse_provider_metadata(
             Path(candidate.relative_metadata_path), candidate.contents
         ).file_id
+        artifact_id = mr_version_key(artifact_id or "")
         version = (
             "1.0"
             if artifact_id in {"1", "d1", "old-artifact", "987655"}
@@ -246,7 +325,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             (
                 core.PackRootRecord(
                     provider,
-                    project_id,
+                    mr_project(project_id) if provider == "modrinth" else project_id,
                     "server",
                 ),
             ),
@@ -271,12 +350,12 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             filename=filename,
         ).encode()
         return core.ResolvedMetadata(
-            ("modrinth", project_id),
+            ("modrinth", mr_project(project_id)),
             relative,
             filename,
             contents,
             "modrinth",
-            project_id,
+            mr_project(project_id),
         )
 
     def resolved_dependency_metadata(
@@ -311,7 +390,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         core.write_pack_root_manifest(
             self.source,
             tuple(
-                core.PackRootRecord("modrinth", project_id, side)
+                core.PackRootRecord("modrinth", mr_project(project_id), side)
                 for project_id, _artifact_id, side in roots
             ),
         )
@@ -342,7 +421,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         core.write_pack_root_manifest(
             self.source,
             (
-                core.PackRootRecord("modrinth", "root", "both"),
+                core.PackRootRecord("modrinth", mr_project("root"), "both"),
                 core.PackRootRecord("url", "url-mod", "client"),
             ),
         )
@@ -360,7 +439,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             for project_id, artifact_id in dependencies
         )
         return core.ResolvedModClosure(
-            ("modrinth", root_project),
+            ("modrinth", mr_project(root_project)),
             tuple(records),
         )
 
@@ -374,10 +453,12 @@ class ExactModVersionSelectionTest(unittest.TestCase):
 
         def materialize(candidate, *_args, **_kwargs):
             _provider, project_id = candidate.provider_identity.split(":", 1)
+            project_id = mr_project_key(project_id)
             artifact_id = core.parse_provider_metadata(
                 Path(candidate.relative_metadata_path), candidate.contents
             ).file_id
             assert artifact_id is not None
+            artifact_id = mr_version_key(artifact_id)
             semantic_members = members.get(
                 artifact_id,
                 ((project_id, versions.get(artifact_id, "1.0")),),
@@ -407,7 +488,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         dependency_artifact: str,
     ) -> core.ResolvedModClosure:
         return core.ResolvedModClosure(
-            ("modrinth", root_project),
+            ("modrinth", mr_project(root_project)),
             (
                 self.resolved_metadata(root_project, root_artifact),
                 self.resolved_dependency_metadata(
@@ -419,7 +500,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
     def test_selection_validation_and_commands(self) -> None:
         self.assertEqual(
             core.build_exact_artifact_command(
-                self.selection("modrinth", "sodium", "v1")
+                self.selection("modrinth", branded_project("sodium"), branded_version("v1"))
             ),
             [
                 "packwiz",
@@ -427,9 +508,9 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 "modrinth",
                 "add",
                 "--project-id",
-                "sodium",
+                MR_PROJECT_IDS["sodium"],
                 "--version-id",
-                "v1",
+                MR_VERSION_IDS["v1"],
             ],
         )
         self.assertEqual(
@@ -451,8 +532,6 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ("curseforge", "0", "1"),
             ("curseforge", "01", "1"),
             ("curseforge", "1", "01"),
-            ("modrinth", " sodium", "v1"),
-            ("modrinth", "sodium", "v 1"),
         ):
             with self.subTest(provider=provider, project_id=project_id):
                 with self.assertRaises(core.HuroshikiError):
@@ -473,15 +552,15 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 core.ExactModArtifactSelection("modrinth", "sodium-extra", "release-1")
         lookup.assert_not_called()
 
-        canonical_project = core.canonical_modrinth_id("sodium-extra")
-        canonical_version = core.canonical_modrinth_id("release-1")
+        canonical_project = core.canonical_modrinth_id("A1b2C3d4")
+        canonical_version = core.canonical_modrinth_id("E5f6G7h8")
         selection = core.ExactModArtifactSelection(
             "modrinth", canonical_project, canonical_version
         )
         self.assertIs(type(selection.project_id), core.CanonicalModrinthId)
         self.assertEqual(
             core.build_exact_artifact_command(selection)[-4:],
-            ["--project-id", "sodium-extra", "--version-id", "release-1"],
+            ["--project-id", "A1b2C3d4", "--version-id", "E5f6G7h8"],
         )
 
     def test_invalid_exact_ids_are_rejected_before_any_resolver_process(self) -> None:
@@ -512,19 +591,33 @@ class ExactModVersionSelectionTest(unittest.TestCase):
 
         invalid_modrinth = (
             "",
-            " ",
-            "\tcanonical",
-            "canonical\n",
-            "canonical\x00",
-            "x" * 129,
-            "https://modrinth.com/mod/canonical",
-            "Display Name",
+            "sodium",
+            "sodium-extra",
+            "release-1",
+            "1.20.1",
+            "Abc1234",
+            "Abcd12345",
+            "Abcd-123",
+            "Abcd_123",
+            "Abcd.123",
+            "Abcd 123",
+            "Abcd123\n",
+            "Abcd12\x00",
+            "https://modrinth.com/mod/sodium",
         )
         with patch.object(core, "run_resolver_process") as resolver:
             for value in invalid_modrinth:
                 with self.subTest(value=value):
                     with self.assertRaises(core.HuroshikiError):
                         core.canonical_modrinth_id(value)
+                    with self.assertRaises(core.HuroshikiError):
+                        core.ExactModArtifactSelection(
+                            "modrinth", value, branded_version("v1")
+                        )
+                    with self.assertRaises(core.HuroshikiError):
+                        core.ExactModArtifactSelection(
+                            "modrinth", branded_project("root"), value
+                        )
                     with self.assertRaises(core.HuroshikiError):
                         core.ExactModArtifactSelection("modrinth", value, "v1")
                     with self.assertRaises(core.HuroshikiError):
@@ -584,7 +677,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             with patch.object(core, "resolve_exact_mod_closure") as resolver:
                 with self.assertRaisesRegex(core.HuroshikiError, "not installed"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "missing", "v2")
+                        self.selection("modrinth", branded_project("missing"), branded_version("v2"))
                     )
                 resolver.assert_not_called()
         finally:
@@ -599,7 +692,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             with patch.object(core, "resolve_exact_mod_closure") as resolver:
                 with self.assertRaisesRegex(core.HuroshikiError, "duplicate identity"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root", "v2")
+                        self.selection("modrinth", branded_project("root"), branded_version("v2"))
                     )
                 resolver.assert_not_called()
         finally:
@@ -615,7 +708,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         }
 
         def resolve(selection, **_):
-            return closures[(selection.provider, selection.project_id, selection.artifact_id)]
+            return closures[selection_fixture_key(selection)]
 
         try:
             materialize = self.dependency_graph_materializer({"root": ()}, {})
@@ -623,10 +716,10 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 core, "materialize_provider_artifact", side_effect=materialize
             ):
                 preview = transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "root", "r2")
+                    self.selection("modrinth", branded_project("root"), branded_version("r2"))
                 )
             self.assertEqual(preview.removed_dependencies, 1)
-            self.assertEqual(preview.removed_dependency_identities, ("modrinth:dependency",))
+            self.assertEqual(preview.removed_dependency_identities, (f"modrinth:{mr_project("dependency")}",))
             self.assertFalse(
                 transaction.source.joinpath("mods/dependency.pw.toml").exists()
             )
@@ -646,12 +739,12 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 core, "materialize_provider_artifact", side_effect=materialize
             ):
                 preview = transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "root", "r2")
+                    self.selection("modrinth", branded_project("root"), branded_version("r2"))
                 )
             self.assertEqual(preview.added_dependencies, 1)
-            self.assertEqual(preview.added_dependency_identities, ("modrinth:dependency",))
+            self.assertEqual(preview.added_dependency_identities, (f"modrinth:{mr_project("dependency")}",))
             self.assertIn(
-                'version = "d1"',
+                f'version = "{mr_version("d1")}"',
                 transaction.source.joinpath("mods/dependency.pw.toml").read_text(),
             )
             self.assertTrue(any(change.relative_path == Path("mods/dependency.pw.toml") for change in preview.changes))
@@ -667,14 +760,14 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         try:
             with patch.object(core, "resolve_exact_mod_closure", return_value=closure):
                 preview = transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "root", "r2")
+                    self.selection("modrinth", branded_project("root"), branded_version("r2"))
                 )
             self.assertEqual(preview.added_dependencies, 0)
             self.assertEqual(preview.removed_dependencies, 0)
             self.assertEqual(preview.added_dependency_identities, ())
             self.assertEqual(preview.removed_dependency_identities, ())
             self.assertIn(
-                'version = "d2"',
+                f'version = "{mr_version("d2")}"',
                 transaction.source.joinpath("mods/dependency.pw.toml").read_text(),
             )
         finally:
@@ -704,11 +797,11 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(core.HuroshikiError, "exact resolver failed"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "introduced", "x2")
+                        self.selection("modrinth", branded_project("introduced"), branded_version("x2"))
                     )
             self.assertEqual(core.tree_digest_snapshot(transaction.source), before_exact)
             self.assertIn(
-                'version = "x1"',
+                f'version = "{mr_version("x1")}"',
                 transaction.source.joinpath("mods/introduced.pw.toml").read_text(),
             )
         finally:
@@ -723,14 +816,14 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         cases = (
             (
                 core.ResolvedMetadata(
-                    ("modrinth", "dependency"),
+                    ("modrinth", mr_project("dependency")),
                     root.relative_path,
                     "dependency.jar",
                     self.metadata(
                         "modrinth", "dependency", "d1", filename="dependency.jar"
                     ).encode(),
                     "modrinth",
-                    "dependency",
+                    mr_project("dependency"),
                 ),
                 "collision",
             ),
@@ -744,14 +837,14 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             for dependency, message in cases:
                 with self.subTest(message=message):
                     closure = core.ResolvedModClosure(
-                        ("modrinth", "root"), (root, dependency)
+                        ("modrinth", mr_project("root")), (root, dependency)
                     )
                     with patch.object(
                         core, "resolve_exact_mod_closure", return_value=closure
                     ):
                         with self.assertRaisesRegex(core.HuroshikiError, message):
                             transaction.prepare_exact_mod_version(
-                                self.selection("modrinth", "root", "r2")
+                                self.selection("modrinth", branded_project("root"), branded_version("r2"))
                             )
                     self.assertEqual(core.tree_digest_snapshot(transaction.source), before)
         finally:
@@ -770,12 +863,12 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         }
 
         def resolve(selection, **_):
-            return closures[(selection.provider, selection.project_id, selection.artifact_id)]
+            return closures[selection_fixture_key(selection)]
 
         try:
             with patch.object(core, "resolve_exact_mod_closure", side_effect=resolve):
                 preview = transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "root-a", "a2")
+                    self.selection("modrinth", branded_project("root-a"), branded_version("a2"))
                 )
             self.assertEqual(preview.removed_dependencies, 0)
             self.assertEqual(preview.removed_dependency_identities, ())
@@ -792,7 +885,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         )
         try:
             def resolve(selection, **_):
-                if selection.identity == ("modrinth", "root-a"):
+                if selection.identity == ("modrinth", mr_project("root-a")):
                     return self.graph_closure_with_dependency_side(
                         "root-a", "a2", "client", "root-b"
                     )
@@ -800,7 +893,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
 
             with patch.object(core, "resolve_exact_mod_closure", side_effect=resolve):
                 transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "root-a", "a2")
+                    self.selection("modrinth", branded_project("root-a"), branded_version("a2"))
                 )
             self.assertIn(
                 'side = "server"',
@@ -830,13 +923,13 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         }
 
         def resolve(selection, **_):
-            return closures[(selection.provider, selection.project_id, selection.artifact_id)]
+            return closures[selection_fixture_key(selection)]
 
         try:
             with patch.object(core, "resolve_exact_mod_closure", side_effect=resolve):
                 with self.assertRaisesRegex(core.HuroshikiError, "disagreement"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root-a", "a2")
+                        self.selection("modrinth", branded_project("root-a"), branded_version("a2"))
                     )
             self.assertEqual(core.tree_digest_snapshot(transaction.source), before)
             self.assertEqual(core.tree_digest_snapshot(self.source), real_before)
@@ -858,16 +951,16 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         }
 
         def resolve(selection, **_):
-            return closures[(selection.provider, selection.project_id, selection.artifact_id)]
+            return closures[selection_fixture_key(selection)]
 
         try:
             with patch.object(core, "resolve_exact_mod_closure", side_effect=resolve):
                 with self.assertRaisesRegex(core.HuroshikiError, "expected"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "dependency", "d2")
+                        self.selection("modrinth", branded_project("dependency"), branded_version("d2"))
                     )
             self.assertIn(
-                'version = "d1"',
+                f'version = "{mr_version("d1")}"',
                 transaction.source.joinpath("mods/dependency.pw.toml").read_text(),
             )
         finally:
@@ -884,10 +977,10 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         def resolve(selection, **_):
             identity = selection.identity
             calls[identity] = calls.get(identity, 0) + 1
-            if identity == ("modrinth", "root-a"):
+            if identity == ("modrinth", mr_project("root-a")):
                 artifact = "d2" if calls[identity] == 2 else "d1"
                 return self.graph_closure("root-a", "a1", ("dependency", artifact))
-            if identity == ("modrinth", "root-b"):
+            if identity == ("modrinth", mr_project("root-b")):
                 return self.graph_closure("root-b", "b1", ("dependency", "d1"))
             raise AssertionError(identity)
 
@@ -898,7 +991,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                     "ownership|selection conflict|Shared dependency disagreement",
                 ):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "dependency", "d2")
+                        self.selection("modrinth", branded_project("dependency"), branded_version("d2"))
                     )
             self.assertEqual(core._file_content_snapshot(transaction.source), before)
         finally:
@@ -920,13 +1013,13 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         }
 
         def resolve(selection, **_):
-            return closures[(selection.provider, selection.project_id, selection.artifact_id)]
+            return closures[selection_fixture_key(selection)]
 
         try:
             with patch.object(core, "resolve_exact_mod_closure", side_effect=resolve):
                 with self.assertRaisesRegex(core.HuroshikiError, "disagreement"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root-a", "a2")
+                        self.selection("modrinth", branded_project("root-a"), branded_version("a2"))
                     )
             self.assertEqual(core._file_content_snapshot(transaction.source), before)
         finally:
@@ -947,15 +1040,15 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         }
 
         def resolve(selection, **_):
-            return closures[(selection.provider, selection.project_id, selection.artifact_id)]
+            return closures[selection_fixture_key(selection)]
 
         try:
             with patch.object(core, "resolve_exact_mod_closure", side_effect=resolve):
                 preview = transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "dependency", "d2")
+                    self.selection("modrinth", branded_project("dependency"), branded_version("d2"))
                 )
-            self.assertEqual(preview.old_artifact_id, "d1")
-            self.assertEqual(preview.new_artifact_id, "d2")
+            self.assertEqual(preview.old_artifact_id, mr_version("d1"))
+            self.assertEqual(preview.new_artifact_id, mr_version("d2"))
             self.assertEqual(preview.removed_dependencies, 0)
             self.assertEqual(preview.added_dependencies, 0)
         finally:
@@ -982,15 +1075,15 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 ):
                     if succeeds:
                         preview = transaction.prepare_exact_mod_version(
-                            self.selection("modrinth", "root-a", "a2")
+                            self.selection("modrinth", branded_project("root-a"), branded_version("a2"))
                         )
-                        self.assertEqual(preview.new_artifact_id, "a2")
+                        self.assertEqual(preview.new_artifact_id, mr_version("a2"))
                     else:
                         with self.assertRaisesRegex(
                             core.HuroshikiError, "graph conflict"
                         ):
                             transaction.prepare_exact_mod_version(
-                                self.selection("modrinth", "root-a", "a2")
+                                self.selection("modrinth", branded_project("root-a"), branded_version("a2"))
                             )
                         self.assertEqual(
                             core._file_content_snapshot(transaction.source), before
@@ -1028,15 +1121,15 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 ):
                     if succeeds:
                         preview = transaction.prepare_exact_mod_version(
-                            self.selection("modrinth", "dependency", "d2")
+                            self.selection("modrinth", branded_project("dependency"), branded_version("d2"))
                         )
-                        self.assertEqual(preview.new_artifact_id, "d2")
+                        self.assertEqual(preview.new_artifact_id, mr_version("d2"))
                     else:
                         with self.assertRaisesRegex(
                             core.HuroshikiError, "graph conflict"
                         ):
                             transaction.prepare_exact_mod_version(
-                                self.selection("modrinth", "dependency", "d2")
+                                self.selection("modrinth", branded_project("dependency"), branded_version("d2"))
                             )
             finally:
                 transaction.discard()
@@ -1060,14 +1153,14 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 ):
                     if succeeds:
                         transaction.prepare_exact_mod_version(
-                            self.selection("modrinth", "root-a", "a2")
+                            self.selection("modrinth", branded_project("root-a"), branded_version("a2"))
                         )
                     else:
                         with self.assertRaisesRegex(
                             core.HuroshikiError, "runtime compatibility conflict"
                         ):
                             transaction.prepare_exact_mod_version(
-                                self.selection("modrinth", "root-a", "a2")
+                                self.selection("modrinth", branded_project("root-a"), branded_version("a2"))
                             )
             finally:
                 transaction.discard()
@@ -1092,7 +1185,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                     core.HuroshikiError, "runtime compatibility conflict"
                 ):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root-a", "a2")
+                        self.selection("modrinth", branded_project("root-a"), branded_version("a2"))
                     )
         finally:
             transaction.discard()
@@ -1110,9 +1203,11 @@ class ExactModVersionSelectionTest(unittest.TestCase):
 
         def materialize(candidate, *_args, **_kwargs):
             _provider, project_id = candidate.provider_identity.split(":", 1)
+            project_id = mr_project_key(project_id)
             artifact_id = core.parse_provider_metadata(
                 Path(candidate.relative_metadata_path), candidate.contents
             ).file_id
+            artifact_id = mr_version_key(artifact_id or "")
             version = "2.0" if artifact_id == "d2" else "1.0"
             requirements = (
                 (
@@ -1138,7 +1233,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                     core.HuroshikiError, "runtime compatibility conflict"
                 ):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root-a", "a2")
+                        self.selection("modrinth", branded_project("root-a"), branded_version("a2"))
                     )
         finally:
             transaction.discard()
@@ -1156,9 +1251,11 @@ class ExactModVersionSelectionTest(unittest.TestCase):
 
         def materialize(candidate, *_args, **_kwargs):
             _provider, project_id = candidate.provider_identity.split(":", 1)
+            project_id = mr_project_key(project_id)
             artifact_id = core.parse_provider_metadata(
                 Path(candidate.relative_metadata_path), candidate.contents
             ).file_id
+            artifact_id = mr_version_key(artifact_id or "")
             version = "2.0" if artifact_id == "d2" else "1.0"
             requirements = (
                 (
@@ -1182,7 +1279,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(core.HuroshikiError, "graph conflict"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root-a", "a2")
+                        self.selection("modrinth", branded_project("root-a"), branded_version("a2"))
                     )
         finally:
             transaction.discard()
@@ -1212,9 +1309,9 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 core, "materialize_provider_artifact", side_effect=materialize
             ):
                 preview = transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "dependency", "d2")
+                    self.selection("modrinth", branded_project("dependency"), branded_version("d2"))
                 )
-            self.assertEqual(preview.new_artifact_id, "d2")
+            self.assertEqual(preview.new_artifact_id, mr_version("d2"))
         finally:
             transaction.discard()
 
@@ -1244,7 +1341,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(core.HuroshikiError, "graph conflict"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "dependency", "d2")
+                        self.selection("modrinth", branded_project("dependency"), branded_version("d2"))
                     )
             self.assertEqual(core._file_content_snapshot(transaction.source), before)
             self.assertEqual(core._file_content_snapshot(self.source), real_before)
@@ -1280,7 +1377,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             )
 
             def resolve(selection, **_kwargs):
-                return closures[selection.project_id]
+                return closures[mr_project_key(selection.project_id)]
 
             try:
                 with patch.object(
@@ -1290,15 +1387,15 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 ):
                     if succeeds:
                         preview = transaction.prepare_exact_mod_version(
-                            self.selection("modrinth", "dependency", "d2")
+                            self.selection("modrinth", branded_project("dependency"), branded_version("d2"))
                         )
-                        self.assertEqual(preview.new_artifact_id, "d2")
+                        self.assertEqual(preview.new_artifact_id, mr_version("d2"))
                     else:
                         with self.assertRaisesRegex(
                             core.HuroshikiError, "graph conflict"
                         ):
                             transaction.prepare_exact_mod_version(
-                                self.selection("modrinth", "dependency", "d2")
+                                self.selection("modrinth", branded_project("dependency"), branded_version("d2"))
                             )
             finally:
                 transaction.discard()
@@ -1327,7 +1424,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                     core.HuroshikiError, "required-edge reachability"
                 ):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "dependency", "d2")
+                        self.selection("modrinth", branded_project("dependency"), branded_version("d2"))
                     )
         finally:
             transaction.discard()
@@ -1356,7 +1453,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(core.HuroshikiError, "evidence is unavailable"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "dependency", "d2")
+                        self.selection("modrinth", branded_project("dependency"), branded_version("d2"))
                     )
         finally:
             transaction.discard()
@@ -1383,9 +1480,9 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 core, "materialize_provider_artifact", side_effect=materialize
             ):
                 preview = transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "dependency", "d2")
+                    self.selection("modrinth", branded_project("dependency"), branded_version("d2"))
                 )
-            self.assertEqual(preview.new_artifact_id, "d2")
+            self.assertEqual(preview.new_artifact_id, mr_version("d2"))
         finally:
             transaction.discard()
 
@@ -1398,9 +1495,11 @@ class ExactModVersionSelectionTest(unittest.TestCase):
 
         def materialize(candidate, *_args, **_kwargs):
             _provider, project_id = candidate.provider_identity.split(":", 1)
+            project_id = mr_project_key(project_id)
             artifact_id = core.parse_provider_metadata(
                 Path(candidate.relative_metadata_path), candidate.contents
             ).file_id
+            artifact_id = mr_version_key(artifact_id or "")
             version = "2.0" if artifact_id == "d2" else "1.0"
             requirements = (
                 (LoaderDependencyRequirement("dependency", "<2.0"),)
@@ -1421,7 +1520,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(core.HuroshikiError, "graph conflict"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "dependency", "d2")
+                        self.selection("modrinth", branded_project("dependency"), branded_version("d2"))
                     )
         finally:
             transaction.discard()
@@ -1434,10 +1533,12 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         closure = self.graph_closure("root", "r2", ("dependency", "d2"))
 
         def materialize(candidate, *_args, **_kwargs):
+            candidate_project_id = mr_project_key(candidate.provider_identity.split(":", 1)[1])
             artifact_id = core.parse_provider_metadata(
                 Path(candidate.relative_metadata_path), candidate.contents
             ).file_id
-            project_id = candidate.provider_identity.split(":", 1)[1]
+            artifact_id = mr_version_key(artifact_id or "")
+            project_id = candidate_project_id
             mod_id = (
                 "other"
                 if project_id == "dependency" and artifact_id == "d2"
@@ -1457,7 +1558,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(core.HuroshikiError, "semantic MOD identity"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root", "r2")
+                        self.selection("modrinth", branded_project("root"), branded_version("r2"))
                     )
         finally:
             transaction.discard()
@@ -1470,10 +1571,11 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         closure = self.graph_closure("root", "r2", ("dependency", "d2"))
 
         def materialize(candidate, *_args, **_kwargs):
+            project_id = mr_project_key(candidate.provider_identity.split(":", 1)[1])
             artifact_id = core.parse_provider_metadata(
                 Path(candidate.relative_metadata_path), candidate.contents
             ).file_id
-            project_id = candidate.provider_identity.split(":", 1)[1]
+            artifact_id = mr_version_key(artifact_id or "")
             if project_id == "dependency":
                 members = (
                     (("d", "2.0"), ("other", "2.0"))
@@ -1495,7 +1597,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(core.HuroshikiError, "semantic MOD identity"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root", "r2")
+                        self.selection("modrinth", branded_project("root"), branded_version("r2"))
                     )
         finally:
             transaction.discard()
@@ -1523,7 +1625,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(core.HuroshikiError, "refresh"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root", "r2")
+                        self.selection("modrinth", branded_project("root"), branded_version("r2"))
                     )
             self.assertEqual(core._file_content_snapshot(transaction.source), before)
             self.assertTrue(
@@ -1553,7 +1655,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 ),
             ):
                 transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "root", "r2")
+                    self.selection("modrinth", branded_project("root"), branded_version("r2"))
                 )
             self.assertIn(
                 'side = "both"',
@@ -1580,7 +1682,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 ),
             ):
                 transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "root", "r2")
+                    self.selection("modrinth", branded_project("root"), branded_version("r2"))
                 )
             self.assertIn(
                 'side = "both"',
@@ -1603,7 +1705,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 ),
             ):
                 transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "root", "r2")
+                    self.selection("modrinth", branded_project("root"), branded_version("r2"))
                 )
             self.assertIn(
                 'side = "client"',
@@ -1624,11 +1726,11 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(core.HuroshikiError, "no resolved"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root", "v2")
+                        self.selection("modrinth", branded_project("root"), branded_version("v2"))
                     )
             self.assertEqual(core.tree_digest_snapshot(transaction.source), before)
             self.assertIn(
-                'version = "old-artifact"',
+                f'version = "{mr_version("old-artifact")}"',
                 self.source.joinpath("mods/root.pw.toml").read_text(),
             )
         finally:
@@ -1645,7 +1747,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                     SemanticJarIdentity(
                         ((
                             "different-mod"
-                            if 'version = "v2"' in candidate.contents.decode("utf-8")
+                            if f'version = "{mr_version("v2")}"' in candidate.contents.decode("utf-8")
                             else "root",
                             "2.0",
                         ),),
@@ -1655,7 +1757,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(core.HuroshikiError, "identity changed"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root", "v2")
+                        self.selection("modrinth", branded_project("root"), branded_version("v2"))
                     )
         finally:
             transaction.discard()
@@ -1676,9 +1778,9 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 ),
             ):
                 preview = transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "root", "v2")
+                    self.selection("modrinth", branded_project("root"), branded_version("v2"))
                 )
-            self.assertEqual(preview.new_artifact_id, "v2")
+            self.assertEqual(preview.new_artifact_id, mr_version("v2"))
         finally:
             transaction.discard()
 
@@ -1698,9 +1800,9 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 core, "materialize_provider_artifact", side_effect=materialize
             ):
                 preview = transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "root", "r2")
+                    self.selection("modrinth", branded_project("root"), branded_version("r2"))
                 )
-            self.assertEqual(preview.new_artifact_id, "r2")
+            self.assertEqual(preview.new_artifact_id, mr_version("r2"))
             self.assertEqual(
                 transaction.source.joinpath(url_relative).read_bytes(), url_contents
             )
@@ -1739,7 +1841,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(core.HuroshikiError, "opaque URL root"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root", "r2")
+                        self.selection("modrinth", branded_project("root"), branded_version("r2"))
                     )
         finally:
             transaction.discard()
@@ -1757,7 +1859,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(core.HuroshikiError, "incompatible loader"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root", "v2")
+                        self.selection("modrinth", branded_project("root"), branded_version("v2"))
                     )
         finally:
             transaction.discard()
@@ -1800,7 +1902,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                     ),
                 ):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root", "r2")
+                        self.selection("modrinth", branded_project("root"), branded_version("r2"))
                     )
         finally:
             transaction.discard()
@@ -1816,7 +1918,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         )
 
         def resolve(selection, **_):
-            if selection.identity == ("modrinth", "root"):
+            if selection.identity == ("modrinth", mr_project("root")):
                 return self.graph_closure_with_dependency_side(
                     "root", "r1", "both", "d2"
                 )
@@ -1827,7 +1929,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         try:
             with patch.object(core, "resolve_exact_mod_closure", side_effect=resolve):
                 transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "dependency", "d2")
+                    self.selection("modrinth", branded_project("dependency"), branded_version("d2"))
                 )
             self.assertIn(
                 'side = "client"',
@@ -1847,7 +1949,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         try:
             with self.assertRaisesRegex(core.HuroshikiError, "authoritative root provenance"):
                 transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "root", "v2")
+                    self.selection("modrinth", branded_project("root"), branded_version("v2"))
                 )
         finally:
             transaction.discard()
@@ -1870,7 +1972,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             with patch.object(core, "resolve_exact_mod_closure", side_effect=fail_resolve):
                 with self.assertRaisesRegex(core.HuroshikiError, "incompatible"):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root", "r2")
+                        self.selection("modrinth", branded_project("root"), branded_version("r2"))
                     )
             self.assertEqual(core.tree_digest_snapshot(transaction.source), before)
             self.assertTrue(staged.exists())
@@ -1896,11 +1998,11 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 core, "materialize_provider_artifact", side_effect=self.materialize
             ) as materialize:
                 preview = transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "root", "v2")
+                    self.selection("modrinth", branded_project("root"), branded_version("v2"))
                 )
-            self.assertEqual(preview.identity, "modrinth:root")
-            self.assertEqual(preview.old_artifact_id, "old-artifact")
-            self.assertEqual(preview.new_artifact_id, "v2")
+            self.assertEqual(preview.identity, f"modrinth:{mr_project("root")}")
+            self.assertEqual(preview.old_artifact_id, mr_version("old-artifact"))
+            self.assertEqual(preview.new_artifact_id, mr_version("v2"))
             self.assertEqual(preview.added_dependencies, 0)
             self.assertEqual(preview.removed_dependencies, 0)
             self.assertGreater(materialize.call_count, 0)
@@ -1913,9 +2015,9 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                         "modrinth",
                         "add",
                         "--project-id",
-                        "root",
+                        mr_project("root"),
                         "--version-id",
-                        "v2",
+                        mr_version("v2"),
                     ),
                     ("packwiz", "refresh"),
                     ("packwiz", "refresh"),
@@ -1930,12 +2032,12 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 transaction.source.joinpath("mods/root.pw.toml").read_text(),
             )
             self.assertIn(
-                'version = "old-artifact"',
+                f'version = "{mr_version("old-artifact")}"',
                 self.source.joinpath("mods/root.pw.toml").read_text(),
             )
             transaction.apply()
             self.assertIn(
-                'version = "v2"',
+                f'version = "{mr_version("v2")}"',
                 self.source.joinpath("mods/root.pw.toml").read_text(),
             )
             self.assertIn(
@@ -1948,7 +2050,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             )
             self.assertEqual(
                 core.read_pack_root_manifest(self.source),
-                (core.PackRootRecord("modrinth", "root", "server"),),
+                (core.PackRootRecord("modrinth", mr_project("root"), "server"),),
             )
             self.assertEqual(
                 (self.source / ".huroshiki-roots.json").read_bytes(),
@@ -2007,7 +2109,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                     core.HuroshikiError, "produced 0 roots|expected"
                 ):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root", "v2")
+                        self.selection("modrinth", branded_project("root"), branded_version("v2"))
                     )
             self.assertEqual(core.tree_digest_snapshot(transaction.source), before)
         finally:
@@ -2032,7 +2134,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                     core.HuroshikiError, "produced 0 roots|expected"
                 ):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root", "v2")
+                        self.selection("modrinth", branded_project("root"), branded_version("v2"))
                     )
             self.assertEqual(core.tree_digest_snapshot(transaction.source), before)
         finally:
@@ -2078,7 +2180,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 core, "materialize_provider_artifact", side_effect=self.materialize
             ):
                 transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "root", "v2")
+                    self.selection("modrinth", branded_project("root"), branded_version("v2"))
                 )
             with self.assertRaisesRegex(core.HuroshikiError, "apply or discard"):
                 transaction.set_side(Path("mods/root.pw.toml"), True, True)
@@ -2089,11 +2191,11 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             with self.assertRaisesRegex(core.HuroshikiError, "changed after preview"):
                 transaction.apply()
             self.assertIn(
-                'version = "old-artifact"',
+                f'version = "{mr_version("old-artifact")}"',
                 transaction.source.joinpath("mods/root.pw.toml").read_text(),
             )
             self.assertIn(
-                'version = "old-artifact"',
+                f'version = "{mr_version("old-artifact")}"',
                 self.source.joinpath("mods/root.pw.toml").read_text(),
             )
         finally:
@@ -2107,7 +2209,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         try:
             with self.assertRaises(core.ExactModVersionCancelled):
                 transaction.prepare_exact_mod_version(
-                    self.selection("modrinth", "root", "v2"),
+                    self.selection("modrinth", branded_project("root"), branded_version("v2")),
                     cancel_event=cancel_event,
                 )
             self.assertEqual(core.tree_digest_snapshot(transaction.source), original)
@@ -2144,7 +2246,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                     side_effect=blocking_resolver,
                 ):
                     transaction.prepare_exact_mod_version(
-                        self.selection("modrinth", "root", "v2")
+                        self.selection("modrinth", branded_project("root"), branded_version("v2"))
                     )
             except BaseException as error:
                 worker_error.append(error)
@@ -2158,7 +2260,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         self.assertEqual(len(worker_error), 1)
         self.assertIsInstance(worker_error[0], core.HuroshikiError)
         self.assertIn(
-            'version = "old-artifact"',
+            f'version = "{mr_version("old-artifact")}"',
             transaction.source.joinpath("mods/root.pw.toml").read_text(),
         )
         self.assertFalse(packctl.project_lock_is_active(self.key))

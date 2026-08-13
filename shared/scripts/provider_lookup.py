@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlencode, urlparse
@@ -15,6 +16,8 @@ USER_AGENT = "upiscium-huroshiki/1.0"
 NETWORK_TIMEOUT_SECONDS = 30
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_ERROR_RESPONSE_BYTES = 16 * 1024
+_MODRINTH_IMMUTABLE_ID_RE = re.compile(r"^[A-Za-z0-9]{8}$")
+
 
 class LookupError(RuntimeError):
     pass
@@ -104,6 +107,13 @@ def required_text(record: object, key: str) -> str:
     return value
 
 
+def required_modrinth_id(record: object, key: str) -> str:
+    value = required_text(record, key)
+    if _MODRINTH_IMMUTABLE_ID_RE.fullmatch(value) is None:
+        raise LookupError(f"Provider returned invalid immutable Modrinth {key}")
+    return value
+
+
 def optional_text(record: object, key: str) -> str:
     if not isinstance(record, dict):
         raise LookupError("Provider returned a non-object project")
@@ -129,7 +139,7 @@ def resolve_modrinth(selector: str) -> dict[str, str]:
     record = request_json(f"{API_ROOT}/project/{quote(reference, safe='')}")
     return {
         "provider": "modrinth",
-        "project_id": required_text(record, "id"),
+        "project_id": required_modrinth_id(record, "id"),
         "slug": required_text(record, "slug"),
         "title": required_text(record, "title"),
     }
@@ -166,7 +176,7 @@ def search_modrinth(
     for hit in hits:
         results.append(
             {
-                "project_id": required_text(hit, "project_id"),
+                "project_id": required_modrinth_id(hit, "project_id"),
                 "slug": required_text(hit, "slug"),
                 "title": required_text(hit, "title"),
                 "description": normalize_description(

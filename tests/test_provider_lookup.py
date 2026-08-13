@@ -58,12 +58,12 @@ class ProviderLookupHelperTest(unittest.TestCase):
             calls.append((request.full_url, timeout))
             return FakeResponse(
                 json.dumps(
-                    {"id": "canonical", "slug": "sodium-extra", "title": "Sodium Extra"}
+                    {"id": "A1b2C3d4", "slug": "sodium-extra", "title": "Sodium Extra"}
                 ).encode()
             )
 
         for selector in (
-            "canonical",
+            "A1b2C3d4",
             "sodium-extra",
             "https://modrinth.com/mod/sodium-extra",
         ):
@@ -71,8 +71,24 @@ class ProviderLookupHelperTest(unittest.TestCase):
                 provider_lookup, "urlopen", side_effect=open_request
             ):
                 result = provider_lookup.resolve_modrinth(selector)
-            self.assertEqual(result["project_id"], "canonical")
+            self.assertEqual(result["project_id"], "A1b2C3d4")
         self.assertEqual(len(calls), 3)
+
+    def test_modrinth_resolve_rejects_noncanonical_provider_id(self) -> None:
+        for value in ("sodium", "Abc1234", "Abcd12345", "Abcd-123"):
+            with self.subTest(value=value), patch.object(
+                provider_lookup,
+                "urlopen",
+                return_value=FakeResponse(
+                    json.dumps(
+                        {"id": value, "slug": "sodium", "title": "Sodium"}
+                    ).encode()
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    provider_lookup.LookupError, "invalid immutable Modrinth id"
+                ):
+                    provider_lookup.resolve_modrinth("sodium")
 
     def test_modrinth_project_reference_rejects_unsafe_whitespace_before_normalizing(
         self,
@@ -101,7 +117,7 @@ class ProviderLookupHelperTest(unittest.TestCase):
                     {
                         "hits": [
                             {
-                                "project_id": "one",
+                                "project_id": "Proj0001",
                                 "slug": "sodium-extra",
                                 "title": "Sodium Extra",
                                 "description": "Extra options",
@@ -121,7 +137,7 @@ class ProviderLookupHelperTest(unittest.TestCase):
         self.assertIn(["project_type:mod"], facets)
         self.assertIn(["versions:1.21.1"], facets)
         self.assertIn(["categories:neoforge"], facets)
-        self.assertEqual(result["results"][0]["project_id"], "one")
+        self.assertEqual(result["results"][0]["project_id"], "Proj0001")
 
     def test_modrinth_search_normalizes_multiline_description(self) -> None:
         def open_request(request, *, timeout):
@@ -130,7 +146,7 @@ class ProviderLookupHelperTest(unittest.TestCase):
                     {
                         "hits": [
                             {
-                                "project_id": "one",
+                                "project_id": "Proj0001",
                                 "slug": "first",
                                 "title": "First",
                                 "description": "First line\nSecond\tline\r\nThird",
@@ -159,7 +175,7 @@ class ProviderLookupHelperTest(unittest.TestCase):
                     {
                         "hits": [
                             {
-                                "project_id": str(index),
+                                "project_id": f"Proj{index:04d}",
                                 "slug": f"project-{index}",
                                 "title": f"Project {index}",
                                 "description": description,
@@ -203,7 +219,7 @@ class ProviderLookupHelperTest(unittest.TestCase):
     def test_modrinth_cli_preserves_request_id_envelope(self) -> None:
         result = {
             "provider": "modrinth",
-            "project_id": "one",
+            "project_id": "Proj0001",
             "slug": "one",
             "title": "One",
         }
@@ -253,7 +269,7 @@ class ProviderLookupCoreTest(unittest.TestCase):
             helper.write_text(
                 "import json, sys\n"
                 "request_id = sys.argv[sys.argv.index('--request-id') + 1]\n"
-                "result = {'provider':'modrinth','project_id':'canonical',"
+                "result = {'provider':'modrinth','project_id':'A1b2C3d4',"
                 "'slug':'slug','title':'Title'}\n"
                 "print(json.dumps({'request_id': request_id, 'result': result}))\n",
                 encoding="utf-8",
@@ -262,7 +278,7 @@ class ProviderLookupCoreTest(unittest.TestCase):
                 core, "ROOT", scripts
             ):
                 result = core.resolve_project_selector("modrinth", "slug")
-        self.assertEqual(result.canonical_project_id, "canonical")
+        self.assertEqual(result.canonical_project_id, "A1b2C3d4")
         self.assertEqual(result.display_label, "Title")
 
     def test_core_selector_normalization_rejects_unsafe_prefix_whitespace(self) -> None:
@@ -283,14 +299,14 @@ class ProviderLookupCoreTest(unittest.TestCase):
             "provider": "modrinth",
             "results": [
                 {
-                    "project_id": "one",
+                    "project_id": "Proj0001",
                     "slug": "first",
                     "title": "Same",
                     "description": "",
                     "author": "",
                 },
                 {
-                    "project_id": "two",
+                    "project_id": "Proj0002",
                     "slug": "second",
                     "title": "Same",
                     "description": "details",
@@ -304,12 +320,12 @@ class ProviderLookupCoreTest(unittest.TestCase):
             projects = core.search_provider_projects(
                 "modrinth", "same", minecraft="1.21.1", loader="neoforge"
             )
-        self.assertEqual([project.project_id for project in projects], ["one", "two"])
+        self.assertEqual([project.project_id for project in projects], ["Proj0001", "Proj0002"])
         command = runner.call_args.args[0]
         self.assertIn("--minecraft", command)
         self.assertIn("--loader", command)
 
-        payload["results"][1]["project_id"] = "one"
+        payload["results"][1]["project_id"] = "Proj0001"
         with patch.object(
             core, "run_resolver_process", side_effect=self.responder(payload)
         ):
@@ -323,7 +339,7 @@ class ProviderLookupCoreTest(unittest.TestCase):
             "provider": "modrinth",
             "results": [
                 {
-                    "project_id": "one",
+                    "project_id": "Proj0001",
                     "slug": "first",
                     "title": "First",
                     "description": "First line Second line",
@@ -353,7 +369,7 @@ class ProviderLookupCoreTest(unittest.TestCase):
 
     def test_search_identity_fields_remain_strict(self) -> None:
         base_result = {
-            "project_id": "one",
+            "project_id": "Proj0001",
             "slug": "first",
             "title": "First",
             "description": "description",
@@ -383,7 +399,7 @@ class ProviderLookupCoreTest(unittest.TestCase):
     def test_lookup_process_and_protocol_failures(self) -> None:
         valid = {
             "provider": "modrinth",
-            "project_id": "one",
+            "project_id": "Proj0001",
             "slug": "one",
             "title": "One",
         }
@@ -425,7 +441,7 @@ class ProviderLookupCoreTest(unittest.TestCase):
             {"provider": "modrinth", "slug": "one", "title": "One"},
             {
                 "provider": "modrinth",
-                "project_id": "one",
+                "project_id": "Proj0001",
                 "slug": "one",
                 "title": "bad\nvalue",
             },
@@ -475,7 +491,7 @@ class ProviderLookupCoreTest(unittest.TestCase):
         deadline = time.monotonic() + 10
         valid = {
             "provider": "modrinth",
-            "project_id": "one",
+            "project_id": "Proj0001",
             "slug": "one",
             "title": "One",
         }

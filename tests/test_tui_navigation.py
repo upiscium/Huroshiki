@@ -1106,10 +1106,10 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
     async def test_install_search_shows_canonical_ids_and_resolves_selection(self) -> None:
         projects = (
             core.ProviderProject(
-                "modrinth", "canonical-one", "sodium-extra", "Sodium Extra", "First", "A"
+                "modrinth", "Canon001", "sodium-extra", "Sodium Extra", "First", "A"
             ),
             core.ProviderProject(
-                "modrinth", "canonical-two", "other", "Sodium Extra", "Second", "B"
+                "modrinth", "Canon002", "other", "Sodium Extra", "Second", "B"
             ),
         )
         transaction = _InstallTransaction()
@@ -1131,20 +1131,20 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(screen.state, "showing_results")
                 self.assertEqual(
                     [item.project_id for item in screen.search_results],
-                    ["canonical-one", "canonical-two"],
+                    ["Canon001", "Canon002"],
                 )
                 await pilot.press("enter")
                 await pilot.pause(0.2)
 
         self.assertEqual(len(transaction.resolved_calls), 1)
         self.assertEqual(
-            transaction.resolved_calls[0]["canonical_project_id"], "canonical-one"
+            transaction.resolved_calls[0]["canonical_project_id"], "Canon001"
         )
 
     async def test_bare_single_word_modrinth_input_uses_provider_search(self) -> None:
         projects = (
             core.ProviderProject(
-                "modrinth", "canonical", "sodium", "Sodium", "Renderer", "author"
+                "modrinth", "Canon001", "sodium", "Sodium", "Renderer", "author"
             ),
         )
         transaction = _InstallTransaction()
@@ -1165,7 +1165,7 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.2)
 
                 self.assertEqual(screen.state, "showing_results")
-                self.assertEqual(screen.search_results[0].project_id, "canonical")
+                self.assertEqual(screen.search_results[0].project_id, "Canon001")
 
         self.assertEqual(search.call_args.args[:2], ("modrinth", "sodium"))
         self.assertEqual(transaction.resolved_calls, [])

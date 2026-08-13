@@ -630,9 +630,9 @@ class UpdateCandidate:
         return len(self.changes)
 
 
-_EXACT_MOD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _EXACT_DECIMAL_ID_RE = re.compile(r"^[0-9]+$")
 _CANONICAL_MODRINTH_ID_TOKEN = object()
+_MODRINTH_IMMUTABLE_ID_RE = re.compile(r"^[A-Za-z0-9]{8}$")
 
 
 class CanonicalModrinthId(str):
@@ -650,9 +650,9 @@ def _validate_canonical_modrinth_id(value: str, context: str) -> str:
     if (
         not isinstance(value, str)
         or value != value.strip()
-        or _EXACT_MOD_ID_RE.fullmatch(value) is None
+        or _MODRINTH_IMMUTABLE_ID_RE.fullmatch(value) is None
     ):
-        raise HuroshikiError(f"{context} must be a canonical Modrinth ID")
+        raise HuroshikiError(f"{context} must be an 8-character immutable Modrinth ID")
     return value
 
 
@@ -1065,22 +1065,8 @@ class ResolvedSelector:
     def __post_init__(self) -> None:
         if self.canonical_project_id is None:
             return
-        if (
-            canonical_provider(self.provider) == "modrinth"
-            and type(self.canonical_project_id) is CanonicalModrinthId
-        ):
-            return
         provider = canonical_provider(self.provider)
-        if provider == "modrinth":
-            object.__setattr__(
-                self,
-                "canonical_project_id",
-                canonical_modrinth_id(
-                    self.canonical_project_id,
-                    "Modrinth project ID",
-                ),
-            )
-        elif provider == "curseforge":
+        if provider == "curseforge":
             object.__setattr__(
                 self,
                 "canonical_project_id",
