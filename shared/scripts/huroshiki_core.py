@@ -765,6 +765,21 @@ class ExactArtifactVerification:
 
 
 @dataclass(frozen=True)
+class ExactDependencyEdge:
+    parent_identity: tuple[str, str]
+    child_identity: tuple[str, str]
+    required_mod_id: str
+    version_range: str
+
+
+@dataclass(frozen=True)
+class ExactDependencyGraph:
+    semantic_bindings: tuple[tuple[str, tuple[str, str]], ...]
+    edges: tuple[ExactDependencyEdge, ...]
+    selected_root_reachability: frozenset[tuple[str, str]]
+
+
+@dataclass(frozen=True)
 class ModVersionSelectionProgress:
     phase: Literal[
         "validating",
@@ -3115,7 +3130,7 @@ class PackTransaction:
                     closure.metadata,
                 )
 
-            selected_dependency_owners: set[str] | None = None
+            selected_dependency_roots: set[tuple[str, str]] | None = None
             root_closures: list[tuple[PackMigrationRoot, ResolvedModClosure]] = []
             emit("resolving", f"Resolving all explicit roots for Pack {project_id}")
             for root_index, root in enumerate(explicit_roots):
@@ -3136,7 +3151,11 @@ class PackTransaction:
                         f"Exact dependency {selection.identity_label} is not required "
                         "by any explicit root"
                     )
-                selected_dependency_owners = set(initial_owners)
+                selected_dependency_roots = {
+                    (root.provider, root.project_id)
+                    for root in explicit_roots
+                    if root.canonical_identity in initial_owners
+                }
                 constrained_closures: list[tuple[PackMigrationRoot, ResolvedModClosure]] = []
                 for root_index, (root, closure) in enumerate(root_closures):
                     checkpoint()
@@ -3244,7 +3263,10 @@ class PackTransaction:
                 cancel_event=operation_cancel,
                 deadline=operation_deadline,
                 process_result_callback=self._record_equivalence_process_result,
-                selected_dependency_owners=selected_dependency_owners,
+                selected_dependency_roots=selected_dependency_roots,
+                explicit_root_identities={
+                    (root.provider, root.project_id) for root in explicit_roots
+                },
                 opaque_url_roots={
                     (root.provider, root.project_id)
                     for root in explicit_roots
@@ -5929,7 +5951,8 @@ def _verify_exact_closure_artifacts(
     cancel_event: threading.Event,
     deadline: float,
     process_result_callback: Callable[[BoundedProcessResult], None] | None,
-    selected_dependency_owners: set[str] | None,
+    selected_dependency_roots: set[tuple[str, str]] | None,
+    explicit_root_identities: set[tuple[str, str]],
     opaque_url_roots: set[tuple[str, str]],
     checkpoint: Callable[[], None],
 ) -> tuple[ExactArtifactVerification, ...]:
@@ -6119,41 +6142,154 @@ def _verify_exact_closure_artifacts(
                 f"Exact dependency semantic MOD identity changed for "
                 f"{identity[0]}:{identity[1]}"
             )
-    if selected_dependency_owners is not None:
-        selected_versions = dict(selected.semantic_identity.members)
-        for owner_label in sorted(selected_dependency_owners):
-            owner_identity = tuple(owner_label.split(":", 1))
-            owner = results.get(owner_identity)
-            if owner is None:
-                raise HuroshikiError(
-                    f"Exact dependency owner evidence is missing for {owner_label}"
-                )
-            requirements = owner.dependency_requirements
-            if requirements is None:
-                raise HuroshikiError(
-                    f"Exact dependency owner compatibility is unverifiable for "
-                    f"{owner_label}"
-                )
-            by_mod_id = {item.mod_id: item.version_range for item in requirements}
-            for mod_id, version in sorted(selected_versions.items()):
-                requirement = by_mod_id.get(mod_id)
-                if requirement is None:
-                    raise HuroshikiError(
-                        f"Exact dependency owner {owner_label} has no machine-readable "
-                        f"requirement for MOD {mod_id}"
-                    )
-                accepted = version_satisfies_requirement(version, requirement)
-                if accepted is None:
-                    raise HuroshikiError(
-                        f"Exact dependency owner compatibility is unverifiable for "
-                        f"{owner_label} requirement {mod_id} {requirement}"
-                    )
-                if not accepted:
-                    raise HuroshikiError(
-                        f"Exact dependency selection conflict: {owner_label} requires "
-                        f"{mod_id} {requirement}, selected {version}"
-                    )
+    if selected_dependency_roots is not None:
+        _build_exact_dependency_graph(
+            tuple(results[identity] for identity in sorted(results)),
+            selection.identity,
+            explicit_root_identities,
+            selected_dependency_roots,
+            checkpoint,
+        )
     return tuple(results[identity] for identity in sorted(results))
+
+
+_EXACT_RUNTIME_MOD_IDS = frozenset(
+    {"minecraft", "java", "fabricloader", "forge", "neoforge"}
+)
+
+
+def _build_exact_dependency_graph(
+    verifications: Sequence[ExactArtifactVerification],
+    selected_identity: tuple[str, str],
+    explicit_root_identities: set[tuple[str, str]],
+    expected_selected_roots: set[tuple[str, str]],
+    checkpoint: Callable[[], None],
+) -> ExactDependencyGraph:
+    """Build and validate required edges from materialized loader metadata."""
+    artifacts = {item.identity: item for item in verifications}
+    bindings: dict[str, tuple[str, str]] = {}
+    for artifact in verifications:
+        checkpoint()
+        for mod_id, _version in artifact.semantic_identity.members:
+            existing = bindings.get(mod_id)
+            if existing is not None and existing != artifact.identity:
+                raise HuroshikiError(
+                    f"Exact dependency semantic MOD binding is ambiguous for {mod_id}: "
+                    f"{existing[0]}:{existing[1]} and "
+                    f"{artifact.identity[0]}:{artifact.identity[1]}"
+                )
+            bindings[mod_id] = artifact.identity
+
+    edges: list[ExactDependencyEdge] = []
+    edges_by_parent: dict[tuple[str, str], list[ExactDependencyEdge]] = {}
+    for artifact in verifications:
+        checkpoint()
+        requirements = artifact.dependency_requirements
+        if requirements is None:
+            continue
+        for requirement in requirements:
+            if requirement.mod_id in _EXACT_RUNTIME_MOD_IDS:
+                continue
+            child_identity = bindings.get(requirement.mod_id)
+            if child_identity is None:
+                raise HuroshikiError(
+                    f"Exact dependency requirement cannot be bound for "
+                    f"{artifact.identity[0]}:{artifact.identity[1]}: "
+                    f"{requirement.mod_id}"
+                )
+            edge = ExactDependencyEdge(
+                artifact.identity,
+                child_identity,
+                requirement.mod_id,
+                requirement.version_range,
+            )
+            edges.append(edge)
+            edges_by_parent.setdefault(artifact.identity, []).append(edge)
+
+    reached_by: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    for root_identity in sorted(explicit_root_identities):
+        checkpoint()
+        if root_identity[0] == "url":
+            continue
+        if root_identity not in artifacts:
+            raise HuroshikiError(
+                f"Exact dependency root evidence is missing for "
+                f"{root_identity[0]}:{root_identity[1]}"
+            )
+        pending = [root_identity]
+        seen: set[tuple[str, str]] = set()
+        while pending:
+            checkpoint()
+            identity = pending.pop()
+            if identity in seen:
+                continue
+            seen.add(identity)
+            reached_by.setdefault(identity, set()).add(root_identity)
+            if identity == selected_identity:
+                continue
+            artifact = artifacts[identity]
+            if artifact.dependency_requirements is None:
+                raise HuroshikiError(
+                    f"Exact dependency graph evidence is unavailable for "
+                    f"{identity[0]}:{identity[1]}"
+                )
+            pending.extend(
+                edge.child_identity for edge in edges_by_parent.get(identity, ())
+            )
+
+    selected_roots = reached_by.get(selected_identity, set())
+    if selected_roots != expected_selected_roots:
+        raise HuroshikiError(
+            "Exact dependency required-edge reachability changed: "
+            f"expected={sorted(expected_selected_roots)}, actual={sorted(selected_roots)}"
+        )
+
+    reachable_identities = set(reached_by)
+    incoming = [
+        edge
+        for edge in edges
+        if edge.child_identity == selected_identity
+        and edge.parent_identity in reachable_identities
+    ]
+    if not incoming:
+        raise HuroshikiError(
+            f"Exact dependency {selected_identity[0]}:{selected_identity[1]} has no "
+            "reachable machine-readable required edge"
+        )
+    for edge in edges:
+        checkpoint()
+        if edge.parent_identity not in reachable_identities:
+            continue
+        child = artifacts[edge.child_identity]
+        child_versions = dict(child.semantic_identity.members)
+        version = child_versions[edge.required_mod_id]
+        accepted = version_satisfies_requirement(version, edge.version_range)
+        parent_label = f"{edge.parent_identity[0]}:{edge.parent_identity[1]}"
+        if accepted is None:
+            raise HuroshikiError(
+                f"Exact dependency graph compatibility is unverifiable for {parent_label} "
+                f"requirement {edge.required_mod_id} {edge.version_range}"
+            )
+        if not accepted:
+            if edge.child_identity == selected_identity:
+                raise HuroshikiError(
+                    f"Exact dependency selection conflict: {parent_label} requires "
+                    f"{edge.required_mod_id} {edge.version_range}, selected {version}"
+                )
+            raise HuroshikiError(
+                f"Exact dependency graph conflict: {parent_label} requires "
+                f"{edge.required_mod_id} {edge.version_range}, found {version}"
+            )
+    return ExactDependencyGraph(
+        tuple(sorted(bindings.items())),
+        tuple(sorted(edges, key=lambda item: (
+            item.parent_identity,
+            item.child_identity,
+            item.required_mod_id,
+            item.version_range,
+        ))),
+        frozenset(selected_roots),
+    )
 
 
 def _exact_verification_digest(

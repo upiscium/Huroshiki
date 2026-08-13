@@ -359,6 +359,41 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             tuple(records),
         )
 
+    def dependency_graph_materializer(
+        self,
+        requirements: dict[str, tuple[tuple[str, str], ...] | None],
+        versions: dict[str, str],
+        members: dict[str, tuple[tuple[str, str], ...]] | None = None,
+    ):
+        members = members or {}
+
+        def materialize(candidate, *_args, **_kwargs):
+            _provider, project_id = candidate.provider_identity.split(":", 1)
+            artifact_id = core.parse_provider_metadata(
+                Path(candidate.relative_metadata_path), candidate.contents
+            ).file_id
+            assert artifact_id is not None
+            semantic_members = members.get(
+                artifact_id,
+                ((project_id, versions.get(artifact_id, "1.0")),),
+            )
+            raw_requirements = requirements.get(project_id, ())
+            loader_requirements = (
+                None
+                if raw_requirements is None
+                else tuple(
+                    LoaderDependencyRequirement(mod_id, version_range)
+                    for mod_id, version_range in raw_requirements
+                )
+            )
+            return MaterializedArtifact(
+                "b" * 64,
+                SemanticJarIdentity(tuple(sorted(semantic_members)), "fabric"),
+                loader_requirements,
+            )
+
+        return materialize
+
     def graph_closure_with_dependency_side(
         self,
         root_project: str,
@@ -912,6 +947,206 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             self.assertEqual(preview.new_artifact_id, "d2")
             self.assertEqual(preview.removed_dependencies, 0)
             self.assertEqual(preview.added_dependencies, 0)
+        finally:
+            transaction.discard()
+
+    def test_transitive_dependency_exact_selection_uses_direct_parent_edge(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"),),
+            (("intermediate-b", "b1"), ("dependency", "d1")),
+        )
+        closure = self.graph_closure(
+            "root-a", "a1", ("intermediate-b", "b1"), ("dependency", "d2")
+        )
+        materialize = self.dependency_graph_materializer(
+            {
+                "root-a": (("intermediate-b", ">=1"),),
+                "intermediate-b": (("dependency", ">=2"),),
+            },
+            {"d1": "1.0", "d2": "2.5"},
+        )
+
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", return_value=closure
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
+                preview = transaction.prepare_exact_mod_version(
+                    self.selection("modrinth", "dependency", "d2")
+                )
+            self.assertEqual(preview.new_artifact_id, "d2")
+        finally:
+            transaction.discard()
+
+    def test_transitive_dependency_conflict_restores_transaction_and_pack(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"),),
+            (("intermediate-b", "b1"), ("dependency", "d1")),
+        )
+        before = core._file_content_snapshot(transaction.source)
+        real_before = core._file_content_snapshot(self.source)
+        closure = self.graph_closure(
+            "root-a", "a1", ("intermediate-b", "b1"), ("dependency", "d2")
+        )
+        materialize = self.dependency_graph_materializer(
+            {
+                "root-a": (("intermediate-b", ">=1"),),
+                "intermediate-b": (("dependency", ">=2"),),
+            },
+            {"d1": "1.0", "d2": "1.5"},
+        )
+
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", return_value=closure
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, "selection conflict"):
+                    transaction.prepare_exact_mod_version(
+                        self.selection("modrinth", "dependency", "d2")
+                    )
+            self.assertEqual(core._file_content_snapshot(transaction.source), before)
+            self.assertEqual(core._file_content_snapshot(self.source), real_before)
+        finally:
+            transaction.discard()
+
+    def test_shared_transitive_dependency_checks_every_direct_parent(self) -> None:
+        def run(version: str, succeeds: bool) -> None:
+            transaction = self.write_graph_pack(
+                (("root-a", "a1", "both"), ("root-c", "c1", "both")),
+                (
+                    ("intermediate-b", "b1"),
+                    ("intermediate-e", "e1"),
+                    ("dependency", "d1"),
+                ),
+            )
+            closures = {
+                "root-a": self.graph_closure(
+                    "root-a", "a1", ("intermediate-b", "b1"), ("dependency", "d2")
+                ),
+                "root-c": self.graph_closure(
+                    "root-c", "c1", ("intermediate-e", "e1"), ("dependency", "d2")
+                ),
+            }
+            materialize = self.dependency_graph_materializer(
+                {
+                    "root-a": (("intermediate-b", ">=1"),),
+                    "root-c": (("intermediate-e", ">=1"),),
+                    "intermediate-b": (("dependency", ">=2"),),
+                    "intermediate-e": (("dependency", "<3"),),
+                },
+                {"d1": "1.0", "d2": version},
+            )
+
+            def resolve(selection, **_kwargs):
+                return closures[selection.project_id]
+
+            try:
+                with patch.object(
+                    core, "resolve_exact_mod_closure", side_effect=resolve
+                ), patch.object(
+                    core, "materialize_provider_artifact", side_effect=materialize
+                ):
+                    if succeeds:
+                        preview = transaction.prepare_exact_mod_version(
+                            self.selection("modrinth", "dependency", "d2")
+                        )
+                        self.assertEqual(preview.new_artifact_id, "d2")
+                    else:
+                        with self.assertRaisesRegex(
+                            core.HuroshikiError, "selection conflict"
+                        ):
+                            transaction.prepare_exact_mod_version(
+                                self.selection("modrinth", "dependency", "d2")
+                            )
+            finally:
+                transaction.discard()
+
+        run("2.5", True)
+        run("3.0", False)
+
+    def test_preseed_without_required_edge_fails_closed(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"),),
+            (("dependency", "d1"),),
+        )
+        closure = self.graph_closure("root-a", "a1", ("dependency", "d2"))
+        materialize = self.dependency_graph_materializer(
+            {"root-a": ()},
+            {"d1": "1.0", "d2": "2.0"},
+        )
+
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", return_value=closure
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
+                with self.assertRaisesRegex(
+                    core.HuroshikiError, "required-edge reachability"
+                ):
+                    transaction.prepare_exact_mod_version(
+                        self.selection("modrinth", "dependency", "d2")
+                    )
+        finally:
+            transaction.discard()
+
+    def test_missing_intermediate_dependency_evidence_fails_closed(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"),),
+            (("intermediate-b", "b1"), ("dependency", "d1")),
+        )
+        closure = self.graph_closure(
+            "root-a", "a1", ("intermediate-b", "b1"), ("dependency", "d2")
+        )
+        materialize = self.dependency_graph_materializer(
+            {
+                "root-a": (("intermediate-b", ">=1"),),
+                "intermediate-b": None,
+            },
+            {"d1": "1.0", "d2": "2.0"},
+        )
+
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", return_value=closure
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, "evidence is unavailable"):
+                    transaction.prepare_exact_mod_version(
+                        self.selection("modrinth", "dependency", "d2")
+                    )
+        finally:
+            transaction.discard()
+
+    def test_multi_mod_selected_dependency_needs_one_declared_provided_id(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"),),
+            (("dependency", "d1"),),
+        )
+        closure = self.graph_closure("root-a", "a1", ("dependency", "d2"))
+        materialize = self.dependency_graph_materializer(
+            {"root-a": (("d", ">=2"),)},
+            {},
+            {
+                "d1": (("d", "1.0"), ("d-helper", "1.0")),
+                "d2": (("d", "2.0"), ("d-helper", "2.0")),
+            },
+        )
+
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", return_value=closure
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
+                preview = transaction.prepare_exact_mod_version(
+                    self.selection("modrinth", "dependency", "d2")
+                )
+            self.assertEqual(preview.new_artifact_id, "d2")
         finally:
             transaction.discard()
 
