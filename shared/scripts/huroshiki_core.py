@@ -32,6 +32,8 @@ import packctl
 from dependency_equivalence import (
     DependencyCandidate,
     EQUIVALENCE_POLICY_VERSION,
+    LoaderDependencyRequirement,
+    version_satisfies_requirement,
     EquivalenceContext,
     EquivalenceError,
     MaterializedArtifact,
@@ -759,6 +761,7 @@ class ExactArtifactVerification:
     artifact_id: str
     sha256: str
     semantic_identity: SemanticJarIdentity
+    dependency_requirements: tuple[LoaderDependencyRequirement, ...] | None
 
 
 @dataclass(frozen=True)
@@ -3112,6 +3115,7 @@ class PackTransaction:
                     closure.metadata,
                 )
 
+            selected_dependency_owners: set[str] | None = None
             root_closures: list[tuple[PackMigrationRoot, ResolvedModClosure]] = []
             emit("resolving", f"Resolving all explicit roots for Pack {project_id}")
             for root_index, root in enumerate(explicit_roots):
@@ -3132,6 +3136,7 @@ class PackTransaction:
                         f"Exact dependency {selection.identity_label} is not required "
                         "by any explicit root"
                     )
+                selected_dependency_owners = set(initial_owners)
                 constrained_closures: list[tuple[PackMigrationRoot, ResolvedModClosure]] = []
                 for root_index, (root, closure) in enumerate(root_closures):
                     checkpoint()
@@ -3161,15 +3166,6 @@ class PackTransaction:
                     raise HuroshikiError(
                         f"Exact dependency selection changed ownership for "
                         f"{selection.identity_label}"
-                    )
-                if any(
-                    artifact_id != selection.artifact_id
-                    for artifact_id in resulting_owners.values()
-                ):
-                    raise HuroshikiError(
-                        f"Exact dependency selection conflict for "
-                        f"{selection.identity_label}: not every owning root accepts "
-                        f"artifact {selection.artifact_id}"
                     )
 
             emit("merging", "Building the complete explicit-root dependency graph")
@@ -3248,6 +3244,12 @@ class PackTransaction:
                 cancel_event=operation_cancel,
                 deadline=operation_deadline,
                 process_result_callback=self._record_equivalence_process_result,
+                selected_dependency_owners=selected_dependency_owners,
+                opaque_url_roots={
+                    (root.provider, root.project_id)
+                    for root in explicit_roots
+                    if root.provider == "url"
+                },
                 checkpoint=checkpoint,
             )
 
@@ -5927,6 +5929,8 @@ def _verify_exact_closure_artifacts(
     cancel_event: threading.Event,
     deadline: float,
     process_result_callback: Callable[[BoundedProcessResult], None] | None,
+    selected_dependency_owners: set[str] | None,
+    opaque_url_roots: set[tuple[str, str]],
     checkpoint: Callable[[], None],
 ) -> tuple[ExactArtifactVerification, ...]:
     workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -5947,11 +5951,27 @@ def _verify_exact_closure_artifacts(
                 f"Exact artifact metadata is not unique for {identity[0]}:{identity[1]}"
             )
         relative, contents, mod = entries[0]
+        if identity[0] == "url":
+            baseline_entries = baseline.get(identity, ())
+            if identity not in opaque_url_roots or len(baseline_entries) != 1:
+                raise HuroshikiError(
+                    f"Exact selection cannot add or replace URL artifact "
+                    f"{identity[0]}:{identity[1]}"
+                )
+            baseline_relative, baseline_contents, baseline_mod = baseline_entries[0]
+            if (
+                relative != baseline_relative
+                or contents != baseline_contents
+                or mod.filename != baseline_mod.filename
+                or mod.side != baseline_mod.side
+            ):
+                raise HuroshikiError(
+                    f"Exact selection cannot change opaque URL root "
+                    f"{identity[0]}:{identity[1]}"
+                )
+            continue
         if identity[0] not in {"modrinth", "curseforge"}:
-            raise HuroshikiError(
-                f"Exact selection cannot semantically verify URL artifact "
-                f"{identity[0]}:{identity[1]}"
-            )
+            raise HuroshikiError(f"Unsupported exact artifact provider {identity[0]}")
         provider_identity = parse_provider_metadata(relative, contents)
         artifact_id = provider_identity.file_id
         if artifact_id is None:
@@ -5997,7 +6017,11 @@ def _verify_exact_closure_artifacts(
                 f"{identity[0]}:{identity[1]}"
             )
         results[identity] = ExactArtifactVerification(
-            identity, artifact_id, materialized.sha256, semantic
+            identity,
+            artifact_id,
+            materialized.sha256,
+            semantic,
+            materialized.dependency_requirements,
         )
     selected = results.get(selection.identity)
     if selected is None:
@@ -6083,11 +6107,52 @@ def _verify_exact_closure_artifacts(
                 f"Installed dependency has incompatible loader metadata: "
                 f"{identity[0]}:{identity[1]}"
             )
-        if old_materialized.semantic_identity.members != results[identity].semantic_identity.members:
+        old_ids = {
+            mod_id for mod_id, _version in old_materialized.semantic_identity.members
+        }
+        new_ids = {
+            mod_id
+            for mod_id, _version in results[identity].semantic_identity.members
+        }
+        if old_ids != new_ids:
             raise HuroshikiError(
                 f"Exact dependency semantic MOD identity changed for "
                 f"{identity[0]}:{identity[1]}"
             )
+    if selected_dependency_owners is not None:
+        selected_versions = dict(selected.semantic_identity.members)
+        for owner_label in sorted(selected_dependency_owners):
+            owner_identity = tuple(owner_label.split(":", 1))
+            owner = results.get(owner_identity)
+            if owner is None:
+                raise HuroshikiError(
+                    f"Exact dependency owner evidence is missing for {owner_label}"
+                )
+            requirements = owner.dependency_requirements
+            if requirements is None:
+                raise HuroshikiError(
+                    f"Exact dependency owner compatibility is unverifiable for "
+                    f"{owner_label}"
+                )
+            by_mod_id = {item.mod_id: item.version_range for item in requirements}
+            for mod_id, version in sorted(selected_versions.items()):
+                requirement = by_mod_id.get(mod_id)
+                if requirement is None:
+                    raise HuroshikiError(
+                        f"Exact dependency owner {owner_label} has no machine-readable "
+                        f"requirement for MOD {mod_id}"
+                    )
+                accepted = version_satisfies_requirement(version, requirement)
+                if accepted is None:
+                    raise HuroshikiError(
+                        f"Exact dependency owner compatibility is unverifiable for "
+                        f"{owner_label} requirement {mod_id} {requirement}"
+                    )
+                if not accepted:
+                    raise HuroshikiError(
+                        f"Exact dependency selection conflict: {owner_label} requires "
+                        f"{mod_id} {requirement}, selected {version}"
+                    )
     return tuple(results[identity] for identity in sorted(results))
 
 
@@ -6103,6 +6168,14 @@ def _exact_verification_digest(
                 "members": verification.semantic_identity.members,
                 "loader": verification.semantic_identity.target_loader,
             },
+            "requirements": (
+                None
+                if verification.dependency_requirements is None
+                else tuple(
+                    (item.mod_id, item.version_range)
+                    for item in verification.dependency_requirements
+                )
+            ),
         }
         for verification in verifications
     ]
@@ -6127,6 +6200,18 @@ def _exact_verification_binding_digest(
                     "members": item.semantic_identity.members,
                     "loader": item.semantic_identity.target_loader,
                 }
+                for item in verifications
+                if item.identity == identity
+            ),
+            "requirements": next(
+                (
+                    None
+                    if item.dependency_requirements is None
+                    else tuple(
+                        (requirement.mod_id, requirement.version_range)
+                        for requirement in item.dependency_requirements
+                    )
+                )
                 for item in verifications
                 if item.identity == identity
             ),

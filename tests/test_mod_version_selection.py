@@ -9,7 +9,11 @@ from unittest.mock import patch
 
 import huroshiki_core as core
 import packctl
-from dependency_equivalence import MaterializedArtifact, SemanticJarIdentity
+from dependency_equivalence import (
+    LoaderDependencyRequirement,
+    MaterializedArtifact,
+    SemanticJarIdentity,
+)
 
 
 class ExactModVersionSelectionTest(unittest.TestCase):
@@ -202,12 +206,29 @@ class ExactModVersionSelectionTest(unittest.TestCase):
 
     def materialize(self, candidate, *_args, **_kwargs):
         _provider, project_id = candidate.provider_identity.split(":", 1)
+        document = candidate.contents.decode("utf-8")
+        artifact_id = core.parse_provider_metadata(
+            Path(candidate.relative_metadata_path), candidate.contents
+        ).file_id
+        version = (
+            "1.0"
+            if artifact_id in {"1", "d1", "old-artifact", "987655"}
+            else "2.0"
+        )
+        requirements = None
+        if project_id in {"root", "root-a", "root-b"} and (
+            "dependency" in document or project_id == "root"
+        ):
+            requirements = (
+                LoaderDependencyRequirement("dependency", ">=2.0"),
+            )
         return MaterializedArtifact(
             "b" * 64,
             SemanticJarIdentity(
-                (("root" if project_id == "root" else project_id, "2.0"),),
+                (("root" if project_id == "root" else project_id, version),),
                 "fabric",
             ),
+            requirements,
         )
 
     def make_transaction(self, provider: str, project_id: str) -> core.PackTransaction:
@@ -290,6 +311,37 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             ),
         )
         return core.PackTransaction.create(self.key)
+
+    def write_pack_with_url_root(self) -> tuple[core.PackTransaction, Path, bytes]:
+        for path in self.source.joinpath("mods").iterdir():
+            path.unlink()
+        self.source.joinpath("mods/root.pw.toml").write_text(
+            self.metadata("modrinth", "root", "r1"), encoding="utf-8"
+        )
+        url_relative = Path("mods/url-mod.pw.toml")
+        url_contents = (
+            'name = "URL Root"\n'
+            'filename = "url-root.jar"\n'
+            'side = "client"\n'
+            '[download]\n'
+            'hash-format = "sha256"\n'
+            f'hash = "{"a" * 64}"\n'
+            'url = "https://example.invalid/url-root.jar"\n'
+            '[huroshiki]\n'
+            'project-id = "url-mod"\n'
+        ).encode()
+        self.source.joinpath(url_relative).write_bytes(url_contents)
+        self.source.joinpath(".packwizignore").write_text(
+            "/.huroshiki-roots.json\n", encoding="utf-8"
+        )
+        core.write_pack_root_manifest(
+            self.source,
+            (
+                core.PackRootRecord("modrinth", "root", "both"),
+                core.PackRootRecord("url", "url-mod", "client"),
+            ),
+        )
+        return core.PackTransaction.create(self.key), url_relative, url_contents
 
     def graph_closure(
         self,
@@ -859,6 +911,118 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             self.assertEqual(preview.old_artifact_id, "d1")
             self.assertEqual(preview.new_artifact_id, "d2")
             self.assertEqual(preview.removed_dependencies, 0)
+            self.assertEqual(preview.added_dependencies, 0)
+        finally:
+            transaction.discard()
+
+    def test_dependency_preseed_presence_does_not_prove_owner_compatibility(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root", "r1", "both"),),
+            (("dependency", "d1"),),
+        )
+        closure = self.graph_closure("root", "r1", ("dependency", "d2"))
+
+        def materialize(candidate, *_args, **_kwargs):
+            _provider, project_id = candidate.provider_identity.split(":", 1)
+            artifact_id = core.parse_provider_metadata(
+                Path(candidate.relative_metadata_path), candidate.contents
+            ).file_id
+            version = "2.0" if artifact_id == "d2" else "1.0"
+            requirements = (
+                (LoaderDependencyRequirement("dependency", "<2.0"),)
+                if project_id == "root"
+                else None
+            )
+            return MaterializedArtifact(
+                "b" * 64,
+                SemanticJarIdentity(((project_id, version),), "fabric"),
+                requirements,
+            )
+
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", return_value=closure
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, "selection conflict"):
+                    transaction.prepare_exact_mod_version(
+                        self.selection("modrinth", "dependency", "d2")
+                    )
+        finally:
+            transaction.discard()
+
+    def test_dependency_semantic_id_replacement_fails_closed(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root", "r1", "both"),),
+            (("dependency", "d1"),),
+        )
+        closure = self.graph_closure("root", "r2", ("dependency", "d2"))
+
+        def materialize(candidate, *_args, **_kwargs):
+            artifact_id = core.parse_provider_metadata(
+                Path(candidate.relative_metadata_path), candidate.contents
+            ).file_id
+            project_id = candidate.provider_identity.split(":", 1)[1]
+            mod_id = (
+                "other"
+                if project_id == "dependency" and artifact_id == "d2"
+                else project_id
+            )
+            version = "2.0" if artifact_id in {"r2", "d2"} else "1.0"
+            return MaterializedArtifact(
+                "b" * 64,
+                SemanticJarIdentity(((mod_id, version),), "fabric"),
+            )
+
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", return_value=closure
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, "semantic MOD identity"):
+                    transaction.prepare_exact_mod_version(
+                        self.selection("modrinth", "root", "r2")
+                    )
+        finally:
+            transaction.discard()
+
+    def test_dependency_multi_mod_semantic_id_set_must_match_completely(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root", "r1", "both"),),
+            (("dependency", "d1"),),
+        )
+        closure = self.graph_closure("root", "r2", ("dependency", "d2"))
+
+        def materialize(candidate, *_args, **_kwargs):
+            artifact_id = core.parse_provider_metadata(
+                Path(candidate.relative_metadata_path), candidate.contents
+            ).file_id
+            project_id = candidate.provider_identity.split(":", 1)[1]
+            if project_id == "dependency":
+                members = (
+                    (("d", "2.0"), ("other", "2.0"))
+                    if artifact_id == "d2"
+                    else (("d", "1.0"), ("library", "1.0"))
+                )
+            else:
+                members = ((project_id, "2.0"),)
+            return MaterializedArtifact(
+                "b" * 64,
+                SemanticJarIdentity(tuple(sorted(members)), "fabric"),
+            )
+
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", return_value=closure
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materialize
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, "semantic MOD identity"):
+                    transaction.prepare_exact_mod_version(
+                        self.selection("modrinth", "root", "r2")
+                    )
         finally:
             transaction.discard()
 
@@ -1034,6 +1198,65 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                     self.selection("modrinth", "root", "v2")
                 )
             self.assertEqual(preview.new_artifact_id, "v2")
+        finally:
+            transaction.discard()
+
+    def test_unchanged_url_root_coexists_with_provider_exact_selection(self) -> None:
+        transaction, url_relative, url_contents = self.write_pack_with_url_root()
+        real_before = core._file_content_snapshot(self.source)
+        manifest_before = transaction.source.joinpath(
+            ".huroshiki-roots.json"
+        ).read_bytes()
+        try:
+            with patch.object(
+                core,
+                "resolve_exact_mod_closure",
+                return_value=self.graph_closure("root", "r2"),
+            ):
+                preview = transaction.prepare_exact_mod_version(
+                    self.selection("modrinth", "root", "r2")
+                )
+            self.assertEqual(preview.new_artifact_id, "r2")
+            self.assertEqual(
+                transaction.source.joinpath(url_relative).read_bytes(), url_contents
+            )
+            self.assertEqual(
+                transaction.source.joinpath(".huroshiki-roots.json").read_bytes(),
+                manifest_before,
+            )
+            self.assertEqual(core._file_content_snapshot(self.source), real_before)
+        finally:
+            transaction.discard()
+
+    def test_changed_url_root_during_reconstruction_fails_closed(self) -> None:
+        transaction, _url_relative, _url_contents = self.write_pack_with_url_root()
+        real_metadata = core._exact_metadata_from_root
+
+        def changed_metadata(root, baseline):
+            item = real_metadata(root, baseline)
+            if root.provider != "url":
+                return item
+            return core.ResolvedMetadata(
+                item.identity,
+                item.relative_path,
+                item.filename,
+                item.contents.replace(b"URL Root", b"Changed!"),
+                item.provider,
+                item.project_id,
+            )
+
+        try:
+            with patch.object(
+                core,
+                "resolve_exact_mod_closure",
+                return_value=self.graph_closure("root", "r2"),
+            ), patch.object(
+                core, "_exact_metadata_from_root", side_effect=changed_metadata
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, "opaque URL root"):
+                    transaction.prepare_exact_mod_version(
+                        self.selection("modrinth", "root", "r2")
+                    )
         finally:
             transaction.discard()
 

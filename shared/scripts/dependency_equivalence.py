@@ -44,6 +44,20 @@ class DependencyCandidate:
 
 
 @dataclass(frozen=True)
+class LoaderDependencyRequirement:
+    mod_id: str
+    version_range: str
+
+    def __post_init__(self) -> None:
+        mod_id = self.mod_id.strip().lower()
+        version_range = self.version_range.strip()
+        if not _resolved(mod_id) or not version_range:
+            raise EquivalenceError("loader dependency requirement is unresolved")
+        object.__setattr__(self, "mod_id", mod_id)
+        object.__setattr__(self, "version_range", version_range)
+
+
+@dataclass(frozen=True)
 class SemanticJarIdentity:
     members: tuple[tuple[str, str], ...]
     target_loader: str
@@ -65,9 +79,90 @@ class SemanticJarIdentity:
 class MaterializedArtifact:
     sha256: str
     semantic_identity: SemanticJarIdentity | None = None
+    dependency_requirements: tuple[LoaderDependencyRequirement, ...] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sha256", _hash(self.sha256))
+        requirements = self.dependency_requirements
+        if requirements is not None:
+            ordered = tuple(sorted(requirements, key=lambda item: item.mod_id))
+            if (
+                ordered != requirements
+                or len({item.mod_id for item in ordered}) != len(ordered)
+            ):
+                raise EquivalenceError(
+                    "loader dependency requirements must be unique and sorted"
+                )
+
+
+def _version_parts(value: str) -> tuple[tuple[int, object], ...] | None:
+    text = value.strip()
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", text) is None:
+        return None
+    return tuple((0, int(token)) for token in text.split("."))
+
+
+def _compare_versions(left: str, right: str) -> int | None:
+    left_parts = _version_parts(left)
+    right_parts = _version_parts(right)
+    if left_parts is None or right_parts is None:
+        return None
+    width = max(len(left_parts), len(right_parts))
+    left_parts += ((0, 0),) * (width - len(left_parts))
+    right_parts += ((0, 0),) * (width - len(right_parts))
+    return (left_parts > right_parts) - (left_parts < right_parts)
+
+
+def version_satisfies_requirement(version: str, requirement: str) -> bool | None:
+    """Conservatively evaluate common Fabric and Maven loader ranges."""
+    expression = requirement.strip()
+    if expression == "*":
+        return True
+    if not expression or "||" in expression or any(
+        marker in expression for marker in ("^", "~")
+    ):
+        return None
+    if expression[0] in "[(" and expression[-1] in ")]":
+        inner = expression[1:-1]
+        if "," not in inner:
+            if expression[0] != "[" or expression[-1] != "]":
+                return None
+            compared = _compare_versions(version, inner)
+            return None if compared is None else compared == 0
+        lower, upper = (part.strip() for part in inner.split(",", 1))
+        if lower:
+            compared = _compare_versions(version, lower)
+            if compared is None:
+                return None
+            if compared < 0 or (compared == 0 and expression[0] == "("):
+                return False
+        if upper:
+            compared = _compare_versions(version, upper)
+            if compared is None:
+                return None
+            if compared > 0 or (compared == 0 and expression[-1] == ")"):
+                return False
+        return True
+    predicates = expression.replace(",", " ").split()
+    if not predicates:
+        return None
+    for predicate in predicates:
+        match = re.fullmatch(r"(>=|<=|>|<|=)?(.+)", predicate)
+        if match is None:
+            return None
+        compared = _compare_versions(version, match.group(2))
+        if compared is None:
+            return None
+        operator = match.group(1) or "="
+        if not {
+            "=": compared == 0,
+            ">": compared > 0,
+            ">=": compared >= 0,
+            "<": compared < 0,
+            "<=": compared <= 0,
+        }[operator]:
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -232,6 +327,81 @@ def parse_semantic_jar(path: Path, target_loader: str) -> SemanticJarIdentity:
     if len({mod_id for mod_id, _ in members}) != len(members):
         raise EquivalenceError("loader metadata contains duplicate MOD IDs")
     return SemanticJarIdentity(tuple(sorted(members)), loader)
+
+
+def parse_loader_dependency_requirements(
+    path: Path, target_loader: str
+) -> tuple[LoaderDependencyRequirement, ...] | None:
+    """Extract only unambiguous mandatory loader dependency constraints."""
+    loader = target_loader.strip().lower().split(":", 1)[0]
+    descriptors = {
+        "neoforge": "META-INF/neoforge.mods.toml",
+        "forge": "META-INF/mods.toml",
+        "fabric": "fabric.mod.json",
+    }
+    descriptor = descriptors.get(loader)
+    if descriptor is None:
+        return None
+    try:
+        with zipfile.ZipFile(path) as jar:
+            info = jar.getinfo(descriptor)
+            if info.file_size > 1024 * 1024:
+                return None
+            with jar.open(info) as stream:
+                raw = stream.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            return None
+        requirements: list[LoaderDependencyRequirement] = []
+        if loader == "fabric":
+            document = json.loads(raw.decode("utf-8"))
+            depends = document.get("depends") if isinstance(document, dict) else None
+            if not isinstance(depends, dict):
+                return ()
+            for mod_id, value in depends.items():
+                if not isinstance(mod_id, str) or not isinstance(value, str):
+                    return None
+                requirements.append(LoaderDependencyRequirement(mod_id, value))
+        else:
+            document = tomllib.loads(raw.decode("utf-8"))
+            dependencies = document.get("dependencies", {})
+            if not isinstance(dependencies, dict):
+                return None
+            for records in dependencies.values():
+                if not isinstance(records, list):
+                    return None
+                for record in records:
+                    if not isinstance(record, dict):
+                        return None
+                    if "mandatory" in record:
+                        mandatory = record.get("mandatory")
+                        if not isinstance(mandatory, bool):
+                            return None
+                        if not mandatory:
+                            continue
+                    elif "type" in record:
+                        dependency_type = record.get("type")
+                        if dependency_type != "required":
+                            if dependency_type in {"optional", "incompatible", "discouraged"}:
+                                continue
+                            return None
+                    else:
+                        return None
+                    mod_id = record.get("modId")
+                    version_range = record.get("versionRange")
+                    if not isinstance(mod_id, str) or not isinstance(version_range, str):
+                        return None
+                    requirements.append(
+                        LoaderDependencyRequirement(mod_id, version_range)
+                    )
+        ordered = tuple(sorted(requirements, key=lambda item: item.mod_id))
+        if len({item.mod_id for item in ordered}) != len(ordered):
+            return None
+        return ordered
+    except (
+        KeyError, OSError, ValueError, UnicodeError,
+        json.JSONDecodeError, tomllib.TOMLDecodeError,
+    ):
+        return None
 
 
 def context_digest(context: EquivalenceContext) -> str:

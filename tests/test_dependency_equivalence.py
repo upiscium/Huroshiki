@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import Mock
+import zipfile
 
 from dependency_equivalence import (
     DependencyCandidate,
     EquivalenceContext,
     EquivalenceError,
+    LoaderDependencyRequirement,
     MaterializedArtifact,
     SemanticJarIdentity,
     declared_download_hash,
+    parse_loader_dependency_requirements,
     select_winner,
+    version_satisfies_requirement,
     verify_equivalence,
 )
 
@@ -203,6 +210,48 @@ class DependencyEquivalenceTest(unittest.TestCase):
             SemanticJarIdentity((("z", "1"), ("a", "1")), CTX.target_loader)
         with self.assertRaises(EquivalenceError):
             SemanticJarIdentity((("a", "latest"),), CTX.target_loader)
+
+    def test_loader_dependency_requirements_are_parsed_from_fabric_and_neoforge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fabric = root / "fabric.jar"
+            with zipfile.ZipFile(fabric, "w") as jar:
+                jar.writestr(
+                    "fabric.mod.json",
+                    json.dumps(
+                        {
+                            "id": "owner",
+                            "version": "1.0",
+                            "depends": {"dependency": ">=2.0 <3.0"},
+                        }
+                    ),
+                )
+            neoforge = root / "neoforge.jar"
+            with zipfile.ZipFile(neoforge, "w") as jar:
+                jar.writestr(
+                    "META-INF/neoforge.mods.toml",
+                    'modLoader="javafml"\nloaderVersion="[4,)"\n'
+                    '[[mods]]\nmodId="owner"\nversion="1.0"\n'
+                    '[[dependencies.owner]]\nmodId="dependency"\n'
+                    'mandatory=true\nversionRange="[2.0,3.0)"\n',
+                )
+
+            self.assertEqual(
+                parse_loader_dependency_requirements(fabric, "fabric"),
+                (LoaderDependencyRequirement("dependency", ">=2.0 <3.0"),),
+            )
+            self.assertEqual(
+                parse_loader_dependency_requirements(neoforge, "neoforge"),
+                (LoaderDependencyRequirement("dependency", "[2.0,3.0)"),),
+            )
+
+    def test_dependency_version_ranges_fail_closed_when_ambiguous(self) -> None:
+        for requirement in (">=2.0 <3.0", "[2.0,3.0)"):
+            with self.subTest(requirement=requirement):
+                self.assertTrue(version_satisfies_requirement("2.5", requirement))
+                self.assertFalse(version_satisfies_requirement("3.0", requirement))
+        self.assertIsNone(version_satisfies_requirement("2.0", "^2.0"))
+        self.assertIsNone(version_satisfies_requirement("2.0-beta", ">=2.0"))
 
 
 if __name__ == "__main__":
