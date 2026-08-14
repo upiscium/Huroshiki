@@ -26,7 +26,7 @@ import time
 import tomllib
 from typing import Any, Callable, Iterable, Literal, Sequence
 import unicodedata
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qsl, urlencode, unquote, urlparse
 from uuid import uuid4
 
 import tomlkit
@@ -85,6 +85,10 @@ PACKWIZ_OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 _LOG_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _LOG_SECRET_OPTION_RE = re.compile(
     r"^--(?:api[-_]?key|authorization|cookie|credential|header|password|secret|token)$",
+    re.IGNORECASE,
+)
+_LOG_SECRET_QUERY_RE = re.compile(
+    r"^(?:api[-_]?key|access[-_]?token|authorization|cookie|credential|password|secret|token)$",
     re.IGNORECASE,
 )
 VALID_SIDES = {"client", "server", "both"}
@@ -1992,7 +1996,10 @@ def compatible_template_ids(minecraft: str, loader: str) -> list[str]:
 
 
 def run(command: list[str], *, cwd: Path | None = None) -> None:
-    print("+", " ".join(shlex.quote(part) for part in command))
+    print(
+        "+",
+        " ".join(shlex.quote(part) for part in _redacted_packwiz_command(command)),
+    )
     subprocess.run(command, cwd=cwd, check=True)
 
 
@@ -2005,7 +2012,10 @@ def run_packwiz(
     project_id: str | None = None,
     operation: str = "packwiz",
 ) -> BoundedProcessResult:
-    print("+", " ".join(shlex.quote(part) for part in command))
+    print(
+        "+",
+        " ".join(shlex.quote(part) for part in _redacted_packwiz_command(command)),
+    )
     process_deadline = time.monotonic() + PACKWIZ_PROCESS_TIMEOUT_SECONDS
     if deadline is not None:
         process_deadline = min(deadline, process_deadline)
@@ -2017,6 +2027,8 @@ def run_packwiz(
         max_output_bytes=PACKWIZ_OUTPUT_MAX_BYTES,
     )
     failure = process_failure_message(result, label="Packwiz")
+    if failure is not None:
+        failure = _redacted_packwiz_output(command, failure)
     diagnostic = record_packwiz_diagnostic(
         command,
         result,
@@ -2085,11 +2097,76 @@ def _redacted_packwiz_command(command: Sequence[str]) -> tuple[str, ...]:
         except ValueError:
             has_credentials = False
             hostname = None
+        query = urlencode(
+            [
+                (key, "<redacted>" if _LOG_SECRET_QUERY_RE.fullmatch(key) else value)
+                for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            ],
+            doseq=True,
+        )
         if has_credentials:
-            redacted.append(f"{parsed.scheme}://<redacted>@{hostname or ''}")
+            redacted.append(
+                parsed._replace(
+                    netloc=f"<redacted>@{hostname or ''}", query=query
+                ).geturl()
+            )
             continue
-        redacted.append(part)
+        redacted.append(parsed._replace(query=query).geturl())
     return tuple(redacted)
+
+
+def _redacted_packwiz_output(command: Sequence[str], output: str) -> str:
+    secrets: set[str] = set()
+    redact_next = False
+    for raw_part in command:
+        part = str(raw_part)
+        if redact_next:
+            if part:
+                secrets.add(part)
+            redact_next = False
+            continue
+        if _LOG_SECRET_OPTION_RE.fullmatch(part):
+            redact_next = True
+            continue
+        if "=" in part:
+            option, _, value = part.partition("=")
+            if _LOG_SECRET_OPTION_RE.fullmatch(option) and value:
+                secrets.add(value)
+        parsed = urlparse(part)
+        try:
+            if parsed.username is not None:
+                secrets.add(parsed.username)
+            if parsed.password is not None:
+                secrets.add(parsed.password)
+        except ValueError:
+            pass
+    redacted = output
+    for secret in sorted(secrets, key=len, reverse=True):
+        redacted = redacted.replace(secret, "<redacted>")
+    redacted = re.sub(
+        r"(?i)\b(https?://)[^\s/@:]+(?::[^\s/@]*)?@",
+        r"\1<redacted>@",
+        redacted,
+    )
+    def redact_url(match: re.Match[str]) -> str:
+        raw_url = match.group(0)
+        parsed = urlparse(raw_url)
+        query = urlencode(
+            [
+                (key, "<redacted>" if _LOG_SECRET_QUERY_RE.fullmatch(key) else value)
+                for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            ],
+            doseq=True,
+        )
+        return parsed._replace(query=query).geturl()
+
+    redacted = re.sub(r"(?i)https?://[^\s]+", redact_url, redacted)
+    redacted = re.sub(
+        r"(?i)([?&](?:api[-_]?key|access[-_]?token|authorization|cookie|credential|password|secret|token)=)[^\s&#]*",
+        r"\1<redacted>",
+        redacted,
+    )
+    return redacted
 
 
 def _packwiz_process_log_text(
@@ -2119,10 +2196,10 @@ def _packwiz_process_log_text(
             f"output_note: {output_note}",
             "",
             "--- stdout ---",
-            result.stdout,
+            _redacted_packwiz_output(command, result.stdout),
             "",
             "--- stderr ---",
-            result.stderr,
+            _redacted_packwiz_output(command, result.stderr),
             "",
         )
     )

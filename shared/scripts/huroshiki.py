@@ -6137,6 +6137,7 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             *(f"  - {identity}" for identity in preview.removed_dependency_identities),
             "Changed files:",
             *(f"  {change.relative_path}" for change in preview.changes),
+            *(f"Diagnostic: {message}" for message in preview.diagnostic_messages),
             "",
             "Press a to Apply, or q/Esc to Cancel.",
         ]

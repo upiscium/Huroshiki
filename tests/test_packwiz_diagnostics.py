@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 import io
 from pathlib import Path
 import stat
@@ -152,6 +152,16 @@ class PackwizDiagnosticsTest(unittest.TestCase):
             self._run(self._result(returncode=1, stdout="failure on stdout\n"))
         self.assertIn("failure on stdout", self._logs()[0].read_text(encoding="utf-8"))
 
+    def test_failure_exception_redacts_sensitive_output(self) -> None:
+        result = self._result(
+            returncode=1,
+            stderr="https://example.invalid/mod.jar?access%5Ftoken=secret-value\n",
+        )
+        with self.assertRaises(packctl.ConfigError) as context:
+            self._run(result)
+        self.assertNotIn("secret-value", str(context.exception))
+        self.assertIn("<redacted>", str(context.exception))
+
     def test_process_lifecycle_failures_are_logged_with_metadata(self) -> None:
         cases = (
             {"cancelled": True},
@@ -194,6 +204,7 @@ class PackwizDiagnosticsTest(unittest.TestCase):
                 "token-value",
                 "--api-key=key-value",
                 "https://user:password@example.invalid/mod.jar",
+                "https://example.invalid/mod.jar?token=query-secret&name=demo",
             ],
             self._result(),
             operation="refresh",
@@ -202,7 +213,47 @@ class PackwizDiagnosticsTest(unittest.TestCase):
         self.assertNotIn("token-value", contents)
         self.assertNotIn("key-value", contents)
         self.assertNotIn("password@example.invalid", contents)
+        self.assertNotIn("query-secret", contents)
         self.assertIn("<redacted>", contents)
+
+    def test_log_output_redacts_echoed_secrets_and_credential_urls(self) -> None:
+        result = self._result(
+            stdout="token-value https://user:password@example.invalid/mod.jar\n",
+            stderr=(
+                "key-value https://example.invalid/mod.jar?access_token=query-secret "
+                "https://example.invalid/mod.jar?access%5Ftoken=encoded-secret\n"
+            ),
+        )
+        contents = packctl._packwiz_process_log_text(
+            [
+                "packwiz",
+                "--token",
+                "token-value",
+                "--api-key=key-value",
+                "https://user:password@example.invalid/mod.jar",
+                "https://example.invalid/mod.jar?access_token=query-secret",
+            ],
+            result,
+            operation="refresh",
+            project="demo",
+        )
+        self.assertNotIn("token-value", contents)
+        self.assertNotIn("key-value", contents)
+        self.assertNotIn("user:password@", contents)
+        self.assertNotIn("query-secret", contents)
+        self.assertNotIn("encoded-secret", contents)
+        self.assertIn("<redacted>", contents)
+
+    def test_run_packwiz_console_command_redacts_secret_arguments(self) -> None:
+        console = io.StringIO()
+        command = ["packwiz", "--token", "token-value", "refresh"]
+        with patch.object(
+            packctl, "run_bounded_process", return_value=self._result()
+        ):
+            with redirect_stdout(console):
+                packctl.run_packwiz(command, cwd=self.cwd)
+        self.assertNotIn("token-value", console.getvalue())
+        self.assertIn("<redacted>", console.getvalue())
 
     def test_failure_diagnostic_log_failure_does_not_replace_primary_error(self) -> None:
         with patch.object(

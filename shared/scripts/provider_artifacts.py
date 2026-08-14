@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -18,6 +19,7 @@ from uuid import uuid4
 
 import tomlkit
 
+import packctl
 from dependency_equivalence import (
     DependencyCandidate,
     EquivalenceContext,
@@ -66,6 +68,7 @@ def _process_ok(
     result: BoundedProcessResult,
     label: str,
     *,
+    command: list[str] | None = None,
     supports_manual_download: bool = False,
     artifact_identity: str | None = None,
 ) -> None:
@@ -77,6 +80,8 @@ def _process_ok(
         raise ProviderArtifactError(f"{label} was cancelled")
     if result.timed_out:
         raise ProviderArtifactError(f"{label} deadline exceeded")
+    if result.output_limit_exceeded:
+        raise ProviderArtifactError(f"{label} exceeded the supported output limit")
     if result.returncode != 0:
         if supports_manual_download and _requires_manual_download(
             result.stdout, result.stderr
@@ -86,8 +91,8 @@ def _process_ok(
             )
         identity = f" for artifact {artifact_identity}" if artifact_identity else ""
         output = _bounded_process_output_tail(
-            result.stdout,
-            result.stderr,
+            packctl._redacted_packwiz_output(command or [], result.stdout),
+            packctl._redacted_packwiz_output(command or [], result.stderr),
             max_lines=PROCESS_ERROR_OUTPUT_LINES,
             max_bytes=PROCESS_ERROR_OUTPUT_BYTES,
         )
@@ -334,6 +339,8 @@ def materialize_provider_artifact(
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
     process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
+    diagnostic_project_id: str | None = None,
+    diagnostic_callback: Callable[[str], None] | None = None,
 ) -> MaterializedArtifact:
     """Materialize one fixed candidate below an operation-owned workspace."""
     workspace = Path(workspace)
@@ -457,14 +464,50 @@ def materialize_provider_artifact(
         }
         if process_result_callback is not None:
             process_kwargs["result_callback"] = process_result_callback
-        refresh = run_bounded_process(["packwiz", "refresh"], **process_kwargs)
-        _process_ok(refresh, "packwiz refresh")
+        refresh_command = ["packwiz", "refresh"]
+        refresh = run_bounded_process(
+            refresh_command,
+            max_output_bytes=packctl.PACKWIZ_OUTPUT_MAX_BYTES,
+            **process_kwargs,
+        )
+        diagnostic = packctl.record_packwiz_diagnostic(
+            refresh_command,
+            refresh,
+            project_id=diagnostic_project_id,
+            operation="provider-artifact-refresh",
+        )
+        try:
+            _process_ok(refresh, "packwiz refresh", command=refresh_command)
+        except ProviderArtifactError as error:
+            if diagnostic.log_path is not None:
+                raise ProviderArtifactError(
+                    f"{error}; Details: {packctl.relative_state_path(diagnostic.log_path)}"
+                ) from error
+            if diagnostic.error is not None:
+                raise ProviderArtifactError(
+                    f"{error}; diagnostic log could not be written: {diagnostic.error}"
+                ) from error
+            raise
+        if diagnostic.has_output:
+            if diagnostic.log_path is not None:
+                notice = (
+                    "Packwiz completed with diagnostics. Details: "
+                    f"{packctl.relative_state_path(diagnostic.log_path)}"
+                )
+            else:
+                notice = (
+                    "Packwiz completed with diagnostics, but the diagnostic log "
+                    f"could not be written: {diagnostic.error}"
+                )
+            if diagnostic_callback is None:
+                print(notice, file=sys.stderr)
+            else:
+                diagnostic_callback(notice)
         pack_toml = project / "pack.toml"
         if not pack_toml.is_file() or pack_toml.is_symlink():
             raise ProviderArtifactError("packwiz refresh did not retain pack.toml")
         pack_url = "file://" + quote(str(pack_toml), safe="/:@")
-        install = run_bounded_process(
-            packwiz_installer_command(
+        install_command = packwiz_installer_command(
                 installer_path,
                 "--no-gui",
                 "--side",
@@ -474,19 +517,57 @@ def materialize_provider_artifact(
                 "--meta-file",
                 "packwiz.json",
                 pack_url,
-            ),
+            )
+        install = run_bounded_process(
+            install_command,
+            max_output_bytes=packctl.PACKWIZ_OUTPUT_MAX_BYTES,
             **process_kwargs,
         )
-        _process_ok(
+        install_diagnostic = packctl.record_packwiz_diagnostic(
+            install_command,
             install,
-            "Packwiz Installer",
-            supports_manual_download=manual_download_supported,
-            artifact_identity=_artifact_identity(
-                candidate.provider_identity,
-                metadata.mode,
-                curseforge_file_id=metadata.curseforge_file_id,
-            ),
+            project_id=diagnostic_project_id,
+            operation="provider-artifact-install",
         )
+        try:
+            _process_ok(
+                install,
+                "Packwiz Installer",
+                command=install_command,
+                supports_manual_download=manual_download_supported,
+                artifact_identity=_artifact_identity(
+                    candidate.provider_identity,
+                    metadata.mode,
+                    curseforge_file_id=metadata.curseforge_file_id,
+                ),
+            )
+        except ProviderArtifactError as error:
+            if install_diagnostic.log_path is not None:
+                raise ProviderArtifactError(
+                    f"{error}; Details: "
+                    f"{packctl.relative_state_path(install_diagnostic.log_path)}"
+                ) from error
+            if install_diagnostic.error is not None:
+                raise ProviderArtifactError(
+                    f"{error}; diagnostic log could not be written: "
+                    f"{install_diagnostic.error}"
+                ) from error
+            raise
+        if install_diagnostic.has_output:
+            if install_diagnostic.log_path is not None:
+                notice = (
+                    "Packwiz Installer completed with diagnostics. Details: "
+                    f"{packctl.relative_state_path(install_diagnostic.log_path)}"
+                )
+            else:
+                notice = (
+                    "Packwiz Installer completed with diagnostics, but the diagnostic "
+                    f"log could not be written: {install_diagnostic.error}"
+                )
+            if diagnostic_callback is None:
+                print(notice, file=sys.stderr)
+            else:
+                diagnostic_callback(notice)
     finally:
         if server is not None:
             try:

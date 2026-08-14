@@ -294,6 +294,21 @@ class ProviderLookupCoreTest(unittest.TestCase):
                         core.resolve_project_selector("modrinth", selector)
             resolver.assert_not_called()
 
+    def test_provider_lookup_output_limit_fails_closed(self) -> None:
+        payload = {
+            "provider": "modrinth",
+            "project_id": "Proj0001",
+            "slug": "one",
+            "title": "One",
+        }
+        with patch.object(
+            core,
+            "run_resolver_process",
+            side_effect=self.responder(payload, output_limit_exceeded=True),
+        ):
+            with self.assertRaisesRegex(core.HuroshikiError, "output limit"):
+                core.resolve_project_selector("modrinth", "one")
+
     def test_search_validates_results_and_rejects_duplicates(self) -> None:
         payload = {
             "provider": "modrinth",
