@@ -972,6 +972,42 @@ class TransactionBatch:
     provider: str
     query: str
     changed_files: tuple[Path, ...]
+    root_identity: tuple[str, str] | None = None
+    closure_identities: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class StagedExactModTarget:
+    mod: ModInfo
+    role: Literal["root", "dependency"]
+    required_by: tuple[str, ...] = ()
+    required_by_complete: bool = False
+
+
+@dataclass(frozen=True)
+class ExactStageEvidence:
+    selection: ExactModArtifactSelection
+    source_digest: tuple[tuple[Path, str], ...]
+    verification_digest: str
+    verifications: tuple[ExactArtifactVerification, ...]
+    manifest: bytes | None
+    versions: tuple[str, str, str]
+    metadata_identities: tuple[tuple[str, str], ...]
+    reachability: tuple[
+        tuple[tuple[str, str], tuple[str, ...]], ...
+    ]
+    accepted_identities: tuple[str, ...]
+    mutation_generation: int
+    checkpoint_digest: tuple[tuple[Path, str], ...]
+
+
+@dataclass(frozen=True)
+class AcceptedExactStage:
+    evidence: ExactStageEvidence
+    checkpoint: Path
+    prior_evidence: ExactStageEvidence | None
+    prior_override_mutated: bool
+    prior_verification_required: bool
 
 
 @dataclass(frozen=True)
@@ -1414,6 +1450,7 @@ class ResolvedAddOperation(_AddOperationLifecycle):
                 self.minecraft, self.loader, self.loader_version = (
                     packctl.project_versions(self.transaction.source)
                 )
+                self.transaction._ensure_empty_pack_root_manifest()
                 self._checkpoint()
             closure = resolve_mod_closure(
                 provider=self.provider,
@@ -1436,6 +1473,7 @@ class ResolvedAddOperation(_AddOperationLifecycle):
                         "Transaction was closed before MOD resolution completed"
                     )
                 self._checkpoint()
+                overrides = self.transaction._validated_version_overrides()
                 changed = merge_metadata_closure(
                     self.transaction.source,
                     closure,
@@ -1445,11 +1483,16 @@ class ResolvedAddOperation(_AddOperationLifecycle):
                     equivalence_workspace=self.resolver_root / "equivalence",
                     process_result_callback=self._record_resolver_process_result,
                 )
+                self.transaction._assert_version_overrides_preserved(overrides)
                 self._checkpoint()
                 batch = TransactionBatch(
                     provider=self.provider,
                     query=self.selector,
                     changed_files=changed,
+                    root_identity=closure.root_identity,
+                    closure_identities=tuple(
+                        sorted(item.identity for item in closure.metadata)
+                    ),
                 )
                 message = (
                     f"Staged {self.provider}:{closure.root_identity[1]} and dependencies"
@@ -1470,6 +1513,7 @@ class ResolvedAddOperation(_AddOperationLifecycle):
                 self._checkpoint_complete = False
                 self._pending_batch = None
                 self.transaction._operation = None
+                self.transaction._record_source_mutation()
         except BaseException as error:
             if not isinstance(error, Exception):
                 fatal_error = error
@@ -1922,23 +1966,14 @@ class PackTransaction:
     update_candidates: tuple[UpdateCandidate, ...] = field(default_factory=tuple)
     selected_update_changes: tuple[UpdateChange, ...] = field(default_factory=tuple)
     _exact_selection_prepared: bool = field(default=False, init=False, repr=False)
-    _exact_selection_digest: dict[Path, str] | None = field(
+    _pending_exact_evidence: ExactStageEvidence | None = field(
         default=None, init=False, repr=False
     )
-    _exact_selection_verification_digest: str | None = field(
+    _accepted_exact_evidence: ExactStageEvidence | None = field(
         default=None, init=False, repr=False
     )
-    _exact_selection_verifications: tuple[ExactArtifactVerification, ...] | None = field(
-        default=None, init=False, repr=False
-    )
-    _exact_selection: ExactModArtifactSelection | None = field(
-        default=None, init=False, repr=False
-    )
-    _exact_selection_manifest: bytes | None = field(
-        default=None, init=False, repr=False
-    )
-    _exact_selection_versions: tuple[str, str, str] | None = field(
-        default=None, init=False, repr=False
+    _accepted_exact_stages: list[AcceptedExactStage] = field(
+        default_factory=list, init=False, repr=False
     )
     _exact_selection_checkpoint: Path | None = field(
         default=None, init=False, repr=False
@@ -1947,6 +1982,11 @@ class PackTransaction:
         default=None, init=False, repr=False
     )
     _version_override_mutated: bool = field(default=False, init=False, repr=False)
+    _exact_verification_required: bool = field(default=False, init=False, repr=False)
+    _mutation_generation: int = field(default=0, init=False, repr=False)
+    _rollback_source_digest: tuple[tuple[Path, str], ...] | None = field(
+        default=None, init=False, repr=False
+    )
     _equivalence_process_results: list[BoundedProcessResult] = field(
         default_factory=list, init=False, repr=False
     )
@@ -2139,6 +2179,101 @@ class PackTransaction:
                 "staging another transaction change"
             )
 
+    @property
+    def exact_selection_prepared(self) -> bool:
+        return self._exact_selection_prepared
+
+    @property
+    def exact_selection_accepted(self) -> bool:
+        return self._accepted_exact_evidence is not None
+
+    @property
+    def operation_active(self) -> bool:
+        with self._lock:
+            return self._operation is not None
+
+    @property
+    def process_cleanup_pending(self) -> bool:
+        with self._lock:
+            return bool(self._equivalence_process_results)
+
+    def _ensure_empty_pack_root_manifest(self) -> None:
+        manifest = self.source / ".huroshiki-roots.json"
+        if manifest.exists():
+            return
+        if metadata_content_snapshot(self.source):
+            return
+        ensure_pack_root_manifest_ignored(self.source)
+        write_pack_root_manifest(self.source, ())
+
+    def _validated_version_overrides(self) -> tuple[ModVersionOverride, ...]:
+        return _validate_mod_version_override_records(
+            self.source,
+            _exact_metadata_records(self.source),
+        )
+
+    def _assert_version_overrides_preserved(
+        self, overrides: tuple[ModVersionOverride, ...]
+    ) -> None:
+        _validate_mod_version_override_records(
+            self.source,
+            _exact_metadata_records(self.source),
+            overrides=overrides,
+        )
+
+    def rollback_exact_mod_version(self, *, deadline: float | None = None) -> None:
+        """Restore the source before the pending or latest accepted selection."""
+        self._lifecycle_lock.acquire()
+        try:
+            with self._lock:
+                self.ensure_active()
+                if self._operation is not None:
+                    raise HuroshikiError(
+                        "Wait for the active exact version operation to finish"
+                    )
+                cleanup_was_pending = bool(self._equivalence_process_results)
+                cleanup_deadline = (
+                    deadline
+                    if deadline is not None
+                    else time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS
+                )
+                self._retry_equivalence_process_cleanup(cleanup_deadline)
+                if not self._exact_selection_prepared and not self._accepted_exact_stages:
+                    if cleanup_was_pending:
+                        return
+                    raise HuroshikiError("No exact MOD version selection can be undone")
+                if self._exact_selection_prepared:
+                    self._restore_exact_selection_checkpoint()
+                else:
+                    stage = self._accepted_exact_stages[-1]
+                    self._restore_exact_selection_source(
+                        stage.checkpoint,
+                        self.root / f"failed-accepted-exact-source-{uuid4().hex}",
+                        expected_digest=stage.evidence.checkpoint_digest,
+                    )
+                    self._accepted_exact_stages.pop()
+                    self._mutation_generation += 1
+                    self._accepted_exact_evidence = (
+                        None
+                        if stage.prior_evidence is None
+                        else replace(
+                            stage.prior_evidence,
+                            mutation_generation=self._mutation_generation,
+                        )
+                    )
+                    if self._accepted_exact_stages and self._accepted_exact_evidence is not None:
+                        previous = self._accepted_exact_stages[-1]
+                        self._accepted_exact_stages[-1] = replace(
+                            previous,
+                            evidence=self._accepted_exact_evidence,
+                        )
+                    self._version_override_mutated = stage.prior_override_mutated
+                    self._exact_verification_required = (
+                        stage.prior_verification_required
+                    )
+        finally:
+            self._lifecycle_lock.release()
+
     def set_mod_version_pin(
         self,
         identity: str,
@@ -2180,68 +2315,137 @@ class PackTransaction:
             except (ModVersionOverrideError, OSError) as error:
                 raise HuroshikiError(str(error)) from error
             self._version_override_mutated = True
+            self._record_source_mutation()
             return updated
+
+    def _record_source_mutation(self) -> None:
+        """Invalidate accepted exact evidence after a successful staged mutation."""
+        had_accepted = self._accepted_exact_evidence is not None
+        self._mutation_generation += 1
+        if had_accepted:
+            self._exact_verification_required = True
+        self._accepted_exact_evidence = None
+        self._accepted_exact_stages.clear()
+        self._rollback_source_digest = None
+
+    def _restore_exact_selection_source(
+        self,
+        checkpoint: Path,
+        failed_source: Path,
+        *,
+        expected_digest: tuple[tuple[Path, str], ...],
+    ) -> None:
+        if not checkpoint.is_dir() or checkpoint.is_symlink():
+            raise HuroshikiError(
+                "Exact MOD selection checkpoint is missing; transaction state retained"
+            )
+        if failed_source.exists():
+            raise HuroshikiError(
+                "Exact MOD selection rollback path already exists; transaction state retained"
+            )
+        checkpoint_fd, checkpoint_metadata = _open_pinned_source(checkpoint)
+        try:
+            checkpoint_issues = packctl.pack_source_fd_entry_issues(checkpoint_fd)
+            if checkpoint_issues:
+                details = "; ".join(
+                    f"{relative}: {message}"
+                    for relative, message in checkpoint_issues
+                )
+                raise HuroshikiError(
+                    f"Unsafe exact MOD selection checkpoint: {details}"
+                )
+            if tuple(sorted(_source_fd_snapshot(checkpoint_fd).items())) != expected_digest:
+                raise HuroshikiError(
+                    "Exact MOD selection checkpoint changed; transaction state retained"
+                )
+            current_checkpoint = os.stat(checkpoint, follow_symlinks=False)
+            if not _same_entry(checkpoint_metadata, current_checkpoint):
+                raise HuroshikiError(
+                    "Exact MOD selection checkpoint was replaced; transaction state retained"
+                )
+            if self.source.exists():
+                self.source.rename(failed_source)
+            try:
+                checkpoint.rename(self.source)
+            except BaseException as error:
+                if failed_source.exists() and not self.source.exists():
+                    failed_source.rename(self.source)
+                raise HuroshikiError(
+                    "Could not restore exact MOD selection checkpoint; transaction retained"
+                ) from error
+            installed = os.stat(self.source, follow_symlinks=False)
+            if not _same_entry(checkpoint_metadata, installed):
+                suspicious = self.root / f"retained-replaced-exact-checkpoint-{uuid4().hex}"
+                try:
+                    self.source.rename(suspicious)
+                    failed_source.rename(self.source)
+                except BaseException as restore_error:
+                    raise HuroshikiError(
+                        "Exact MOD checkpoint identity changed during rollback and the "
+                        f"original source could not be restored; state retained at {self.root}"
+                    ) from restore_error
+                raise HuroshikiError(
+                    "Exact MOD checkpoint identity changed during rollback; original "
+                    f"source restored and replacement retained at {suspicious}"
+                )
+            self._rollback_source_digest = expected_digest
+        finally:
+            os.close(checkpoint_fd)
 
     def _restore_exact_selection_checkpoint(self) -> None:
         checkpoint = self._exact_selection_checkpoint
         failed_source = self._exact_selection_failed_source
         if checkpoint is None:
             return
-        if not checkpoint.is_dir() or checkpoint.is_symlink():
-            raise HuroshikiError(
-                "Exact MOD selection checkpoint is missing; transaction state retained"
-            )
         if failed_source is None:
             raise HuroshikiError(
                 "Exact MOD selection rollback path is missing; transaction state retained"
             )
-        if failed_source.exists():
+        evidence = self._pending_exact_evidence
+        if evidence is None:
             raise HuroshikiError(
-                "Exact MOD selection rollback path already exists; transaction state retained"
+                "Exact MOD selection rollback evidence is missing; transaction state retained"
             )
-        if self.source.exists():
-            self.source.rename(failed_source)
-        checkpoint.rename(self.source)
+        self._restore_exact_selection_source(
+            checkpoint,
+            failed_source,
+            expected_digest=evidence.checkpoint_digest,
+        )
         self._exact_selection_prepared = False
-        self._exact_selection_digest = None
-        self._exact_selection_verification_digest = None
-        self._exact_selection_verifications = None
-        self._exact_selection = None
-        self._exact_selection_manifest = None
-        self._exact_selection_versions = None
+        self._pending_exact_evidence = None
+        self._exact_selection_checkpoint = None
+        self._exact_selection_failed_source = None
 
-    def _validate_exact_selection_stage(self) -> None:
-        selection = self._exact_selection
-        expected_digest = self._exact_selection_digest
-        expected_verification_digest = self._exact_selection_verification_digest
-        expected_verifications = self._exact_selection_verifications
-        expected_manifest = self._exact_selection_manifest
-        expected_versions = self._exact_selection_versions
-        if (
-            selection is None
-            or expected_digest is None
-            or expected_verification_digest is None
-            or expected_verifications is None
-            or expected_versions is None
-        ):
+    def _validate_exact_selection_stage(self, evidence: ExactStageEvidence) -> None:
+        if evidence.mutation_generation != self._mutation_generation:
             raise HuroshikiError(
-                "Exact MOD selection state is incomplete; transaction retained"
+                "Exact MOD verification evidence is stale after a staged mutation"
             )
         ensure_safe_pack_source(self.source)
-        if tree_digest_snapshot(self.source) != expected_digest:
+        if _exact_source_digest(self.source) != evidence.source_digest:
             raise HuroshikiError(
                 "The exact MOD selection staging changed after preview; apply aborted"
             )
-        if _exact_manifest_bytes(self.source) != expected_manifest:
+        if _exact_manifest_bytes(self.source) != evidence.manifest:
             raise HuroshikiError(
                 "The exact MOD root manifest changed after preview; apply aborted"
             )
-        if packctl.project_versions(self.source) != expected_versions:
+        if packctl.project_versions(self.source) != evidence.versions:
             raise HuroshikiError(
                 "The exact MOD Minecraft or loader version changed after preview; "
                 "apply aborted"
             )
         records = _exact_metadata_records(self.source)
+        if _exact_metadata_identity_snapshot(records) != evidence.metadata_identities:
+            raise HuroshikiError(
+                "Exact MOD metadata identities changed after verification; apply aborted"
+            )
+        overrides = _validate_mod_version_override_records(self.source, records)
+        if _exact_override_identity_snapshot(overrides) != evidence.accepted_identities:
+            raise HuroshikiError(
+                "Exact MOD accepted selections changed after verification; apply aborted"
+            )
+        selection = evidence.selection
         matches = records.get(selection.identity, ())
         if len(matches) != 1:
             raise HuroshikiError(
@@ -2266,11 +2470,55 @@ class PackTransaction:
                 f"{identity.file_id or '<missing>'}"
             )
         _exact_assert_root_manifest_identities(self.source, records)
-        _validate_mod_version_override_records(self.source, records)
-        if _exact_verification_binding_digest(expected_verifications, records) != expected_verification_digest:
+        if set(identity for identity, _owners in evidence.reachability) != set(records):
+            raise HuroshikiError(
+                "Exact MOD reachability evidence is incomplete; apply aborted"
+            )
+        if (
+            _exact_verification_binding_digest(evidence.verifications, records)
+            != evidence.verification_digest
+        ):
             raise HuroshikiError(
                 "Exact MOD semantic verification evidence changed after preview; apply aborted"
             )
+
+    def accept_exact_mod_version(self) -> None:
+        """Accept a pending exact preview without publishing the Pack transaction."""
+        with self._lifecycle_lock:
+            with self._lock:
+                self.ensure_active()
+                if self._operation is not None:
+                    raise HuroshikiError(
+                        "Wait for the active exact version operation to finish"
+                    )
+                evidence = self._pending_exact_evidence
+                checkpoint = self._exact_selection_checkpoint
+                if not self._exact_selection_prepared or evidence is None or checkpoint is None:
+                    raise HuroshikiError("No exact MOD version preview is prepared")
+                self._validate_exact_selection_stage(evidence)
+                prior_evidence = self._accepted_exact_evidence
+                prior_override_mutated = self._version_override_mutated
+                prior_verification_required = self._exact_verification_required
+                self._mutation_generation += 1
+                accepted = replace(
+                    evidence, mutation_generation=self._mutation_generation
+                )
+                self._accepted_exact_stages.append(
+                    AcceptedExactStage(
+                        accepted,
+                        checkpoint,
+                        prior_evidence,
+                        prior_override_mutated,
+                        prior_verification_required,
+                    )
+                )
+                self._accepted_exact_evidence = accepted
+                self._version_override_mutated = True
+                self._exact_verification_required = False
+                self._pending_exact_evidence = None
+                self._exact_selection_prepared = False
+                self._exact_selection_checkpoint = None
+                self._exact_selection_failed_source = None
 
     def _record_equivalence_process_result(
         self, result: BoundedProcessResult
@@ -2415,8 +2663,14 @@ class PackTransaction:
 
     def add(self, provider: str, query: str) -> subprocess.CompletedProcess[str]:
         """Compatibility path for synchronous add callers."""
+        with self._lock:
+            return self._add(provider, query)
+
+    def _add(self, provider: str, query: str) -> subprocess.CompletedProcess[str]:
         self.ensure_active()
         self._ensure_exact_selection_not_prepared()
+        if self._operation is not None:
+            raise HuroshikiError("Wait for the active transaction operation to finish")
         provider, query = normalize_add_selector(provider, query)
         if provider == "url":
             operation = self.begin_add(
@@ -2433,6 +2687,7 @@ class PackTransaction:
                 "" if result.success else result.message,
             )
         try:
+            self._ensure_empty_pack_root_manifest()
             minecraft, loader, loader_version = packctl.project_versions(self.source)
             closure = resolve_mod_closure(
                 provider=provider,
@@ -2444,6 +2699,7 @@ class PackTransaction:
                 process_result_callback=self._record_equivalence_process_result,
                 diagnostic_project_id=self.project_key.partition(":")[2],
             )
+            overrides = self._validated_version_overrides()
             changed = merge_metadata_closure(
                 self.source,
                 closure,
@@ -2451,19 +2707,54 @@ class PackTransaction:
                 equivalence_workspace=self.root / "equivalence",
                 process_result_callback=self._record_equivalence_process_result,
             )
+            self._assert_version_overrides_preserved(overrides)
         except Exception as error:
             return subprocess.CompletedProcess(
                 build_add_command(provider, query), 1, "", str(error)
             )
         self.batches.append(
-            TransactionBatch(provider=provider, query=query, changed_files=changed)
+            TransactionBatch(
+                provider=provider,
+                query=query,
+                changed_files=changed,
+                root_identity=closure.root_identity,
+                closure_identities=tuple(
+                    sorted(item.identity for item in closure.metadata)
+                ),
+            )
         )
+        self._record_source_mutation()
         return subprocess.CompletedProcess(build_add_command(provider, query), 0, "", "")
 
-    def add_mod_transactionally(self, provider: str, selector: str, side: str) -> int:
+    def add_mod_transactionally(
+        self,
+        provider: str,
+        selector: str,
+        side: str,
+        *,
+        artifact_id: str | None = None,
+    ) -> int:
         """Run one synchronous add entirely in staging, then atomically apply it."""
+        with self._lock:
+            return self._add_mod_transactionally(
+                provider,
+                selector,
+                side,
+                artifact_id=artifact_id,
+            )
+
+    def _add_mod_transactionally(
+        self,
+        provider: str,
+        selector: str,
+        side: str,
+        *,
+        artifact_id: str | None,
+    ) -> int:
         self.ensure_active()
         self._ensure_exact_selection_not_prepared()
+        if self._operation is not None:
+            raise HuroshikiError("Wait for the active transaction operation to finish")
         kind, _ = split_project_key(self.project_key)
         if kind != "pack":
             raise HuroshikiError("Synchronous add can only modify MODPACK projects")
@@ -2472,6 +2763,10 @@ class PackTransaction:
         except packctl.ConfigError as error:
             raise HuroshikiError(str(error)) from error
         provider, selector = normalize_add_selector(provider, selector)
+        if artifact_id is not None and provider == "url":
+            raise HuroshikiError(
+                "Exact artifact selection is unavailable for self-hosted URL MODs"
+            )
         ensure_safe_pack_source(self.source)
 
         if provider == "url":
@@ -2487,6 +2782,7 @@ class PackTransaction:
                     raise HuroshikiError(result.message)
                 return result.returncode or 1
         else:
+            self._ensure_empty_pack_root_manifest()
             minecraft, loader, loader_version = packctl.project_versions(self.source)
             closure = resolve_mod_closure(
                 provider=provider,
@@ -2498,6 +2794,7 @@ class PackTransaction:
                 process_result_callback=self._record_equivalence_process_result,
                 diagnostic_project_id=self.project_key.partition(":")[2],
             )
+            overrides = self._validated_version_overrides()
             try:
                 changed = merge_metadata_closure(
                     self.source,
@@ -2508,13 +2805,37 @@ class PackTransaction:
                 )
             except Exception as error:
                 raise HuroshikiError(f"Could not merge resolved MOD closure: {error}") from error
+            self._assert_version_overrides_preserved(overrides)
             self.batches.append(
                 TransactionBatch(
                     provider=provider,
                     query=selector,
                     changed_files=changed,
+                    root_identity=closure.root_identity,
+                    closure_identities=tuple(
+                        sorted(item.identity for item in closure.metadata)
+                    ),
                 )
             )
+            self._record_source_mutation()
+
+            if artifact_id is not None:
+                root_provider, root_project_id = closure.root_identity
+                selected_artifact_id = artifact_id
+                if root_provider == "modrinth":
+                    root_project_id = canonical_modrinth_id(
+                        root_project_id, "Modrinth project ID"
+                    )
+                    selected_artifact_id = canonical_modrinth_id(
+                        artifact_id, "Modrinth version ID"
+                    )
+                self.prepare_exact_mod_version(
+                    ExactModArtifactSelection(
+                        root_provider,
+                        root_project_id,
+                        selected_artifact_id,
+                    )
+                )
 
         self.apply()
         return 0
@@ -2636,6 +2957,8 @@ class PackTransaction:
                 )
                 closure = ResolvedModClosure(root_identity, probe_metadata)
             operation._checkpoint()
+            self._ensure_empty_pack_root_manifest()
+            overrides = self._validated_version_overrides()
             changed = merge_metadata_closure(
                 self.source,
                 closure,
@@ -2645,12 +2968,17 @@ class PackTransaction:
                 equivalence_workspace=operation.resolver_root / "equivalence",
                 process_result_callback=operation._record_resolver_process_result,
             )
+            self._assert_version_overrides_preserved(overrides)
             operation._checkpoint()
 
             batch = TransactionBatch(
                 provider=operation.provider,
                 query=operation.query,
                 changed_files=changed,
+                root_identity=closure.root_identity,
+                closure_identities=tuple(
+                    sorted(item.identity for item in closure.metadata)
+                ),
             )
             result = AddOperationResult(
                 returncode=0,
@@ -2666,6 +2994,7 @@ class PackTransaction:
             operation._checkpoint_complete = False
             operation._pending_batch = None
             self._operation = None
+            self._record_source_mutation()
             return result
 
     def _finish_url_add(
@@ -2710,11 +3039,13 @@ class PackTransaction:
             metadata = _read_resolver_metadata(operation.resolver_source)
             identity = ("url", artifact.mod_id)
             operation._checkpoint()
+            overrides = self._validated_version_overrides()
             changed = merge_metadata_closure(
                 self.source,
                 ResolvedModClosure(identity, metadata),
                 requested_side=side_from_flags(operation.client, operation.server),
             )
+            self._assert_version_overrides_preserved(overrides)
             operation._checkpoint()
             if not changed:
                 raise HuroshikiError("The URL metadata is already current")
@@ -2739,6 +3070,7 @@ class PackTransaction:
             operation._checkpoint_complete = False
             operation._pending_batch = None
             self._operation = None
+            self._record_source_mutation()
         return result
 
     def _rollback_add(
@@ -2796,6 +3128,109 @@ class PackTransaction:
             if (self.source / path).exists()
         ]
 
+    def staged_removed_mods(self) -> list[ModInfo]:
+        """Return baseline MODs removed from the current staged source."""
+        self.ensure_active()
+        current = metadata_digest_snapshot(self.source)
+        removed: list[ModInfo] = []
+        for path in sorted(changed_paths(self.baseline, current)):
+            if (self.source / path).exists():
+                continue
+            contents = self.baseline_contents.get(path)
+            if contents is None:
+                continue
+            removed.append(
+                read_mod_data(path, tomllib.loads(contents.decode("utf-8")))
+            )
+        return removed
+
+    def staged_exact_mod_targets(self) -> list[StagedExactModTarget]:
+        """List exact-selectable artifacts with the strongest known reachability."""
+        self.ensure_active()
+        if self._exact_selection_prepared:
+            return []
+        root_identities = {
+            (root.provider, root.project_id)
+            for root in read_pack_root_manifest(self.source)
+        }
+        accepted = self._accepted_exact_evidence
+        if accepted is not None:
+            if (
+                accepted.mutation_generation != self._mutation_generation
+                or _exact_source_digest(self.source) != accepted.source_digest
+            ):
+                return []
+            reachability = dict(accepted.reachability)
+            targets = [
+                StagedExactModTarget(
+                    mod,
+                    "root" if identity in root_identities else "dependency",
+                    tuple(reachability.get(identity, ())),
+                    True,
+                )
+                for mod in list_mods_from_source(self.source)
+                if (provider := canonical_provider(mod.provider))
+                in {"modrinth", "curseforge"}
+                and (identity := (provider, mod.project_id)) in reachability
+            ]
+            return sorted(
+                targets,
+                key=lambda item: (
+                    0 if item.role == "root" else 1,
+                    item.mod.name.casefold(),
+                    canonical_provider(item.mod.provider),
+                    item.mod.project_id,
+                ),
+            )
+        active_batches = [
+            batch
+            for batch in self.batches
+            if batch.root_identity is not None
+            and batch.root_identity in root_identities
+        ]
+        closure_identities = {
+            identity
+            for batch in active_batches
+            for identity in batch.closure_identities
+        }
+        if not closure_identities:
+            return []
+        requiring_roots: dict[tuple[str, str], set[str]] = {}
+        for batch in active_batches:
+            assert batch.root_identity is not None
+            root_label = f"{batch.root_identity[0]}:{batch.root_identity[1]}"
+            for identity in batch.closure_identities:
+                if identity != batch.root_identity:
+                    requiring_roots.setdefault(identity, set()).add(root_label)
+        targets: list[StagedExactModTarget] = []
+        for mod in list_mods_from_source(self.source):
+            provider = canonical_provider(mod.provider)
+            identity = (provider, mod.project_id)
+            if provider not in {"modrinth", "curseforge"}:
+                continue
+            if identity not in closure_identities:
+                continue
+            role: Literal["root", "dependency"] = (
+                "root" if identity in root_identities else "dependency"
+            )
+            targets.append(
+                StagedExactModTarget(
+                    mod,
+                    role,
+                    tuple(sorted(requiring_roots.get(identity, ()))),
+                    False,
+                )
+            )
+        return sorted(
+            targets,
+            key=lambda item: (
+                0 if item.role == "root" else 1,
+                item.mod.name.casefold(),
+                canonical_provider(item.mod.provider),
+                item.mod.project_id,
+            ),
+        )
+
     def set_side(self, relative_path: Path, client: bool, server: bool) -> None:
         with self._lock:
             self.ensure_active()
@@ -2826,6 +3261,7 @@ class PackTransaction:
                 except BaseException:
                     path.write_bytes(original)
                     raise
+            self._record_source_mutation()
 
     def unstage(self, relative_path: Path) -> None:
         """Remove one selected metadata change from the transaction.
@@ -2919,9 +3355,12 @@ class PackTransaction:
                             provider=batch.provider,
                             query=batch.query,
                             changed_files=remaining,
+                            root_identity=batch.root_identity,
+                            closure_identities=batch.closure_identities,
                         )
                     )
             self.batches = remaining_batches
+            self._record_source_mutation()
 
     def prepare_exact_mod_version(
         self,
@@ -3095,6 +3534,9 @@ class PackTransaction:
         )
         versions = packctl.project_versions(self.source)
         operation_before = _file_content_snapshot(self.source, checkpoint)
+        operation_digest_before = tuple(
+            sorted(tree_digest_snapshot(self.source, checkpoint=checkpoint).items())
+        )
 
         operation_id = uuid4().hex
         checkpoint_source = self.root / f"exact-selection-checkpoint-{operation_id}"
@@ -3141,6 +3583,17 @@ class PackTransaction:
                 retained_destination=retained_checkpoint,
             )
             checkpoint_created = True
+            if tuple(
+                sorted(
+                    tree_digest_snapshot(
+                        checkpoint_source,
+                        checkpoint=checkpoint,
+                    ).items()
+                )
+            ) != operation_digest_before:
+                raise HuroshikiError(
+                    "Exact MOD selection checkpoint does not match the transaction source"
+                )
             checkpoint()
             create_resolver_source(
                 resolver_source,
@@ -3234,6 +3687,37 @@ class PackTransaction:
             initial_reachability = _exact_closure_reachability(
                 root_closures, checkpoint
             )
+            explicit_root_identities = {
+                (root.provider, root.project_id) for root in explicit_roots
+            }
+            dependency_constraints: dict[
+                tuple[str, str], ExactModArtifactSelection
+            ] = {}
+            for override in overrides_before:
+                checkpoint()
+                identity = (override.provider, override.project_id)
+                if identity in explicit_root_identities:
+                    continue
+                owners = initial_reachability.get(identity)
+                if not owners:
+                    raise HuroshikiError(
+                        "Exact MOD selection found a stale/orphan version override: "
+                        f"{override.canonical_identity}"
+                    )
+                project_identity: str | CanonicalModrinthId = override.project_id
+                artifact_identity: str | CanonicalModrinthId = override.artifact_id
+                if override.provider == "modrinth":
+                    project_identity = canonical_modrinth_id(
+                        override.project_id, "Modrinth project ID"
+                    )
+                    artifact_identity = canonical_modrinth_id(
+                        override.artifact_id, "Modrinth version ID"
+                    )
+                dependency_constraints[identity] = ExactModArtifactSelection(
+                    override.provider,
+                    project_identity,
+                    artifact_identity,
+                )
             if selected_root is None:
                 initial_owners = initial_reachability.get(selection.identity)
                 if not initial_owners:
@@ -3246,36 +3730,63 @@ class PackTransaction:
                     for root in explicit_roots
                     if root.canonical_identity in initial_owners
                 }
-                constrained_closures: list[tuple[PackMigrationRoot, ResolvedModClosure]] = []
-                for root_index, (root, closure) in enumerate(root_closures):
-                    checkpoint()
-                    if root.canonical_identity in initial_owners:
-                        constrained = resolve_root_closure(
-                            root,
-                            root_index,
-                            preseed_selections=(selection,),
-                        )
+                dependency_constraints[selection.identity] = selection
+
+            constrained_closures: list[
+                tuple[PackMigrationRoot, ResolvedModClosure]
+            ] = []
+            for root_index, (root, closure) in enumerate(root_closures):
+                checkpoint()
+                preseeds = tuple(
+                    dependency_constraints[identity]
+                    for identity in sorted(dependency_constraints)
+                    if root.canonical_identity
+                    in initial_reachability[identity]
+                )
+                if preseeds:
+                    constrained = resolve_root_closure(
+                        root,
+                        root_index,
+                        preseed_selections=preseeds,
+                    )
+                    for constrained_selection in preseeds:
                         try:
                             _verify_exact_root_metadata(
-                                selection, constrained.metadata
+                                constrained_selection, constrained.metadata
                             )
                         except HuroshikiError as error:
+                            constraint_label = (
+                                "Exact dependency selection"
+                                if selected_root is None
+                                and constrained_selection.identity == selection.identity
+                                else "Existing version override constraint"
+                            )
                             raise HuroshikiError(
-                                f"Exact dependency selection conflict for "
-                                f"{selection.identity_label}: {error}"
+                                f"{constraint_label} conflict for "
+                                f"{constrained_selection.identity_label}: {error}"
                             ) from error
-                        closure = constrained
-                    constrained_closures.append((root, closure))
-                root_closures = constrained_closures
-                resulting_reachability = _exact_closure_reachability(
-                    root_closures, checkpoint
+                    closure = constrained
+                constrained_closures.append((root, closure))
+            root_closures = constrained_closures
+            resulting_reachability = _exact_closure_reachability(
+                root_closures, checkpoint
+            )
+            for constrained_identity in dependency_constraints:
+                initial_owners = initial_reachability[constrained_identity]
+                resulting_owners = resulting_reachability.get(
+                    constrained_identity, {}
                 )
-                resulting_owners = resulting_reachability.get(selection.identity, {})
                 if set(resulting_owners) != set(initial_owners):
-                    raise HuroshikiError(
-                        f"Exact dependency selection changed ownership for "
-                        f"{selection.identity_label}"
+                    label = (
+                        f"{constrained_identity[0]}:{constrained_identity[1]}"
                     )
+                    raise HuroshikiError(
+                        f"Exact dependency selection changed ownership for {label}"
+                    )
+
+            final_reachability = _exact_closure_reachability(
+                root_closures, checkpoint
+            )
 
             emit("merging", "Building the complete explicit-root dependency graph")
             for root, closure in root_closures:
@@ -3516,30 +4027,41 @@ class PackTransaction:
                 diagnostic_messages=tuple(diagnostic_messages),
             )
             checkpoint()
+            final_overrides = _validate_mod_version_override_records(
+                self.source, final_records
+            )
+            pending_evidence = ExactStageEvidence(
+                selection=selection,
+                source_digest=tuple(
+                    sorted(
+                        tree_digest_snapshot(
+                            self.source,
+                            checkpoint=checkpoint,
+                        ).items()
+                    )
+                ),
+                verification_digest=_exact_verification_binding_digest(
+                    exact_verifications, final_records
+                ),
+                verifications=exact_verifications,
+                manifest=manifest_before,
+                versions=versions,
+                metadata_identities=_exact_metadata_identity_snapshot(final_records),
+                reachability=_exact_reachability_snapshot(final_reachability),
+                accepted_identities=_exact_override_identity_snapshot(final_overrides),
+                mutation_generation=self._mutation_generation,
+                checkpoint_digest=operation_digest_before,
+            )
             self._exact_selection_prepared = True
-            self._exact_selection_digest = tree_digest_snapshot(
-                self.source,
-                checkpoint=checkpoint,
-            )
-            self._exact_selection_verification_digest = _exact_verification_digest(
-                exact_verifications
-            )
-            self._exact_selection_verifications = exact_verifications
-            self._exact_selection = selection
-            self._exact_selection_manifest = manifest_before
-            self._exact_selection_versions = versions
+            self._pending_exact_evidence = pending_evidence
+            self._rollback_source_digest = None
             self._exact_selection_checkpoint = checkpoint_source
             self._exact_selection_failed_source = failed_source
             emit("complete", "Exact MOD version selection staged")
             return preview
         except BaseException as error:
             self._exact_selection_prepared = False
-            self._exact_selection_digest = None
-            self._exact_selection_verification_digest = None
-            self._exact_selection_verifications = None
-            self._exact_selection = None
-            self._exact_selection_manifest = None
-            self._exact_selection_versions = None
+            self._pending_exact_evidence = None
             self._exact_selection_checkpoint = None
             self._exact_selection_failed_source = None
             try:
@@ -3567,8 +4089,24 @@ class PackTransaction:
         deadline: float | None = None,
         on_progress: Callable[[UpdateProgress], None] | None = None,
     ) -> list[UpdateCandidate]:
+        with self._lock:
+            return self._prepare_updates(
+                cancel_event=cancel_event,
+                deadline=deadline,
+                on_progress=on_progress,
+            )
+
+    def _prepare_updates(
+        self,
+        *,
+        cancel_event: threading.Event | None,
+        deadline: float | None,
+        on_progress: Callable[[UpdateProgress], None] | None,
+    ) -> list[UpdateCandidate]:
         self.ensure_active()
         self._ensure_exact_selection_not_prepared()
+        if self._operation is not None:
+            raise HuroshikiError("Wait for the active transaction operation to finish")
         kind, _ = split_project_key(self.project_key)
         if kind != "pack":
             raise HuroshikiError(
@@ -3618,8 +4156,24 @@ class PackTransaction:
         cancel_event: threading.Event | None = None,
         deadline: float | None = None,
     ) -> None:
+        with self._lock:
+            self._select_updates(
+                selected_paths,
+                cancel_event=cancel_event,
+                deadline=deadline,
+            )
+
+    def _select_updates(
+        self,
+        selected_paths: Iterable[Path],
+        *,
+        cancel_event: threading.Event | None,
+        deadline: float | None,
+    ) -> None:
         self.ensure_active()
         self._ensure_exact_selection_not_prepared()
+        if self._operation is not None:
+            raise HuroshikiError("Wait for the active transaction operation to finish")
         selected = set(selected_paths)
         available = {
             candidate.root: candidate
@@ -3660,6 +4214,7 @@ class PackTransaction:
         for change in merged:
             _apply_update_change(self.source, change, use_after=True)
         self.selected_update_changes = merged
+        self._record_source_mutation()
 
     def remove_mods(
         self,
@@ -3668,8 +4223,24 @@ class PackTransaction:
         cancel_event: threading.Event | None = None,
         deadline: float | None = None,
     ) -> int:
+        with self._lock:
+            return self._remove_mods(
+                slugs,
+                cancel_event=cancel_event,
+                deadline=deadline,
+            )
+
+    def _remove_mods(
+        self,
+        slugs: Iterable[str],
+        *,
+        cancel_event: threading.Event | None,
+        deadline: float | None,
+    ) -> int:
         self.ensure_active()
         self._ensure_exact_selection_not_prepared()
+        if self._operation is not None:
+            raise HuroshikiError("Wait for the active transaction operation to finish")
         selected = set(slugs)
         kind, project_id = split_project_key(self.project_key)
         if kind == "template":
@@ -3741,6 +4312,7 @@ class PackTransaction:
             if removed_identity is not None:
                 remove_pack_root(self.source, removed_identity)
             ensure_safe_pack_source(self.source)
+            self._record_source_mutation()
         return 0
 
     def apply(
@@ -3751,23 +4323,24 @@ class PackTransaction:
         deadline: float | None = None,
     ) -> None:
         with self._lifecycle_lock:
-            exact_prepared = self._exact_selection_prepared
-            try:
-                self._apply(
-                    refresh=refresh,
-                    cancel_event=cancel_event,
-                    deadline=deadline,
-                )
-            except BaseException as error:
-                if exact_prepared:
-                    try:
-                        self._restore_exact_selection_checkpoint()
-                    except BaseException as restore_error:
-                        raise HuroshikiError(
-                            f"{error}; exact MOD selection rollback failed: "
-                            f"{restore_error}"
-                        ) from error
-                raise
+            with self._lock:
+                exact_prepared = self._exact_selection_prepared
+                try:
+                    self._apply(
+                        refresh=refresh,
+                        cancel_event=cancel_event,
+                        deadline=deadline,
+                    )
+                except BaseException as error:
+                    if exact_prepared:
+                        try:
+                            self._restore_exact_selection_checkpoint()
+                        except BaseException as restore_error:
+                            raise HuroshikiError(
+                                f"{error}; exact MOD selection rollback failed: "
+                                f"{restore_error}"
+                            ) from error
+                    raise
 
     def _apply(
         self,
@@ -3777,10 +4350,19 @@ class PackTransaction:
         deadline: float | None,
     ) -> None:
         self.ensure_active()
-        exact_prepared = self._exact_selection_prepared
-        if exact_prepared:
-            self._validate_exact_selection_stage()
+        exact_evidence = (
+            self._pending_exact_evidence
+            if self._exact_selection_prepared
+            else self._accepted_exact_evidence
+        )
+        if exact_evidence is not None:
+            self._validate_exact_selection_stage(exact_evidence)
             refresh = False
+        elif self._exact_verification_required:
+            raise HuroshikiError(
+                "Staged changes invalidated exact MOD verification; select an exact "
+                "version again to verify the complete closure before applying"
+            )
         if self._equivalence_process_results:
             cleanup_deadline = time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS
             if deadline is not None:
@@ -3876,6 +4458,13 @@ class PackTransaction:
                     f"{relative}: {message}" for relative, message in staged_issues
                 )
                 raise HuroshikiError(f"Unsafe staged Packwiz source: {details}")
+            if self._rollback_source_digest is not None and tuple(
+                sorted(_source_fd_snapshot(staged_fd).items())
+            ) != self._rollback_source_digest:
+                raise HuroshikiError(
+                    "The staged source changed after exact-selection rollback; "
+                    "publication aborted"
+                )
             original_fd, original_metadata = _open_pinned_source(real_source)
             if (
                 _source_fd_snapshot(original_fd) != self.real_source_baseline
@@ -5948,6 +6537,47 @@ def _exact_metadata_records(
         identity = canonical_provider(mod.provider), mod.project_id
         records.setdefault(identity, []).append((relative, contents, mod))
     return {identity: tuple(items) for identity, items in records.items()}
+
+
+def _exact_source_digest(source: Path) -> tuple[tuple[Path, str], ...]:
+    return tuple(sorted(tree_digest_snapshot(source).items()))
+
+
+def _exact_metadata_identity_snapshot(
+    records: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
+) -> tuple[tuple[str, str], ...]:
+    snapshot: list[tuple[str, str]] = []
+    for identity, entries in sorted(records.items()):
+        if len(entries) != 1:
+            raise HuroshikiError(
+                f"Exact MOD metadata identity is not unique: {identity[0]}:{identity[1]}"
+            )
+        relative, contents, _mod = entries[0]
+        parsed = parse_provider_metadata(relative, contents)
+        snapshot.append(
+            (f"{identity[0]}:{identity[1]}", parsed.file_id or "")
+        )
+    return tuple(snapshot)
+
+
+def _exact_reachability_snapshot(
+    reachability: Mapping[tuple[str, str], Mapping[str, str | None]],
+) -> tuple[tuple[tuple[str, str], tuple[str, ...]], ...]:
+    return tuple(
+        (identity, tuple(sorted(owners)))
+        for identity, owners in sorted(reachability.items())
+    )
+
+
+def _exact_override_identity_snapshot(
+    overrides: Sequence[ModVersionOverride],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            f"{override.canonical_identity}={override.artifact_id}"
+            for override in overrides
+        )
+    )
 
 
 def _exact_closure_reachability(
@@ -8283,11 +8913,18 @@ def add_mod_transactionally(
     provider: str,
     selector: str,
     side: str,
+    *,
+    artifact_id: str | None = None,
 ) -> int:
     """Add a mod on a disposable source copy and atomically publish on success."""
     transaction = PackTransaction.create(project_key_value)
     try:
-        return transaction.add_mod_transactionally(provider, selector, side)
+        return transaction.add_mod_transactionally(
+            provider,
+            selector,
+            side,
+            artifact_id=artifact_id,
+        )
     finally:
         transaction.discard()
 

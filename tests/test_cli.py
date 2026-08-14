@@ -128,5 +128,69 @@ class ExactVersionCliTest(unittest.TestCase):
         transaction.discard.assert_called_once_with()
 
 
+class AddExactArtifactCliTest(unittest.TestCase):
+    def test_parser_accepts_provider_specific_exact_artifact_flags(self) -> None:
+        cases = (
+            ("--version-id", "E5f6G7h8"),
+            ("--file-id", "6529130"),
+            ("--artifact-id", "E5f6G7h8"),
+        )
+        for flag, value in cases:
+            with self.subTest(flag=flag):
+                parsed = packctl.parser().parse_args(
+                    ["add", "demo", "mr:A1b2C3d4", "both", flag, value]
+                )
+                self.assertEqual(getattr(parsed, flag[2:].replace("-", "_")), value)
+
+    def test_cmd_add_passes_exact_root_artifact_into_one_transactional_call(self) -> None:
+        parsed = packctl.parser().parse_args(
+            [
+                "add",
+                "demo",
+                "mr:A1b2C3d4",
+                "client",
+                "--version-id",
+                "E5f6G7h8",
+            ]
+        )
+        with patch.object(
+            core, "add_mod_transactionally", return_value=0
+        ) as add:
+            self.assertEqual(packctl.cmd_add(parsed), 0)
+        add.assert_called_once_with(
+            "pack:demo",
+            "modrinth",
+            "A1b2C3d4",
+            "client",
+            artifact_id="E5f6G7h8",
+        )
+
+    def test_cmd_add_rejects_wrong_provider_flag_and_url_exact_selection(self) -> None:
+        wrong = packctl.parser().parse_args(
+            [
+                "add",
+                "demo",
+                "mr:A1b2C3d4",
+                "both",
+                "--file-id",
+                "123",
+            ]
+        )
+        with self.assertRaisesRegex(packctl.ConfigError, "CurseForge"):
+            packctl.cmd_add(wrong)
+        url = packctl.parser().parse_args(
+            [
+                "add",
+                "demo",
+                "url:https://example.invalid/mod.jar",
+                "both",
+                "--artifact-id",
+                "123",
+            ]
+        )
+        with self.assertRaisesRegex(packctl.ConfigError, "self-hosted URL"):
+            packctl.cmd_add(url)
+
+
 if __name__ == "__main__":
     unittest.main()

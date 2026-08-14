@@ -2506,6 +2506,10 @@ def cmd_add(args: argparse.Namespace) -> int:
     import huroshiki_core
 
     direct = direct_project_selector(args.query)
+    artifact_values = tuple(
+        getattr(args, name, None)
+        for name in ("artifact_id", "file_id", "version_id")
+    )
 
     if direct is not None:
         provider, selector = direct
@@ -2517,15 +2521,32 @@ def cmd_add(args: argparse.Namespace) -> int:
         selector = args.query
 
     if provider == "url":
+        if any(
+            value is not None
+            for value in artifact_values
+        ):
+            raise ConfigError(
+                "Exact artifact selection is unavailable for self-hosted URL MODs"
+            )
         print("Using self-hosted URL download/install.")
     else:
         print(f"Using Packwiz {provider} search/install.")
     try:
+        artifact_id = None
+        if any(
+            value is not None
+            for value in artifact_values
+        ):
+            artifact_id = _exact_artifact_argument(args, provider)
+        call_kwargs = (
+            {"artifact_id": artifact_id} if artifact_id is not None else {}
+        )
         return huroshiki_core.add_mod_transactionally(
             huroshiki_core.project_key("pack", args.pack),
             provider,
             selector,
             args.side,
+            **call_kwargs,
         )
     except huroshiki_core.HuroshikiError as error:
         raise ConfigError(str(error)) from error
@@ -5349,6 +5370,9 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("pack")
     item.add_argument("query")
     item.add_argument("side")
+    item.add_argument("--artifact-id")
+    item.add_argument("--file-id")
+    item.add_argument("--version-id")
     item.set_defaults(func=cmd_add)
     item = sub.add_parser("remove")
     item.add_argument("pack")

@@ -4845,7 +4845,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
     help_text = (
         "Tab: focus  Ctrl+t: provider  Enter: search/select/review  "
         "c: discard results  j/k: move  Ctrl+c/Ctrl+s: toggle side  b: both  "
-        "d: unstage  l: list  u: update  q: project"
+        "v: Select version  d: unstage  l: list  u: update/undo exact selection  q: project"
     )
 
     def __init__(self, project_key: str) -> None:
@@ -4861,6 +4861,9 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         self.search_results: list[core.InstallSearchResult] = []
         self.packwiz_menu_items: list[MenuItem] = []
         self.staged: list[core.ModInfo] = []
+        self.changed_staged: list[core.ModInfo] = []
+        self.staged_targets: list[core.StagedExactModTarget] = []
+        self.removed: list[core.ModInfo] = []
         self.operation: (
             core.ProviderSearchOperation
             | core.ResolvedAddOperation
@@ -4899,7 +4902,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         staged = self.query_one("#staged-table", DataTable)
         staged.cursor_type = "row"
         staged.zebra_stripes = True
-        staged.add_columns("MOD", "C", "S", "Source", "Metadata")
+        staged.add_columns("MOD", "Role", "C", "S", "Source", "Metadata")
 
         self.refresh_staged()
         self.query_one("#mod-search", Input).focus()
@@ -4920,23 +4923,117 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         transaction = self.app.transactions.get(self.project_key)
         if transaction is None or not transaction.active:
             self.staged = []
+            self.changed_staged = []
+            self.staged_targets = []
+            self.removed = []
         else:
             try:
-                self.staged = transaction.staged_mods()
+                self.changed_staged = transaction.staged_mods()
+                target_loader = getattr(
+                    transaction, "staged_exact_mod_targets", None
+                )
+                self.staged_targets = (
+                    target_loader() if callable(target_loader) else []
+                )
+                removed = getattr(transaction, "staged_removed_mods", None)
+                self.removed = removed() if callable(removed) else []
             except Exception as error:
                 self.app.notify(str(error), severity="error")
                 self.staged = []
+                self.changed_staged = []
+                self.staged_targets = []
+                self.removed = []
 
         table = self.query_one("#staged-table", DataTable)
         table.clear()
-        for mod in self.staged:
+        displayed: list[tuple[core.ModInfo, str]] = [
+            (target.mod, target.role.title()) for target in self.staged_targets
+        ]
+        target_paths = {target.mod.relative_path for target in self.staged_targets}
+        displayed.extend(
+            (mod, "Staged")
+            for mod in self.changed_staged
+            if mod.relative_path not in target_paths
+        )
+        self.staged = [mod for mod, _role in displayed]
+        for mod, role in displayed:
             table.add_row(
                 mod.name,
+                role,
                 enabled_marker(mod.client),
                 enabled_marker(mod.server),
                 mod.provider,
                 str(mod.relative_path),
             )
+
+    def _exact_selection_is_prepared(self) -> bool:
+        transaction = self.app.transactions.get(self.project_key)
+        return bool(
+            transaction is not None
+            and getattr(transaction, "exact_selection_prepared", False)
+        )
+
+    def _exact_selection_is_accepted(self) -> bool:
+        transaction = self.app.transactions.get(self.project_key)
+        return bool(
+            transaction is not None
+            and getattr(transaction, "exact_selection_accepted", False)
+        )
+
+    def _block_exact_selection_mutation(self) -> bool:
+        if self._exact_selection_is_prepared():
+            self.set_status("Exact version selected; press Enter to Apply changes or u to undo")
+            self.app.notify(
+                "Apply changes or undo the exact version selection first",
+                severity="warning",
+            )
+            return True
+        return False
+
+    def undo_exact_selection(self) -> None:
+        transaction = self.app.transactions.get(self.project_key)
+        if transaction is None or not (
+            transaction.exact_selection_prepared
+            or getattr(transaction, "exact_selection_accepted", False)
+        ):
+            self.app.notify("No exact version selection to undo", severity="warning")
+            return
+        self.app.push_screen(
+            ExactSelectionRollbackScreen(self.project_key, transaction)
+        )
+
+    def select_staged_version(self) -> None:
+        if self._block_exact_selection_mutation():
+            return
+        target = self.current_staged_exact_target()
+        if target is None:
+            self.app.notify(
+                "Select a staged Modrinth or CurseForge MOD", severity="warning"
+            )
+            return
+        self.app.push_screen(
+            StagedExactModVersionScreen(self.project_key, target)
+        )
+
+    def current_staged_exact_target(self) -> core.StagedExactModTarget | None:
+        transaction = self.app.transactions.get(self.project_key)
+        if transaction is None or not transaction.active:
+            return None
+        table = self.query_one("#staged-table", DataTable)
+        index = self.current_index(table, len(self.staged))
+        if index is None:
+            return None
+        mod = self.staged[index]
+        return next(
+            (
+                target
+                for target in self.staged_targets
+                if target.mod.relative_path == mod.relative_path
+                and core.canonical_provider(target.mod.provider)
+                in {"modrinth", "curseforge"}
+            ),
+            None,
+        )
 
     def refresh_search_results(self) -> None:
         table = self.query_one("#search-results-table", DataTable)
@@ -4967,6 +5064,8 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         self.query_one("#packwiz-status", Static).update(message)
 
     def toggle_provider(self) -> None:
+        if self._block_exact_selection_mutation():
+            return
         if self._pending_navigation is not None:
             return
         if self.operation is not None and not self.operation.done.is_set():
@@ -5150,6 +5249,8 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
     @on(Input.Submitted, "#mod-search")
     def start_search(self, event: Input.Submitted) -> None:
         if self._pending_navigation is not None:
+            return
+        if self._block_exact_selection_mutation():
             return
         query = event.value.strip()
         if not query:
@@ -5474,6 +5575,8 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         return None if index is None else self.staged[index]
 
     def update_staged_side(self, client: bool, server: bool) -> None:
+        if self._block_exact_selection_mutation():
+            return
         mod = self.current_staged_mod()
         if mod is None:
             self.app.notify("No staged MOD is selected", severity="warning")
@@ -5485,9 +5588,21 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             self.app.notify(str(error), severity="error")
 
     def remove_staged_mod(self) -> None:
+        if self._block_exact_selection_mutation():
+            return
         mod = self.current_staged_mod()
         if mod is None:
             self.app.notify("No staged MOD is selected", severity="warning")
+            return
+        if not any(
+            staged.relative_path == mod.relative_path
+            for staged in self.changed_staged
+        ):
+            self.app.notify(
+                "This unchanged shared dependency is a closure member and cannot be "
+                "unstaged independently",
+                severity="warning",
+            )
             return
         try:
             self.transaction().unstage(mod.relative_path)
@@ -5552,17 +5667,21 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             self.app.notify("Wait for the install operation to finish", severity="warning")
             return
         self.refresh_staged()
-        if not self.staged:
+        if not self.changed_staged and not self.removed:
             self.app.notify("No staged changes", severity="warning")
             return
         lines = [
             f"{mod.name}  C={'yes' if mod.client else 'no'}  "
             f"S={'yes' if mod.server else 'no'}  ({mod.provider})"
-            for mod in self.staged
+            for mod in self.changed_staged
         ]
+        lines.extend(
+            f"Removed: {mod.name}  ({mod.provider})"
+            for mod in self.removed
+        )
         self.app.push_screen(
             ConfirmModal(
-                f"Apply {len(self.staged)} staged MOD changes?",
+                "Apply changes",
                 [
                     *lines,
                     "",
@@ -5610,6 +5729,12 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
 
         key = event.key
         result_count = len(self.packwiz_menu_items) or len(self.search_results)
+        exact_prepared = self._exact_selection_is_prepared()
+        exact_accepted = self._exact_selection_is_accepted()
+        if exact_prepared and key not in {"enter", "u", "q", "escape", "p", "l"}:
+            event.stop()
+            self.set_status("Exact version selected; press Enter to Apply changes or u to undo")
+            return
         if key == "c":
             self.discard_search_results()
         elif focused is results and key == "j":
@@ -5628,9 +5753,15 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             self.remove_staged_mod()
         elif focused is staged and key == "enter":
             self.review()
+        elif focused is staged and key == "v":
+            self.select_staged_version()
         elif key == "l":
             self.navigate_after_cancellation(lambda: self.app.open_list(self.project_key))
         elif key == "u":
+            if exact_prepared or exact_accepted:
+                self.undo_exact_selection()
+                event.stop()
+                return
             if core.split_project_key(self.project_key)[0] == "pack":
                 self.navigate_after_cancellation(
                     lambda: self.app.open_update(self.project_key)
@@ -5886,6 +6017,326 @@ class InstalledModsScreen(ProjectChildScreen, FilterListScreen):
         else:
             return
         event.stop()
+
+
+class StagedExactModVersionScreen(ProjectChildScreen, BaseScreen):
+    """Select an exact version on the Install transaction without owning it."""
+
+    help_text = "Enter: prepare  a: Accept version change  q / Esc: Install"
+
+    def __init__(self, project_key: str, target: core.StagedExactModTarget) -> None:
+        super().__init__()
+        self.project_key = project_key
+        self.target = target
+        self.mod = target.mod
+        self.screen_title = f"{self.mod.name} / Select version"
+        # The borrowed transaction is resolved after the screen is mounted; this
+        # screen must not retain or create ownership during construction.
+        self.transaction: core.PackTransaction | None = None
+        self.cancel_event = threading.Event()
+        self.deadline: float | None = None
+        self.prepare_thread: threading.Thread | None = None
+        self.prepare_done = threading.Event()
+        self.prepare_error: BaseException | None = None
+        self.preview: core.ModVersionSelectionPreview | None = None
+        self.progress: list[core.ModVersionSelectionProgress] = []
+        self.progress_lock = threading.Lock()
+        self.timer: Timer | None = None
+        self.pending_cancel = False
+        self.rollback_thread: threading.Thread | None = None
+        self.rollback_done = threading.Event()
+        self.rollback_error: BaseException | None = None
+        self.accept_thread: threading.Thread | None = None
+        self.accept_done = threading.Event()
+        self.accept_error: BaseException | None = None
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        required_by = ", ".join(self.target.required_by) or "none (explicit root)"
+        yield Static(
+            "\n".join(
+                (
+                    f"Provider: {core.canonical_provider(self.mod.provider)}",
+                    f"Canonical project ID: {self.mod.project_id}",
+                    f"Role: {self.target.role}",
+                    f"Required by: {required_by}",
+                    "Reachability: "
+                    + ("complete" if self.target.required_by_complete else "Add batch only"),
+                    f"Side: {self.mod.side}",
+                    f"Metadata: {self.mod.relative_path}",
+                )
+            ),
+            id="staged-version-details",
+            markup=False,
+        )
+        yield Static("Select version: enter an exact provider artifact ID", id="staged-version-prompt")
+        yield Input(placeholder="Exact file/version ID", id="staged-version-artifact")
+        yield Static("Idle", id="staged-version-status", markup=False)
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#staged-version-artifact", Input).focus()
+
+    def _selection(self, artifact_id: str) -> core.ExactModArtifactSelection:
+        provider = core.canonical_provider(self.mod.provider)
+        if provider == "modrinth":
+            return core.ExactModArtifactSelection(
+                provider,
+                core.canonical_modrinth_id(self.mod.project_id, "Modrinth project ID"),
+                core.canonical_modrinth_id(artifact_id, "Modrinth version ID"),
+            )
+        if provider == "curseforge":
+            return core.ExactModArtifactSelection(provider, self.mod.project_id, artifact_id)
+        raise core.HuroshikiError("Exact version selection is available only for Modrinth or CurseForge MODs")
+
+    @on(Input.Submitted, "#staged-version-artifact")
+    def submit_artifact(self, event: Input.Submitted) -> None:
+        if (
+            self.prepare_thread is not None
+            or self.rollback_thread is not None
+            or self.accept_thread is not None
+        ):
+            return
+        transaction = self.app.transactions.get(self.project_key)
+        if transaction is None or not transaction.active:
+            self._status("Install transaction is no longer available")
+            return
+        try:
+            selection = self._selection(event.value.strip())
+        except BaseException as error:
+            self._status(str(error))
+            return
+        self.transaction = transaction
+        self.cancel_event = threading.Event()
+        self.deadline = time.monotonic() + core.UPDATE_OPERATION_TIMEOUT_SECONDS
+        self.prepare_done.clear()
+        self.prepare_error = None
+        self.preview = None
+        self._status("Preparing exact version...")
+        self.prepare_thread = threading.Thread(
+            target=self._run_prepare,
+            args=(selection,),
+            name=f"huroshiki-staged-exact-version-{self.project_key}",
+            daemon=False,
+        )
+        try:
+            self.prepare_thread.start()
+        except BaseException as error:
+            self.prepare_thread = None
+            self.prepare_error = error
+            self.prepare_done.set()
+            self._status(str(error))
+            return
+        self.timer = self.set_interval(0.05, self._poll)
+
+    def _status(self, message: str) -> None:
+        self.query_one("#staged-version-status", Static).update(message)
+
+    def _record_progress(self, progress: core.ModVersionSelectionProgress) -> None:
+        with self.progress_lock:
+            self.progress.append(progress)
+
+    def _run_prepare(self, selection: core.ExactModArtifactSelection) -> None:
+        try:
+            assert self.transaction is not None
+            self.preview = self.transaction.prepare_exact_mod_version(
+                selection,
+                cancel_event=self.cancel_event,
+                deadline=self.deadline,
+                progress=self._record_progress,
+            )
+        except BaseException as error:
+            self.prepare_error = error
+        finally:
+            self.prepare_done.set()
+
+    def _poll(self) -> None:
+        with self.progress_lock:
+            progress = tuple(self.progress)
+            self.progress.clear()
+        if progress:
+            self._status(progress[-1].message)
+        if self.prepare_thread is not None and self.prepare_done.is_set():
+            if self.timer is not None:
+                self.timer.stop()
+                self.timer = None
+            self.prepare_thread = None
+            if self.pending_cancel:
+                self._begin_rollback()
+            elif self.prepare_error is not None:
+                self._status(str(self.prepare_error))
+            else:
+                self._show_preview()
+        if self.rollback_thread is not None and self.rollback_done.is_set():
+            if self.timer is not None:
+                self.timer.stop()
+                self.timer = None
+            self.rollback_thread = None
+            if self.rollback_error is not None:
+                self._status(f"Rollback failed; remaining on Select version: {self.rollback_error}")
+                self.app.notify(str(self.rollback_error), severity="error")
+                self.pending_cancel = False
+            else:
+                self.app.open_install(self.project_key)
+        if self.accept_thread is not None and self.accept_done.is_set():
+            if self.timer is not None:
+                self.timer.stop()
+                self.timer = None
+            self.accept_thread = None
+            if self.accept_error is not None:
+                self._status(f"Accept failed; remaining on Select version: {self.accept_error}")
+                self.app.notify(str(self.accept_error), severity="error")
+            else:
+                self.app.open_install(self.project_key)
+
+    def _show_preview(self) -> None:
+        assert self.preview is not None
+        preview = self.preview
+        self._status("\n".join((
+            f"Version: {preview.old_version} -> {preview.new_version}",
+            f"Artifact ID: {preview.old_artifact_id} -> {preview.new_artifact_id}",
+            *(
+                (
+                    f"User selection intent: {preview.override_identity} -> "
+                    f"{preview.override_artifact_id} "
+                    f"({'locked' if preview.override_locked else 'unlocked'})",
+                )
+                if preview.override_identity is not None
+                else ()
+            ),
+            f"Added dependencies: {preview.added_dependencies}",
+            *(f"  + {item}" for item in preview.added_dependency_identities),
+            f"Removed dependencies: {preview.removed_dependencies}",
+            *(f"  - {item}" for item in preview.removed_dependency_identities),
+            *(f"Diagnostic: {message}" for message in preview.diagnostic_messages),
+            "",
+            "Press a: Accept version change, or q/Esc to Cancel.",
+        )))
+        self.focus()
+
+    def accept_version_change(self) -> None:
+        if self.preview is None or self.transaction is None:
+            self.app.notify("Prepare an exact version preview first", severity="warning")
+            return
+        if (
+            self.prepare_thread is not None
+            or self.rollback_thread is not None
+            or self.accept_thread is not None
+        ):
+            return
+        self.accept_done.clear()
+        self.accept_error = None
+        self._status("Accepting exact version...")
+        self.accept_thread = threading.Thread(
+            target=self._run_accept,
+            name=f"huroshiki-staged-exact-accept-{self.project_key}",
+            daemon=False,
+        )
+        try:
+            self.accept_thread.start()
+        except BaseException as error:
+            self.accept_thread = None
+            self.accept_error = error
+            self._status(f"Accept failed; remaining on Select version: {error}")
+            self.app.notify(str(error), severity="error")
+            return
+        self.timer = self.set_interval(0.05, self._poll)
+
+    def _run_accept(self) -> None:
+        try:
+            assert self.transaction is not None
+            self.transaction.accept_exact_mod_version()
+        except BaseException as error:
+            self.accept_error = error
+        finally:
+            self.accept_done.set()
+
+    def _begin_rollback(self) -> None:
+        transaction = self.transaction
+        if transaction is not None and transaction.operation_active:
+            message = (
+                "Exact version cleanup is incomplete; remaining on Select version"
+            )
+            self._status(message)
+            self.app.notify(message, severity="error")
+            self.pending_cancel = False
+            return
+        if transaction is None or (
+            not transaction.exact_selection_prepared
+            and not getattr(transaction, "exact_selection_accepted", False)
+            and not transaction.process_cleanup_pending
+        ):
+            self.app.open_install(self.project_key)
+            return
+        self.rollback_done.clear()
+        self.rollback_error = None
+        self._status("Undoing exact version selection...")
+        self.rollback_thread = threading.Thread(
+            target=self._run_rollback,
+            name=f"huroshiki-staged-exact-rollback-{self.project_key}",
+            daemon=False,
+        )
+        try:
+            self.rollback_thread.start()
+        except BaseException as error:
+            self.rollback_thread = None
+            self.rollback_error = error
+            self._status(f"Rollback failed; remaining on Select version: {error}")
+            self.app.notify(str(error), severity="error")
+            return
+        self.timer = self.set_interval(0.05, self._poll)
+
+    def _run_rollback(self) -> None:
+        try:
+            assert self.transaction is not None
+            self.transaction.rollback_exact_mod_version()
+        except BaseException as error:
+            self.rollback_error = error
+        finally:
+            self.rollback_done.set()
+
+    def cancel_and_navigate(self) -> None:
+        if self.rollback_thread is not None or self.accept_thread is not None:
+            return
+        self.pending_cancel = True
+        self.cancel_event.set()
+        if self.prepare_thread is None:
+            self._begin_rollback()
+        else:
+            self._status("Cancelling exact version preparation...")
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "a":
+            self.accept_version_change()
+        elif event.key in {"q", "escape", "p"}:
+            self.cancel_and_navigate()
+        else:
+            return
+        event.stop()
+
+    def on_unmount(self) -> None:
+        if self.prepare_thread is not None:
+            self.cancel_event.set()
+
+
+# Descriptive compatibility alias for callers/tests that use the shorter name.
+StagedModVersionScreen = StagedExactModVersionScreen
+
+
+class ExactSelectionRollbackScreen(StagedExactModVersionScreen):
+    """Undo an accepted exact selection in a worker before returning to Install."""
+
+    def __init__(self, project_key: str, transaction: core.PackTransaction) -> None:
+        target = core.StagedExactModTarget(
+            mod=transaction.staged_mods()[0], role="root", required_by=()
+        )
+        super().__init__(project_key, target)
+        self.transaction = transaction
+        self.pending_cancel = True
+
+    def on_mount(self) -> None:
+        self._status("Undoing exact version selection...")
+        self._begin_rollback()
 
 
 class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):

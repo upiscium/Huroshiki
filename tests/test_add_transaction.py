@@ -233,6 +233,55 @@ class AddTransactionTest(unittest.TestCase):
         self.assertEqual((self.source / "index.toml").read_bytes(), b"refreshed index\n")
         self.assert_unlocked()
 
+    def test_cli_exact_root_selection_uses_the_add_transaction_before_apply(self) -> None:
+        original = self.snapshot()
+        prepared: list[tuple[core.PackTransaction, core.ExactModArtifactSelection]] = []
+        applied: list[core.PackTransaction] = []
+        original_apply = core.PackTransaction.apply
+
+        def run(command, *, cwd, **_):
+            self.assertEqual(self.snapshot(), original)
+            if "add" in command and command[-1] == MODRINTH_IDS["example"]:
+                self.install_files(cwd, MODRINTH_IDS["example"])
+            elif command == ["packwiz", "refresh"]:
+                (cwd / "index.toml").write_bytes(b"refreshed index\n")
+            return self.completed(command)
+
+        def prepare(transaction, selection, **_kwargs):
+            prepared.append((transaction, selection))
+            return None
+
+        def apply(transaction, *args, **kwargs):
+            applied.append(transaction)
+            return original_apply(transaction, *args, **kwargs)
+
+        with patch.object(core.subprocess, "run", side_effect=run), patch.object(
+            core.PackTransaction,
+            "prepare_exact_mod_version",
+            autospec=True,
+            side_effect=prepare,
+        ), patch.object(
+            core.PackTransaction,
+            "apply",
+            autospec=True,
+            side_effect=apply,
+        ):
+            result = core.add_mod_transactionally(
+                self.key,
+                "modrinth",
+                "example",
+                "client",
+                artifact_id="Exact001",
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(len(applied), 1)
+        self.assertIs(prepared[0][0], applied[0])
+        self.assertEqual(prepared[0][1].identity_label, "modrinth:Examp001")
+        self.assertEqual(prepared[0][1].artifact_id, "Exact001")
+        self.assert_unlocked()
+
     def test_add_and_refresh_failures_leave_real_tree_unchanged(self) -> None:
         for failure in ("add", "refresh"):
             with self.subTest(failure=failure):
