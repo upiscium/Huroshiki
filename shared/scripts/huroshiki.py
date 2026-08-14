@@ -4973,6 +4973,13 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
             and getattr(transaction, "exact_selection_prepared", False)
         )
 
+    def _exact_selection_is_accepted(self) -> bool:
+        transaction = self.app.transactions.get(self.project_key)
+        return bool(
+            transaction is not None
+            and getattr(transaction, "exact_selection_accepted", False)
+        )
+
     def _block_exact_selection_mutation(self) -> bool:
         if self._exact_selection_is_prepared():
             self.set_status("Exact version selected; press Enter to Apply changes or u to undo")
@@ -4985,7 +4992,10 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
 
     def undo_exact_selection(self) -> None:
         transaction = self.app.transactions.get(self.project_key)
-        if transaction is None or not transaction.exact_selection_prepared:
+        if transaction is None or not (
+            transaction.exact_selection_prepared
+            or getattr(transaction, "exact_selection_accepted", False)
+        ):
             self.app.notify("No exact version selection to undo", severity="warning")
             return
         self.app.push_screen(
@@ -5720,6 +5730,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         key = event.key
         result_count = len(self.packwiz_menu_items) or len(self.search_results)
         exact_prepared = self._exact_selection_is_prepared()
+        exact_accepted = self._exact_selection_is_accepted()
         if exact_prepared and key not in {"enter", "u", "q", "escape", "p", "l"}:
             event.stop()
             self.set_status("Exact version selected; press Enter to Apply changes or u to undo")
@@ -5747,7 +5758,7 @@ class InstallScreen(ProjectChildScreen, BaseScreen):
         elif key == "l":
             self.navigate_after_cancellation(lambda: self.app.open_list(self.project_key))
         elif key == "u":
-            if exact_prepared:
+            if exact_prepared or exact_accepted:
                 self.undo_exact_selection()
                 event.stop()
                 return
@@ -6035,6 +6046,9 @@ class StagedExactModVersionScreen(ProjectChildScreen, BaseScreen):
         self.rollback_thread: threading.Thread | None = None
         self.rollback_done = threading.Event()
         self.rollback_error: BaseException | None = None
+        self.accept_thread: threading.Thread | None = None
+        self.accept_done = threading.Event()
+        self.accept_error: BaseException | None = None
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -6046,6 +6060,8 @@ class StagedExactModVersionScreen(ProjectChildScreen, BaseScreen):
                     f"Canonical project ID: {self.mod.project_id}",
                     f"Role: {self.target.role}",
                     f"Required by: {required_by}",
+                    "Reachability: "
+                    + ("complete" if self.target.required_by_complete else "Add batch only"),
                     f"Side: {self.mod.side}",
                     f"Metadata: {self.mod.relative_path}",
                 )
@@ -6075,7 +6091,11 @@ class StagedExactModVersionScreen(ProjectChildScreen, BaseScreen):
 
     @on(Input.Submitted, "#staged-version-artifact")
     def submit_artifact(self, event: Input.Submitted) -> None:
-        if self.prepare_thread is not None or self.rollback_thread is not None:
+        if (
+            self.prepare_thread is not None
+            or self.rollback_thread is not None
+            or self.accept_thread is not None
+        ):
             return
         transaction = self.app.transactions.get(self.project_key)
         if transaction is None or not transaction.active:
@@ -6158,6 +6178,16 @@ class StagedExactModVersionScreen(ProjectChildScreen, BaseScreen):
                 self.pending_cancel = False
             else:
                 self.app.open_install(self.project_key)
+        if self.accept_thread is not None and self.accept_done.is_set():
+            if self.timer is not None:
+                self.timer.stop()
+                self.timer = None
+            self.accept_thread = None
+            if self.accept_error is not None:
+                self._status(f"Accept failed; remaining on Select version: {self.accept_error}")
+                self.app.notify(str(self.accept_error), severity="error")
+            else:
+                self.app.open_install(self.project_key)
 
     def _show_preview(self) -> None:
         assert self.preview is not None
@@ -6188,7 +6218,38 @@ class StagedExactModVersionScreen(ProjectChildScreen, BaseScreen):
         if self.preview is None or self.transaction is None:
             self.app.notify("Prepare an exact version preview first", severity="warning")
             return
-        self.app.open_install(self.project_key)
+        if (
+            self.prepare_thread is not None
+            or self.rollback_thread is not None
+            or self.accept_thread is not None
+        ):
+            return
+        self.accept_done.clear()
+        self.accept_error = None
+        self._status("Accepting exact version...")
+        self.accept_thread = threading.Thread(
+            target=self._run_accept,
+            name=f"huroshiki-staged-exact-accept-{self.project_key}",
+            daemon=False,
+        )
+        try:
+            self.accept_thread.start()
+        except BaseException as error:
+            self.accept_thread = None
+            self.accept_error = error
+            self._status(f"Accept failed; remaining on Select version: {error}")
+            self.app.notify(str(error), severity="error")
+            return
+        self.timer = self.set_interval(0.05, self._poll)
+
+    def _run_accept(self) -> None:
+        try:
+            assert self.transaction is not None
+            self.transaction.accept_exact_mod_version()
+        except BaseException as error:
+            self.accept_error = error
+        finally:
+            self.accept_done.set()
 
     def _begin_rollback(self) -> None:
         transaction = self.transaction
@@ -6202,6 +6263,7 @@ class StagedExactModVersionScreen(ProjectChildScreen, BaseScreen):
             return
         if transaction is None or (
             not transaction.exact_selection_prepared
+            and not getattr(transaction, "exact_selection_accepted", False)
             and not transaction.process_cleanup_pending
         ):
             self.app.open_install(self.project_key)
@@ -6234,7 +6296,7 @@ class StagedExactModVersionScreen(ProjectChildScreen, BaseScreen):
             self.rollback_done.set()
 
     def cancel_and_navigate(self) -> None:
-        if self.rollback_thread is not None:
+        if self.rollback_thread is not None or self.accept_thread is not None:
             return
         self.pending_cancel = True
         self.cancel_event.set()

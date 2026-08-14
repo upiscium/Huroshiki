@@ -78,6 +78,26 @@ class _InstallReviewApp(App[None]):
         self.push_screen(huroshiki.InstallScreen("pack:demo"))
 
 
+class _AcceptedRollbackApp(App[None]):
+    CSS_PATH = str(Path(huroshiki.__file__).with_name("huroshiki.tcss"))
+
+    def __init__(self, transaction: MagicMock) -> None:
+        super().__init__()
+        self.transactions = {"pack:demo": transaction}
+        self.opened_install = threading.Event()
+
+    def on_mount(self) -> None:
+        self.push_screen(
+            huroshiki.ExactSelectionRollbackScreen(
+                "pack:demo", self.transactions["pack:demo"]
+            )
+        )
+
+    def open_install(self, project_key: str) -> None:
+        if project_key == "pack:demo":
+            self.opened_install.set()
+
+
 class BorrowedStagedVersionTuiTest(unittest.IsolatedAsyncioTestCase):
     async def test_accept_keeps_borrowed_transaction_for_final_add_apply(self) -> None:
         transaction = MagicMock()
@@ -86,12 +106,16 @@ class BorrowedStagedVersionTuiTest(unittest.IsolatedAsyncioTestCase):
         transaction.exact_selection_prepared = True
         transaction.prepare_exact_mod_version.return_value = preview()
         worker_threads: list[int] = []
+        accept_threads: list[int] = []
 
         def prepare(*args, **kwargs):
             worker_threads.append(threading.get_ident())
             return preview()
 
         transaction.prepare_exact_mod_version.side_effect = prepare
+        transaction.accept_exact_mod_version.side_effect = (
+            lambda: accept_threads.append(threading.get_ident())
+        )
         app = _StagedVersionApp(transaction)
         caller = threading.get_ident()
         with patch.object(core.PackTransaction, "create") as create:
@@ -119,6 +143,7 @@ class BorrowedStagedVersionTuiTest(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 app.screen.accept_version_change()
+                await pilot.pause(0.2)
                 self.assertTrue(app.opened_install.is_set())
         create.assert_not_called()
         transaction.apply.assert_not_called()
@@ -126,6 +151,8 @@ class BorrowedStagedVersionTuiTest(unittest.IsolatedAsyncioTestCase):
         transaction.rollback_exact_mod_version.assert_not_called()
         self.assertIs(app.transactions["pack:demo"], transaction)
         self.assertNotEqual(worker_threads[0], caller)
+        transaction.accept_exact_mod_version.assert_called_once_with()
+        self.assertNotEqual(accept_threads[0], caller)
 
     async def test_cancel_preview_rolls_back_without_discarding_add(self) -> None:
         transaction = MagicMock()
@@ -148,6 +175,20 @@ class BorrowedStagedVersionTuiTest(unittest.IsolatedAsyncioTestCase):
         transaction.apply.assert_not_called()
         transaction.discard.assert_not_called()
         self.assertIs(app.transactions["pack:demo"], transaction)
+
+    async def test_undo_accepted_selection_runs_rollback_before_navigation(self) -> None:
+        transaction = MagicMock()
+        transaction.active = True
+        transaction.operation_active = False
+        transaction.process_cleanup_pending = False
+        transaction.exact_selection_prepared = False
+        transaction.exact_selection_accepted = True
+        transaction.staged_mods.return_value = [mod_info()]
+        app = _AcceptedRollbackApp(transaction)
+        async with app.run_test() as pilot:
+            await pilot.pause(0.2)
+            self.assertTrue(app.opened_install.is_set())
+        transaction.rollback_exact_mod_version.assert_called_once_with()
 
     def test_target_exposes_dependency_reachability(self) -> None:
         target = core.StagedExactModTarget(

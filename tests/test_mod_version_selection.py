@@ -1003,6 +1003,267 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         finally:
             transaction.discard()
 
+    def test_multiple_accepted_exact_selections_compose_and_later_cancel_restores(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"), ("root-b", "b1", "both")),
+            (),
+        )
+
+        def closure_for(selection, **_kwargs):
+            _provider, project_id, artifact_id = selection_fixture_key(selection)
+            return self.graph_closure(project_id, artifact_id)
+
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", side_effect=closure_for
+            ):
+                transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth",
+                        branded_project("root-a"),
+                        branded_version("a2"),
+                    )
+                )
+                transaction.accept_exact_mod_version()
+                first_accepted = core._file_content_snapshot(transaction.source)
+                self.assertTrue(transaction.exact_selection_accepted)
+                self.assertFalse(transaction.exact_selection_prepared)
+                self.assertTrue(
+                    all(
+                        target.required_by_complete
+                        for target in transaction.staged_exact_mod_targets()
+                    )
+                )
+
+                transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth",
+                        branded_project("root-b"),
+                        branded_version("x2"),
+                    )
+                )
+                transaction.accept_exact_mod_version()
+                second_accepted = core._file_content_snapshot(transaction.source)
+                self.assertNotEqual(second_accepted, first_accepted)
+
+                transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth",
+                        branded_project("root-a"),
+                        branded_version("a1"),
+                    )
+                )
+                transaction.rollback_exact_mod_version()
+                self.assertEqual(
+                    core._file_content_snapshot(transaction.source), second_accepted
+                )
+                self.assertTrue(transaction.exact_selection_accepted)
+
+            transaction.apply()
+            self.assertIn(
+                f'version = "{mr_version("a2")}"',
+                self.source.joinpath("mods/root-a.pw.toml").read_text(),
+            )
+            self.assertIn(
+                f'version = "{mr_version("x2")}"',
+                self.source.joinpath("mods/root-b.pw.toml").read_text(),
+            )
+        finally:
+            if transaction.active:
+                transaction.discard()
+
+    def test_mutation_after_accept_requires_fresh_complete_exact_verification(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root", "r1", "both"),), (("dependency", "d2"),)
+        )
+        try:
+            with patch.object(
+                core,
+                "resolve_exact_mod_closure",
+                return_value=self.graph_closure("root", "r2", ("dependency", "d2")),
+            ):
+                transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth",
+                        branded_project("root"),
+                        branded_version("r2"),
+                    )
+                )
+                transaction.accept_exact_mod_version()
+            target = transaction.staged_exact_mod_targets()[0]
+            transaction.set_side(target.mod.relative_path, True, False)
+            self.assertFalse(transaction.exact_selection_accepted)
+            with self.assertRaisesRegex(core.HuroshikiError, "invalidated exact MOD"):
+                transaction.apply()
+            with patch.object(
+                core,
+                "resolve_exact_mod_closure",
+                return_value=self.graph_closure(
+                    "root", "r2", ("dependency", "d2")
+                ),
+            ):
+                transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth",
+                        branded_project("root"),
+                        branded_version("r2"),
+                    )
+                )
+                transaction.accept_exact_mod_version()
+            transaction.apply()
+            self.assertFalse(transaction.active)
+        finally:
+            if transaction.active:
+                transaction.discard()
+
+    def test_resolved_add_after_accept_invalidates_evidence_and_undo_history(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root", "r1", "both"),), (("dependency", "d2"),)
+        )
+        try:
+            with patch.object(
+                core,
+                "resolve_exact_mod_closure",
+                return_value=self.graph_closure(
+                    "root", "r2", ("dependency", "d2")
+                ),
+            ):
+                transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth",
+                        branded_project("root"),
+                        branded_version("r2"),
+                    )
+                )
+                transaction.accept_exact_mod_version()
+            add = transaction.begin_resolved_add(
+                provider="modrinth",
+                selector="introduced",
+                canonical_project_id=mr_project("introduced"),
+                side="both",
+            )
+            with patch.object(
+                core,
+                "resolve_mod_closure",
+                return_value=self.graph_closure("introduced", "x1"),
+            ):
+                result = add.run()
+            self.assertTrue(result.success, result.message)
+            self.assertFalse(transaction.exact_selection_accepted)
+            with self.assertRaisesRegex(
+                core.HuroshikiError, "No exact MOD version selection"
+            ):
+                transaction.rollback_exact_mod_version()
+            with self.assertRaisesRegex(core.HuroshikiError, "invalidated exact MOD"):
+                transaction.apply()
+        finally:
+            if transaction.active:
+                transaction.discard()
+
+    def test_final_apply_excludes_concurrent_mutation_after_exact_validation(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root", "r1", "both"),), (("dependency", "d2"),)
+        )
+        entered_validation = threading.Event()
+        release_validation = threading.Event()
+        mutation_started = threading.Event()
+        apply_errors: list[BaseException] = []
+        mutation_errors: list[BaseException] = []
+        try:
+            with patch.object(
+                core,
+                "resolve_exact_mod_closure",
+                return_value=self.graph_closure(
+                    "root", "r2", ("dependency", "d2")
+                ),
+            ):
+                transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth",
+                        branded_project("root"),
+                        branded_version("r2"),
+                    )
+                )
+                transaction.accept_exact_mod_version()
+            target = transaction.staged_exact_mod_targets()[0]
+            validate = transaction._validate_exact_selection_stage
+
+            def blocking_validate(evidence):
+                entered_validation.set()
+                self.assertTrue(release_validation.wait(2))
+                validate(evidence)
+
+            def apply() -> None:
+                try:
+                    transaction.apply()
+                except BaseException as error:
+                    apply_errors.append(error)
+
+            def mutate() -> None:
+                mutation_started.set()
+                try:
+                    transaction.set_side(target.mod.relative_path, True, False)
+                except BaseException as error:
+                    mutation_errors.append(error)
+
+            with patch.object(
+                transaction,
+                "_validate_exact_selection_stage",
+                side_effect=blocking_validate,
+            ):
+                apply_thread = threading.Thread(target=apply, daemon=False)
+                mutation_thread = threading.Thread(target=mutate, daemon=False)
+                apply_thread.start()
+                self.assertTrue(entered_validation.wait(2))
+                mutation_thread.start()
+                self.assertTrue(mutation_started.wait(2))
+                self.assertTrue(mutation_thread.is_alive())
+                release_validation.set()
+                apply_thread.join(2)
+                mutation_thread.join(2)
+
+            self.assertFalse(apply_errors)
+            self.assertEqual(len(mutation_errors), 1)
+            self.assertRegex(str(mutation_errors[0]), "no longer active")
+            self.assertFalse(transaction.active)
+        finally:
+            release_validation.set()
+            if transaction.active:
+                transaction.discard()
+
+    def test_accepted_rollback_digest_blocks_external_staged_replacement(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root", "r1", "both"),), (("dependency", "d2"),)
+        )
+        try:
+            with patch.object(
+                core,
+                "resolve_exact_mod_closure",
+                return_value=self.graph_closure(
+                    "root", "r2", ("dependency", "d2")
+                ),
+            ):
+                transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth",
+                        branded_project("root"),
+                        branded_version("r2"),
+                    )
+                )
+                transaction.accept_exact_mod_version()
+            transaction.rollback_exact_mod_version()
+            transaction.source.joinpath("pack.toml").write_text(
+                '[versions]\nminecraft = "1.20.1"\nfabric = "0.16.0"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                core.HuroshikiError, "changed after exact-selection rollback"
+            ):
+                transaction.apply(refresh=False)
+        finally:
+            if transaction.active:
+                transaction.discard()
+
     def test_staged_dependency_selection_rebuilds_added_root_closure_shape(self) -> None:
         for path in self.source.joinpath("mods").iterdir():
             path.unlink()
