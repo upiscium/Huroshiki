@@ -972,6 +972,15 @@ class TransactionBatch:
     provider: str
     query: str
     changed_files: tuple[Path, ...]
+    root_identity: tuple[str, str] | None = None
+    closure_identities: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class StagedExactModTarget:
+    mod: ModInfo
+    role: Literal["root", "dependency"]
+    required_by: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1414,6 +1423,7 @@ class ResolvedAddOperation(_AddOperationLifecycle):
                 self.minecraft, self.loader, self.loader_version = (
                     packctl.project_versions(self.transaction.source)
                 )
+                self.transaction._ensure_empty_pack_root_manifest()
                 self._checkpoint()
             closure = resolve_mod_closure(
                 provider=self.provider,
@@ -1436,6 +1446,7 @@ class ResolvedAddOperation(_AddOperationLifecycle):
                         "Transaction was closed before MOD resolution completed"
                     )
                 self._checkpoint()
+                overrides = self.transaction._validated_version_overrides()
                 changed = merge_metadata_closure(
                     self.transaction.source,
                     closure,
@@ -1445,11 +1456,16 @@ class ResolvedAddOperation(_AddOperationLifecycle):
                     equivalence_workspace=self.resolver_root / "equivalence",
                     process_result_callback=self._record_resolver_process_result,
                 )
+                self.transaction._assert_version_overrides_preserved(overrides)
                 self._checkpoint()
                 batch = TransactionBatch(
                     provider=self.provider,
                     query=self.selector,
                     changed_files=changed,
+                    root_identity=closure.root_identity,
+                    closure_identities=tuple(
+                        sorted(item.identity for item in closure.metadata)
+                    ),
                 )
                 message = (
                     f"Staged {self.provider}:{closure.root_identity[1]} and dependencies"
@@ -2139,6 +2155,71 @@ class PackTransaction:
                 "staging another transaction change"
             )
 
+    @property
+    def exact_selection_prepared(self) -> bool:
+        return self._exact_selection_prepared
+
+    @property
+    def operation_active(self) -> bool:
+        with self._lock:
+            return self._operation is not None
+
+    @property
+    def process_cleanup_pending(self) -> bool:
+        with self._lock:
+            return bool(self._equivalence_process_results)
+
+    def _ensure_empty_pack_root_manifest(self) -> None:
+        manifest = self.source / ".huroshiki-roots.json"
+        if manifest.exists():
+            return
+        if metadata_content_snapshot(self.source):
+            return
+        ensure_pack_root_manifest_ignored(self.source)
+        write_pack_root_manifest(self.source, ())
+
+    def _validated_version_overrides(self) -> tuple[ModVersionOverride, ...]:
+        return _validate_mod_version_override_records(
+            self.source,
+            _exact_metadata_records(self.source),
+        )
+
+    def _assert_version_overrides_preserved(
+        self, overrides: tuple[ModVersionOverride, ...]
+    ) -> None:
+        _validate_mod_version_override_records(
+            self.source,
+            _exact_metadata_records(self.source),
+            overrides=overrides,
+        )
+
+    def rollback_exact_mod_version(self, *, deadline: float | None = None) -> None:
+        """Restore the staged source from immediately before exact selection."""
+        self._lifecycle_lock.acquire()
+        try:
+            with self._lock:
+                self.ensure_active()
+                if self._operation is not None:
+                    raise HuroshikiError(
+                        "Wait for the active exact version operation to finish"
+                    )
+                cleanup_was_pending = bool(self._equivalence_process_results)
+                cleanup_deadline = (
+                    deadline
+                    if deadline is not None
+                    else time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS
+                )
+                self._retry_equivalence_process_cleanup(cleanup_deadline)
+                if not self._exact_selection_prepared:
+                    if cleanup_was_pending:
+                        return
+                    raise HuroshikiError("No exact MOD version preview is prepared")
+                self._restore_exact_selection_checkpoint()
+                self._exact_selection_checkpoint = None
+                self._exact_selection_failed_source = None
+        finally:
+            self._lifecycle_lock.release()
+
     def set_mod_version_pin(
         self,
         identity: str,
@@ -2433,6 +2514,7 @@ class PackTransaction:
                 "" if result.success else result.message,
             )
         try:
+            self._ensure_empty_pack_root_manifest()
             minecraft, loader, loader_version = packctl.project_versions(self.source)
             closure = resolve_mod_closure(
                 provider=provider,
@@ -2444,6 +2526,7 @@ class PackTransaction:
                 process_result_callback=self._record_equivalence_process_result,
                 diagnostic_project_id=self.project_key.partition(":")[2],
             )
+            overrides = self._validated_version_overrides()
             changed = merge_metadata_closure(
                 self.source,
                 closure,
@@ -2451,16 +2534,32 @@ class PackTransaction:
                 equivalence_workspace=self.root / "equivalence",
                 process_result_callback=self._record_equivalence_process_result,
             )
+            self._assert_version_overrides_preserved(overrides)
         except Exception as error:
             return subprocess.CompletedProcess(
                 build_add_command(provider, query), 1, "", str(error)
             )
         self.batches.append(
-            TransactionBatch(provider=provider, query=query, changed_files=changed)
+            TransactionBatch(
+                provider=provider,
+                query=query,
+                changed_files=changed,
+                root_identity=closure.root_identity,
+                closure_identities=tuple(
+                    sorted(item.identity for item in closure.metadata)
+                ),
+            )
         )
         return subprocess.CompletedProcess(build_add_command(provider, query), 0, "", "")
 
-    def add_mod_transactionally(self, provider: str, selector: str, side: str) -> int:
+    def add_mod_transactionally(
+        self,
+        provider: str,
+        selector: str,
+        side: str,
+        *,
+        artifact_id: str | None = None,
+    ) -> int:
         """Run one synchronous add entirely in staging, then atomically apply it."""
         self.ensure_active()
         self._ensure_exact_selection_not_prepared()
@@ -2472,6 +2571,10 @@ class PackTransaction:
         except packctl.ConfigError as error:
             raise HuroshikiError(str(error)) from error
         provider, selector = normalize_add_selector(provider, selector)
+        if artifact_id is not None and provider == "url":
+            raise HuroshikiError(
+                "Exact artifact selection is unavailable for self-hosted URL MODs"
+            )
         ensure_safe_pack_source(self.source)
 
         if provider == "url":
@@ -2487,6 +2590,7 @@ class PackTransaction:
                     raise HuroshikiError(result.message)
                 return result.returncode or 1
         else:
+            self._ensure_empty_pack_root_manifest()
             minecraft, loader, loader_version = packctl.project_versions(self.source)
             closure = resolve_mod_closure(
                 provider=provider,
@@ -2498,6 +2602,7 @@ class PackTransaction:
                 process_result_callback=self._record_equivalence_process_result,
                 diagnostic_project_id=self.project_key.partition(":")[2],
             )
+            overrides = self._validated_version_overrides()
             try:
                 changed = merge_metadata_closure(
                     self.source,
@@ -2508,13 +2613,36 @@ class PackTransaction:
                 )
             except Exception as error:
                 raise HuroshikiError(f"Could not merge resolved MOD closure: {error}") from error
+            self._assert_version_overrides_preserved(overrides)
             self.batches.append(
                 TransactionBatch(
                     provider=provider,
                     query=selector,
                     changed_files=changed,
+                    root_identity=closure.root_identity,
+                    closure_identities=tuple(
+                        sorted(item.identity for item in closure.metadata)
+                    ),
                 )
             )
+
+            if artifact_id is not None:
+                root_provider, root_project_id = closure.root_identity
+                selected_artifact_id = artifact_id
+                if root_provider == "modrinth":
+                    root_project_id = canonical_modrinth_id(
+                        root_project_id, "Modrinth project ID"
+                    )
+                    selected_artifact_id = canonical_modrinth_id(
+                        artifact_id, "Modrinth version ID"
+                    )
+                self.prepare_exact_mod_version(
+                    ExactModArtifactSelection(
+                        root_provider,
+                        root_project_id,
+                        selected_artifact_id,
+                    )
+                )
 
         self.apply()
         return 0
@@ -2636,6 +2764,8 @@ class PackTransaction:
                 )
                 closure = ResolvedModClosure(root_identity, probe_metadata)
             operation._checkpoint()
+            self._ensure_empty_pack_root_manifest()
+            overrides = self._validated_version_overrides()
             changed = merge_metadata_closure(
                 self.source,
                 closure,
@@ -2645,12 +2775,17 @@ class PackTransaction:
                 equivalence_workspace=operation.resolver_root / "equivalence",
                 process_result_callback=operation._record_resolver_process_result,
             )
+            self._assert_version_overrides_preserved(overrides)
             operation._checkpoint()
 
             batch = TransactionBatch(
                 provider=operation.provider,
                 query=operation.query,
                 changed_files=changed,
+                root_identity=closure.root_identity,
+                closure_identities=tuple(
+                    sorted(item.identity for item in closure.metadata)
+                ),
             )
             result = AddOperationResult(
                 returncode=0,
@@ -2710,11 +2845,13 @@ class PackTransaction:
             metadata = _read_resolver_metadata(operation.resolver_source)
             identity = ("url", artifact.mod_id)
             operation._checkpoint()
+            overrides = self._validated_version_overrides()
             changed = merge_metadata_closure(
                 self.source,
                 ResolvedModClosure(identity, metadata),
                 requested_side=side_from_flags(operation.client, operation.server),
             )
+            self._assert_version_overrides_preserved(overrides)
             operation._checkpoint()
             if not changed:
                 raise HuroshikiError("The URL metadata is already current")
@@ -2795,6 +2932,79 @@ class PackTransaction:
             for path in paths
             if (self.source / path).exists()
         ]
+
+    def staged_removed_mods(self) -> list[ModInfo]:
+        """Return baseline MODs removed from the current staged source."""
+        self.ensure_active()
+        current = metadata_digest_snapshot(self.source)
+        removed: list[ModInfo] = []
+        for path in sorted(changed_paths(self.baseline, current)):
+            if (self.source / path).exists():
+                continue
+            contents = self.baseline_contents.get(path)
+            if contents is None:
+                continue
+            removed.append(
+                read_mod_data(path, tomllib.loads(contents.decode("utf-8")))
+            )
+        return removed
+
+    def staged_exact_mod_targets(self) -> list[StagedExactModTarget]:
+        """List provider artifacts reachable from roots staged by Add batches."""
+        self.ensure_active()
+        if self._exact_selection_prepared:
+            return []
+        root_identities = {
+            (root.provider, root.project_id)
+            for root in read_pack_root_manifest(self.source)
+        }
+        active_batches = [
+            batch
+            for batch in self.batches
+            if batch.root_identity is not None
+            and batch.root_identity in root_identities
+        ]
+        closure_identities = {
+            identity
+            for batch in active_batches
+            for identity in batch.closure_identities
+        }
+        if not closure_identities:
+            return []
+        requiring_roots: dict[tuple[str, str], set[str]] = {}
+        for batch in active_batches:
+            assert batch.root_identity is not None
+            root_label = f"{batch.root_identity[0]}:{batch.root_identity[1]}"
+            for identity in batch.closure_identities:
+                if identity != batch.root_identity:
+                    requiring_roots.setdefault(identity, set()).add(root_label)
+        targets: list[StagedExactModTarget] = []
+        for mod in list_mods_from_source(self.source):
+            provider = canonical_provider(mod.provider)
+            identity = (provider, mod.project_id)
+            if provider not in {"modrinth", "curseforge"}:
+                continue
+            if identity not in closure_identities:
+                continue
+            role: Literal["root", "dependency"] = (
+                "root" if identity in root_identities else "dependency"
+            )
+            targets.append(
+                StagedExactModTarget(
+                    mod,
+                    role,
+                    tuple(sorted(requiring_roots.get(identity, ()))),
+                )
+            )
+        return sorted(
+            targets,
+            key=lambda item: (
+                0 if item.role == "root" else 1,
+                item.mod.name.casefold(),
+                canonical_provider(item.mod.provider),
+                item.mod.project_id,
+            ),
+        )
 
     def set_side(self, relative_path: Path, client: bool, server: bool) -> None:
         with self._lock:
@@ -2919,6 +3129,8 @@ class PackTransaction:
                             provider=batch.provider,
                             query=batch.query,
                             changed_files=remaining,
+                            root_identity=batch.root_identity,
+                            closure_identities=batch.closure_identities,
                         )
                     )
             self.batches = remaining_batches
@@ -8283,11 +8495,18 @@ def add_mod_transactionally(
     provider: str,
     selector: str,
     side: str,
+    *,
+    artifact_id: str | None = None,
 ) -> int:
     """Add a mod on a disposable source copy and atomically publish on success."""
     transaction = PackTransaction.create(project_key_value)
     try:
-        return transaction.add_mod_transactionally(provider, selector, side)
+        return transaction.add_mod_transactionally(
+            provider,
+            selector,
+            side,
+            artifact_id=artifact_id,
+        )
     finally:
         transaction.discard()
 
