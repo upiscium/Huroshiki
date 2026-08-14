@@ -3687,6 +3687,37 @@ class PackTransaction:
             initial_reachability = _exact_closure_reachability(
                 root_closures, checkpoint
             )
+            explicit_root_identities = {
+                (root.provider, root.project_id) for root in explicit_roots
+            }
+            dependency_constraints: dict[
+                tuple[str, str], ExactModArtifactSelection
+            ] = {}
+            for override in overrides_before:
+                checkpoint()
+                identity = (override.provider, override.project_id)
+                if identity in explicit_root_identities:
+                    continue
+                owners = initial_reachability.get(identity)
+                if not owners:
+                    raise HuroshikiError(
+                        "Exact MOD selection found a stale/orphan version override: "
+                        f"{override.canonical_identity}"
+                    )
+                project_identity: str | CanonicalModrinthId = override.project_id
+                artifact_identity: str | CanonicalModrinthId = override.artifact_id
+                if override.provider == "modrinth":
+                    project_identity = canonical_modrinth_id(
+                        override.project_id, "Modrinth project ID"
+                    )
+                    artifact_identity = canonical_modrinth_id(
+                        override.artifact_id, "Modrinth version ID"
+                    )
+                dependency_constraints[identity] = ExactModArtifactSelection(
+                    override.provider,
+                    project_identity,
+                    artifact_identity,
+                )
             if selected_root is None:
                 initial_owners = initial_reachability.get(selection.identity)
                 if not initial_owners:
@@ -3699,35 +3730,58 @@ class PackTransaction:
                     for root in explicit_roots
                     if root.canonical_identity in initial_owners
                 }
-                constrained_closures: list[tuple[PackMigrationRoot, ResolvedModClosure]] = []
-                for root_index, (root, closure) in enumerate(root_closures):
-                    checkpoint()
-                    if root.canonical_identity in initial_owners:
-                        constrained = resolve_root_closure(
-                            root,
-                            root_index,
-                            preseed_selections=(selection,),
-                        )
+                dependency_constraints[selection.identity] = selection
+
+            constrained_closures: list[
+                tuple[PackMigrationRoot, ResolvedModClosure]
+            ] = []
+            for root_index, (root, closure) in enumerate(root_closures):
+                checkpoint()
+                preseeds = tuple(
+                    dependency_constraints[identity]
+                    for identity in sorted(dependency_constraints)
+                    if root.canonical_identity
+                    in initial_reachability[identity]
+                )
+                if preseeds:
+                    constrained = resolve_root_closure(
+                        root,
+                        root_index,
+                        preseed_selections=preseeds,
+                    )
+                    for constrained_selection in preseeds:
                         try:
                             _verify_exact_root_metadata(
-                                selection, constrained.metadata
+                                constrained_selection, constrained.metadata
                             )
                         except HuroshikiError as error:
+                            constraint_label = (
+                                "Exact dependency selection"
+                                if selected_root is None
+                                and constrained_selection.identity == selection.identity
+                                else "Existing version override constraint"
+                            )
                             raise HuroshikiError(
-                                f"Exact dependency selection conflict for "
-                                f"{selection.identity_label}: {error}"
+                                f"{constraint_label} conflict for "
+                                f"{constrained_selection.identity_label}: {error}"
                             ) from error
-                        closure = constrained
-                    constrained_closures.append((root, closure))
-                root_closures = constrained_closures
-                resulting_reachability = _exact_closure_reachability(
-                    root_closures, checkpoint
+                    closure = constrained
+                constrained_closures.append((root, closure))
+            root_closures = constrained_closures
+            resulting_reachability = _exact_closure_reachability(
+                root_closures, checkpoint
+            )
+            for constrained_identity in dependency_constraints:
+                initial_owners = initial_reachability[constrained_identity]
+                resulting_owners = resulting_reachability.get(
+                    constrained_identity, {}
                 )
-                resulting_owners = resulting_reachability.get(selection.identity, {})
                 if set(resulting_owners) != set(initial_owners):
+                    label = (
+                        f"{constrained_identity[0]}:{constrained_identity[1]}"
+                    )
                     raise HuroshikiError(
-                        f"Exact dependency selection changed ownership for "
-                        f"{selection.identity_label}"
+                        f"Exact dependency selection changed ownership for {label}"
                     )
 
             final_reachability = _exact_closure_reachability(

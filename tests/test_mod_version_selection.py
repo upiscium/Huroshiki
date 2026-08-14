@@ -32,6 +32,9 @@ MR_PROJECT_IDS = {
     "staged": "Stage001",
     "different-project": "DiffP001",
     "sodium": "Sodium01",
+    "dep-d": "DepD0001",
+    "dep-f": "DepF0001",
+    "dep-g": "DepG0001",
 }
 MR_VERSION_IDS = {
     "r1": "VersR001",
@@ -54,6 +57,10 @@ MR_VERSION_IDS = {
     "tampered": "Tamper01",
     "dependency-artifact": "DepArt01",
     "dependency-new": "DepNew01",
+    "f1": "VersF001",
+    "f2": "VersF002",
+    "g1": "VersG001",
+    "g2": "VersG002",
 }
 
 
@@ -444,6 +451,48 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         return core.ResolvedModClosure(
             ("modrinth", mr_project(root_project)),
             tuple(records),
+        )
+
+    def composing_dependency_resolver(
+        self,
+        automatic_dependencies: dict[str, tuple[tuple[str, str], ...]],
+        calls: list[tuple[str, tuple[tuple[str, str], ...]]] | None = None,
+    ):
+        def resolve(selection, *, preseed_selections=(), **_kwargs):
+            _provider, root_project, root_artifact = selection_fixture_key(selection)
+            selected = dict(automatic_dependencies[root_project])
+            preseeds: list[tuple[str, str]] = []
+            for preseed in preseed_selections:
+                _preseed_provider, project_id, artifact_id = selection_fixture_key(
+                    preseed
+                )
+                selected[project_id] = artifact_id
+                preseeds.append((project_id, artifact_id))
+            if calls is not None:
+                calls.append((root_project, tuple(preseeds)))
+            return self.graph_closure(
+                root_project,
+                root_artifact,
+                *tuple(sorted(selected.items())),
+            )
+
+        return resolve
+
+    def composition_materializer(
+        self, requirements: dict[str, tuple[tuple[str, str], ...]]
+    ):
+        return self.dependency_graph_materializer(
+            requirements,
+            {
+                "a1": "1.0",
+                "b1": "1.0",
+                "d1": "1.0",
+                "d2": "2.0",
+                "f1": "1.0",
+                "f2": "2.0",
+                "g1": "1.0",
+                "g2": "2.0",
+            },
         )
 
     def dependency_graph_materializer(
@@ -1002,6 +1051,346 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             transaction.unstage(Path("mods/introduced.pw.toml"))
         finally:
             transaction.discard()
+
+    def assert_sibling_dependency_selection_order(
+        self, order: tuple[tuple[str, str], ...]
+    ) -> None:
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"),),
+            (("dep-d", "d1"), ("dep-f", "f1")),
+        )
+        resolver = self.composing_dependency_resolver(
+            {"root-a": (("dep-d", "d1"), ("dep-f", "f1"))}
+        )
+        materializer = self.composition_materializer(
+            {"root-a": (("dep-d", ">=1.0"), ("dep-f", ">=1.0"))}
+        )
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", side_effect=resolver
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materializer
+            ):
+                for project_id, artifact_id in order:
+                    transaction.prepare_exact_mod_version(
+                        self.selection(
+                            "modrinth",
+                            branded_project(project_id),
+                            branded_version(artifact_id),
+                        )
+                    )
+                    transaction.accept_exact_mod_version()
+            overrides = {
+                override.canonical_identity: override.artifact_id
+                for override in read_mod_version_overrides(transaction.source)
+            }
+            self.assertEqual(
+                overrides,
+                {
+                    f"modrinth:{mr_project('dep-d')}": mr_version("d2"),
+                    f"modrinth:{mr_project('dep-f')}": mr_version("f2"),
+                },
+            )
+            transaction.apply()
+            self.assertIn(
+                f'version = "{mr_version("d2")}"',
+                self.source.joinpath("mods/dep-d.pw.toml").read_text(),
+            )
+            self.assertIn(
+                f'version = "{mr_version("f2")}"',
+                self.source.joinpath("mods/dep-f.pw.toml").read_text(),
+            )
+            self.assertFalse(transaction.active)
+        finally:
+            if transaction.active:
+                transaction.discard()
+
+    def test_sibling_dependency_selections_compose(self) -> None:
+        self.assert_sibling_dependency_selection_order(
+            (("dep-d", "d2"), ("dep-f", "f2"))
+        )
+
+    def test_sibling_dependency_selections_compose_in_reverse_order(self) -> None:
+        self.assert_sibling_dependency_selection_order(
+            (("dep-f", "f2"), ("dep-d", "d2"))
+        )
+
+    def test_three_accepted_dependency_choices_remain_constrained(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"),),
+            (("dep-d", "d1"), ("dep-f", "f1"), ("dep-g", "g1")),
+        )
+        resolver = self.composing_dependency_resolver(
+            {
+                "root-a": (
+                    ("dep-d", "d1"),
+                    ("dep-f", "f1"),
+                    ("dep-g", "g1"),
+                )
+            }
+        )
+        materializer = self.composition_materializer(
+            {
+                "root-a": (
+                    ("dep-d", ">=1.0"),
+                    ("dep-f", ">=1.0"),
+                    ("dep-g", ">=1.0"),
+                )
+            }
+        )
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", side_effect=resolver
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materializer
+            ):
+                for project_id, artifact_id in (
+                    ("dep-d", "d2"),
+                    ("dep-f", "f2"),
+                    ("dep-g", "g2"),
+                ):
+                    transaction.prepare_exact_mod_version(
+                        self.selection(
+                            "modrinth",
+                            branded_project(project_id),
+                            branded_version(artifact_id),
+                        )
+                    )
+                    transaction.accept_exact_mod_version()
+            records = core._exact_metadata_records(transaction.source)
+            self.assertEqual(
+                {
+                    identity: core.parse_provider_metadata(entries[0][0], entries[0][1]).file_id
+                    for identity, entries in records.items()
+                    if identity[1]
+                    in {
+                        mr_project("dep-d"),
+                        mr_project("dep-f"),
+                        mr_project("dep-g"),
+                    }
+                },
+                {
+                    ("modrinth", mr_project("dep-d")): mr_version("d2"),
+                    ("modrinth", mr_project("dep-f")): mr_version("f2"),
+                    ("modrinth", mr_project("dep-g")): mr_version("g2"),
+                },
+            )
+        finally:
+            transaction.discard()
+
+    def test_dependency_overrides_are_preseeded_only_into_owning_roots(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"), ("root-b", "b1", "both")),
+            (("dep-d", "d2"), ("dep-f", "f2")),
+        )
+        set_mod_version_override(
+            transaction.source,
+            ModVersionOverride(
+                "modrinth", mr_project("dep-d"), mr_version("d2"), False
+            ),
+        )
+        set_mod_version_override(
+            transaction.source,
+            ModVersionOverride(
+                "modrinth", mr_project("dep-f"), mr_version("f2"), False
+            ),
+        )
+        calls: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        resolver = self.composing_dependency_resolver(
+            {
+                "root-a": (("dep-d", "d1"),),
+                "root-b": (("dep-f", "f1"),),
+            },
+            calls,
+        )
+        materializer = self.composition_materializer(
+            {
+                "root-a": (("dep-d", ">=1.0"),),
+                "root-b": (("dep-f", ">=1.0"),),
+            }
+        )
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", side_effect=resolver
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materializer
+            ):
+                transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth",
+                        branded_project("root-a"),
+                        branded_version("a1"),
+                    )
+                )
+            constrained = [call for call in calls if call[1]]
+            self.assertEqual(
+                constrained,
+                [
+                    ("root-a", (("dep-d", "d2"),)),
+                    ("root-b", (("dep-f", "f2"),)),
+                ],
+            )
+        finally:
+            transaction.discard()
+
+    def test_shared_dependency_override_is_preseeded_into_every_owner(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"), ("root-b", "b1", "both")),
+            (("dep-d", "d2"),),
+        )
+        set_mod_version_override(
+            transaction.source,
+            ModVersionOverride(
+                "modrinth", mr_project("dep-d"), mr_version("d2"), False
+            ),
+        )
+        calls: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        resolver = self.composing_dependency_resolver(
+            {
+                "root-a": (("dep-d", "d1"),),
+                "root-b": (("dep-d", "d1"),),
+            },
+            calls,
+        )
+        materializer = self.composition_materializer(
+            {
+                "root-a": (("dep-d", ">=1.0"),),
+                "root-b": (("dep-d", ">=1.0"),),
+            }
+        )
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", side_effect=resolver
+            ), patch.object(
+                core, "materialize_provider_artifact", side_effect=materializer
+            ):
+                transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth",
+                        branded_project("root-a"),
+                        branded_version("a1"),
+                    )
+                )
+            self.assertEqual(
+                [call for call in calls if call[1]],
+                [
+                    ("root-a", (("dep-d", "d2"),)),
+                    ("root-b", (("dep-d", "d2"),)),
+                ],
+            )
+        finally:
+            transaction.discard()
+
+    def test_orphaned_stored_dependency_override_is_not_preseeded(self) -> None:
+        transaction = self.write_graph_pack(
+            (("root-a", "a1", "both"),), (("dep-d", "d2"),)
+        )
+        set_mod_version_override(
+            transaction.source,
+            ModVersionOverride(
+                "modrinth", mr_project("dep-d"), mr_version("d2"), False
+            ),
+        )
+        calls: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        resolver = self.composing_dependency_resolver({"root-a": ()}, calls)
+        try:
+            with patch.object(
+                core, "resolve_exact_mod_closure", side_effect=resolver
+            ):
+                with self.assertRaisesRegex(
+                    core.HuroshikiError, "stale/orphan version override"
+                ):
+                    transaction.prepare_exact_mod_version(
+                        self.selection(
+                            "modrinth",
+                            branded_project("root-a"),
+                            branded_version("a1"),
+                        )
+                    )
+            self.assertEqual(calls, [("root-a", ())])
+        finally:
+            transaction.discard()
+
+    def test_locked_and_unlocked_overrides_are_constraints_and_current_wins(self) -> None:
+        for locked in (False, True):
+            with self.subTest(locked=locked):
+                self.source.joinpath(
+                    ".huroshiki-version-overrides.json"
+                ).unlink(missing_ok=True)
+                transaction = self.write_graph_pack(
+                    (("root-a", "a1", "both"),),
+                    (("dep-d", "d2"), ("dep-f", "f1")),
+                )
+                set_mod_version_override(
+                    transaction.source,
+                    ModVersionOverride(
+                        "modrinth",
+                        mr_project("dep-d"),
+                        mr_version("d2"),
+                        locked,
+                    ),
+                )
+                set_mod_version_override(
+                    transaction.source,
+                    ModVersionOverride(
+                        "modrinth",
+                        mr_project("dep-f"),
+                        mr_version("f1"),
+                        locked,
+                    ),
+                )
+                calls: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+                resolver = self.composing_dependency_resolver(
+                    {"root-a": (("dep-d", "d1"), ("dep-f", "f1"))},
+                    calls,
+                )
+                materializer = self.composition_materializer(
+                    {
+                        "root-a": (
+                            ("dep-d", ">=1.0"),
+                            ("dep-f", ">=1.0"),
+                        )
+                    }
+                )
+                try:
+                    with patch.object(
+                        core, "resolve_exact_mod_closure", side_effect=resolver
+                    ), patch.object(
+                        core,
+                        "materialize_provider_artifact",
+                        side_effect=materializer,
+                    ):
+                        transaction.prepare_exact_mod_version(
+                            self.selection(
+                                "modrinth",
+                                branded_project("dep-f"),
+                                branded_version("f2"),
+                            )
+                        )
+                    self.assertEqual(
+                        [call for call in calls if call[1]],
+                        [
+                            (
+                                "root-a",
+                                (("dep-d", "d2"), ("dep-f", "f2")),
+                            )
+                        ],
+                    )
+                    override = next(
+                        item
+                        for item in read_mod_version_overrides(transaction.source)
+                        if item.project_id == mr_project("dep-d")
+                    )
+                    self.assertEqual(override.locked, locked)
+                    replaced = next(
+                        item
+                        for item in read_mod_version_overrides(transaction.source)
+                        if item.project_id == mr_project("dep-f")
+                    )
+                    self.assertEqual(replaced.artifact_id, mr_version("f2"))
+                    self.assertEqual(replaced.locked, locked)
+                finally:
+                    transaction.discard()
 
     def test_multiple_accepted_exact_selections_compose_and_later_cancel_restores(self) -> None:
         transaction = self.write_graph_pack(
