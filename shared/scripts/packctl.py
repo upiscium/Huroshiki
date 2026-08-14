@@ -3370,6 +3370,35 @@ def _print_exact_mod_version_preview(preview: Any) -> None:
         print("  (none)")
 
 
+def _print_mod_version_intent_preview(preview: Any) -> None:
+    def selection(value: str) -> str:
+        return "Automatic" if value == "automatic" else "User exact"
+
+    def pin(value: bool | None) -> str:
+        return "N/A" if value is None else "Locked" if value else "Unlocked"
+
+    print(f"MOD: {preview.identity}")
+    print(f"Installed artifact: {preview.installed_artifact_id or '<missing>'}")
+    if preview.selected_artifact_id is not None:
+        print(f"Selected artifact: {preview.selected_artifact_id}")
+    if preview.old_selection != preview.new_selection:
+        print(
+            f"Selection: {selection(preview.old_selection)} -> "
+            f"{selection(preview.new_selection)}"
+        )
+    else:
+        print(f"Selection: {selection(preview.new_selection)}")
+    if preview.old_locked != preview.new_locked:
+        print(f"Pin: {pin(preview.old_locked)} -> {pin(preview.new_locked)}")
+    else:
+        print(f"Pin: {pin(preview.new_locked)}")
+    print(f"Reason: {preview.reason or 'none'}")
+    if preview.override_status is not None:
+        print(f"Status: {preview.override_status}")
+    if preview.new_selection == "automatic":
+        print("Installed artifact will not change.")
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     import huroshiki_core
 
@@ -3382,25 +3411,36 @@ def cmd_version(args: argparse.Namespace) -> int:
             raise ConfigError(
                 "MOD identity must use curseforge:<project-id> or modrinth:<project-id>"
             )
-        artifact_id = _exact_artifact_argument(args, provider)
-        if provider == "modrinth":
-            project_id = huroshiki_core.canonical_modrinth_id(
-                project_id, "Modrinth project ID"
-            )
-            artifact_id = huroshiki_core.canonical_modrinth_id(
-                artifact_id, "Modrinth version ID"
-            )
-        selection = huroshiki_core.ExactModArtifactSelection(
-            provider, project_id, artifact_id
-        )
         transaction = huroshiki_core.PackTransaction.create(
             huroshiki_core.project_key("pack", args.pack)
         )
-        preview = transaction.prepare_exact_mod_version(selection)
-        _print_exact_mod_version_preview(preview)
+        if getattr(args, "automatic", False):
+            preview = transaction.prepare_mod_version_automatic(args.identity)
+            _print_mod_version_intent_preview(preview)
+        else:
+            artifact_id = _exact_artifact_argument(args, provider)
+            if provider == "modrinth":
+                project_id = huroshiki_core.canonical_modrinth_id(
+                    project_id, "Modrinth project ID"
+                )
+                artifact_id = huroshiki_core.canonical_modrinth_id(
+                    artifact_id, "Modrinth version ID"
+                )
+            selection = huroshiki_core.ExactModArtifactSelection(
+                provider, project_id, artifact_id
+            )
+            preview = transaction.prepare_exact_mod_version(selection)
+            _print_exact_mod_version_preview(preview)
         if args.apply:
-            transaction.apply()
-            print("Exact MOD version applied.")
+            if getattr(args, "automatic", False):
+                transaction.apply(refresh=False)
+            else:
+                transaction.apply()
+            print(
+                "MOD version intent applied."
+                if getattr(args, "automatic", False)
+                else "Exact MOD version applied."
+            )
         else:
             transaction.discard()
             print("Dry run only; no files were changed.")
@@ -3418,6 +3458,50 @@ def cmd_version(args: argparse.Namespace) -> int:
                 raise ConfigError(
                     f"Exact MOD version transaction cleanup failed: {cleanup_error}"
                 ) from cleanup_error
+
+
+def _cmd_mod_version_pin(args: argparse.Namespace, *, locked: bool) -> int:
+    import huroshiki_core
+
+    transaction = None
+    try:
+        transaction = huroshiki_core.PackTransaction.create(
+            huroshiki_core.project_key("pack", args.pack)
+        )
+        preview = transaction.prepare_mod_version_pin(
+            args.identity,
+            locked=locked,
+            reason=getattr(args, "reason", None),
+        )
+        _print_mod_version_intent_preview(preview)
+        if args.apply:
+            transaction.apply(refresh=False)
+            print("MOD version intent applied.")
+        else:
+            transaction.discard()
+            print("Dry run only; no files were changed.")
+        return 0
+    except KeyboardInterrupt:
+        print("MOD version intent operation cancelled.", file=sys.stderr)
+        return 130
+    except huroshiki_core.HuroshikiError as error:
+        raise ConfigError(str(error)) from error
+    finally:
+        if transaction is not None and transaction.active:
+            try:
+                transaction.discard()
+            except huroshiki_core.HuroshikiError as cleanup_error:
+                raise ConfigError(
+                    f"MOD version intent transaction cleanup failed: {cleanup_error}"
+                ) from cleanup_error
+
+
+def cmd_pin(args: argparse.Namespace) -> int:
+    return _cmd_mod_version_pin(args, locked=True)
+
+
+def cmd_unpin(args: argparse.Namespace) -> int:
+    return _cmd_mod_version_pin(args, locked=False)
 
 
 def _template_import_resolution(path: Path, plan: Any) -> Any:
@@ -5391,11 +5475,24 @@ def parser() -> argparse.ArgumentParser:
     item = sub.add_parser("version")
     item.add_argument("pack")
     item.add_argument("identity")
-    item.add_argument("--artifact-id")
-    item.add_argument("--file-id")
-    item.add_argument("--version-id")
+    version_action = item.add_mutually_exclusive_group(required=True)
+    version_action.add_argument("--automatic", action="store_true")
+    version_action.add_argument("--artifact-id")
+    version_action.add_argument("--file-id")
+    version_action.add_argument("--version-id")
     item.add_argument("--apply", action="store_true")
     item.set_defaults(func=cmd_version)
+    item = sub.add_parser("pin")
+    item.add_argument("pack")
+    item.add_argument("identity")
+    item.add_argument("--reason")
+    item.add_argument("--apply", action="store_true")
+    item.set_defaults(func=cmd_pin)
+    item = sub.add_parser("unpin")
+    item.add_argument("pack")
+    item.add_argument("identity")
+    item.add_argument("--apply", action="store_true")
+    item.set_defaults(func=cmd_unpin)
     item = sub.add_parser("apply-template")
     item.add_argument("pack")
     item.add_argument("templates", nargs="+")

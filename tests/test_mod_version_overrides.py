@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -201,7 +203,7 @@ class ModVersionOverrideCoreTest(unittest.TestCase):
 
     def test_pin_requires_existing_user_override_and_preserves_artifact(self) -> None:
         transaction = self.transaction()
-        with self.assertRaisesRegex(core.HuroshikiError, "existing user selection"):
+        with self.assertRaisesRegex(core.HuroshikiError, "automatically selected"):
             transaction.set_mod_version_pin("curseforge:1")
         write_mod_version_overrides(
             self.source, (ModVersionOverride("curseforge", "1", "2", False),)
@@ -262,6 +264,212 @@ class ModVersionOverrideCoreTest(unittest.TestCase):
             manifest_before,
         )
         self.assertEqual(self.source.joinpath(".packwizignore").read_bytes(), ignore_before)
+
+    def test_automatic_preview_removes_only_target_intent(self) -> None:
+        write_mod_version_overrides(
+            self.source,
+            (
+                ModVersionOverride("curseforge", "1", "2", True, "Compatibility"),
+                ModVersionOverride("modrinth", "Ab12Cd34", "Ef56Gh78", False),
+            ),
+        )
+        transaction = self.transaction()
+        metadata_before = self.metadata.read_bytes()
+        preview = transaction.prepare_mod_version_automatic("curseforge:1")
+        self.assertEqual(preview.old_selection, "user")
+        self.assertEqual(preview.new_selection, "automatic")
+        self.assertEqual(preview.installed_artifact_id, "2")
+        self.assertEqual(preview.selected_artifact_id, "2")
+        self.assertTrue(preview.old_locked)
+        self.assertIsNone(preview.new_locked)
+        self.assertEqual(preview.reason, "Compatibility")
+        self.assertEqual(preview.override_status, "active")
+        self.assertEqual(self.metadata.read_bytes(), metadata_before)
+        self.assertEqual(
+            read_mod_version_overrides(self.source),
+            (ModVersionOverride("modrinth", "Ab12Cd34", "Ef56Gh78", False),),
+        )
+
+    def test_automatic_allows_drifted_and_stale_cleanup(self) -> None:
+        for identity, override, expected_status, installed in (
+            (
+                "curseforge:1",
+                ModVersionOverride("curseforge", "1", "3", True),
+                "drifted",
+                "2",
+            ),
+            (
+                "modrinth:Ab12Cd34",
+                ModVersionOverride("modrinth", "Ab12Cd34", "Ef56Gh78", False),
+                "stale",
+                None,
+            ),
+        ):
+            with self.subTest(status=expected_status):
+                write_mod_version_overrides(self.source, (override,))
+                metadata_before = self.metadata.read_bytes()
+                preview = self.transaction().prepare_mod_version_automatic(identity)
+                self.assertEqual(preview.override_status, expected_status)
+                self.assertEqual(preview.installed_artifact_id, installed)
+                self.assertEqual(read_mod_version_overrides(self.source), ())
+                self.assertEqual(self.metadata.read_bytes(), metadata_before)
+
+    def test_automatic_missing_override_is_stable_noop(self) -> None:
+        transaction = self.transaction()
+        before = core._file_content_snapshot(self.source)
+        preview = transaction.prepare_mod_version_automatic("curseforge:1")
+        self.assertEqual(preview.old_selection, "automatic")
+        self.assertEqual(preview.new_selection, "automatic")
+        self.assertEqual(preview.installed_artifact_id, "2")
+        self.assertEqual(preview.changes, ())
+        self.assertEqual(core._file_content_snapshot(self.source), before)
+
+    def test_automatic_malformed_manifest_fails_without_mutation(self) -> None:
+        manifest = self.source / ".huroshiki-version-overrides.json"
+        manifest.write_bytes(b"{not-json")
+        before = core._file_content_snapshot(self.source)
+        with self.assertRaisesRegex(core.HuroshikiError, "invalid JSON"):
+            self.transaction().prepare_mod_version_automatic("curseforge:1")
+        self.assertEqual(core._file_content_snapshot(self.source), before)
+
+    def test_automatic_write_failure_preserves_previous_manifest(self) -> None:
+        write_mod_version_overrides(
+            self.source, (ModVersionOverride("curseforge", "1", "2", True),)
+        )
+        manifest = self.source / ".huroshiki-version-overrides.json"
+        before = manifest.read_bytes()
+        with patch(
+            "pack_migration_roots.packctl.renameat2",
+            side_effect=OSError("injected automatic write failure"),
+        ), self.assertRaisesRegex(core.HuroshikiError, "injected automatic write failure"):
+            self.transaction().prepare_mod_version_automatic("curseforge:1")
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertEqual(self.metadata.read_text().count("file-id = 2"), 1)
+
+    def test_pin_unpin_preview_preserves_artifact_and_reason(self) -> None:
+        write_mod_version_overrides(
+            self.source,
+            (ModVersionOverride("curseforge", "1", "2", False, "Original"),),
+        )
+        transaction = self.transaction()
+        pinned = transaction.prepare_mod_version_pin(
+            "curseforge:1", locked=True, reason="Replacement"
+        )
+        self.assertEqual(pinned.selected_artifact_id, "2")
+        self.assertFalse(pinned.old_locked)
+        self.assertTrue(pinned.new_locked)
+        self.assertEqual(pinned.reason, "Replacement")
+        unpinned = transaction.prepare_mod_version_pin(
+            "curseforge:1", locked=False
+        )
+        self.assertTrue(unpinned.old_locked)
+        self.assertFalse(unpinned.new_locked)
+        self.assertEqual(unpinned.reason, "Replacement")
+
+    def test_pin_unpin_reject_drifted_and_stale_intent(self) -> None:
+        for identity, override, expected_status in (
+            (
+                "curseforge:1",
+                ModVersionOverride("curseforge", "1", "3", False),
+                "drifted",
+            ),
+            (
+                "modrinth:Ab12Cd34",
+                ModVersionOverride("modrinth", "Ab12Cd34", "Ef56Gh78", True),
+                "stale",
+            ),
+        ):
+            with self.subTest(status=expected_status):
+                write_mod_version_overrides(self.source, (override,))
+                before = core._file_content_snapshot(self.source)
+                with self.assertRaisesRegex(
+                    core.HuroshikiError,
+                    f"{expected_status}.*re-select.*Automatic",
+                ):
+                    self.transaction().prepare_mod_version_pin(
+                        identity, locked=not override.locked
+                    )
+                self.assertEqual(core._file_content_snapshot(self.source), before)
+
+    def test_intent_only_refresh_state_is_monotonic_in_mixed_transactions(self) -> None:
+        write_mod_version_overrides(
+            self.source, (ModVersionOverride("curseforge", "1", "2", False),)
+        )
+        metadata_path = Path("mods/demo.pw.toml")
+
+        metadata_then_intent = self.transaction()
+        metadata_then_intent.set_side(metadata_path, True, False)
+        metadata_then_intent.prepare_mod_version_pin("curseforge:1", locked=True)
+        self.assertFalse(metadata_then_intent._intent_only_mutation)
+
+        self.metadata.write_text(
+            self.metadata.read_text().replace('side = "client"', 'side = "both"'),
+            encoding="utf-8",
+        )
+        write_mod_version_overrides(
+            self.source, (ModVersionOverride("curseforge", "1", "2", False),)
+        )
+        intent_then_metadata = self.transaction()
+        intent_then_metadata.prepare_mod_version_pin("curseforge:1", locked=True)
+        intent_then_metadata.set_side(metadata_path, True, False)
+        self.assertFalse(intent_then_metadata._intent_only_mutation)
+
+    def test_intent_prepare_honors_cancellation_and_deadline(self) -> None:
+        write_mod_version_overrides(
+            self.source, (ModVersionOverride("curseforge", "1", "2", False),)
+        )
+        before = core._file_content_snapshot(self.source)
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaises(core.ExactModVersionCancelled):
+            self.transaction().prepare_mod_version_automatic(
+                "curseforge:1", cancel_event=cancelled
+            )
+        with self.assertRaises(core.ExactModVersionDeadlineExceeded):
+            self.transaction().prepare_mod_version_pin(
+                "curseforge:1", deadline=time.monotonic() - 1
+            )
+        self.assertEqual(core._file_content_snapshot(self.source), before)
+
+    def test_intent_cancellation_after_manifest_exchange_rolls_back(self) -> None:
+        write_mod_version_overrides(
+            self.source, (ModVersionOverride("curseforge", "1", "2", True),)
+        )
+        transaction = self.transaction()
+        before = core._file_content_snapshot(self.source)
+        cancelled = threading.Event()
+        original_rename = __import__("pack_migration_roots").packctl.renameat2
+
+        def rename_then_cancel(*args, **kwargs):
+            result = original_rename(*args, **kwargs)
+            cancelled.set()
+            return result
+
+        with patch(
+            "pack_migration_roots.packctl.renameat2",
+            side_effect=rename_then_cancel,
+        ), self.assertRaises(core.ExactModVersionCancelled):
+            transaction.prepare_mod_version_automatic(
+                "curseforge:1", cancel_event=cancelled
+            )
+        self.assertEqual(core._file_content_snapshot(self.source), before)
+        self.assertFalse(transaction._source_mutation_recorded)
+        self.assertFalse(transaction._version_override_mutated)
+
+    def test_intent_rollback_cleanup_has_fresh_bounded_deadline(self) -> None:
+        write_mod_version_overrides(
+            self.source, (ModVersionOverride("curseforge", "1", "2", True),)
+        )
+        transaction = self.transaction()
+        contents = self.source.joinpath(
+            ".huroshiki-version-overrides.json"
+        ).read_bytes()
+        with self.assertRaisesRegex(
+            core.HuroshikiError, "rollback cleanup deadline exceeded"
+        ):
+            transaction._restore_version_intent_manifest(
+                contents, deadline=time.monotonic() - 1
+            )
 
 
 if __name__ == "__main__":

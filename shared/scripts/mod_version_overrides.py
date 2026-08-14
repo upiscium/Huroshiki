@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from pack_migration_roots import (
     PackMigrationRootError,
@@ -180,8 +180,11 @@ def serialize_mod_version_overrides(entries: tuple[ModVersionOverride, ...]) -> 
     return contents
 
 
-def read_mod_version_overrides(source: Path) -> tuple[ModVersionOverride, ...]:
-    scan = scan_pack_migration_source(source, checkpoint=lambda: None)
+def read_mod_version_overrides(
+    source: Path, checkpoint: Callable[[], None] | None = None
+) -> tuple[ModVersionOverride, ...]:
+    effective_checkpoint = checkpoint or (lambda: None)
+    scan = scan_pack_migration_source(source, checkpoint=effective_checkpoint)
     entry = next(
         (item for item in scan.entries if item.relative_path == VERSION_OVERRIDE_MANIFEST_PATH),
         None,
@@ -194,64 +197,94 @@ def read_mod_version_overrides(source: Path) -> tuple[ModVersionOverride, ...]:
             scan,
             VERSION_OVERRIDE_MANIFEST_PATH,
             max_bytes=VERSION_OVERRIDE_MANIFEST_MAX_BYTES,
+            checkpoint=effective_checkpoint,
         )
     except PackMigrationRootError as error:
         raise ModVersionOverrideError(str(error)) from error
     return parse_mod_version_overrides(contents).entries
 
 
-def get_mod_version_override(source: Path, identity: str) -> ModVersionOverride | None:
+def get_mod_version_override(
+    source: Path,
+    identity: str,
+    checkpoint: Callable[[], None] | None = None,
+) -> ModVersionOverride | None:
     return next(
-        (entry for entry in read_mod_version_overrides(source) if entry.canonical_identity == identity),
+        (
+            entry
+            for entry in read_mod_version_overrides(source, checkpoint=checkpoint)
+            if entry.canonical_identity == identity
+        ),
         None,
     )
 
 
 def write_mod_version_overrides(
-    source: Path, entries: tuple[ModVersionOverride, ...]
+    source: Path,
+    entries: tuple[ModVersionOverride, ...],
+    checkpoint: Callable[[], None] | None = None,
 ) -> None:
     try:
-        scan = scan_pack_migration_source(source, checkpoint=lambda: None)
+        effective_checkpoint = checkpoint or (lambda: None)
+        scan = scan_pack_migration_source(source, checkpoint=effective_checkpoint)
         write_pack_control_file(
             source,
             VERSION_OVERRIDE_MANIFEST_PATH,
             serialize_mod_version_overrides(entries),
             expected_root_identity=scan.root_identity,
+            checkpoint=effective_checkpoint,
         )
     except PackMigrationRootError as error:
         raise ModVersionOverrideError(str(error)) from error
 
 
 def set_mod_version_override(
-    source: Path, override: ModVersionOverride
+    source: Path,
+    override: ModVersionOverride,
+    checkpoint: Callable[[], None] | None = None,
 ) -> tuple[ModVersionOverride, ...]:
-    entries = {item.canonical_identity: item for item in read_mod_version_overrides(source)}
+    entries = {
+        item.canonical_identity: item
+        for item in read_mod_version_overrides(source, checkpoint=checkpoint)
+    }
     entries[override.canonical_identity] = override
     result = tuple(entries.values())
-    write_mod_version_overrides(source, result)
+    write_mod_version_overrides(source, result, checkpoint=checkpoint)
     return tuple(sorted(result, key=lambda item: item.canonical_identity))
 
 
 def remove_mod_version_override(
-    source: Path, identity: str
+    source: Path,
+    identity: str,
+    checkpoint: Callable[[], None] | None = None,
 ) -> tuple[ModVersionOverride, ...]:
-    entries = {item.canonical_identity: item for item in read_mod_version_overrides(source)}
+    entries = {
+        item.canonical_identity: item
+        for item in read_mod_version_overrides(source, checkpoint=checkpoint)
+    }
     entries.pop(identity, None)
     result = tuple(entries.values())
-    write_mod_version_overrides(source, result)
+    write_mod_version_overrides(source, result, checkpoint=checkpoint)
     return tuple(sorted(result, key=lambda item: item.canonical_identity))
 
 
-def ensure_mod_version_overrides_ignored(source: Path) -> None:
+def ensure_mod_version_overrides_ignored(
+    source: Path, checkpoint: Callable[[], None] | None = None
+) -> None:
     try:
-        scan = scan_pack_migration_source(source, checkpoint=lambda: None)
+        effective_checkpoint = checkpoint or (lambda: None)
+        scan = scan_pack_migration_source(source, checkpoint=effective_checkpoint)
         ignore = Path(".packwizignore")
         entry = next((item for item in scan.entries if item.relative_path == ignore), None)
         contents = (
             b""
             if entry is None
             else read_pack_control_file(
-                source, scan, ignore, max_bytes=1024 * 1024
+                source,
+                scan,
+                ignore,
+                max_bytes=1024 * 1024,
+                checkpoint=effective_checkpoint,
             )
         )
     except PackMigrationRootError as error:
@@ -276,16 +309,24 @@ def ensure_mod_version_overrides_ignored(source: Path) -> None:
             ignore,
             (text + "".join(f"{item}\n" for item in additions)).encode("utf-8"),
             expected_root_identity=scan.root_identity,
+            checkpoint=effective_checkpoint,
         )
     except PackMigrationRootError as error:
         raise ModVersionOverrideError(str(error)) from error
 
 
-def require_mod_version_overrides_ignored(source: Path) -> None:
+def require_mod_version_overrides_ignored(
+    source: Path, checkpoint: Callable[[], None] | None = None
+) -> None:
     try:
-        scan = scan_pack_migration_source(source, checkpoint=lambda: None)
+        effective_checkpoint = checkpoint or (lambda: None)
+        scan = scan_pack_migration_source(source, checkpoint=effective_checkpoint)
         contents = read_pack_control_file(
-            source, scan, Path(".packwizignore"), max_bytes=1024 * 1024
+            source,
+            scan,
+            Path(".packwizignore"),
+            max_bytes=1024 * 1024,
+            checkpoint=effective_checkpoint,
         )
         lines = {line.strip() for line in contents.decode("utf-8").splitlines()}
     except (PackMigrationRootError, UnicodeError) as error:

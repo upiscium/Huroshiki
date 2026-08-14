@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import threading
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import huroshiki
 import huroshiki_core as core
@@ -63,6 +63,31 @@ def preview() -> core.ModVersionSelectionPreview:
     )
 
 
+def intent_status(
+    *,
+    selection: str = "user",
+    installed: str | None = "E5f6G7h8",
+    selected: str | None = "E5f6G7h8",
+    locked: bool | None = False,
+    reason: str | None = "test",
+    override_status: str | None = "active",
+) -> core.ModVersionIntentStatus:
+    return core.ModVersionIntentStatus(
+        "modrinth:A1b2C3d4", selection, installed, selected, locked, reason,
+        override_status,
+    )
+
+
+def intent_preview(action: str) -> core.ModVersionIntentPreview:
+    new_selection = "automatic" if action == "automatic" else "user"
+    return core.ModVersionIntentPreview(
+        "modrinth:A1b2C3d4", "E5f6G7h8", "E5f6G7h8", "user", new_selection,
+        False if action == "automatic" else (False if action == "pin" else True),
+        None if action == "automatic" else (True if action == "pin" else False),
+        "test", "active", (),
+    )
+
+
 def completed_discard(transaction, error: BaseException | None = None):
     operation = MagicMock()
     operation.transaction = transaction
@@ -74,6 +99,13 @@ def completed_discard(transaction, error: BaseException | None = None):
 
 
 class InstalledModVersionTuiTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        intent_patcher = patch.object(
+            core, "installed_mod_version_intent", return_value=intent_status()
+        )
+        self.intent_mock = intent_patcher.start()
+        self.addAsyncCleanup(intent_patcher.stop)
+
     async def test_details_exposes_role_and_exact_version_input(self) -> None:
         with patch.object(core, "project_config", return_value={}), patch.object(
             core, "installed_mod_provenance", return_value="Explicit root"
@@ -90,6 +122,186 @@ class InstalledModVersionTuiTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Select version", screen.help_text)
                 artifact = screen.query_one("#mod-version-artifact", huroshiki.Input)
                 self.assertEqual(artifact.placeholder, "Exact file/version ID")
+
+    async def test_details_displays_automatic_and_all_user_intent_states(self) -> None:
+        cases = (
+            ("automatic", None, "Selection: Automatic", "Pin: N/A"),
+            ("user", False, "Pin: Unlocked", "Status: active"),
+            ("user", True, "Pin: Locked", "Status: active"),
+            ("user", False, "Status: drifted", "Selected artifact: E5f6G7h8"),
+            ("user", True, "Status: stale", "Installed artifact: <missing>"),
+        )
+        for selection, locked, expected, also_expected in cases:
+            self.intent_mock.return_value = intent_status(
+                selection=selection,
+                locked=None if selection == "automatic" else locked,
+                installed=None if also_expected.endswith("<missing>") else "E5f6G7h8",
+                override_status=(None if selection == "automatic" else
+                                 ("drifted" if expected.endswith("drifted") else
+                                  "stale" if expected.endswith("stale") else "active")),
+            )
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                details = app.screen.query_one("#mod-version-details", huroshiki.Static)
+                rendered = str(details.render())
+                self.assertIn(expected, rendered)
+                self.assertIn(also_expected, rendered)
+
+    async def test_navigation_waits_for_cancellable_detail_loading_worker(self) -> None:
+        started = threading.Event()
+        stopped = threading.Event()
+
+        def provenance(*_args, cancel_event, **_kwargs):
+            started.set()
+            cancel_event.wait(2)
+            stopped.set()
+            raise core.ExactModVersionCancelled("detail loading cancelled")
+
+        with patch.object(core, "project_config", return_value={}), patch.object(
+            core, "installed_mod_provenance", side_effect=provenance
+        ):
+            app = _VersionApp(mod_info())
+            with patch.object(app, "open_list") as open_list:
+                async with app.run_test() as pilot:
+                    screen = app.screen
+                    self.assertTrue(started.wait(1))
+                    screen.cancel_and_navigate(lambda: app.open_list("pack:demo"))
+                    open_list.assert_not_called()
+                    await pilot.pause(0.2)
+                    self.assertTrue(stopped.is_set())
+                    open_list.assert_called_once_with("pack:demo")
+
+    async def test_intent_controls_availability_and_no_duplicate_transaction_ownership(self) -> None:
+        transaction = MagicMock()
+        transaction.active = True
+        transaction.prepare_mod_version_pin.return_value = intent_preview("pin")
+        transaction.prepare_mod_version_automatic.return_value = intent_preview("automatic")
+        with patch.object(core, "project_config", return_value={}), patch.object(
+            core, "installed_mod_provenance", return_value="Explicit root"
+        ), patch.object(core.PackTransaction, "create", return_value=transaction):
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                screen = app.screen
+                await pilot.pause(0.1)
+                screen.start_intent_prepare("pin")
+                screen.start_intent_prepare("pin")
+                await pilot.pause(0.2)
+                pin_call = transaction.prepare_mod_version_pin.call_args
+                self.assertEqual(pin_call.args, ("modrinth:A1b2C3d4",))
+                self.assertTrue(pin_call.kwargs["locked"])
+                self.assertIs(pin_call.kwargs["cancel_event"], screen.cancel_event)
+                self.assertEqual(pin_call.kwargs["deadline"], screen.deadline)
+                self.assertIs(app.transactions["pack:demo"], screen.transaction)
+                self.assertIn("Selection: User exact -> User exact", str(
+                    screen.query_one("#mod-version-status", huroshiki.Static).render()
+                ))
+                screen.cancel_and_navigate(None)
+                await pilot.pause(0.2)
+                self.assertIsNone(screen.transaction)
+                self.assertNotIn("pack:demo", app.transactions)
+
+    async def test_ctrl_r_ctrl_k_ctrl_u_dispatch_available_intent_actions(self) -> None:
+        transaction = MagicMock()
+        transaction.active = True
+        transaction.prepare_mod_version_automatic.return_value = intent_preview("automatic")
+        transaction.prepare_mod_version_pin.return_value = intent_preview("pin")
+        with patch.object(core, "project_config", return_value={}), patch.object(
+            core, "installed_mod_provenance", return_value="Explicit root"
+        ), patch.object(core.PackTransaction, "create", return_value=transaction):
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                screen = app.screen
+                await pilot.pause(0.1)
+                with patch.object(screen, "start_intent_prepare") as start:
+                    await pilot.press("ctrl+r")
+                    await pilot.press("ctrl+k")
+                    await pilot.press("ctrl+u")
+                self.assertEqual(
+                    [call.args[0] for call in start.call_args_list],
+                    ["automatic", "pin", "unpin"],
+                )
+
+    async def test_automatic_pin_and_unpin_preview_apply_without_refresh(self) -> None:
+        for action, locked, status in (
+            ("automatic", None, intent_status()),
+            ("pin", False, intent_status(locked=False)),
+            ("unpin", True, intent_status(locked=True)),
+        ):
+            self.intent_mock.return_value = status
+            transaction = MagicMock()
+            transaction.active = True
+            transaction.prepare_mod_version_automatic.return_value = intent_preview(action)
+            transaction.prepare_mod_version_pin.return_value = intent_preview(action)
+            transaction.apply.side_effect = lambda **_: setattr(transaction, "active", False)
+            with patch.object(core, "project_config", return_value={}), patch.object(
+                core, "installed_mod_provenance", return_value="Explicit root"
+            ), patch.object(core.PackTransaction, "create", return_value=transaction):
+                app = _VersionApp(mod_info())
+                with patch.object(app, "open_list"):
+                    async with app.run_test() as pilot:
+                        screen = app.screen
+                        await pilot.pause(0.1)
+                        screen.start_intent_prepare(action)
+                        await pilot.pause(0.2)
+                        self.assertIsInstance(screen.preview, core.ModVersionIntentPreview)
+                        prepare_event = screen.cancel_event
+                        prepare_deadline = screen.deadline
+                        screen.apply_preview()
+                        await pilot.pause(0.2)
+                        self.assertEqual(transaction.apply.call_args.kwargs["refresh"], False)
+                        if action == "automatic":
+                            intent_call = (
+                                transaction.prepare_mod_version_automatic.call_args
+                            )
+                        else:
+                            intent_call = transaction.prepare_mod_version_pin.call_args
+                            self.assertEqual(
+                                intent_call.kwargs["locked"], action == "pin"
+                            )
+                        self.assertEqual(
+                            intent_call.args, ("modrinth:A1b2C3d4",)
+                        )
+                        self.assertIs(
+                            intent_call.kwargs["cancel_event"], prepare_event
+                        )
+                        self.assertEqual(
+                            intent_call.kwargs["deadline"], prepare_deadline
+                        )
+
+    async def test_intent_navigation_waits_for_worker_and_discard_cleanup(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        worker_threads: list[int] = []
+        transaction = MagicMock()
+        transaction.active = True
+
+        def prepare(_identity, **_kwargs):
+            worker_threads.append(threading.get_ident())
+            started.set()
+            release.wait(2)
+            return intent_preview("automatic")
+
+        transaction.prepare_mod_version_automatic.side_effect = prepare
+        transaction.begin_discard.return_value = completed_discard(transaction)
+        with patch.object(core, "project_config", return_value={}), patch.object(
+            core, "installed_mod_provenance", return_value="Explicit root"
+        ), patch.object(core.PackTransaction, "create", return_value=transaction):
+            app = _VersionApp(mod_info())
+            caller = threading.get_ident()
+            with patch.object(app, "open_list") as open_list:
+                async with app.run_test() as pilot:
+                    screen = app.screen
+                    await pilot.pause(0.1)
+                    screen.start_intent_prepare("automatic")
+                    self.assertTrue(started.wait(1))
+                    screen.cancel_and_navigate(lambda: app.open_list("pack:demo"))
+                    open_list.assert_not_called()
+                    release.set()
+                    await pilot.pause(0.3)
+                    open_list.assert_called_once_with("pack:demo")
+                    transaction.begin_discard.assert_called_once_with()
+                    self.assertNotEqual(worker_threads[0], caller)
 
     async def test_prepare_runs_off_loop_shows_progress_and_cancel_does_not_apply(self) -> None:
         transaction = MagicMock()

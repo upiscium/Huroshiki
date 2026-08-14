@@ -52,6 +52,7 @@ from pack_migration_roots import (
     read_pack_root_manifest,
     record_pack_root,
     remove_pack_root,
+    write_pack_control_file,
     write_pack_root_manifest,
 )
 from pack_tree_policy import scan_pack_migration_source
@@ -61,9 +62,11 @@ from mod_version_overrides import (
     ModVersionOverride,
     ModVersionOverrideError,
     ModVersionOverrideStatus,
+    VERSION_OVERRIDE_MANIFEST_PATH,
     ensure_mod_version_overrides_ignored,
     get_mod_version_override,
     read_mod_version_overrides,
+    remove_mod_version_override,
     require_mod_version_overrides_ignored,
     set_mod_version_override,
 )
@@ -767,6 +770,31 @@ class ModVersionSelectionPreview:
     override_artifact_id: str | None = None
     override_locked: bool | None = None
     diagnostic_messages: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ModVersionIntentStatus:
+    identity: str
+    selection: Literal["automatic", "user"]
+    installed_artifact_id: str | None
+    selected_artifact_id: str | None
+    locked: bool | None
+    reason: str | None
+    override_status: Literal["active", "drifted", "stale"] | None
+
+
+@dataclass(frozen=True)
+class ModVersionIntentPreview:
+    identity: str
+    installed_artifact_id: str | None
+    selected_artifact_id: str | None
+    old_selection: Literal["automatic", "user"]
+    new_selection: Literal["automatic", "user"]
+    old_locked: bool | None
+    new_locked: bool | None
+    reason: str | None
+    override_status: Literal["active", "drifted", "stale"] | None
+    changes: tuple[UpdateChange, ...]
 
 
 @dataclass(frozen=True)
@@ -1987,6 +2015,8 @@ class PackTransaction:
     _rollback_source_digest: tuple[tuple[Path, str], ...] | None = field(
         default=None, init=False, repr=False
     )
+    _intent_only_mutation: bool = field(default=False, init=False, repr=False)
+    _source_mutation_recorded: bool = field(default=False, init=False, repr=False)
     _equivalence_process_results: list[BoundedProcessResult] = field(
         default_factory=list, init=False, repr=False
     )
@@ -2221,6 +2251,30 @@ class PackTransaction:
             overrides=overrides,
         )
 
+    def _restore_version_intent_manifest(
+        self, contents: bytes, *, deadline: float
+    ) -> None:
+        def checkpoint() -> None:
+            if time.monotonic() >= deadline:
+                raise TransactionDiscardIntegrityError(
+                    "Version intent rollback cleanup deadline exceeded"
+                )
+
+        try:
+            scan = scan_pack_migration_source(self.source, checkpoint=checkpoint)
+            write_pack_control_file(
+                self.source,
+                VERSION_OVERRIDE_MANIFEST_PATH,
+                contents,
+                expected_root_identity=scan.root_identity,
+                checkpoint=checkpoint,
+            )
+        except BaseException as error:
+            raise HuroshikiError(
+                "Could not restore version intent manifest; transaction retained: "
+                f"{error}"
+            ) from error
+
     def rollback_exact_mod_version(self, *, deadline: float | None = None) -> None:
         """Restore the source before the pending or latest accepted selection."""
         self._lifecycle_lock.acquire()
@@ -2274,15 +2328,130 @@ class PackTransaction:
         finally:
             self._lifecycle_lock.release()
 
-    def set_mod_version_pin(
+    def prepare_mod_version_automatic(
+        self,
+        identity: str,
+        *,
+        cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> ModVersionIntentPreview:
+        """Stage removal of one user exact-selection intent without changing metadata."""
+        def checkpoint() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ExactModVersionCancelled(
+                    "MOD version intent operation was cancelled"
+                )
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ExactModVersionDeadlineExceeded(
+                    "MOD version intent operation deadline exceeded"
+                )
+
+        with self._lock:
+            checkpoint()
+            self.ensure_active()
+            self._ensure_exact_selection_not_prepared()
+            if self._operation is not None:
+                raise HuroshikiError("Wait for the active transaction operation to finish")
+            kind, _project_id = split_project_key(self.project_key)
+            if kind != "pack":
+                raise HuroshikiError(
+                    "MOD version intent controls are available only for packs"
+                )
+            status = mod_version_intent_status(
+                self.source, identity, checkpoint=checkpoint
+            )
+            before = _file_content_snapshot(self.source, checkpoint)
+            if status.selection == "user":
+                manifest_before = before.get(VERSION_OVERRIDE_MANIFEST_PATH)
+                if manifest_before is None:
+                    raise HuroshikiError(
+                        "Version intent manifest disappeared before mutation"
+                    )
+                try:
+                    require_mod_version_overrides_ignored(
+                        self.source, checkpoint=checkpoint
+                    )
+                    remove_mod_version_override(
+                        self.source, status.identity, checkpoint=checkpoint
+                    )
+                    after = _file_content_snapshot(self.source, checkpoint)
+                    changes = _content_changes(before, after)
+                    if any(
+                        change.relative_path != VERSION_OVERRIDE_MANIFEST_PATH
+                        for change in changes
+                    ):
+                        raise HuroshikiError(
+                            "Automatic intent mutation changed non-intent Pack files"
+                        )
+                except BaseException as error:
+                    cleanup_deadline = (
+                        time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS
+                    )
+
+                    def cleanup_checkpoint() -> None:
+                        if time.monotonic() >= cleanup_deadline:
+                            raise TransactionDiscardIntegrityError(
+                                "Version intent rollback cleanup deadline exceeded"
+                            )
+
+                    try:
+                        current = _file_content_snapshot(
+                            self.source, cleanup_checkpoint
+                        )
+                        if current.get(VERSION_OVERRIDE_MANIFEST_PATH) != manifest_before:
+                            self._restore_version_intent_manifest(
+                                manifest_before, deadline=cleanup_deadline
+                            )
+                    except BaseException as restore_error:
+                        raise HuroshikiError(
+                            f"{error}; version intent rollback failed: {restore_error}"
+                        ) from error
+                    if isinstance(error, (ModVersionOverrideError, OSError)):
+                        raise HuroshikiError(str(error)) from error
+                    raise
+            else:
+                after = before
+                changes = ()
+            if changes:
+                self._version_override_mutated = True
+                self._record_source_mutation(intent_only=True)
+            elif not self._source_mutation_recorded:
+                self._intent_only_mutation = True
+            return ModVersionIntentPreview(
+                identity=status.identity,
+                installed_artifact_id=status.installed_artifact_id,
+                selected_artifact_id=status.selected_artifact_id,
+                old_selection=status.selection,
+                new_selection="automatic",
+                old_locked=status.locked,
+                new_locked=None,
+                reason=status.reason,
+                override_status=status.override_status,
+                changes=changes,
+            )
+
+    def prepare_mod_version_pin(
         self,
         identity: str,
         *,
         locked: bool = True,
         reason: str | None = None,
-    ) -> ModVersionOverride:
-        """Change lock state for an existing user-selected exact artifact."""
+        cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> ModVersionIntentPreview:
+        """Stage a lock-state change for one active user exact-selection intent."""
+        def checkpoint() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ExactModVersionCancelled(
+                    "MOD version intent operation was cancelled"
+                )
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ExactModVersionDeadlineExceeded(
+                    "MOD version intent operation deadline exceeded"
+                )
+
         with self._lock:
+            checkpoint()
             self.ensure_active()
             self._ensure_exact_selection_not_prepared()
             if self._operation is not None:
@@ -2292,15 +2461,31 @@ class PackTransaction:
                 raise HuroshikiError("MOD version pins are available only for packs")
             if type(locked) is not bool:
                 raise HuroshikiError("MOD version pin state must be a boolean")
+            status = mod_version_intent_status(
+                self.source, identity, checkpoint=checkpoint
+            )
+            if status.selection == "automatic":
+                raise HuroshikiError(
+                    "Cannot pin an automatically selected MOD; select an exact version first"
+                )
+            if status.override_status != "active":
+                raise HuroshikiError(
+                    f"Cannot change pin state for {status.identity}: version intent status "
+                    f"is {status.override_status}; re-select the exact artifact or return "
+                    "to Automatic"
+                )
+            before = _file_content_snapshot(self.source, checkpoint)
+            manifest_before = before.get(VERSION_OVERRIDE_MANIFEST_PATH)
+            if manifest_before is None:
+                raise HuroshikiError(
+                    "Version intent manifest disappeared before mutation"
+                )
             try:
-                existing = get_mod_version_override(self.source, identity)
+                existing = get_mod_version_override(
+                    self.source, status.identity, checkpoint=checkpoint
+                )
                 if existing is None:
-                    raise HuroshikiError(
-                        "Cannot change pin state without an existing user selection: "
-                        f"{identity}"
-                    )
-                records = _exact_metadata_records(self.source)
-                _validate_mod_version_override_records(self.source, records)
+                    raise HuroshikiError("Version intent changed while preparing preview")
                 updated = ModVersionOverride(
                     existing.provider,
                     existing.project_id,
@@ -2308,17 +2493,84 @@ class PackTransaction:
                     locked,
                     existing.reason if reason is None else reason,
                 )
-                require_mod_version_overrides_ignored(self.source)
-                set_mod_version_override(self.source, updated)
-            except HuroshikiError:
-                raise
-            except (ModVersionOverrideError, OSError) as error:
-                raise HuroshikiError(str(error)) from error
-            self._version_override_mutated = True
-            self._record_source_mutation()
-            return updated
+                require_mod_version_overrides_ignored(
+                    self.source, checkpoint=checkpoint
+                )
+                set_mod_version_override(
+                    self.source, updated, checkpoint=checkpoint
+                )
+                after = _file_content_snapshot(self.source, checkpoint)
+                changes = _content_changes(before, after)
+                if any(
+                    change.relative_path != VERSION_OVERRIDE_MANIFEST_PATH
+                    for change in changes
+                ):
+                    raise HuroshikiError(
+                        "Pin intent mutation changed non-intent Pack files"
+                    )
+            except BaseException as error:
+                cleanup_deadline = (
+                    time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS
+                )
 
-    def _record_source_mutation(self) -> None:
+                def cleanup_checkpoint() -> None:
+                    if time.monotonic() >= cleanup_deadline:
+                        raise TransactionDiscardIntegrityError(
+                            "Version intent rollback cleanup deadline exceeded"
+                        )
+
+                try:
+                    current = _file_content_snapshot(
+                        self.source, cleanup_checkpoint
+                    )
+                    if current.get(VERSION_OVERRIDE_MANIFEST_PATH) != manifest_before:
+                        self._restore_version_intent_manifest(
+                            manifest_before, deadline=cleanup_deadline
+                        )
+                except BaseException as restore_error:
+                    raise HuroshikiError(
+                        f"{error}; version intent rollback failed: {restore_error}"
+                    ) from error
+                if isinstance(error, HuroshikiError):
+                    raise
+                if isinstance(error, (ModVersionOverrideError, OSError)):
+                    raise HuroshikiError(str(error)) from error
+                raise
+            if changes:
+                self._version_override_mutated = True
+                self._record_source_mutation(intent_only=True)
+            elif not self._source_mutation_recorded:
+                self._intent_only_mutation = True
+            return ModVersionIntentPreview(
+                identity=status.identity,
+                installed_artifact_id=status.installed_artifact_id,
+                selected_artifact_id=updated.artifact_id,
+                old_selection="user",
+                new_selection="user",
+                old_locked=status.locked,
+                new_locked=updated.locked,
+                reason=updated.reason,
+                override_status=status.override_status,
+                changes=changes,
+            )
+
+    def set_mod_version_pin(
+        self,
+        identity: str,
+        *,
+        locked: bool = True,
+        reason: str | None = None,
+    ) -> ModVersionOverride:
+        """Compatibility API returning the resulting override record."""
+        preview = self.prepare_mod_version_pin(
+            identity, locked=locked, reason=reason
+        )
+        override = get_mod_version_override(self.source, preview.identity)
+        if override is None:
+            raise HuroshikiError("Version intent changed while preparing preview")
+        return override
+
+    def _record_source_mutation(self, *, intent_only: bool = False) -> None:
         """Invalidate accepted exact evidence after a successful staged mutation."""
         had_accepted = self._accepted_exact_evidence is not None
         self._mutation_generation += 1
@@ -2327,6 +2579,12 @@ class PackTransaction:
         self._accepted_exact_evidence = None
         self._accepted_exact_stages.clear()
         self._rollback_source_digest = None
+        self._intent_only_mutation = (
+            intent_only
+            if not self._source_mutation_recorded
+            else self._intent_only_mutation and intent_only
+        )
+        self._source_mutation_recorded = True
 
     def _restore_exact_selection_source(
         self,
@@ -3481,7 +3739,11 @@ class PackTransaction:
         _validate_mod_version_override_records(
             self.source,
             baseline_records,
-            overrides=overrides_before,
+            overrides=tuple(
+                override
+                for override in overrides_before
+                if override.canonical_identity != selection.identity_label
+            ),
         )
         target_records = baseline_records.get(selection.identity, ())
         if len(target_records) == 0:
@@ -3923,8 +4185,12 @@ class PackTransaction:
                 existing_override.reason if existing_override is not None else None,
             )
             try:
-                ensure_mod_version_overrides_ignored(self.source)
-                set_mod_version_override(self.source, selected_override)
+                ensure_mod_version_overrides_ignored(
+                    self.source, checkpoint=checkpoint
+                )
+                set_mod_version_override(
+                    self.source, selected_override, checkpoint=checkpoint
+                )
             except (ModVersionOverrideError, OSError) as error:
                 raise HuroshikiError(str(error)) from error
             ensure_safe_pack_source(self.source, checkpoint=checkpoint)
@@ -4363,6 +4629,8 @@ class PackTransaction:
                 "Staged changes invalidated exact MOD verification; select an exact "
                 "version again to verify the complete closure before applying"
             )
+        if self._intent_only_mutation:
+            refresh = False
         if self._equivalence_process_results:
             cleanup_deadline = time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS
             if deadline is not None:
@@ -7274,6 +7542,109 @@ def _validate_mod_version_override_records(
     return overrides
 
 
+def canonical_mod_version_identity(identity: str) -> str:
+    if not isinstance(identity, str) or identity.count(":") != 1:
+        raise HuroshikiError(
+            "MOD identity must use curseforge:<project-id> or modrinth:<project-id>"
+        )
+    provider, project_id = identity.split(":", 1)
+    if provider == "modrinth":
+        project_id = str(
+            canonical_modrinth_id(project_id, "Modrinth project ID")
+        )
+    elif provider == "curseforge":
+        project_id = canonical_curseforge_project_id(project_id)
+    else:
+        raise HuroshikiError(
+            "MOD identity must use curseforge:<project-id> or modrinth:<project-id>"
+        )
+    return f"{provider}:{project_id}"
+
+
+def mod_version_intent_status(
+    source: Path,
+    identity: str,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> ModVersionIntentStatus:
+    _run_checkpoint(checkpoint)
+    canonical_identity = canonical_mod_version_identity(identity)
+    provider, project_id = canonical_identity.split(":", 1)
+    records = _exact_metadata_records(source, checkpoint)
+    matching = records.get((provider, project_id), ())
+    if len(matching) > 1:
+        raise HuroshikiError(
+            f"MOD version intent identity is ambiguous: {canonical_identity}"
+        )
+    installed = (
+        None
+        if not matching
+        else parse_provider_metadata(matching[0][0], matching[0][1]).file_id
+    )
+    try:
+        override = get_mod_version_override(
+            source, canonical_identity, checkpoint=checkpoint
+        )
+    except ModVersionOverrideError as error:
+        raise HuroshikiError(str(error)) from error
+    if override is None:
+        return ModVersionIntentStatus(
+            canonical_identity,
+            "automatic",
+            installed,
+            None,
+            None,
+            None,
+            None,
+        )
+    status: Literal["active", "drifted", "stale"] = (
+        "stale"
+        if installed is None
+        else "active"
+        if installed == override.artifact_id
+        else "drifted"
+    )
+    return ModVersionIntentStatus(
+        canonical_identity,
+        "user",
+        installed,
+        override.artifact_id,
+        override.locked,
+        override.reason,
+        status,
+    )
+
+
+def installed_mod_version_intent(
+    project_key_value: str,
+    mod: ModInfo,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> ModVersionIntentStatus:
+    def checkpoint() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ExactModVersionCancelled(
+                "Installed MOD version intent loading was cancelled"
+            )
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ExactModVersionDeadlineExceeded(
+                "Installed MOD version intent loading deadline exceeded"
+            )
+
+    checkpoint()
+    kind, _project_id = split_project_key(project_key_value)
+    if kind != "pack":
+        raise HuroshikiError("MOD version intent is available only for packs")
+    provider = canonical_provider(mod.provider)
+    identity = canonical_mod_version_identity(f"{provider}:{mod.project_id}")
+    return mod_version_intent_status(
+        project_root(project_key_value) / "source",
+        identity,
+        checkpoint=checkpoint,
+    )
+
+
 def inspect_mod_version_overrides(source: Path) -> tuple[ModVersionOverrideStatus, ...]:
     records = _exact_metadata_records(source)
     try:
@@ -8717,9 +9088,24 @@ def list_mods_from_source(source: Path) -> list[ModInfo]:
     ]
 
 
-def installed_mod_provenance(project_key_value: str, mod: ModInfo) -> str:
+def installed_mod_provenance(
+    project_key_value: str,
+    mod: ModInfo,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> str:
     """Return the authoritative root-manifest role for one installed Pack MOD."""
 
+    def checkpoint() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ExactModVersionCancelled("Installed MOD provenance loading was cancelled")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ExactModVersionDeadlineExceeded(
+                "Installed MOD provenance loading deadline exceeded"
+            )
+
+    checkpoint()
     kind, _project_id = split_project_key(project_key_value)
     if kind != "pack":
         return "Recipe entry"
@@ -8727,7 +9113,9 @@ def installed_mod_provenance(project_key_value: str, mod: ModInfo) -> str:
     if provider not in {"modrinth", "curseforge", "url"} or not mod.project_id:
         return "Dependency"
     identity = f"{provider}:{mod.project_id}"
-    roots = read_pack_root_manifest(project_source(project_key_value))
+    roots = read_pack_root_manifest(
+        project_source(project_key_value), checkpoint=checkpoint
+    )
     return (
         "Explicit root"
         if any(root.canonical_identity == identity for root in roots)

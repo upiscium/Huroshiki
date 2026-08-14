@@ -88,7 +88,10 @@ def read_pack_control_file(
     relative: Path,
     *,
     max_bytes: int,
+    checkpoint: Callable[[], None] | None = None,
 ) -> bytes:
+    if checkpoint is not None:
+        checkpoint()
     entries = {entry.relative_path: entry for entry in scan.entries}
     expected = entries.get(relative)
     if expected is None or expected.kind != "file" or expected.errors:
@@ -118,6 +121,8 @@ def read_pack_control_file(
         chunks: list[bytes] = []
         total = 0
         while True:
+            if checkpoint is not None:
+                checkpoint()
             chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - total))
             if not chunk:
                 break
@@ -128,6 +133,8 @@ def read_pack_control_file(
         contents = b"".join(chunks)
         if total != expected.size:
             raise PackMigrationRootError(f"File changed while reading: {relative}")
+        if checkpoint is not None:
+            checkpoint()
         return contents
     finally:
         if descriptor >= 0:
@@ -177,13 +184,17 @@ def _manifest_records(contents: bytes) -> tuple[PackRootRecord, ...]:
     return tuple(sorted(records, key=lambda item: item.canonical_identity))
 
 
-def read_pack_root_manifest(source_root: Path) -> tuple[PackRootRecord, ...]:
-    scan = scan_pack_migration_source(source_root, checkpoint=lambda: None)
+def read_pack_root_manifest(
+    source_root: Path, checkpoint: Callable[[], None] | None = None
+) -> tuple[PackRootRecord, ...]:
+    effective_checkpoint = checkpoint or (lambda: None)
+    scan = scan_pack_migration_source(source_root, checkpoint=effective_checkpoint)
     contents = _read_relative_file(
         source_root,
         scan,
         ROOT_MANIFEST_PATH,
         max_bytes=ROOT_MANIFEST_MAX_BYTES,
+        checkpoint=effective_checkpoint,
     )
     return _manifest_records(contents)
 
@@ -254,7 +265,10 @@ def write_pack_control_file(
     contents: bytes,
     *,
     expected_root_identity: tuple[int, int] | None = None,
+    checkpoint: Callable[[], None] | None = None,
 ) -> None:
+    if checkpoint is not None:
+        checkpoint()
     root_fd = os.open(source_root, _DIRECTORY_FLAGS)
     opened: list[int] = []
     descriptor = -1
@@ -279,6 +293,8 @@ def write_pack_control_file(
         )
         view = memoryview(contents)
         while view:
+            if checkpoint is not None:
+                checkpoint()
             written = os.write(descriptor, view)
             if written == 0:
                 raise OSError("short provenance write")
@@ -314,6 +330,8 @@ def write_pack_control_file(
             )
             os.unlink(temporary, dir_fd=parent_fd)
         os.fsync(parent_fd)
+        if checkpoint is not None:
+            checkpoint()
     finally:
         if descriptor >= 0:
             os.close(descriptor)
