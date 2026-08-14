@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import re
 import sys
@@ -17,6 +18,10 @@ NETWORK_TIMEOUT_SECONDS = 30
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_ERROR_RESPONSE_BYTES = 16 * 1024
 _MODRINTH_IMMUTABLE_ID_RE = re.compile(r"^[A-Za-z0-9]{8}$")
+_VERSION_TYPES = frozenset(("release", "beta", "alpha"))
+_VERSION_TEXT_MAX = 256
+_FILENAME_MAX = 512
+_MAX_PROVIDER_VERSION_RECORDS = 1000
 
 
 class LookupError(RuntimeError):
@@ -134,6 +139,132 @@ def normalize_description(value: str) -> str:
     return " ".join(value.split())
 
 
+def _bounded_text(record: object, key: str, maximum: int) -> str:
+    value = required_text(record, key)
+    if len(value) > maximum or any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    ):
+        raise LookupError(f"Provider version has invalid {key}")
+    return value
+
+
+def _version_list(record: object, key: str, requested: str) -> list[str]:
+    if not isinstance(record, dict):
+        raise LookupError("Provider returned a non-object version")
+    values = record.get(key)
+    if not isinstance(values, list) or not values or not all(
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= _VERSION_TEXT_MAX
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+        for value in values
+    ):
+        raise LookupError(f"Provider version has invalid {key}")
+    if requested not in values:
+        raise LookupError(f"Provider version does not support requested {key}")
+    return values
+
+
+def modrinth_versions(
+    project_id: str,
+    *,
+    minecraft: str,
+    loader: str,
+    include_prerelease: bool = False,
+    limit: int = 20,
+) -> list[dict[str, object]]:
+    """Return strictly validated, deterministic Modrinth version candidates."""
+    if _MODRINTH_IMMUTABLE_ID_RE.fullmatch(project_id) is None:
+        raise LookupError("Invalid canonical Modrinth project ID")
+    if (
+        not isinstance(minecraft, str)
+        or not minecraft
+        or len(minecraft) > _VERSION_TEXT_MAX
+    ):
+        raise LookupError("Invalid Minecraft version")
+    if loader not in {"fabric", "forge", "neoforge", "quilt"}:
+        raise LookupError("Invalid Modrinth loader")
+    if (
+        not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or not 1 <= limit <= 100
+    ):
+        raise LookupError("Version limit must be between 1 and 100")
+    query: dict[str, str] = {
+        "game_versions": json.dumps([minecraft], separators=(",", ":")),
+        "loaders": json.dumps([loader], separators=(",", ":")),
+        "limit": str(limit),
+        "include_changelog": "false",
+    }
+    if not include_prerelease:
+        query["version_type"] = "release"
+    parameters = urlencode(query)
+    response = request_json(
+        f"{API_ROOT}/project/{quote(project_id, safe='')}/version?{parameters}"
+    )
+    if not isinstance(response, list):
+        raise LookupError("Provider versions response is not a list")
+    if len(response) > _MAX_PROVIDER_VERSION_RECORDS:
+        raise LookupError("Provider returned too many version records")
+    if len(response) > limit:
+        raise LookupError("Provider returned more versions than requested")
+    candidates: list[tuple[datetime, dict[str, object]]] = []
+    seen: set[str] = set()
+    for version in response:
+        if not isinstance(version, dict):
+            raise LookupError("Provider returned a non-object version")
+        returned_project = required_text(version, "project_id")
+        if returned_project != project_id:
+            raise LookupError("Provider version has a mismatched project ID")
+        artifact_id = required_modrinth_id(version, "id")
+        if artifact_id in seen:
+            raise LookupError("Provider returned duplicate version IDs")
+        seen.add(artifact_id)
+        version_number = _bounded_text(version, "version_number", _VERSION_TEXT_MAX)
+        release_type = required_text(version, "version_type")
+        if release_type not in _VERSION_TYPES:
+            raise LookupError("Provider version has an invalid release type")
+        published_at = _bounded_text(version, "date_published", _VERSION_TEXT_MAX)
+        try:
+            published = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise LookupError("Provider version has an invalid publication date") from error
+        if published.tzinfo is None or published.utcoffset() is None:
+            raise LookupError("Provider version publication date is not timezone-aware")
+        game_versions = _version_list(version, "game_versions", minecraft)
+        loaders = _version_list(version, "loaders", loader)
+        files = version.get("files")
+        if not isinstance(files, list) or not files:
+            raise LookupError("Provider version has no files")
+        primary: list[str] = []
+        for file in files:
+            if not isinstance(file, dict):
+                raise LookupError("Provider version has an invalid file")
+            if file.get("primary") is True:
+                primary.append(_bounded_text(file, "filename", _FILENAME_MAX))
+        if len(primary) != 1:
+            raise LookupError("Provider version must have exactly one primary file")
+        candidate = {
+            "provider": "modrinth",
+            "project_id": project_id,
+            "artifact_id": artifact_id,
+            "version": version_number,
+            "filename": primary[0],
+            "game_versions": game_versions,
+            "loaders": loaders,
+            "release_type": release_type,
+            "published_at": published_at,
+        }
+        if include_prerelease or release_type == "release":
+            candidates.append((published, candidate))
+    candidates.sort(key=lambda item: item[1]["artifact_id"])
+    candidates.sort(
+        key=lambda item: item[0].astimezone(timezone.utc),
+        reverse=True,
+    )
+    return [candidate for _, candidate in candidates]
+
+
 def resolve_modrinth(selector: str) -> dict[str, str]:
     reference = modrinth_project_reference(selector)
     record = request_json(f"{API_ROOT}/project/{quote(reference, safe='')}")
@@ -200,6 +331,14 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--minecraft", required=True)
     search.add_argument("--loader", required=True)
     search.add_argument("--limit", type=int, default=20, choices=range(1, 51))
+    versions = subcommands.add_parser("versions")
+    versions.add_argument("project_id")
+    versions.add_argument("--minecraft", required=True)
+    versions.add_argument(
+        "--loader", required=True, choices=("fabric", "forge", "neoforge", "quilt")
+    )
+    versions.add_argument("--include-prerelease", action="store_true")
+    versions.add_argument("--limit", type=int, default=20, choices=range(1, 101))
     return parser
 
 
@@ -215,11 +354,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.action == "resolve":
             result = resolve_modrinth(args.selector)
-        else:
+        elif args.action == "search":
             result = search_modrinth(
                 args.query,
                 minecraft=args.minecraft,
                 loader=args.loader,
+                limit=args.limit,
+            )
+        else:
+            result = modrinth_versions(
+                args.project_id,
+                minecraft=args.minecraft,
+                loader=args.loader,
+                include_prerelease=args.include_prerelease,
                 limit=args.limit,
             )
     except LookupError as error:

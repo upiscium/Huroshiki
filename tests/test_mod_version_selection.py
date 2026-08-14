@@ -4139,6 +4139,394 @@ class ExactModVersionSelectionTest(unittest.TestCase):
                 finally:
                     transaction.discard()
 
+    @staticmethod
+    def version_candidate(
+        artifact_id: str,
+        *,
+        published_at: str = "2026-01-01T00:00:00Z",
+        release_type: str = "release",
+    ) -> dict[str, object]:
+        return {
+            "provider": "modrinth",
+            "project_id": mr_project("root"),
+            "artifact_id": mr_version(artifact_id),
+            "version": artifact_id,
+            "filename": f"{artifact_id}.jar",
+            "game_versions": ["1.21.1"],
+            "loaders": ["fabric"],
+            "release_type": release_type,
+            "published_at": published_at,
+        }
+
+    def test_candidate_catalog_propagates_pack_context_and_automatic_state(self) -> None:
+        self.write_installed_mods("modrinth", "root")
+        before = core._file_content_snapshot(self.source)
+        payload = [
+            self.version_candidate("old-artifact"),
+            self.version_candidate("v2", published_at="2026-02-01T00:00:00Z"),
+        ]
+        cancel = threading.Event()
+        deadline = time.monotonic() + 10
+        with patch.object(core, "_run_provider_lookup", return_value=payload) as lookup:
+            catalog = core.list_mod_version_candidates(
+                self.key,
+                f"modrinth:{mr_project('root')}",
+                cancel_event=cancel,
+                deadline=deadline,
+            )
+        self.assertEqual(catalog.identity, f"modrinth:{mr_project('root')}")
+        self.assertEqual((catalog.minecraft, catalog.loader), ("1.21.1", "fabric"))
+        self.assertEqual(
+            [view.candidate.artifact_id for view in catalog.candidates],
+            [mr_version("v2"), mr_version("old-artifact")],
+        )
+        current = catalog.candidates[1]
+        self.assertTrue(current.current)
+        self.assertFalse(current.selected)
+        self.assertFalse(current.pinned)
+        self.assertEqual(catalog.intent_status.selection, "automatic")
+        self.assertFalse(catalog.selected_candidate_missing)
+        arguments = lookup.call_args.args[0]
+        self.assertEqual(
+            arguments,
+            [
+                "modrinth",
+                "versions",
+                mr_project("root"),
+                "--minecraft",
+                "1.21.1",
+                "--loader",
+                "fabric",
+                "--limit",
+                "20",
+            ],
+        )
+        self.assertIs(lookup.call_args.kwargs["cancel_event"], cancel)
+        self.assertEqual(lookup.call_args.kwargs["deadline"], deadline)
+        self.assertEqual(core._file_content_snapshot(self.source), before)
+        self.assertFalse((self.root / ".huroshiki").exists())
+
+    def test_candidate_catalog_enriches_unlocked_pinned_and_drifted_intent(self) -> None:
+        self.write_installed_mods("modrinth", "root")
+        payload = [
+            self.version_candidate("old-artifact"),
+            self.version_candidate("v2"),
+        ]
+        for locked in (False, True):
+            with self.subTest(locked=locked):
+                set_mod_version_override(
+                    self.source,
+                    ModVersionOverride(
+                        "modrinth",
+                        mr_project("root"),
+                        mr_version("v2"),
+                        locked,
+                    ),
+                )
+                with patch.object(core, "_run_provider_lookup", return_value=payload):
+                    catalog = core.list_mod_version_candidates(
+                        self.key,
+                        f"modrinth:{mr_project('root')}",
+                    )
+                views = {
+                    view.candidate.artifact_id: view
+                    for view in catalog.candidates
+                }
+                self.assertTrue(views[mr_version("old-artifact")].current)
+                self.assertFalse(views[mr_version("old-artifact")].selected)
+                selected = views[mr_version("v2")]
+                self.assertFalse(selected.current)
+                self.assertTrue(selected.selected)
+                self.assertEqual(selected.pinned, locked)
+                self.assertEqual(catalog.intent_status.override_status, "drifted")
+
+    def test_candidate_catalog_marks_active_and_missing_selected_candidate(self) -> None:
+        self.write_installed_mods("modrinth", "root")
+        set_mod_version_override(
+            self.source,
+            ModVersionOverride(
+                "modrinth",
+                mr_project("root"),
+                mr_version("old-artifact"),
+                True,
+            ),
+        )
+        with patch.object(
+            core,
+            "_run_provider_lookup",
+            return_value=[self.version_candidate("old-artifact")],
+        ):
+            active = core.list_mod_version_candidates(
+                self.key,
+                f"modrinth:{mr_project('root')}",
+            )
+        self.assertTrue(active.candidates[0].current)
+        self.assertTrue(active.candidates[0].selected)
+        self.assertTrue(active.candidates[0].pinned)
+        selection = active.candidates[0].candidate.as_exact_selection()
+        self.assertIsInstance(selection.project_id, core.CanonicalModrinthId)
+        self.assertIsInstance(selection.artifact_id, core.CanonicalModrinthId)
+        self.assertEqual(active.intent_status.override_status, "active")
+        self.assertFalse(active.selected_candidate_missing)
+
+        set_mod_version_override(
+            self.source,
+            ModVersionOverride(
+                "modrinth",
+                mr_project("root"),
+                mr_version("v2"),
+                False,
+            ),
+        )
+        with patch.object(core, "_run_provider_lookup", return_value=[]):
+            missing = core.list_mod_version_candidates(
+                self.key,
+                f"modrinth:{mr_project('root')}",
+            )
+        self.assertEqual(missing.candidates, ())
+        self.assertTrue(missing.selected_candidate_missing)
+        self.assertEqual(missing.intent_status.override_status, "drifted")
+
+    def test_candidate_catalog_allows_stale_intent_without_repair(self) -> None:
+        set_mod_version_override(
+            self.source,
+            ModVersionOverride(
+                "modrinth",
+                mr_project("root"),
+                mr_version("v2"),
+                True,
+            ),
+        )
+        before = core._file_content_snapshot(self.source)
+        with patch.object(
+            core,
+            "_run_provider_lookup",
+            return_value=[self.version_candidate("v2")],
+        ):
+            catalog = core.list_mod_version_candidates(
+                self.key,
+                f"modrinth:{mr_project('root')}",
+            )
+        self.assertEqual(catalog.intent_status.override_status, "stale")
+        self.assertIsNone(catalog.intent_status.installed_artifact_id)
+        self.assertTrue(catalog.candidates[0].selected)
+        self.assertTrue(catalog.candidates[0].pinned)
+        self.assertEqual(core._file_content_snapshot(self.source), before)
+
+    def test_candidate_catalog_rejects_unsupported_providers_without_lookup(self) -> None:
+        with patch.object(core, "_run_provider_lookup") as lookup:
+            with self.assertRaisesRegex(
+                core.HuroshikiError,
+                "not currently available for CurseForge",
+            ):
+                core.list_mod_version_candidates(self.key, "curseforge:123")
+            with self.assertRaisesRegex(
+                core.HuroshikiError,
+                "unavailable for URL artifacts",
+            ):
+                core.list_mod_version_candidates(self.key, "url:example")
+        lookup.assert_not_called()
+
+    def test_candidate_catalog_honors_cancellation_and_deadline_before_lookup(self) -> None:
+        cancelled = threading.Event()
+        cancelled.set()
+        with patch.object(core, "_run_provider_lookup") as lookup:
+            with self.assertRaises(core.ExactModVersionCancelled):
+                core.list_mod_version_candidates(
+                    self.key,
+                    f"modrinth:{mr_project('root')}",
+                    cancel_event=cancelled,
+                )
+            with self.assertRaises(core.ExactModVersionDeadlineExceeded):
+                core.list_mod_version_candidates(
+                    self.key,
+                    f"modrinth:{mr_project('root')}",
+                    deadline=time.monotonic() - 1,
+                )
+        lookup.assert_not_called()
+
+    def test_candidate_catalog_rejects_child_protocol_and_lifecycle_failures(self) -> None:
+        self.write_installed_mods("modrinth", "root")
+
+        def response(stdout: str, **flags):
+            values = {
+                "returncode": 0,
+                "stdout": stdout,
+                "stderr": "",
+                "cancelled": False,
+                "timed_out": False,
+                "orphaned_descendants": False,
+            }
+            values.update(flags)
+            return core.ResolverProcessResult(**values)
+
+        cases = (
+            (response("not json"), "invalid JSON"),
+            (
+                response('{"request_id":"one","request_id":"two","result":[]}'),
+                "invalid JSON",
+            ),
+            (
+                response('{"request_id":"wrong","result":[]}'),
+                "mismatched request ID",
+            ),
+            (response("", cancelled=True), "cancelled"),
+            (response("", timed_out=True), "deadline exceeded"),
+            (
+                response("", termination_incomplete=True),
+                "termination was incomplete",
+            ),
+            (
+                response("", orphaned_descendants=True),
+                "background processes",
+            ),
+            (
+                response("", returncode=7, stderr="catalog failed"),
+                "catalog failed",
+            ),
+        )
+        before = core._file_content_snapshot(self.source)
+        for result, message in cases:
+            with self.subTest(message=message), patch.object(
+                core,
+                "run_resolver_process",
+                return_value=result,
+            ):
+                with self.assertRaisesRegex(core.HuroshikiError, message):
+                    core.list_mod_version_candidates(
+                        self.key,
+                        f"modrinth:{mr_project('root')}",
+                    )
+                self.assertEqual(core._file_content_snapshot(self.source), before)
+
+    def test_candidate_catalog_strictly_revalidates_child_candidates(self) -> None:
+        self.write_installed_mods("modrinth", "root")
+        valid = self.version_candidate("old-artifact")
+        invalid_records = (
+            {**valid, "project_id": mr_project("root-a")},
+            {**valid, "artifact_id": "bad"},
+            {**valid, "game_versions": "1.21.1"},
+            {**valid, "loaders": ["forge"]},
+            {**valid, "release_type": "unknown"},
+            {**valid, "published_at": "2026-01-01T00:00:00"},
+        )
+        before = core._file_content_snapshot(self.source)
+        for record in invalid_records:
+            with self.subTest(record=record), patch.object(
+                core,
+                "_run_provider_lookup",
+                return_value=[record],
+            ):
+                with self.assertRaises(core.HuroshikiError):
+                    core.list_mod_version_candidates(
+                        self.key,
+                        f"modrinth:{mr_project('root')}",
+                    )
+                self.assertEqual(core._file_content_snapshot(self.source), before)
+
+    def test_candidate_catalog_selection_uses_existing_exact_prepare_path(self) -> None:
+        self.write_installed_mods("modrinth", "root")
+        with patch.object(
+            core,
+            "_run_provider_lookup",
+            return_value=[self.version_candidate("v2")],
+        ):
+            catalog = core.list_mod_version_candidates(
+                self.key,
+                f"modrinth:{mr_project('root')}",
+            )
+        transaction = self.make_transaction("modrinth", "root")
+        try:
+            preview = transaction.prepare_exact_mod_version(
+                catalog.candidates[0].candidate.as_exact_selection()
+            )
+            self.assertEqual(preview.new_artifact_id, mr_version("v2"))
+        finally:
+            transaction.discard()
+
+    def test_candidate_catalog_rejects_unsafe_source_before_lookup(self) -> None:
+        self.write_installed_mods("modrinth", "root")
+        outside = self.root / "outside.pw.toml"
+        outside.write_text(
+            self.metadata("modrinth", "root", "v2"),
+            encoding="utf-8",
+        )
+        (self.source / "mods" / "unsafe.pw.toml").symlink_to(outside)
+        with patch.object(core, "_run_provider_lookup") as lookup:
+            with self.assertRaisesRegex(core.HuroshikiError, "unsafe"):
+                core.list_mod_version_candidates(
+                    self.key,
+                    f"modrinth:{mr_project('root')}",
+                )
+        lookup.assert_not_called()
+
+    def test_candidate_catalog_rejects_source_replacement_during_lookup(self) -> None:
+        self.write_installed_mods("modrinth", "root")
+        original = self.source.with_name("source-original")
+
+        def replace_source(_arguments, **_kwargs):
+            self.source.rename(original)
+            self.source.mkdir()
+            return []
+
+        with patch.object(
+            core,
+            "_run_provider_lookup",
+            side_effect=replace_source,
+        ):
+            with self.assertRaisesRegex(core.HuroshikiError, "changed"):
+                core.list_mod_version_candidates(
+                    self.key,
+                    f"modrinth:{mr_project('root')}",
+                )
+
+    def test_candidate_catalog_binds_reads_to_scanned_content_digest(self) -> None:
+        self.write_installed_mods("modrinth", "root")
+        pack_file = self.source / "pack.toml"
+        original_contents = pack_file.read_bytes()
+        transient_contents = original_contents.replace(b"1.21.1", b"1.20.1")
+        original_read = core.read_pack_control_file
+
+        def transient_read(source, scan, relative, **kwargs):
+            if relative != Path("pack.toml"):
+                return original_read(source, scan, relative, **kwargs)
+            pack_file.write_bytes(transient_contents)
+            try:
+                return original_read(source, scan, relative, **kwargs)
+            finally:
+                pack_file.write_bytes(original_contents)
+
+        with patch.object(
+            core,
+            "read_pack_control_file",
+            side_effect=transient_read,
+        ), patch.object(core, "_run_provider_lookup") as lookup:
+            with self.assertRaisesRegex(core.HuroshikiError, "changed"):
+                core.list_mod_version_candidates(
+                    self.key,
+                    f"modrinth:{mr_project('root')}",
+                )
+        lookup.assert_not_called()
+        self.assertEqual(pack_file.read_bytes(), original_contents)
+
+    def test_candidate_catalog_enforces_authoritative_scan_bounds(self) -> None:
+        self.write_installed_mods("modrinth", "root")
+        for constant, message in (
+            ("VERSION_CATALOG_SOURCE_MAX_ENTRIES", "entry scan limit"),
+            ("VERSION_CATALOG_SOURCE_MAX_TOTAL_BYTES", "byte scan limit"),
+        ):
+            with self.subTest(constant=constant), patch.object(
+                core,
+                constant,
+                1,
+            ), patch.object(core, "_run_provider_lookup") as lookup:
+                with self.assertRaisesRegex(core.HuroshikiError, message):
+                    core.list_mod_version_candidates(
+                        self.key,
+                        f"modrinth:{mr_project('root')}",
+                    )
+                lookup.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
