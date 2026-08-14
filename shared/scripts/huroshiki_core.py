@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import tomllib
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Iterable, Literal, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
@@ -49,22 +50,25 @@ from pack_migration_roots import (
     extract_pack_migration_roots,
     ensure_pack_root_manifest_ignored,
     identify_pack_metadata_by_slug,
+    read_pack_control_file,
     read_pack_root_manifest,
     record_pack_root,
     remove_pack_root,
     write_pack_control_file,
     write_pack_root_manifest,
 )
-from pack_tree_policy import scan_pack_migration_source
+from pack_tree_policy import PackTreePolicyError, PackTreeScan, scan_pack_migration_source
 from provider_identity import parse_provider_metadata
 from provider_artifacts import materialize_provider_artifact
 from mod_version_overrides import (
     ModVersionOverride,
     ModVersionOverrideError,
     ModVersionOverrideStatus,
+    VERSION_OVERRIDE_MANIFEST_MAX_BYTES,
     VERSION_OVERRIDE_MANIFEST_PATH,
     ensure_mod_version_overrides_ignored,
     get_mod_version_override,
+    parse_mod_version_overrides,
     read_mod_version_overrides,
     remove_mod_version_override,
     require_mod_version_overrides_ignored,
@@ -781,6 +785,47 @@ class ModVersionIntentStatus:
     locked: bool | None
     reason: str | None
     override_status: Literal["active", "drifted", "stale"] | None
+
+
+@dataclass(frozen=True)
+class ModVersionCandidate:
+    provider: str
+    project_id: str | CanonicalModrinthId
+    artifact_id: str | CanonicalModrinthId
+    version: str
+    filename: str
+    game_versions: tuple[str, ...]
+    loaders: tuple[str, ...]
+    release_type: Literal["release", "beta", "alpha"]
+    published_at: str
+
+    def as_exact_selection(self) -> ExactModArtifactSelection:
+        """Convert provider output into the existing exact-selection authority."""
+        return ExactModArtifactSelection(
+            self.provider,
+            self.project_id,
+            self.artifact_id,
+        )
+
+
+@dataclass(frozen=True)
+class ModVersionCandidateView:
+    candidate: ModVersionCandidate
+    current: bool
+    selected: bool
+    pinned: bool
+    compatible: bool
+    compatibility_notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ModVersionCandidateCatalog:
+    identity: str
+    minecraft: str
+    loader: str
+    candidates: tuple[ModVersionCandidateView, ...]
+    intent_status: ModVersionIntentStatus
+    selected_candidate_missing: bool
 
 
 @dataclass(frozen=True)
@@ -5209,9 +5254,17 @@ def _run_provider_lookup(
         raise HuroshikiError(
             concise_process_error(result).replace("Packwiz", "Provider lookup")
         )
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate provider protocol field {key!r}")
+            value[key] = item
+        return value
+
     try:
-        envelope = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
+        envelope = json.loads(result.stdout, object_pairs_hook=strict_object)
+    except (json.JSONDecodeError, ValueError) as error:
         raise HuroshikiError("Provider lookup returned invalid JSON") from error
     if not isinstance(envelope, dict) or set(envelope) != {"request_id", "result"}:
         raise HuroshikiError("Provider lookup returned an invalid response envelope")
@@ -7642,6 +7695,433 @@ def installed_mod_version_intent(
         project_root(project_key_value) / "source",
         identity,
         checkpoint=checkpoint,
+    )
+
+
+VERSION_CATALOG_PACK_TOML_MAX_BYTES = 1024 * 1024
+VERSION_CATALOG_METADATA_MAX_BYTES = 2 * 1024 * 1024
+VERSION_CATALOG_METADATA_TOTAL_MAX_BYTES = 64 * 1024 * 1024
+VERSION_CATALOG_METADATA_MAX_FILES = 10_000
+VERSION_CATALOG_SOURCE_MAX_ENTRIES = 20_000
+VERSION_CATALOG_SOURCE_MAX_TOTAL_BYTES = 128 * 1024 * 1024
+
+
+def _mod_version_catalog_source_snapshot(
+    source: Path,
+    checkpoint: Callable[[], None],
+) -> tuple[PackTreeScan, bytes, dict[Path, bytes], bytes | None]:
+    """Read only catalog inputs through one descriptor-verified tree scan."""
+    try:
+        scan = scan_pack_migration_source(
+            source,
+            checkpoint=checkpoint,
+            max_entries=VERSION_CATALOG_SOURCE_MAX_ENTRIES,
+            max_total_file_bytes=VERSION_CATALOG_SOURCE_MAX_TOTAL_BYTES,
+        )
+    except (OSError, PackTreePolicyError) as error:
+        raise HuroshikiError(f"Could not inspect Packwiz source safely: {error}") from error
+    if any(entry.kind == "invalid" or entry.errors for entry in scan.entries):
+        raise HuroshikiError("Packwiz source contains unsafe filesystem entries")
+    files = {
+        entry.relative_path: entry
+        for entry in scan.entries
+        if entry.kind == "file"
+    }
+    pack_entry = files.get(Path("pack.toml"))
+    if pack_entry is None:
+        raise HuroshikiError(f"{source / 'pack.toml'}: missing required file")
+    if pack_entry.size > VERSION_CATALOG_PACK_TOML_MAX_BYTES:
+        raise HuroshikiError("pack.toml exceeds the candidate catalog size limit")
+    metadata_entries = tuple(
+        entry
+        for relative, entry in sorted(files.items())
+        if relative.name.endswith(".pw.toml")
+    )
+    if len(metadata_entries) > VERSION_CATALOG_METADATA_MAX_FILES:
+        raise HuroshikiError("Packwiz metadata exceeds the candidate catalog file limit")
+    if any(
+        entry.size > VERSION_CATALOG_METADATA_MAX_BYTES
+        for entry in metadata_entries
+    ):
+        raise HuroshikiError("Packwiz metadata exceeds the candidate catalog file size limit")
+    if sum(entry.size for entry in metadata_entries) > VERSION_CATALOG_METADATA_TOTAL_MAX_BYTES:
+        raise HuroshikiError("Packwiz metadata exceeds the candidate catalog total size limit")
+    try:
+        pack_contents = read_pack_control_file(
+            source,
+            scan,
+            Path("pack.toml"),
+            max_bytes=VERSION_CATALOG_PACK_TOML_MAX_BYTES,
+            checkpoint=checkpoint,
+        )
+        if hashlib.sha256(pack_contents).hexdigest() != pack_entry.digest:
+            raise HuroshikiError("pack.toml changed after the catalog snapshot")
+        metadata = {
+            entry.relative_path: read_pack_control_file(
+                source,
+                scan,
+                entry.relative_path,
+                max_bytes=VERSION_CATALOG_METADATA_MAX_BYTES,
+                checkpoint=checkpoint,
+            )
+            for entry in metadata_entries
+        }
+        if any(
+            hashlib.sha256(metadata[entry.relative_path]).hexdigest()
+            != entry.digest
+            for entry in metadata_entries
+        ):
+            raise HuroshikiError("Packwiz metadata changed after the catalog snapshot")
+        manifest_entry = files.get(VERSION_OVERRIDE_MANIFEST_PATH)
+        manifest_contents = (
+            None
+            if manifest_entry is None
+            else read_pack_control_file(
+                source,
+                scan,
+                VERSION_OVERRIDE_MANIFEST_PATH,
+                max_bytes=VERSION_OVERRIDE_MANIFEST_MAX_BYTES,
+                checkpoint=checkpoint,
+            )
+        )
+        if (
+            manifest_entry is not None
+            and manifest_contents is not None
+            and hashlib.sha256(manifest_contents).hexdigest()
+            != manifest_entry.digest
+        ):
+            raise HuroshikiError(
+                "Version override manifest changed after the catalog snapshot"
+            )
+    except PackMigrationRootError as error:
+        raise HuroshikiError(str(error)) from error
+    return scan, pack_contents, metadata, manifest_contents
+
+
+def list_mod_version_candidates(
+    project_key_value: str,
+    identity: str,
+    *,
+    include_prerelease: bool = False,
+    limit: int = 20,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> ModVersionCandidateCatalog:
+    """Read-only catalog of provider versions for an installed pack MOD."""
+    operation_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + PROVIDER_LOOKUP_TIMEOUT_SECONDS
+    )
+
+    def checkpoint() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ExactModVersionCancelled("MOD version candidate listing was cancelled")
+        if time.monotonic() >= operation_deadline:
+            raise ExactModVersionDeadlineExceeded(
+                "MOD version candidate listing deadline exceeded"
+            )
+
+    checkpoint()
+    kind, _project_id = split_project_key(project_key_value)
+    if kind != "pack":
+        raise HuroshikiError("MOD version candidate listing is available only for packs")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+        raise HuroshikiError("MOD version candidate limit must be between 1 and 100")
+    if not isinstance(include_prerelease, bool):
+        raise HuroshikiError("include_prerelease must be a boolean")
+    if isinstance(identity, str) and identity.startswith("url:"):
+        raise HuroshikiError("Provider version catalog is unavailable for URL artifacts")
+    if isinstance(identity, str) and identity.startswith("curseforge:"):
+        # This is intentionally checked before any filesystem or child-process work.
+        canonical_mod_version_identity(identity)
+        raise HuroshikiError(
+            "Provider version catalog is not currently available for CurseForge; "
+            "enter an exact file ID instead."
+        )
+    canonical_identity = canonical_mod_version_identity(identity)
+    provider, project_id = canonical_identity.split(":", 1)
+    if provider != "modrinth":
+        raise HuroshikiError(
+            "Provider version catalog is not currently available for CurseForge; "
+            "enter an exact file ID instead."
+        )
+
+    source = project_root(project_key_value) / "source"
+    before, pack_contents, metadata_snapshot, manifest_contents = (
+        _mod_version_catalog_source_snapshot(source, checkpoint)
+    )
+    pack_file = Path("pack.toml")
+    try:
+        pack_data = tomllib.loads(pack_contents.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise HuroshikiError(f"{source / pack_file}: {error}") from error
+    versions = pack_data.get("versions", {})
+    if not isinstance(versions, dict):
+        raise HuroshikiError("pack.toml has invalid versions")
+    minecraft = versions.get("minecraft")
+    loaders = [name for name in packctl.LOADER_FLAGS if name in versions]
+    if (
+        not isinstance(minecraft, str)
+        or not minecraft.strip()
+        or len(loaders) != 1
+    ):
+        raise HuroshikiError(
+            "Installed pack has an ambiguous or missing Minecraft/loader target"
+        )
+    minecraft = minecraft.strip()
+    loader = loaders[0]
+    loader_version = versions.get(loader)
+    if not isinstance(loader_version, str) or not loader_version.strip():
+        raise HuroshikiError(
+            "Installed pack has an ambiguous or missing Minecraft/loader target"
+        )
+
+    records: dict[tuple[str, str], list[tuple[Path, bytes, ModInfo]]] = {}
+    for relative, contents in sorted(metadata_snapshot.items()):
+        checkpoint()
+        try:
+            mod = read_mod_data(
+                relative,
+                tomllib.loads(contents.decode("utf-8")),
+            )
+        except (UnicodeError, tomllib.TOMLDecodeError, ValueError) as error:
+            raise HuroshikiError(
+                f"MOD version candidate metadata {relative} is invalid: {error}"
+            ) from error
+        record_identity = canonical_provider(mod.provider), mod.project_id
+        records.setdefault(record_identity, []).append((relative, contents, mod))
+    matching = records.get((provider, project_id), ())
+    if len(matching) > 1:
+        raise HuroshikiError(
+            f"MOD version candidate identity is ambiguous: {canonical_identity}"
+        )
+    installed = None
+    if matching:
+        installed = parse_provider_metadata(matching[0][0], matching[0][1]).file_id
+
+    try:
+        overrides = (
+            ()
+            if manifest_contents is None
+            else parse_mod_version_overrides(manifest_contents).entries
+        )
+    except ModVersionOverrideError as error:
+        raise HuroshikiError(str(error)) from error
+    override = next(
+        (
+            item
+            for item in overrides
+            if item.canonical_identity == canonical_identity
+        ),
+        None,
+    )
+    if installed is None and override is None:
+        raise HuroshikiError(
+            f"Installed MOD version target is missing: {canonical_identity}"
+        )
+    if override is None:
+        intent = ModVersionIntentStatus(
+            canonical_identity,
+            "automatic",
+            installed,
+            None,
+            None,
+            None,
+            None,
+        )
+    else:
+        status: Literal["active", "drifted", "stale"] = (
+            "stale"
+            if installed is None
+            else "active"
+            if installed == override.artifact_id
+            else "drifted"
+        )
+        intent = ModVersionIntentStatus(
+            canonical_identity,
+            "user",
+            installed,
+            override.artifact_id,
+            override.locked,
+            override.reason,
+            status,
+        )
+    arguments = [
+        "modrinth",
+        "versions",
+        project_id,
+        "--minecraft",
+        minecraft,
+        "--loader",
+        loader,
+        "--limit",
+        str(limit),
+    ]
+    if include_prerelease:
+        arguments.append("--include-prerelease")
+    raw = _run_provider_lookup(
+        arguments,
+        cancel_event=cancel_event,
+        deadline=operation_deadline,
+    )
+    checkpoint()
+    if not isinstance(raw, list) or len(raw) > limit:
+        raise HuroshikiError("Provider lookup returned an invalid version catalog")
+    fields = {
+        "provider",
+        "project_id",
+        "artifact_id",
+        "version",
+        "filename",
+        "game_versions",
+        "loaders",
+        "release_type",
+        "published_at",
+    }
+    candidates: list[ModVersionCandidate] = []
+    published_dates: dict[str, datetime] = {}
+    seen: set[str] = set()
+    for record in raw:
+        checkpoint()
+        item = _provider_protocol_mapping(
+            record,
+            fields=fields,
+            context="version candidate",
+        )
+        text_values: dict[str, str] = {}
+        for key, maximum in (
+            ("provider", 32),
+            ("project_id", 64),
+            ("artifact_id", 64),
+            ("version", 256),
+            ("filename", 512),
+            ("published_at", 256),
+        ):
+            value = item[key]
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value) > maximum
+                or any(
+                    ord(character) < 32 or ord(character) == 127
+                    for character in value
+                )
+            ):
+                raise HuroshikiError(f"Provider lookup returned invalid {key}")
+            text_values[key] = value
+        if (
+            text_values["provider"] != "modrinth"
+            or text_values["project_id"] != project_id
+        ):
+            raise HuroshikiError("Provider lookup returned a mismatched project identity")
+        artifact_id = canonical_modrinth_id(
+            text_values["artifact_id"],
+            "Modrinth version ID",
+        )
+        if text_values["artifact_id"] in seen:
+            raise HuroshikiError("Provider lookup returned duplicate version artifacts")
+        seen.add(text_values["artifact_id"])
+        if item["release_type"] not in {"release", "beta", "alpha"}:
+            raise HuroshikiError("Provider lookup returned an invalid release type")
+        if not include_prerelease and item["release_type"] != "release":
+            raise HuroshikiError(
+                "Provider lookup returned an unexpected prerelease candidate"
+            )
+
+        def tuple_field(key: str) -> tuple[str, ...]:
+            value = item[key]
+            if (
+                not isinstance(value, list)
+                or not value
+                or any(
+                    not isinstance(item_value, str)
+                    or not item_value
+                    or len(item_value) > 256
+                    or any(
+                        ord(character) < 32 or ord(character) == 127
+                        for character in item_value
+                    )
+                    for item_value in value
+                )
+            ):
+                raise HuroshikiError(f"Provider lookup returned invalid {key}")
+            return tuple(value)
+
+        game_versions = tuple_field("game_versions")
+        candidate_loaders = tuple_field("loaders")
+        if minecraft not in game_versions or loader not in candidate_loaders:
+            raise HuroshikiError("Provider lookup returned an incompatible version candidate")
+        try:
+            published = datetime.fromisoformat(
+                text_values["published_at"].replace("Z", "+00:00")
+            )
+            if published.tzinfo is None or published.utcoffset() is None:
+                raise ValueError
+        except ValueError as error:
+            raise HuroshikiError("Provider lookup returned an invalid publication date") from error
+        published_dates[str(artifact_id)] = published.astimezone(timezone.utc)
+        candidates.append(
+            ModVersionCandidate(
+                text_values["provider"],
+                canonical_modrinth_id(
+                    text_values["project_id"],
+                    "Modrinth project ID",
+                ),
+                artifact_id,
+                text_values["version"],
+                text_values["filename"],
+                game_versions,
+                candidate_loaders,
+                item["release_type"],
+                text_values["published_at"],
+            )
+        )
+    candidates.sort(key=lambda candidate: candidate.artifact_id)
+    candidates.sort(
+        key=lambda candidate: published_dates[candidate.artifact_id],
+        reverse=True,
+    )
+    views = tuple(
+        ModVersionCandidateView(
+            candidate,
+            candidate.artifact_id == installed,
+            override is not None and candidate.artifact_id == override.artifact_id,
+            override is not None
+            and candidate.artifact_id == override.artifact_id
+            and override.locked,
+            True,
+            (),
+        )
+        for candidate in candidates
+    )
+    try:
+        after = scan_pack_migration_source(
+            source,
+            checkpoint=checkpoint,
+            max_entries=VERSION_CATALOG_SOURCE_MAX_ENTRIES,
+            max_total_file_bytes=VERSION_CATALOG_SOURCE_MAX_TOTAL_BYTES,
+        )
+    except (OSError, PackTreePolicyError) as error:
+        raise HuroshikiError(
+            f"Could not revalidate Packwiz source safely: {error}"
+        ) from error
+    if any(entry.kind == "invalid" or entry.errors for entry in after.entries):
+        raise HuroshikiError("Packwiz source contains unsafe filesystem entries")
+    if (
+        after.root_identity != before.root_identity
+        or after.snapshot_digest != before.snapshot_digest
+    ):
+        raise HuroshikiError("Pack source changed while listing MOD version candidates")
+    return ModVersionCandidateCatalog(
+        canonical_identity,
+        minecraft,
+        loader,
+        views,
+        intent,
+        override is not None
+        and override.artifact_id
+        not in {candidate.artifact_id for candidate in candidates},
     )
 
 

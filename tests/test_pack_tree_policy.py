@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from pack_tree_policy import (
     PackTreePolicyError,
@@ -99,6 +100,32 @@ class PackTreePolicyTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "cancelled"):
             scan_pack_migration_source(self.source, checkpoint=checkpoint)
+
+    def test_optional_scan_entry_and_byte_limits_fail_before_excess_hashing(self) -> None:
+        with self.assertRaisesRegex(PackTreePolicyError, "entry scan limit"):
+            scan_pack_migration_source(
+                self.source,
+                checkpoint=self.checkpoint,
+                max_entries=1,
+            )
+        with self.assertRaisesRegex(PackTreePolicyError, "byte scan limit"):
+            scan_pack_migration_source(
+                self.source,
+                checkpoint=self.checkpoint,
+                max_total_file_bytes=1,
+            )
+
+    def test_byte_limit_is_enforced_against_stream_growth(self) -> None:
+        isolated = self.root / "bounded-source"
+        isolated.mkdir()
+        (isolated / "one.bin").write_bytes(b"x")
+        with patch("pack_tree_policy.os.read", return_value=b"xx"):
+            with self.assertRaisesRegex(PackTreePolicyError, "byte scan limit"):
+                scan_pack_migration_source(
+                    isolated,
+                    checkpoint=self.checkpoint,
+                    max_total_file_bytes=1,
+                )
 
     def test_source_mutation_after_scan_is_rejected(self) -> None:
         scan = scan_pack_migration_source(self.source, checkpoint=self.checkpoint)
