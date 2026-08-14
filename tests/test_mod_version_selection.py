@@ -2829,6 +2829,75 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         finally:
             transaction.discard()
 
+    def test_exact_selection_success_preserves_diagnostic_and_stages_override(self) -> None:
+        transaction = self.make_transaction("modrinth", "root")
+        real_before = core._file_content_snapshot(self.source)
+        original = self.run_fake_resolver
+
+        def diagnostic_resolver(*args, **kwargs):
+            result = original(*args, **kwargs)
+            return core.ResolverProcessResult(
+                result.returncode,
+                result.stdout,
+                "first diagnostic\nsecond diagnostic\n",
+                result.cancelled,
+                result.timed_out,
+                result.orphaned_descendants,
+                result.termination_incomplete,
+            )
+
+        with patch.object(core, "run_resolver_process", side_effect=diagnostic_resolver):
+            preview = transaction.prepare_exact_mod_version(
+                self.selection(
+                    "modrinth", branded_project("root"), branded_version("v2")
+                )
+            )
+        self.assertTrue(preview.diagnostic_messages)
+        self.assertIn("Details: .huroshiki/logs/demo/", " ".join(preview.diagnostic_messages))
+        logs = list((self.root / ".huroshiki/logs/demo").glob("*.log"))
+        self.assertTrue(logs)
+        self.assertIn("second diagnostic", logs[0].read_text(encoding="utf-8"))
+        self.assertEqual(core._file_content_snapshot(self.source), real_before)
+        self.assertEqual(
+            read_mod_version_overrides(transaction.source)[0].artifact_id,
+            mr_version("v2"),
+        )
+        transaction.discard()
+
+    def test_exact_selection_failure_logs_and_restores_override_bytes(self) -> None:
+        set_mod_version_override(
+            self.source,
+            ModVersionOverride(
+                "modrinth", mr_project("root"), mr_version("old-artifact"), True
+            ),
+        )
+        transaction = self.make_transaction("modrinth", "root")
+        staged_before = core._file_content_snapshot(transaction.source)
+        real_before = core._file_content_snapshot(self.source)
+
+        def failed_resolver(command, **kwargs):
+            result = core.ResolverProcessResult(
+                2, "resolver stdout\n", "resolver failure\nfull detail\n", False, False
+            )
+            callback = kwargs.get("result_callback")
+            if callback is not None:
+                callback(result)
+            return result
+
+        with patch.object(core, "run_resolver_process", side_effect=failed_resolver):
+            with self.assertRaisesRegex(core.HuroshikiError, "Details: .huroshiki/logs/demo/"):
+                transaction.prepare_exact_mod_version(
+                    self.selection(
+                        "modrinth", branded_project("root"), branded_version("v2")
+                    )
+                )
+        self.assertEqual(core._file_content_snapshot(transaction.source), staged_before)
+        self.assertEqual(core._file_content_snapshot(self.source), real_before)
+        logs = list((self.root / ".huroshiki/logs/demo").glob("*.log"))
+        self.assertEqual(len(logs), 1)
+        self.assertIn("full detail", logs[0].read_text(encoding="utf-8"))
+        transaction.discard()
+
     def test_exact_selection_preserves_existing_locked_override_reason(self) -> None:
         set_mod_version_override(
             self.source,

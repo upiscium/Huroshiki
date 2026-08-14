@@ -342,8 +342,19 @@ class ResolverProcessTest(unittest.TestCase):
     def test_legacy_core_api_reexports_shared_runner(self) -> None:
         self.assertIs(core.ResolverProcessResult, runner.BoundedProcessResult)
         self.assertIs(core.ResolverTerminationResult, runner.ProcessTerminationResult)
-        self.assertIs(core.run_resolver_process, runner.run_bounded_process)
+        self.assertTrue(callable(core.run_resolver_process))
         self.assertIs(core.stop_resolver_process_group, runner.stop_process_group)
+
+    def test_core_resolver_wrapper_defaults_to_packwiz_output_limit(self) -> None:
+        expected = runner.BoundedProcessResult(0, "", "", False, False)
+        with patch.object(core, "run_bounded_process", return_value=expected) as bounded:
+            self.assertIs(
+                core.run_resolver_process(["packwiz", "refresh"]), expected
+            )
+        self.assertEqual(
+            bounded.call_args.kwargs["max_output_bytes"],
+            core.packctl.PACKWIZ_OUTPUT_MAX_BYTES,
+        )
 
     def test_failure_message_prioritizes_cleanup_integrity_and_stderr(self) -> None:
         result = runner.BoundedProcessResult(

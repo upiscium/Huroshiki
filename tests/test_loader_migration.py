@@ -42,6 +42,8 @@ class LoaderMigrationTest(unittest.TestCase):
         self.templates = self.root / "templates"
         self.pack = self.packs / "demo"
         self.source = self.pack / "source"
+        self.state_root = self.root / ".huroshiki"
+        self.log_root = self.state_root / "logs"
         self.source.mkdir(parents=True)
         self.templates.mkdir()
         (self.pack / "pack.yaml").write_text(
@@ -57,6 +59,8 @@ class LoaderMigrationTest(unittest.TestCase):
             patch.object(packctl, "ROOT", self.root),
             patch.object(packctl, "PACKS", self.packs),
             patch.object(packctl, "TEMPLATES", self.templates),
+            patch.object(packctl, "STATE_ROOT", self.state_root),
+            patch.object(packctl, "LOG_ROOT", self.log_root),
         )
         for item in self.patches:
             item.start()
@@ -149,6 +153,31 @@ class LoaderMigrationTest(unittest.TestCase):
                         core.prepare_loader_migration("pack:demo", "21.1.2")
                 self.assertEqual(core.tree_digest_snapshot(self.source), before)
                 self.assert_unlocked()
+
+    def test_successful_diagnostics_reach_loader_migration_progress(self) -> None:
+        def diagnostic(
+            command: list[str], **kwargs: object
+        ) -> core.ResolverProcessResult:
+            result = self.fake_packwiz(command, **kwargs)
+            return core.ResolverProcessResult(
+                result.returncode,
+                result.stdout,
+                "Metadata disagreement: details\nexpected: foo\nactual: bar\n",
+                result.cancelled,
+                result.timed_out,
+                result.orphaned_descendants,
+                result.termination_incomplete,
+            )
+
+        with patch.object(core, "run_resolver_process", side_effect=diagnostic):
+            operation = core.prepare_loader_migration("pack:demo", "21.1.2")
+        progress = operation.drain_progress()
+        self.assertTrue(
+            any("completed with diagnostics" in message for message in progress)
+        )
+        self.assertTrue(any(".huroshiki/logs/demo/" in message for message in progress))
+        self.assertEqual(len(list(self.log_root.rglob("*.log"))), 2)
+        operation.discard()
 
     def test_timeout_and_incomplete_cleanup_fail_closed(self) -> None:
         results = (

@@ -12,6 +12,7 @@ import zipfile
 
 from dependency_equivalence import DependencyCandidate, EquivalenceContext
 import provider_artifacts
+import packctl
 from provider_artifacts import ProviderArtifactError, materialize_provider_artifact
 from process_runner import BoundedProcessResult
 
@@ -132,6 +133,140 @@ class ProviderArtifactTest(unittest.TestCase):
             ],
             [("dependency", ">=2.0")],
         )
+
+    def test_refresh_persists_diagnostic_once_and_reports_notice(self) -> None:
+        notices = []
+        refresh = BoundedProcessResult(0, "refresh details\n", "", False, False)
+        install = BoundedProcessResult(0, "", "", False, False)
+
+        def process(command, **kwargs):
+            if command[0] == "java":
+                destination = (
+                    Path(kwargs["cwd"]).parent / "output" / "mods" / "demo.jar"
+                )
+                destination.parent.mkdir(parents=True)
+                destination.write_bytes(self.payload)
+                return install
+            return refresh
+
+        with mock.patch(
+            "provider_artifacts.packctl.record_packwiz_diagnostic",
+            side_effect=(
+                packctl.PackwizDiagnostic(
+                    True, log_path=self.workspace / "refresh.log"
+                ),
+                packctl.PackwizDiagnostic(False),
+            ),
+        ) as record:
+            with mock.patch(
+                "provider_artifacts.run_bounded_process", side_effect=process
+            ):
+                materialize_provider_artifact(
+                    self.candidate,
+                    self.context,
+                    workspace=self.workspace,
+                    cancel_event=self.cancel,
+                    deadline=self.deadline,
+                    diagnostic_project_id="demo",
+                    diagnostic_callback=notices.append,
+                )
+
+        self.assertEqual(record.call_count, 2)
+        refresh_record = record.call_args_list[0]
+        self.assertEqual(refresh_record.kwargs["project_id"], "demo")
+        self.assertEqual(refresh_record.kwargs["operation"], "provider-artifact-refresh")
+        self.assertEqual(len(notices), 1)
+        self.assertIn("refresh.log", notices[0])
+
+    def test_refresh_failure_reports_persisted_diagnostic_once(self) -> None:
+        refresh = BoundedProcessResult(2, "", "refresh failed\n", False, False)
+        log_path = self.workspace / "refresh.log"
+        with mock.patch(
+            "provider_artifacts.run_bounded_process", return_value=refresh
+        ) as runner:
+            with mock.patch(
+                "provider_artifacts.packctl.record_packwiz_diagnostic",
+                return_value=packctl.PackwizDiagnostic(True, log_path=log_path),
+            ) as record:
+                with self.assertRaisesRegex(
+                    ProviderArtifactError, r"Details: .*refresh\.log"
+                ):
+                    materialize_provider_artifact(
+                        self.candidate,
+                        self.context,
+                        workspace=self.workspace,
+                        cancel_event=self.cancel,
+                        deadline=self.deadline,
+                        diagnostic_project_id="demo",
+                    )
+
+        record.assert_called_once()
+        self.assertEqual(
+            runner.call_args.kwargs["max_output_bytes"],
+            packctl.PACKWIZ_OUTPUT_MAX_BYTES,
+        )
+
+    def test_installer_failure_is_bounded_and_reports_diagnostic_once(self) -> None:
+        success = BoundedProcessResult(0, "", "", False, False)
+        failure = BoundedProcessResult(2, "", "installer failed\n", False, False)
+        calls = []
+
+        def process(command, **kwargs):
+            calls.append((command, kwargs))
+            return success if command[0] == "packwiz" else failure
+
+        def diagnostic(command, result, **kwargs):
+            if command[0] == "java":
+                return packctl.PackwizDiagnostic(
+                    True, log_path=self.workspace / "installer.log"
+                )
+            return packctl.PackwizDiagnostic(False)
+
+        with mock.patch(
+            "provider_artifacts.run_bounded_process", side_effect=process
+        ):
+            with mock.patch(
+                "provider_artifacts.packctl.record_packwiz_diagnostic",
+                side_effect=diagnostic,
+            ) as record:
+                with self.assertRaisesRegex(
+                    ProviderArtifactError, r"Details: .*installer\.log"
+                ):
+                    materialize_provider_artifact(
+                        self.candidate,
+                        self.context,
+                        workspace=self.workspace,
+                        cancel_event=self.cancel,
+                        deadline=self.deadline,
+                        diagnostic_project_id="demo",
+                    )
+
+        self.assertEqual(record.call_count, 2)
+        self.assertEqual(
+            calls[1][1]["max_output_bytes"], packctl.PACKWIZ_OUTPUT_MAX_BYTES
+        )
+
+    def test_output_limit_fails_closed(self) -> None:
+        limited = BoundedProcessResult(
+            0, "truncated", "", False, False, output_limit_exceeded=True
+        )
+        with self.assertRaisesRegex(
+            ProviderArtifactError, "exceeded the supported output limit"
+        ):
+            self._run(process_result=limited)
+
+    def test_failure_tail_redacts_sensitive_output(self) -> None:
+        failure = BoundedProcessResult(
+            2,
+            "",
+            "https://example.invalid/mod.jar?access_token=secret-value\n",
+            False,
+            False,
+        )
+        with self.assertRaises(ProviderArtifactError) as context:
+            self._run(process_result=failure)
+        self.assertNotIn("secret-value", str(context.exception))
+        self.assertIn("<redacted>", str(context.exception))
 
     def test_mode_metadata_curseforge_is_supported_without_download_url(self) -> None:
         candidate = DependencyCandidate(

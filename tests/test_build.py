@@ -181,7 +181,14 @@ class TransactionalBuildTest(unittest.TestCase):
         deadline = time.monotonic() + 30
         calls: list[tuple[threading.Event | None, float | None]] = []
 
-        def run(command, *, cwd, cancel_event, deadline):
+        def run(
+            command,
+            *,
+            cwd,
+            cancel_event,
+            deadline,
+            max_output_bytes: int | None = None,
+        ):
             calls.append((cancel_event, deadline))
             return BoundedProcessResult(0, "", "", False, False)
 

@@ -67,7 +67,14 @@ class SideTransactionTest(unittest.TestCase):
         cancel_event = threading.Event()
         deadline = time.monotonic() + 30
 
-        def refresh(command, *, cwd, cancel_event: object, deadline: float):
+        def refresh(
+            command,
+            *,
+            cwd,
+            cancel_event: object,
+            deadline: float,
+            max_output_bytes: int | None = None,
+        ):
             self.assertIs(cancel_event, expected_cancel)
             self.assertEqual(deadline, expected_deadline)
             (cwd / "index.toml").write_bytes(b"refreshed index\n")
