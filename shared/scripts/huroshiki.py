@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import threading
 import time
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Literal
 
 from huroshiki_paths import resolve_root, set_import_root
 from huroshiki_version import VERSION
@@ -6340,7 +6340,10 @@ class ExactSelectionRollbackScreen(StagedExactModVersionScreen):
 
 
 class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
-    help_text = "v: Select version  a: Apply preview  q / Esc: Installed MODs"
+    help_text = (
+        "v: Select version  Ctrl+R: Automatic  Ctrl+K: Pin  Ctrl+U: Unpin  "
+        "a: Apply preview  q / Esc: Installed MODs"
+    )
 
     def __init__(self, project_key: str, mod: core.ModInfo) -> None:
         super().__init__()
@@ -6351,11 +6354,17 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
         self.provenance_thread: threading.Thread | None = None
         self.provenance_done = threading.Event()
         self.provenance_error: BaseException | None = None
+        self.provenance_cancel_event = threading.Event()
+        self.provenance_deadline: float | None = None
+        self.intent_status: core.ModVersionIntentStatus | None = None
+        self.intent_status_error: BaseException | None = None
         self.provenance_timer: Timer | None = None
         self.cancel_event = threading.Event()
         self.deadline: float | None = None
         self.transaction: core.PackTransaction | None = None
-        self.preview: core.ModVersionSelectionPreview | None = None
+        self.preview: (
+            core.ModVersionSelectionPreview | core.ModVersionIntentPreview | None
+        ) = None
         self.prepare_thread: threading.Thread | None = None
         self.prepare_done = threading.Event()
         self.prepare_error: BaseException | None = None
@@ -6374,15 +6383,7 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
         yield Static(
-            "\n".join(
-                (
-                    f"Provider: {core.canonical_provider(self.mod.provider)}",
-                    f"Canonical project ID: {self.mod.project_id}",
-                    f"Role: {self.provenance}",
-                    f"Side: {self.mod.side}",
-                    f"Metadata: {self.mod.relative_path}",
-                )
-            ),
+            "\n".join(self._details_lines(self.provenance)),
             id="mod-version-details",
             markup=False,
         )
@@ -6393,21 +6394,94 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
 
     def on_mount(self) -> None:
         self.query_one("#mod-version-artifact", Input).focus()
+        self.provenance_cancel_event = threading.Event()
+        self.provenance_deadline = (
+            time.monotonic() + core.UPDATE_OPERATION_TIMEOUT_SECONDS
+        )
         self.provenance_thread = threading.Thread(
             target=self._run_provenance,
             name=f"huroshiki-mod-provenance-{self.project_key}",
             daemon=False,
         )
-        self.provenance_thread.start()
+        self.app.exact_version_workers[self.project_key] = (
+            self.provenance_thread,
+            self.provenance_done,
+            self.provenance_cancel_event,
+            lambda: None,
+        )
+        try:
+            self.provenance_thread.start()
+        except BaseException:
+            self.app.exact_version_workers.pop(self.project_key, None)
+            self.provenance_thread = None
+            raise
         self.provenance_timer = self.set_interval(0.05, self._poll_provenance)
 
     def _run_provenance(self) -> None:
         try:
-            self.provenance = core.installed_mod_provenance(self.project_key, self.mod)
+            if self.provenance_cancel_event.is_set():
+                raise core.ExactModVersionCancelled(
+                    "Installed MOD detail loading was cancelled"
+                )
+            self.provenance = core.installed_mod_provenance(
+                self.project_key,
+                self.mod,
+                cancel_event=self.provenance_cancel_event,
+                deadline=self.provenance_deadline,
+            )
         except BaseException as error:
             self.provenance_error = error
+        try:
+            if self.provenance_cancel_event.is_set():
+                raise core.ExactModVersionCancelled(
+                    "Installed MOD detail loading was cancelled"
+                )
+            if (
+                self.provenance_deadline is not None
+                and time.monotonic() >= self.provenance_deadline
+            ):
+                raise core.ExactModVersionDeadlineExceeded(
+                    "Installed MOD detail loading deadline exceeded"
+                )
+            self.intent_status = core.installed_mod_version_intent(
+                self.project_key,
+                self.mod,
+                cancel_event=self.provenance_cancel_event,
+                deadline=self.provenance_deadline,
+            )
+        except BaseException as error:
+            self.intent_status_error = error
         finally:
             self.provenance_done.set()
+
+    def _details_lines(self, role: str) -> tuple[str, ...]:
+        status = self.intent_status
+        intent_lines: tuple[str, ...]
+        if status is None:
+            intent_lines = ("Selection: Unavailable",)
+        elif status.selection == "automatic":
+            intent_lines = (
+                "Selection: Automatic",
+                f"Installed artifact: {status.installed_artifact_id or '<missing>'}",
+                "Pin: N/A",
+            )
+        else:
+            intent_lines = (
+                "Selection: User exact",
+                f"Installed artifact: {status.installed_artifact_id or '<missing>'}",
+                f"Selected artifact: {status.selected_artifact_id}",
+                f"Pin: {'Locked' if status.locked else 'Unlocked'}",
+                f"Reason: {status.reason or 'none'}",
+                f"Status: {status.override_status}",
+            )
+        return (
+            f"Provider: {core.canonical_provider(self.mod.provider)}",
+            f"Canonical project ID: {self.mod.project_id}",
+            f"Role: {role}",
+            *intent_lines,
+            f"Side: {self.mod.side}",
+            f"Metadata: {self.mod.relative_path}",
+        )
 
     def _poll_provenance(self) -> None:
         if not self.provenance_done.is_set():
@@ -6415,23 +6489,25 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
         if self.provenance_timer is not None:
             self.provenance_timer.stop()
             self.provenance_timer = None
+        thread = self.provenance_thread
+        worker = self.app.exact_version_workers.get(self.project_key)
+        if worker is not None and worker[0] is thread:
+            self.app.exact_version_workers.pop(self.project_key, None)
         self.provenance_thread = None
         if self.provenance_error is not None:
             self.app.notify(str(self.provenance_error), severity="error")
             role = "Unavailable"
         else:
             role = self.provenance
+        if self.intent_status_error is not None:
+            self.app.notify(str(self.intent_status_error), severity="error")
         self.query_one("#mod-version-details", Static).update(
-            "\n".join(
-                (
-                    f"Provider: {core.canonical_provider(self.mod.provider)}",
-                    f"Canonical project ID: {self.mod.project_id}",
-                    f"Role: {role}",
-                    f"Side: {self.mod.side}",
-                    f"Metadata: {self.mod.relative_path}",
-                )
-            )
+            "\n".join(self._details_lines(role))
         )
+        if self.pending_destination is not None and self.transaction is None:
+            destination = self.pending_destination
+            self.pending_destination = None
+            destination()
 
     def _selection(self, artifact_id: str) -> core.ExactModArtifactSelection:
         provider = core.canonical_provider(self.mod.provider)
@@ -6456,6 +6532,9 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
         self.start_prepare(event.value.strip())
 
     def start_prepare(self, artifact_id: str) -> None:
+        if self.provenance_thread is not None and not self.provenance_done.is_set():
+            self.app.notify("Wait for installed MOD details to finish loading", severity="warning")
+            return
         if self.prepare_thread is not None or self.apply_thread is not None:
             self.app.notify("Exact version operation is already running", severity="warning")
             return
@@ -6477,6 +6556,68 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             target=self._run_prepare,
             args=(selection,),
             name=f"huroshiki-exact-version-{self.project_key}",
+            daemon=False,
+        )
+        self.app.exact_version_workers[self.project_key] = (
+            self.prepare_thread,
+            self.prepare_done,
+            self.cancel_event,
+            lambda: self.transaction,
+        )
+        try:
+            self.prepare_thread.start()
+        except BaseException as error:
+            self.app.exact_version_workers.pop(self.project_key, None)
+            self.prepare_thread = None
+            self.prepare_error = error
+            self.prepare_done.set()
+            self.app.notify(str(error), severity="error")
+            return
+        self.prepare_timer = self.set_interval(0.05, self._poll_prepare)
+
+    def start_intent_prepare(
+        self, action: Literal["automatic", "pin", "unpin"]
+    ) -> None:
+        if self.provenance_thread is not None and not self.provenance_done.is_set():
+            self.app.notify("Wait for installed MOD details to finish loading", severity="warning")
+            return
+        if self.prepare_thread is not None or self.apply_thread is not None:
+            self.app.notify("Version intent operation is already running", severity="warning")
+            return
+        if self.transaction is not None:
+            self.app.notify("Apply or cancel the current preview first", severity="warning")
+            return
+        status = self.intent_status
+        if status is None:
+            self.app.notify("Version intent status is unavailable", severity="warning")
+            return
+        if action == "automatic" and status.selection == "automatic":
+            self.app.notify("This MOD is already Automatic", severity="warning")
+            return
+        if action in {"pin", "unpin"} and status.override_status != "active":
+            self.app.notify(
+                "Pin controls require an active user exact selection",
+                severity="warning",
+            )
+            return
+        if action == "pin" and status.locked:
+            self.app.notify("This MOD is already pinned", severity="warning")
+            return
+        if action == "unpin" and not status.locked:
+            self.app.notify("This MOD is already unpinned", severity="warning")
+            return
+        self.cancel_event = threading.Event()
+        self.deadline = time.monotonic() + core.UPDATE_OPERATION_TIMEOUT_SECONDS
+        self.prepare_done.clear()
+        self.prepare_error = None
+        self.preview = None
+        self.query_one("#mod-version-status", Static).update(
+            "Creating version intent transaction..."
+        )
+        self.prepare_thread = threading.Thread(
+            target=self._run_intent_prepare,
+            args=(action,),
+            name=f"huroshiki-version-intent-{action}-{self.project_key}",
             daemon=False,
         )
         self.app.exact_version_workers[self.project_key] = (
@@ -6541,6 +6682,51 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
                         self.prepare_error = cleanup_error
             self.prepare_done.set()
 
+    def _run_intent_prepare(
+        self, action: Literal["automatic", "pin", "unpin"]
+    ) -> None:
+        try:
+            transaction = core.PackTransaction.create(
+                self.project_key, checkpoint=self._checkpoint
+            )
+            self.transaction = transaction
+            identity = (
+                f"{core.canonical_provider(self.mod.provider)}:{self.mod.project_id}"
+            )
+            if action == "automatic":
+                self.preview = transaction.prepare_mod_version_automatic(
+                    identity,
+                    cancel_event=self.cancel_event,
+                    deadline=self.deadline,
+                )
+            else:
+                self.preview = transaction.prepare_mod_version_pin(
+                    identity,
+                    locked=action == "pin",
+                    cancel_event=self.cancel_event,
+                    deadline=self.deadline,
+                )
+        except BaseException as error:
+            self.prepare_error = error
+        finally:
+            transaction = self.transaction
+            if (
+                self.app._shutting_down
+                and transaction is not None
+                and transaction.active
+            ):
+                try:
+                    transaction.discard(
+                        deadline=(
+                            time.monotonic()
+                            + core.TRANSACTION_DISCARD_TIMEOUT_SECONDS
+                        )
+                    )
+                except BaseException as cleanup_error:
+                    if self.prepare_error is None:
+                        self.prepare_error = cleanup_error
+            self.prepare_done.set()
+
     def _poll_prepare(self) -> None:
         with self.progress_lock:
             progress = tuple(self.progress)
@@ -6569,29 +6755,64 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             return
         assert self.preview is not None
         preview = self.preview
-        lines = [
-            f"Identity: {preview.identity}",
-            f"Version: {preview.old_version} -> {preview.new_version}",
-            f"Artifact ID: {preview.old_artifact_id} -> {preview.new_artifact_id}",
-            *(
-                [
-                    f"User selection intent: {preview.override_identity} -> "
-                    f"{preview.override_artifact_id} "
-                    f"({'locked' if preview.override_locked else 'unlocked'})"
-                ]
-                if preview.override_identity is not None
-                else []
-            ),
-            f"Added dependencies: {preview.added_dependencies}",
-            *(f"  + {identity}" for identity in preview.added_dependency_identities),
-            f"Removed dependencies: {preview.removed_dependencies}",
-            *(f"  - {identity}" for identity in preview.removed_dependency_identities),
-            "Changed files:",
-            *(f"  {change.relative_path}" for change in preview.changes),
-            *(f"Diagnostic: {message}" for message in preview.diagnostic_messages),
-            "",
-            "Press a to Apply, or q/Esc to Cancel.",
-        ]
+        if isinstance(preview, core.ModVersionIntentPreview):
+            selection_label = {
+                "automatic": "Automatic",
+                "user": "User exact",
+            }
+            pin_label = lambda value: (
+                "N/A" if value is None else "Locked" if value else "Unlocked"
+            )
+            lines = [
+                f"MOD: {preview.identity}",
+                f"Installed artifact: {preview.installed_artifact_id or '<missing>'}",
+                *(
+                    [f"Selected artifact: {preview.selected_artifact_id}"]
+                    if preview.selected_artifact_id is not None
+                    else []
+                ),
+                f"Selection: {selection_label[preview.old_selection]} -> "
+                f"{selection_label[preview.new_selection]}",
+                f"Pin: {pin_label(preview.old_locked)} -> "
+                f"{pin_label(preview.new_locked)}",
+                f"Reason: {preview.reason or 'none'}",
+                *(
+                    [f"Status: {preview.override_status}"]
+                    if preview.override_status is not None
+                    else []
+                ),
+                *(
+                    ["Installed artifact will not change."]
+                    if preview.new_selection == "automatic"
+                    else []
+                ),
+                "",
+                "Press a to Apply, or q/Esc to Cancel.",
+            ]
+        else:
+            lines = [
+                f"Identity: {preview.identity}",
+                f"Version: {preview.old_version} -> {preview.new_version}",
+                f"Artifact ID: {preview.old_artifact_id} -> {preview.new_artifact_id}",
+                *(
+                    [
+                        f"User selection intent: {preview.override_identity} -> "
+                        f"{preview.override_artifact_id} "
+                        f"({'locked' if preview.override_locked else 'unlocked'})"
+                    ]
+                    if preview.override_identity is not None
+                    else []
+                ),
+                f"Added dependencies: {preview.added_dependencies}",
+                *(f"  + {identity}" for identity in preview.added_dependency_identities),
+                f"Removed dependencies: {preview.removed_dependencies}",
+                *(f"  - {identity}" for identity in preview.removed_dependency_identities),
+                "Changed files:",
+                *(f"  {change.relative_path}" for change in preview.changes),
+                *(f"Diagnostic: {message}" for message in preview.diagnostic_messages),
+                "",
+                "Press a to Apply, or q/Esc to Cancel.",
+            ]
         self.query_one("#mod-version-status", Static).update("\n".join(lines))
         self.focus()
         if self.pending_destination is not None:
@@ -6639,6 +6860,7 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
         try:
             assert self.transaction is not None
             self.transaction.apply(
+                refresh=not isinstance(self.preview, core.ModVersionIntentPreview),
                 cancel_event=self.cancel_event,
                 deadline=self.deadline,
             )
@@ -6669,11 +6891,21 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
         if self.app.transactions.get(self.project_key) is transaction:
             self.app.transactions.pop(self.project_key, None)
         self.transaction = None
-        self.app.notify("Exact MOD version applied")
+        self.app.notify(
+            "MOD version intent applied"
+            if isinstance(self.preview, core.ModVersionIntentPreview)
+            else "Exact MOD version applied"
+        )
         self.app.open_list(self.project_key)
 
     def cancel_and_navigate(self, destination: Callable[[], None]) -> None:
         self.pending_destination = destination
+        if self.provenance_thread is not None and not self.provenance_done.is_set():
+            self.provenance_cancel_event.set()
+            self.query_one("#mod-version-status", Static).update(
+                "Cancelling installed MOD detail loading..."
+            )
+            return
         if self.prepare_thread is not None or self.apply_thread is not None:
             self.cancel_event.set()
             self.query_one("#mod-version-status", Static).update(
@@ -6737,6 +6969,18 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             self.query_one("#mod-version-artifact", Input).focus()
 
     def on_key(self, event: events.Key) -> None:
+        if event.key == "ctrl+r":
+            self.start_intent_prepare("automatic")
+            event.stop()
+            return
+        if event.key == "ctrl+k":
+            self.start_intent_prepare("pin")
+            event.stop()
+            return
+        if event.key == "ctrl+u":
+            self.start_intent_prepare("unpin")
+            event.stop()
+            return
         if isinstance(self.focused, Input):
             if event.key == "escape":
                 self.cancel_and_navigate(lambda: self.app.open_list(self.project_key))
@@ -6753,6 +6997,8 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
         event.stop()
 
     def on_unmount(self) -> None:
+        if self.provenance_thread is not None:
+            self.provenance_cancel_event.set()
         if self.provenance_timer is not None:
             self.provenance_timer.stop()
         if self.prepare_timer is not None:

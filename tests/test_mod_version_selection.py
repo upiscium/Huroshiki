@@ -3783,11 +3783,127 @@ class ExactModVersionSelectionTest(unittest.TestCase):
         try:
             with self.assertRaisesRegex(
                 core.HuroshikiError,
-                "Cannot change pin state without an existing user selection",
+                "Cannot pin an automatically selected MOD",
             ):
                 transaction.set_mod_version_pin(f"modrinth:{mr_project('root')}")
             self.assertEqual(core._file_content_snapshot(transaction.source), staged_before)
             self.assertEqual(core._file_content_snapshot(self.source), real_before)
+        finally:
+            transaction.discard()
+
+    def test_return_to_automatic_applies_intent_only_with_metadata_unchanged(self) -> None:
+        set_mod_version_override(
+            self.source,
+            ModVersionOverride(
+                "modrinth",
+                mr_project("root"),
+                mr_version("old-artifact"),
+                True,
+                "Compatibility",
+            ),
+        )
+        transaction = self.make_transaction("modrinth", "root")
+        metadata_before = self.source.joinpath("mods/root.pw.toml").read_bytes()
+        roots_before = self.source.joinpath(".huroshiki-roots.json").read_bytes()
+        real_before = core._file_content_snapshot(self.source)
+        preview = transaction.prepare_mod_version_automatic(
+            f"modrinth:{mr_project('root')}"
+        )
+        self.assertEqual(preview.override_status, "active")
+        self.assertEqual(core._file_content_snapshot(self.source), real_before)
+        self.assertEqual(read_mod_version_overrides(transaction.source), ())
+        self.assertEqual(
+            transaction.source.joinpath("mods/root.pw.toml").read_bytes(),
+            metadata_before,
+        )
+        transaction.apply()
+        self.assertEqual(read_mod_version_overrides(self.source), ())
+        self.assertEqual(
+            self.source.joinpath("mods/root.pw.toml").read_bytes(), metadata_before
+        )
+        self.assertEqual(
+            self.source.joinpath(".huroshiki-roots.json").read_bytes(), roots_before
+        )
+
+    def test_return_to_automatic_discard_preserves_real_source(self) -> None:
+        override = ModVersionOverride(
+            "modrinth", mr_project("root"), mr_version("old-artifact"), False
+        )
+        set_mod_version_override(self.source, override)
+        transaction = self.make_transaction("modrinth", "root")
+        real_before = core._file_content_snapshot(self.source)
+        transaction.prepare_mod_version_automatic(
+            f"modrinth:{mr_project('root')}"
+        )
+        transaction.discard()
+        self.assertEqual(core._file_content_snapshot(self.source), real_before)
+        self.assertEqual(read_mod_version_overrides(self.source), (override,))
+
+    def test_intent_apply_rejects_stale_real_source(self) -> None:
+        set_mod_version_override(
+            self.source,
+            ModVersionOverride(
+                "modrinth",
+                mr_project("root"),
+                mr_version("old-artifact"),
+                False,
+            ),
+        )
+        transaction = self.make_transaction("modrinth", "root")
+        transaction.prepare_mod_version_automatic(
+            f"modrinth:{mr_project('root')}"
+        )
+        external = self.source.joinpath("pack.toml").read_bytes() + b"\n# external\n"
+        self.source.joinpath("pack.toml").write_bytes(external)
+        try:
+            with self.assertRaisesRegex(core.HuroshikiError, "real Packwiz source changed"):
+                transaction.apply()
+            self.assertEqual(self.source.joinpath("pack.toml").read_bytes(), external)
+        finally:
+            transaction.discard()
+
+    def test_intent_mutation_invalidates_accepted_exact_evidence(self) -> None:
+        transaction = self.make_transaction("modrinth", "root")
+        try:
+            transaction.prepare_exact_mod_version(
+                self.selection(
+                    "modrinth", branded_project("root"), branded_version("v2")
+                )
+            )
+            transaction.accept_exact_mod_version()
+            self.assertTrue(transaction.exact_selection_accepted)
+            transaction.prepare_mod_version_automatic(
+                f"modrinth:{mr_project('root')}"
+            )
+            self.assertFalse(transaction.exact_selection_accepted)
+            with self.assertRaisesRegex(core.HuroshikiError, "invalidated exact MOD"):
+                transaction.apply()
+        finally:
+            transaction.discard()
+
+    def test_exact_reselection_repairs_drifted_target_intent(self) -> None:
+        set_mod_version_override(
+            self.source,
+            ModVersionOverride(
+                "modrinth",
+                mr_project("root"),
+                mr_version("v1"),
+                True,
+                "Compatibility",
+            ),
+        )
+        transaction = self.make_transaction("modrinth", "root")
+        try:
+            preview = transaction.prepare_exact_mod_version(
+                self.selection(
+                    "modrinth", branded_project("root"), branded_version("v2")
+                )
+            )
+            self.assertEqual(preview.new_artifact_id, mr_version("v2"))
+            override = read_mod_version_overrides(transaction.source)[0]
+            self.assertEqual(override.artifact_id, mr_version("v2"))
+            self.assertTrue(override.locked)
+            self.assertEqual(override.reason, "Compatibility")
         finally:
             transaction.discard()
 
