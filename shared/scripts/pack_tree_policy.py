@@ -23,6 +23,27 @@ class PackTreePolicyError(RuntimeError):
     pass
 
 
+@dataclass
+class _ScanBudget:
+    max_entries: int | None
+    max_total_file_bytes: int | None
+    entries: int = 0
+    total_file_bytes: int = 0
+
+    def consume_entry(self) -> None:
+        self.entries += 1
+        if self.max_entries is not None and self.entries > self.max_entries:
+            raise PackTreePolicyError("Pack source exceeded the entry scan limit")
+
+    def consume_file(self, size: int) -> None:
+        self.total_file_bytes += size
+        if (
+            self.max_total_file_bytes is not None
+            and self.total_file_bytes > self.max_total_file_bytes
+        ):
+            raise PackTreePolicyError("Pack source exceeded the byte scan limit")
+
+
 @dataclass(frozen=True)
 class PackMigrationTreeEntry:
     relative_path: Path
@@ -124,13 +145,19 @@ def _inspect_file(
     relative: Path,
     listed: os.stat_result,
     checkpoint: Callable[[], None],
+    budget: _ScanBudget,
 ) -> PackMigrationTreeEntry:
+    budget.consume_file(listed.st_size)
     try:
         file_fd = os.open(name, _FILE_FLAGS, dir_fd=parent_fd)
     except OSError as error:
         return _invalid_entry(relative, listed, f"cannot open file safely: {error}")
     try:
         opened = os.fstat(file_fd)
+        reserved_bytes = listed.st_size
+        if opened.st_size > reserved_bytes:
+            budget.consume_file(opened.st_size - reserved_bytes)
+            reserved_bytes = opened.st_size
         errors: list[str] = []
         if not stat.S_ISREG(opened.st_mode):
             errors.append("special filesystem entry is not allowed")
@@ -144,6 +171,11 @@ def _inspect_file(
             chunk = os.read(file_fd, _STREAM_CHUNK_SIZE)
             if not chunk:
                 break
+            if len(chunk) > reserved_bytes:
+                budget.consume_file(len(chunk) - reserved_bytes)
+                reserved_bytes = 0
+            else:
+                reserved_bytes -= len(chunk)
             digest.update(chunk)
         after = os.fstat(file_fd)
         try:
@@ -182,6 +214,7 @@ def _scan_directory(
     entries: list[PackMigrationTreeEntry],
     checkpoint: Callable[[], None],
     excluded_roots: frozenset[str],
+    budget: _ScanBudget,
 ) -> None:
     checkpoint()
     opened = os.fstat(directory_fd)
@@ -205,6 +238,9 @@ def _scan_directory(
         with os.scandir(directory_fd) as iterator:
             for child in iterator:
                 checkpoint()
+                if relative == Path(".") and child.name in excluded_roots:
+                    continue
+                budget.consume_entry()
                 children.append(child)
         children.sort(key=lambda child: child.name)
     except OSError as error:
@@ -217,8 +253,6 @@ def _scan_directory(
 
     for child in children:
         checkpoint()
-        if relative == Path(".") and child.name in excluded_roots:
-            continue
         child_relative = (
             Path(child.name) if relative == Path(".") else relative / child.name
         )
@@ -277,6 +311,7 @@ def _scan_directory(
                     entries,
                     checkpoint,
                     excluded_roots,
+                    budget,
                 )
                 try:
                     bound = os.stat(
@@ -314,6 +349,7 @@ def _scan_directory(
                     child_relative,
                     listed,
                     checkpoint,
+                    budget,
                 )
             )
             continue
@@ -382,7 +418,17 @@ def scan_pack_migration_source(
     *,
     checkpoint: Callable[[], None],
     excluded_roots: frozenset[str] = frozenset(),
+    max_entries: int | None = None,
+    max_total_file_bytes: int | None = None,
 ) -> PackTreeScan:
+    for value, context in (
+        (max_entries, "entry scan limit"),
+        (max_total_file_bytes, "byte scan limit"),
+    ):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            raise PackTreePolicyError(f"Pack source {context} must be a positive integer")
     checkpoint()
     descriptor_bound_path = (
         pack_root.parent.parent == Path("/proc/self/fd")
@@ -404,7 +450,14 @@ def scan_pack_migration_source(
         if (listed.st_dev, listed.st_ino) != (opened.st_dev, opened.st_ino):
             raise PackTreePolicyError("Pack migration source changed while opening")
         entries: list[PackMigrationTreeEntry] = []
-        _scan_directory(root_fd, Path("."), entries, checkpoint, excluded_roots)
+        _scan_directory(
+            root_fd,
+            Path("."),
+            entries,
+            checkpoint,
+            excluded_roots,
+            _ScanBudget(max_entries, max_total_file_bytes),
+        )
         checkpoint()
         try:
             bound = (
