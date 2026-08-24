@@ -193,11 +193,8 @@ def modrinth_versions(
     query: dict[str, str] = {
         "game_versions": json.dumps([minecraft], separators=(",", ":")),
         "loaders": json.dumps([loader], separators=(",", ":")),
-        "limit": str(limit),
         "include_changelog": "false",
     }
-    if not include_prerelease:
-        query["version_type"] = "release"
     parameters = urlencode(query)
     response = request_json(
         f"{API_ROOT}/project/{quote(project_id, safe='')}/version?{parameters}"
@@ -206,8 +203,6 @@ def modrinth_versions(
         raise LookupError("Provider versions response is not a list")
     if len(response) > _MAX_PROVIDER_VERSION_RECORDS:
         raise LookupError("Provider returned too many version records")
-    if len(response) > limit:
-        raise LookupError("Provider returned more versions than requested")
     candidates: list[tuple[datetime, dict[str, object]]] = []
     seen: set[str] = set()
     for version in response:
@@ -236,20 +231,22 @@ def modrinth_versions(
         files = version.get("files")
         if not isinstance(files, list) or not files:
             raise LookupError("Provider version has no files")
-        primary: list[str] = []
+        explicit_primary: list[dict[str, object]] = []
         for file in files:
             if not isinstance(file, dict):
                 raise LookupError("Provider version has an invalid file")
             if file.get("primary") is True:
-                primary.append(_bounded_text(file, "filename", _FILENAME_MAX))
-        if len(primary) != 1:
-            raise LookupError("Provider version must have exactly one primary file")
+                explicit_primary.append(file)
+        if len(explicit_primary) > 1:
+            raise LookupError("Provider version has multiple primary files")
+        selected_file = explicit_primary[0] if explicit_primary else files[0]
+        filename = _bounded_text(selected_file, "filename", _FILENAME_MAX)
         candidate = {
             "provider": "modrinth",
             "project_id": project_id,
             "artifact_id": artifact_id,
             "version": version_number,
-            "filename": primary[0],
+            "filename": filename,
             "game_versions": game_versions,
             "loaders": loaders,
             "release_type": release_type,
@@ -262,7 +259,7 @@ def modrinth_versions(
         key=lambda item: item[0].astimezone(timezone.utc),
         reverse=True,
     )
-    return [candidate for _, candidate in candidates]
+    return [candidate for _, candidate in candidates[:limit]]
 
 
 def resolve_modrinth(selector: str) -> dict[str, str]:

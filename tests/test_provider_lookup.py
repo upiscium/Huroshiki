@@ -59,8 +59,8 @@ class ProviderLookupHelperTest(unittest.TestCase):
         query = parse_qs(urlparse(seen["url"]).query)
         self.assertEqual(json.loads(query["game_versions"][0]), ["1.21.1"])
         self.assertEqual(json.loads(query["loaders"][0]), ["fabric"])
-        self.assertEqual(query["version_type"], ["release"])
-        self.assertEqual(query["limit"], ["3"])
+        self.assertNotIn("version_type", query)
+        self.assertNotIn("limit", query)
         self.assertEqual(query["include_changelog"], ["false"])
         self.assertEqual(seen["ua"], provider_lookup.USER_AGENT)
         self.assertEqual([item["artifact_id"] for item in result], ["Bbbb1111", "Zzzz9999"])
@@ -77,6 +77,162 @@ class ProviderLookupHelperTest(unittest.TestCase):
             )
         self.assertEqual([item["artifact_id"] for item in result], ["Aaaa0000", "Zzzz9999"])
 
+    def test_modrinth_versions_truncates_validated_provider_response_locally(self) -> None:
+        payload = [
+            self.version(
+                artifact_id=f"Rel{index:05d}",
+                date=f"2026-01-{index + 1:02d}T00:00:00Z",
+            )
+            for index in range(10)
+        ]
+        with patch.object(
+            provider_lookup,
+            "urlopen",
+            return_value=FakeResponse(json.dumps(payload).encode()),
+        ):
+            result = provider_lookup.modrinth_versions(
+                "Proj0001", minecraft="1.21.1", loader="fabric", limit=3
+            )
+        self.assertEqual(
+            [item["artifact_id"] for item in result],
+            ["Rel00009", "Rel00008", "Rel00007"],
+        )
+
+    def test_modrinth_versions_filters_releases_before_truncation(self) -> None:
+        payload = [
+            self.version(
+                artifact_id="Alpha001",
+                release_type="alpha",
+                date="2026-04-01T00:00:00Z",
+            ),
+            self.version(
+                artifact_id="Beta0001",
+                release_type="beta",
+                date="2026-03-01T00:00:00Z",
+            ),
+            self.version(
+                artifact_id="RelB0001",
+                date="2026-02-01T00:00:00Z",
+            ),
+            self.version(
+                artifact_id="RelA0001",
+                date="2026-01-01T00:00:00Z",
+            ),
+        ]
+        with patch.object(
+            provider_lookup,
+            "urlopen",
+            return_value=FakeResponse(json.dumps(payload).encode()),
+        ):
+            result = provider_lookup.modrinth_versions(
+                "Proj0001", minecraft="1.21.1", loader="fabric", limit=2
+            )
+        self.assertEqual(
+            [item["artifact_id"] for item in result],
+            ["RelB0001", "RelA0001"],
+        )
+
+    def test_modrinth_versions_includes_prereleases_before_truncation(self) -> None:
+        payload = [
+            self.version(
+                artifact_id="Alpha001",
+                release_type="alpha",
+                date="2026-04-01T00:00:00Z",
+            ),
+            self.version(
+                artifact_id="Beta0001",
+                release_type="beta",
+                date="2026-03-01T00:00:00Z",
+            ),
+            self.version(artifact_id="RelB0001", date="2026-02-01T00:00:00Z"),
+            self.version(artifact_id="RelA0001", date="2026-01-01T00:00:00Z"),
+        ]
+        with patch.object(
+            provider_lookup,
+            "urlopen",
+            return_value=FakeResponse(json.dumps(payload).encode()),
+        ):
+            result = provider_lookup.modrinth_versions(
+                "Proj0001",
+                minecraft="1.21.1",
+                loader="fabric",
+                include_prerelease=True,
+                limit=2,
+            )
+        self.assertEqual(
+            [item["artifact_id"] for item in result],
+            ["Alpha001", "Beta0001"],
+        )
+
+    def test_modrinth_versions_uses_implicit_first_primary_file(self) -> None:
+        payload = [
+            self.version(
+                files=[
+                    {"filename": "main.jar", "primary": False},
+                    {"filename": "sources.jar", "primary": False},
+                ]
+            )
+        ]
+        with patch.object(
+            provider_lookup,
+            "urlopen",
+            return_value=FakeResponse(json.dumps(payload).encode()),
+        ):
+            result = provider_lookup.modrinth_versions(
+                "Proj0001", minecraft="1.21.1", loader="fabric"
+            )
+        self.assertEqual(result[0]["filename"], "main.jar")
+
+    def test_modrinth_versions_uses_single_explicit_primary_file(self) -> None:
+        payload = [
+            self.version(
+                files=[
+                    {"filename": "sources.jar", "primary": False},
+                    {"filename": "main.jar", "primary": True},
+                ]
+            )
+        ]
+        with patch.object(
+            provider_lookup,
+            "urlopen",
+            return_value=FakeResponse(json.dumps(payload).encode()),
+        ):
+            result = provider_lookup.modrinth_versions(
+                "Proj0001", minecraft="1.21.1", loader="fabric"
+            )
+        self.assertEqual(result[0]["filename"], "main.jar")
+
+    def test_modrinth_versions_rejects_multiple_explicit_primary_files(self) -> None:
+        payload = [
+            self.version(
+                files=[
+                    {"filename": "a.jar", "primary": True},
+                    {"filename": "b.jar", "primary": True},
+                ]
+            )
+        ]
+        with patch.object(
+            provider_lookup,
+            "urlopen",
+            return_value=FakeResponse(json.dumps(payload).encode()),
+        ):
+            with self.assertRaisesRegex(provider_lookup.LookupError, "multiple primary"):
+                provider_lookup.modrinth_versions(
+                    "Proj0001", minecraft="1.21.1", loader="fabric"
+                )
+
+    def test_modrinth_versions_rejects_empty_files(self) -> None:
+        payload = [self.version(files=[])]
+        with patch.object(
+            provider_lookup,
+            "urlopen",
+            return_value=FakeResponse(json.dumps(payload).encode()),
+        ):
+            with self.assertRaisesRegex(provider_lookup.LookupError, "no files"):
+                provider_lookup.modrinth_versions(
+                    "Proj0001", minecraft="1.21.1", loader="fabric"
+                )
+
     def test_modrinth_versions_rejects_malformed_candidates(self) -> None:
         cases = [
             [self.version(project_id="Other001")],
@@ -86,9 +242,7 @@ class ProviderLookupHelperTest(unittest.TestCase):
             [self.version(game_versions="1.21.1")],
             [self.version(loaders="fabric")],
             [self.version(files=[{"filename": "", "primary": True}])],
-            [self.version(files=[{"filename": "mod.jar", "primary": False}])],
             [self.version(files=[{"primary": True}])],
-            [self.version(files=[{"filename": "a.jar", "primary": True}, {"filename": "b.jar", "primary": True}])],
             [self.version(game_versions=["1.20.1"])],
             [self.version(loaders=["forge"])],
         ]
@@ -109,13 +263,7 @@ class ProviderLookupHelperTest(unittest.TestCase):
             with self.assertRaisesRegex(provider_lookup.LookupError, "duplicate version"):
                 provider_lookup.modrinth_versions("Proj0001", minecraft="1.21.1", loader="fabric")
 
-    def test_modrinth_versions_rejects_over_limit_response_and_accepts_cli_max(self) -> None:
-        payload = [self.version(artifact_id="Abcd1234"), self.version(artifact_id="Efgh5678")]
-        with patch.object(provider_lookup, "urlopen", return_value=FakeResponse(json.dumps(payload).encode())):
-            with self.assertRaisesRegex(provider_lookup.LookupError, "more versions"):
-                provider_lookup.modrinth_versions(
-                    "Proj0001", minecraft="1.21.1", loader="fabric", limit=1
-                )
+    def test_modrinth_versions_accepts_cli_max(self) -> None:
         output = StringIO()
         with patch.object(provider_lookup, "modrinth_versions", return_value=[]), redirect_stdout(output):
             self.assertEqual(provider_lookup.main(["--request-id", "r", "modrinth", "versions", "Proj0001", "--minecraft", "1.21.1", "--loader", "fabric", "--limit", "100"]), 0)
