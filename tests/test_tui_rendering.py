@@ -340,3 +340,45 @@ class CheckboxRenderingScreensTest(unittest.IsolatedAsyncioTestCase):
                 _assert_checkbox_cell(self, row[0], row[1])
                 app.screen.toggle_candidate()
                 self.assertEqual(table.get_row_at(0)[0].plain, "[ ]")
+
+    async def test_update_screen_renders_version_locked_as_non_toggleable(self) -> None:
+        _FakeUpdatePreparationOperation.candidates = (
+            core.UpdateCandidate(
+                key="mods/locked.pw.toml",
+                root=Path("mods/locked.pw.toml"),
+                slug="locked",
+                name="Locked Mod",
+                provider="curseforge",
+                current_version="1.2.3",
+                current_file_id="456",
+                new_version="1.2.4",
+                status="version-locked",
+            ),
+        )
+        with (
+            patch.object(core, "project_config", return_value={"display_name": "Demo"}),
+            patch.object(
+                huroshiki.core,
+                "UpdatePreparationOperation",
+                _FakeUpdatePreparationOperation,
+            ),
+        ):
+            app = _ScreenApp(huroshiki.UpdateScreen("pack:demo"))
+            async with app.run_test() as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.05)
+                    if app.screen.query_one("#update-options", DataTable).row_count:
+                        break
+                table = app.screen.query_one("#update-options", DataTable)
+                row = table.get_row_at(0)
+                self.assertEqual(row[0].plain, "[ ]")
+                self.assertEqual(str(row[3]), "1.2.3 (456)")
+                self.assertEqual(str(row[6]), "version locked")
+                with patch.object(app, "notify") as notify:
+                    app.screen.toggle_candidate()
+                self.assertEqual(table.get_row_at(0)[0].plain, "[ ]")
+                notify.assert_called_once_with(
+                    "Locked Mod is version locked and cannot be selected; "
+                    "update or remove its version pin first",
+                    severity="warning",
+                )

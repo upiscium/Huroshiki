@@ -7803,13 +7803,17 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
                 (
                     f"unavailable: {candidate.error}"
                     if candidate.error
-                    else candidate.status
+                    else self._status_label(candidate.status)
                 ),
             )
 
     @staticmethod
     def _version_label(version: str, file_id: str) -> str:
         return core.update_version_label(version, file_id)
+
+    @staticmethod
+    def _status_label(status: str) -> str:
+        return "version locked" if status == "version-locked" else status
 
     def toggle_candidate(self) -> None:
         if self.operation is not None:
@@ -7821,8 +7825,18 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
             return
         candidate = self.candidates[index]
         if not candidate.available:
+            if candidate.status == "version-locked":
+                message = (
+                    f"{candidate.name} is version locked and cannot be selected; "
+                    "update or remove its version pin first"
+                )
+            else:
+                message = (
+                    f"{candidate.name} is {self._status_label(candidate.status)} "
+                    "and cannot be selected"
+                )
             self.app.notify(
-                f"{candidate.name} is {candidate.status} and cannot be selected",
+                message,
                 severity="warning",
             )
             return
