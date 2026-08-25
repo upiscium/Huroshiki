@@ -2405,6 +2405,11 @@ class PackTransaction:
             status = mod_version_intent_status(
                 self.source, identity, checkpoint=checkpoint
             )
+            if status.selection == "user" and status.override_status != "active":
+                raise HuroshikiError(
+                    f"Cannot clear version intent for {status.identity}: status is "
+                    f"{status.override_status}; re-select the exact artifact"
+                )
             before = _file_content_snapshot(self.source, checkpoint)
             if status.selection == "user":
                 manifest_before = before.get(VERSION_OVERRIDE_MANIFEST_PATH)
@@ -2516,8 +2521,7 @@ class PackTransaction:
             if status.override_status != "active":
                 raise HuroshikiError(
                     f"Cannot change pin state for {status.identity}: version intent status "
-                    f"is {status.override_status}; re-select the exact artifact or return "
-                    "to Automatic"
+                    f"is {status.override_status}; re-select the exact artifact"
                 )
             before = _file_content_snapshot(self.source, checkpoint)
             manifest_before = before.get(VERSION_OVERRIDE_MANIFEST_PATH)

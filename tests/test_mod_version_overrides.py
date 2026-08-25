@@ -290,29 +290,36 @@ class ModVersionOverrideCoreTest(unittest.TestCase):
             (ModVersionOverride("modrinth", "Ab12Cd34", "Ef56Gh78", False),),
         )
 
-    def test_automatic_allows_drifted_and_stale_cleanup(self) -> None:
-        for identity, override, expected_status, installed in (
+    def test_automatic_rejects_drifted_and_stale_without_mutation(self) -> None:
+        for identity, override, expected_status in (
             (
                 "curseforge:1",
                 ModVersionOverride("curseforge", "1", "3", True),
                 "drifted",
-                "2",
             ),
             (
                 "modrinth:Ab12Cd34",
                 ModVersionOverride("modrinth", "Ab12Cd34", "Ef56Gh78", False),
                 "stale",
-                None,
             ),
         ):
             with self.subTest(status=expected_status):
                 write_mod_version_overrides(self.source, (override,))
-                metadata_before = self.metadata.read_bytes()
-                preview = self.transaction().prepare_mod_version_automatic(identity)
-                self.assertEqual(preview.override_status, expected_status)
-                self.assertEqual(preview.installed_artifact_id, installed)
-                self.assertEqual(read_mod_version_overrides(self.source), ())
-                self.assertEqual(self.metadata.read_bytes(), metadata_before)
+                transaction = self.transaction()
+                before = core._file_content_snapshot(self.source)
+                with self.assertRaisesRegex(
+                    core.HuroshikiError,
+                    f"{expected_status}.*re-select the exact artifact",
+                ) as raised:
+                    transaction.prepare_mod_version_automatic(identity)
+                self.assertNotIn("Return to Automatic", str(raised.exception))
+                self.assertEqual(core._file_content_snapshot(self.source), before)
+                self.assertEqual(
+                    read_mod_version_overrides(self.source), (override,)
+                )
+                self.assertFalse(transaction._source_mutation_recorded)
+                self.assertFalse(transaction._version_override_mutated)
+                self.assertFalse(transaction._intent_only_mutation)
 
     def test_automatic_missing_override_is_stable_noop(self) -> None:
         transaction = self.transaction()
@@ -384,11 +391,12 @@ class ModVersionOverrideCoreTest(unittest.TestCase):
                 before = core._file_content_snapshot(self.source)
                 with self.assertRaisesRegex(
                     core.HuroshikiError,
-                    f"{expected_status}.*re-select.*Automatic",
-                ):
+                    f"{expected_status}.*re-select the exact artifact",
+                ) as raised:
                     self.transaction().prepare_mod_version_pin(
                         identity, locked=not override.locked
                     )
+                self.assertNotIn("Return to Automatic", str(raised.exception))
                 self.assertEqual(core._file_content_snapshot(self.source), before)
 
     def test_intent_only_refresh_state_is_monotonic_in_mixed_transactions(self) -> None:

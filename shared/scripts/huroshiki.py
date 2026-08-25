@@ -6594,6 +6594,13 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
         if action == "automatic" and status.selection == "automatic":
             self.app.notify("This MOD is already Automatic", severity="warning")
             return
+        if action == "automatic" and status.override_status != "active":
+            self.app.notify(
+                "Return to Automatic requires an active user exact selection; "
+                "re-select the exact artifact first",
+                severity="warning",
+            )
+            return
         if action in {"pin", "unpin"} and status.override_status != "active":
             self.app.notify(
                 "Pin controls require an active user exact selection",
