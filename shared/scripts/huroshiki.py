@@ -83,6 +83,15 @@ CONTENT_WORKER_TIMEOUT_SECONDS = 600.0
 CONTENT_DISCARD_TIMEOUT_SECONDS = 10.0
 
 
+@dataclass
+class VersionCatalogWorker:
+    thread: threading.Thread
+    done: threading.Event
+    cancel_event: threading.Event
+    deadline: float
+    generation: int
+
+
 def enabled_marker(enabled: bool) -> str:
     return "+" if enabled else "-"
 
@@ -153,6 +162,8 @@ class HuroshikiApp(App[None]):
                 Callable[[], core.PackTransaction | None],
             ],
         ] = {}
+        self.version_catalog_workers: dict[str, VersionCatalogWorker] = {}
+        self._version_catalog_generation: dict[str, int] = {}
         self._shutting_down = False
         self.content_workers: dict[str, ContentWorker[object]] = {}
         self.content_plans: dict[str, core.ContentChangePlan] = {}
@@ -197,6 +208,25 @@ class HuroshikiApp(App[None]):
             self.exact_version_workers.values()
         ):
             cancel_event.set()
+        for worker in tuple(self.version_catalog_workers.values()):
+            worker.cancel_event.set()
+        for project_key, worker in tuple(self.version_catalog_workers.items()):
+            remaining = max(0.0, deadline - time.monotonic())
+            if not worker.done.wait(remaining):
+                print(
+                    f"Version catalog worker did not stop before shutdown for {project_key}",
+                    file=sys.stderr,
+                )
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            worker.thread.join(remaining)
+            if worker.thread.is_alive():
+                print(
+                    f"Version catalog worker did not join before shutdown for {project_key}",
+                    file=sys.stderr,
+                )
+            elif self.version_catalog_workers.get(project_key) is worker:
+                self.version_catalog_workers.pop(project_key, None)
         unfinished_update_workers: set[str] = set()
         for project_key, (_thread, done, _cancel_event) in tuple(
             self.update_apply_workers.items()
@@ -214,6 +244,14 @@ class HuroshikiApp(App[None]):
                 unfinished_update_workers.add(project_key)
                 print(
                     f"Exact version worker did not stop before shutdown for {project_key}",
+                    file=sys.stderr,
+                )
+                continue
+            _thread.join(max(0.0, deadline - time.monotonic()))
+            if _thread.is_alive():
+                unfinished_update_workers.add(project_key)
+                print(
+                    f"Exact version worker did not join before shutdown for {project_key}",
                     file=sys.stderr,
                 )
                 continue
@@ -348,6 +386,17 @@ class HuroshikiApp(App[None]):
             return
         self.selected_project = project_key
         self.switch_screen(InstalledModDetailsScreen(project_key, mod))
+
+    def open_mod_version_browser(self, project_key: str, mod: core.ModInfo) -> None:
+        if hasattr(self, "project_is_usable") and not self.project_is_usable(project_key):
+            return
+        if self.exact_version_workers.get(project_key) is not None:
+            self.notify("Wait for the installed MOD operation to finish", severity="warning")
+            return
+        if self.version_catalog_workers.get(project_key) is not None:
+            self.notify("Version catalog is already loading", severity="warning")
+            return
+        self.switch_screen(InstalledModVersionBrowserScreen(project_key, mod))
 
     def open_update(self, project_key: str) -> None:
         if not self.project_is_usable(project_key):
@@ -6339,17 +6388,488 @@ class ExactSelectionRollbackScreen(StagedExactModVersionScreen):
         self._begin_rollback()
 
 
-class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
-    help_text = (
-        "v: Select version  Ctrl+R: Automatic  Ctrl+K: Pin  Ctrl+U: Unpin  "
-        "a: Apply preview  q / Esc: Installed MODs"
-    )
+class InstalledModVersionCandidateScreen(ProjectChildScreen, BaseScreen):
+    """Read-only details for one catalog entry."""
+    BINDINGS = [
+        Binding("enter", "select_version", "Select this version"),
+        Binding("q", "back", "Back"),
+        Binding("escape", "back", "Back"),
+    ]
+
+    def __init__(
+        self,
+        project_key: str,
+        mod: core.ModInfo,
+        catalog: core.ModVersionCandidateCatalog,
+        view: core.ModVersionCandidateView,
+    ) -> None:
+        super().__init__()
+        self.project_key = project_key
+        self.mod = mod
+        self.catalog = catalog
+        self.view = view
+        self.screen_title = f"{mod.name} / Compatible version"
+        self.help_text = "Enter: Select this version  q / Esc: Back"
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        c = self.view.candidate
+        flags = (
+            f"Current: {'yes' if self.view.current else 'no'}\n"
+            f"Selected: {'yes' if self.view.selected else 'no'}\n"
+            f"Pinned: {'yes' if self.view.pinned else 'no'}\n"
+            f"Compatible: {'yes' if self.view.compatible else 'no'}"
+        )
+        lines = (
+            f"Provider: {c.provider}",
+            f"Project ID: {c.project_id}",
+            f"Artifact ID: {c.artifact_id}",
+            f"Version: {c.version}",
+            f"Filename: {c.filename}",
+            f"Channel: {c.release_type}",
+            f"Published: {c.published_at}",
+            f"Minecraft: {', '.join(c.game_versions)}",
+            f"Loaders: {', '.join(c.loaders)}",
+            flags,
+            *(f"Note: {note}" for note in self.view.compatibility_notes),
+            "Action: Select this version",
+        )
+        yield Static("\n".join(lines), id="mod-version-candidate-details", markup=False)
+        yield from self.compose_footer()
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    def action_select_version(self) -> None:
+        if not self.view.compatible:
+            self.app.notify("This version is not compatible", severity="warning")
+            return
+        if self.project_key in getattr(self.app, "version_catalog_workers", {}):
+            self.app.notify(
+                "Wait for the current version catalog load to finish",
+                severity="warning",
+            )
+            return
+        # The catalog screen owns the worker; it is released before this transition.
+        self.app.pop_screen()
+        self.app.switch_screen(
+            InstalledModDetailsScreen(
+                self.project_key,
+                self.mod,
+                pending_selection=self.view.candidate.as_exact_selection(),
+            )
+        )
+
+
+class InstalledModVersionBrowserScreen(ProjectChildScreen, BaseScreen):
+    BINDINGS = [
+        Binding("r", "reload", "Reload"),
+        Binding("p", "toggle_prerelease", "Prerelease"),
+        Binding("q", "back", "Back"),
+        Binding("escape", "back", "Back"),
+    ]
 
     def __init__(self, project_key: str, mod: core.ModInfo) -> None:
         super().__init__()
         self.project_key = project_key
         self.mod = mod
+        self.screen_title = f"{mod.name} / Compatible versions"
+        self.help_text = (
+            "Enter: Candidate details  r: Reload  p: Toggle prerelease  "
+            "q / Esc: Details"
+        )
+        self.catalog: core.ModVersionCandidateCatalog | None = None
+        self.include_prerelease = False
+        self.cancel_event = threading.Event()
+        self.done = threading.Event()
+        self.error: BaseException | None = None
+        self.thread: threading.Thread | None = None
+        self.timer: Timer | None = None
+        self.generation = 0
+        self.previous_artifact: str | None = None
+        self.pending_back = False
+        self.active_worker: VersionCatalogWorker | None = None
+        self.requested_include_prerelease = False
+        self._load_results: dict[
+            int,
+            tuple[core.ModVersionCandidateCatalog | None, BaseException | None],
+        ] = {}
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        yield Static(
+            "Loading compatible versions...",
+            id="mod-version-catalog-status",
+            markup=False,
+        )
+        yield DataTable(id="mod-version-catalog-table")
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#mod-version-catalog-table", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns(
+            "State", "Version", "Channel", "Published", "Artifact ID", "Filename"
+        )
+        self.start_load()
+
+    def _identity(self) -> str:
+        return f"{core.canonical_provider(self.mod.provider)}:{self.mod.project_id}"
+
+    def start_load(self) -> None:
+        if self.thread is not None and not self.done.is_set():
+            return
+        exact = getattr(self.app, "exact_version_workers", {})
+        if self.project_key in exact:
+            self.error = core.HuroshikiError("Wait for the installed MOD operation to finish")
+            self._render_status(str(self.error))
+            return
+        registry = getattr(self.app, "version_catalog_workers", None)
+        if registry is None:
+            registry = {}
+            self.app.version_catalog_workers = registry
+        if self.project_key in registry:
+            return
+        self.cancel_event = threading.Event()
+        self.done = threading.Event()
+        self.error = None
+        requested_include_prerelease = self.include_prerelease
+        self.requested_include_prerelease = requested_include_prerelease
+        generations = getattr(self.app, "_version_catalog_generation", None)
+        if generations is None:
+            generations = {}
+            self.app._version_catalog_generation = generations
+        self.generation = generations.get(self.project_key, 0) + 1
+        generations[self.project_key] = self.generation
+        deadline = time.monotonic() + core.PROVIDER_LOOKUP_TIMEOUT_SECONDS
+        generation = self.generation
+        self.thread = threading.Thread(
+            target=self._run_load,
+            args=(
+                deadline,
+                generation,
+                requested_include_prerelease,
+                self.cancel_event,
+            ),
+            name=f"huroshiki-version-catalog-{self.project_key}",
+            daemon=False,
+        )
+        worker = VersionCatalogWorker(
+            self.thread,
+            self.done,
+            self.cancel_event,
+            deadline,
+            generation,
+        )
+        self.active_worker = worker
+        registry[self.project_key] = worker
+        self.catalog = None
+        table = self.query_one("#mod-version-catalog-table", DataTable)
+        table.clear(columns=False)
+        try:
+            self.thread.start()
+        except BaseException as error:
+            if registry.get(self.project_key) is worker:
+                registry.pop(self.project_key, None)
+            self.thread = None
+            self.active_worker = None
+            self.error = error
+            self.done.set()
+            self._render_status(str(error))
+            return
+        self._render_status("Loading compatible versions...")
+        self.timer = self.set_interval(0.05, self._poll_load)
+
+    def _run_load(
+        self,
+        deadline: float,
+        generation: int,
+        include_prerelease: bool,
+        cancel_event: threading.Event,
+    ) -> None:
+        catalog: core.ModVersionCandidateCatalog | None = None
+        error: BaseException | None = None
+        try:
+            catalog = core.list_mod_version_candidates(
+                self.project_key,
+                self._identity(),
+                include_prerelease=include_prerelease,
+                cancel_event=cancel_event,
+                deadline=deadline,
+            )
+        except BaseException as caught:
+            error = caught
+        finally:
+            self._load_results[generation] = (catalog, error)
+            self.done.set()
+
+    def _render_status(self, message: str) -> None:
+        try:
+            self.query_one("#mod-version-catalog-status", Static).update(message)
+        except Exception:
+            pass
+
+    def _release_worker(self) -> None:
+        registry = getattr(self.app, "version_catalog_workers", {})
+        worker = registry.get(self.project_key)
+        if worker is not None and worker is self.active_worker:
+            registry.pop(self.project_key, None)
+
+    def _poll_load(self) -> None:
+        if not self.done.is_set():
+            return
+        registry = getattr(self.app, "version_catalog_workers", {})
+        registered_worker = registry.get(self.project_key)
+        if (
+            registered_worker is not self.active_worker
+            or registered_worker is None
+            or registered_worker.generation != self.generation
+        ):
+            thread = self.thread
+            if thread is not None:
+                thread.join(0)
+                if thread.is_alive():
+                    return
+            if self.timer is not None:
+                self.timer.stop()
+                self.timer = None
+            self._load_results.pop(self.generation, None)
+            self.thread = None
+            self.active_worker = None
+            return
+        if self.timer is not None:
+            timer = self.timer
+        else:
+            timer = None
+        thread = self.thread
+        if thread is not None:
+            thread.join(0)
+            if thread.is_alive():
+                return
+        if timer is not None:
+            timer.stop()
+            self.timer = None
+        self._release_worker()
+        self.thread = None
+        self.active_worker = None
+        catalog, error = self._load_results.pop(self.generation, (None, None))
+        self.catalog = catalog
+        self.error = error
+        if self.error is not None:
+            self._render_status(str(self.error))
+            if self.pending_back:
+                self.pending_back = False
+                self.app.switch_screen(InstalledModDetailsScreen(self.project_key, self.mod))
+            return
+        if self.catalog is None:
+            self._render_status("Version catalog worker returned no result")
+            return
+        status = self.catalog.intent_status
+        selection = "Automatic" if status.selection == "automatic" else "User exact"
+        intent = status.override_status
+        channels = (
+            "Release + Beta + Alpha"
+            if self.requested_include_prerelease
+            else "Release only"
+        )
+        header = (
+            f"Identity: {self.catalog.identity}\n"
+            f"Minecraft: {self.catalog.minecraft}\n"
+            f"Loader: {self.catalog.loader}\n"
+            f"Selection: {selection}\n"
+            f"Intent: {intent or 'none'}\n"
+            f"Channels: {channels}"
+        )
+        if self.catalog.selected_candidate_missing:
+            header += (
+                "\nStored selected artifact is not present in the compatible "
+                "candidate list."
+            )
+        if not self.catalog.candidates:
+            header += "\nNo compatible versions found."
+        self._render_status(header)
+        table = self.query_one("#mod-version-catalog-table", DataTable)
+        table.clear(columns=False)
+        for view in self.catalog.candidates:
+            c = view.candidate
+            state = "/".join(
+                flag
+                for flag, enabled in (
+                    ("C", view.current),
+                    ("S", view.selected),
+                    ("P", view.pinned),
+                )
+                if enabled
+            )
+            table.add_row(
+                state,
+                c.version,
+                c.release_type,
+                c.published_at,
+                str(c.artifact_id),
+                c.filename,
+            )
+        if table.row_count:
+            selected = next(
+                (
+                    i
+                    for i, v in enumerate(self.catalog.candidates)
+                    if v.candidate.artifact_id == self.previous_artifact
+                ),
+                0,
+            )
+            table.move_cursor(row=min(selected, table.row_count - 1))
+        if self.pending_back:
+            self.pending_back = False
+            self.app.switch_screen(InstalledModDetailsScreen(self.project_key, self.mod))
+
+    def action_reload(self) -> None:
+        if self.thread is not None and self.done.is_set():
+            self._poll_load()
+        if self.thread is not None:
+            self.app.notify(
+                "Wait for the current version catalog load to finish",
+                severity="warning",
+            )
+            return
+        self.previous_artifact = self._selected_artifact()
+        self.start_load()
+
+    def action_toggle_prerelease(self) -> None:
+        if self.thread is not None and self.done.is_set():
+            self._poll_load()
+        if self.thread is not None and not self.done.is_set():
+            self.app.notify(
+                "Wait for the current version catalog load to finish",
+                severity="warning",
+            )
+            return
+        if self.thread is not None:
+            self.app.notify(
+                "Wait for the current version catalog load to finish",
+                severity="warning",
+            )
+            return
+        self.include_prerelease = not self.include_prerelease
+        self.previous_artifact = self._selected_artifact()
+        self.start_load()
+
+    def _selected_artifact(self) -> str | None:
+        if self.catalog is None:
+            return None
+        table = self.query_one("#mod-version-catalog-table", DataTable)
+        index = self.current_index(table, len(self.catalog.candidates))
+        return (
+            None
+            if index is None
+            else str(self.catalog.candidates[index].candidate.artifact_id)
+        )
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if (
+            self.thread is not None
+            or self.project_key
+            in getattr(self.app, "version_catalog_workers", {})
+        ):
+            self.app.notify(
+                "Wait for the current version catalog load to finish",
+                severity="warning",
+            )
+            return
+        if self.catalog is None or not self.catalog.candidates:
+            return
+        view = self.catalog.candidates[
+            self.current_index(event.data_table, len(self.catalog.candidates)) or 0
+        ]
+        self.app.push_screen(
+            InstalledModVersionCandidateScreen(
+                self.project_key, self.mod, self.catalog, view
+            )
+        )
+
+    def action_back(self) -> None:
+        if self.thread is not None and not self.done.is_set():
+            self.cancel_event.set()
+            self.pending_back = True
+            self._render_status("Cancelling version catalog...")
+            return
+        if self.thread is not None:
+            return
+        self.app.switch_screen(InstalledModDetailsScreen(self.project_key, self.mod))
+
+    def _begin_detached_worker_cleanup(self) -> None:
+        worker = self.active_worker
+        if worker is None or getattr(self.app, "_shutting_down", False):
+            return
+        cleanup_timer: Timer | None = None
+
+        def poll_cleanup() -> None:
+            nonlocal cleanup_timer
+            registry = getattr(self.app, "version_catalog_workers", {})
+            if registry.get(self.project_key) is not worker:
+                if cleanup_timer is not None:
+                    cleanup_timer.stop()
+                return
+            if not worker.done.is_set():
+                return
+            worker.thread.join(0)
+            if worker.thread.is_alive():
+                return
+            if registry.get(self.project_key) is worker:
+                registry.pop(self.project_key, None)
+            self._load_results.pop(worker.generation, None)
+            if self.active_worker is worker:
+                self.thread = None
+                self.active_worker = None
+            if cleanup_timer is not None:
+                cleanup_timer.stop()
+
+        cleanup_timer = self.app.set_interval(0.05, poll_cleanup)
+        if self.timer is not None:
+            self.timer.stop()
+            self.timer = None
+
+    def on_unmount(self) -> None:
+        if self.thread is not None and not self.done.is_set():
+            self.cancel_event.set()
+        if self.thread is not None:
+            self._begin_detached_worker_cleanup()
+
+
+class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
+    help_text = (
+        "Ctrl+V: Compatible versions (Modrinth)  "
+        "Select version: exact ID + Enter  Ctrl+R: Automatic  "
+        "Ctrl+K: Pin  Ctrl+U: Unpin  "
+        "a: Apply preview  q / Esc: Installed MODs"
+    )
+
+    BINDINGS = [
+        Binding("ctrl+v", "browse_versions", "Compatible versions", priority=True)
+    ]
+
+    def __init__(
+        self,
+        project_key: str,
+        mod: core.ModInfo,
+        pending_selection: core.ExactModArtifactSelection | None = None,
+    ) -> None:
+        super().__init__()
+        self.project_key = project_key
+        self.mod = mod
         self.screen_title = f"{mod.name} / Installed MOD details"
+        provider = core.canonical_provider(mod.provider)
+        if provider == "curseforge":
+            self.help_text = (
+                "Exact File ID + Enter  Ctrl+R: Automatic  Ctrl+K: Pin  "
+                "Ctrl+U: Unpin  a: Apply preview  q / Esc: Installed MODs"
+            )
+        elif provider == "url":
+            self.help_text = (
+                "Provider version catalog and exact selection unavailable  "
+                "q / Esc: Installed MODs"
+            )
         self.provenance = "Loading..."
         self.provenance_thread: threading.Thread | None = None
         self.provenance_done = threading.Event()
@@ -6379,6 +6899,7 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
         self.discard_timer: Timer | None = None
         self.pending_destination: Callable[[], None] | None = None
         self.discard_completion_message: str | None = None
+        self.pending_selection = pending_selection
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -6387,13 +6908,56 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             id="mod-version-details",
             markup=False,
         )
-        yield Static("Select version: enter an exact provider artifact ID", id="mod-version-prompt")
-        yield Input(placeholder="Exact file/version ID", id="mod-version-artifact")
+        provider = core.canonical_provider(self.mod.provider)
+        if provider == "modrinth":
+            selection_prompt = "Select version: enter an exact provider artifact ID"
+            catalog_hint = "Compatible versions: Ctrl+V (Modrinth)"
+        elif provider == "curseforge":
+            selection_prompt = "Select version: enter an exact File ID"
+            catalog_hint = "Compatible versions unavailable for CurseForge"
+        else:
+            selection_prompt = "Provider exact file/version selection unavailable"
+            catalog_hint = "Provider version catalog unavailable for URL artifacts"
+        yield Static(
+            f"{selection_prompt}\n{catalog_hint}",
+            id="mod-version-prompt",
+        )
+        artifact_input = Input(
+            placeholder=(
+                "Exact file/version ID"
+                if provider != "url"
+                else "Exact provider artifact selection unavailable"
+            ),
+            id="mod-version-artifact",
+        )
+        artifact_input.disabled = provider == "url"
+        yield artifact_input
         yield Static("Idle", id="mod-version-status", markup=False)
         yield from self.compose_footer()
 
     def on_mount(self) -> None:
-        self.query_one("#mod-version-artifact", Input).focus()
+        artifact_input = self.query_one("#mod-version-artifact", Input)
+        if artifact_input.disabled:
+            self.focus()
+        else:
+            artifact_input.focus()
+        catalog_workers = getattr(self.app, "version_catalog_workers", {})
+        if self.project_key in catalog_workers:
+            self.provenance_error = core.HuroshikiError(
+                "Wait for the version catalog operation to finish"
+            )
+            self.query_one("#mod-version-status", Static).update(
+                str(self.provenance_error)
+            )
+            return
+        if self.project_key in self.app.exact_version_workers:
+            self.provenance_error = core.HuroshikiError(
+                "Wait for the installed MOD operation to finish"
+            )
+            self.query_one("#mod-version-status", Static).update(
+                str(self.provenance_error)
+            )
+            return
         self.provenance_cancel_event = threading.Event()
         self.provenance_deadline = (
             time.monotonic() + core.UPDATE_OPERATION_TIMEOUT_SECONDS
@@ -6403,19 +6967,46 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             name=f"huroshiki-mod-provenance-{self.project_key}",
             daemon=False,
         )
-        self.app.exact_version_workers[self.project_key] = (
+        worker = (
             self.provenance_thread,
             self.provenance_done,
             self.provenance_cancel_event,
             lambda: None,
         )
+        self.app.exact_version_workers[self.project_key] = worker
         try:
             self.provenance_thread.start()
         except BaseException:
-            self.app.exact_version_workers.pop(self.project_key, None)
+            if self.app.exact_version_workers.get(self.project_key) is worker:
+                self.app.exact_version_workers.pop(self.project_key, None)
             self.provenance_thread = None
             raise
         self.provenance_timer = self.set_interval(0.05, self._poll_provenance)
+
+    def action_browse_versions(self) -> None:
+        provider = core.canonical_provider(self.mod.provider)
+        if provider == "curseforge":
+            self.app.notify(
+                "Provider version catalog is not currently available for "
+                "CurseForge; enter an exact file ID instead.",
+                severity="warning",
+            )
+            return
+        if provider == "url":
+            self.app.notify(
+                "Provider version catalog is unavailable for URL artifacts",
+                severity="warning",
+            )
+            return
+        if self.provenance_thread is not None and self.provenance_done.is_set():
+            self._poll_provenance()
+        if self.provenance_thread is not None and not self.provenance_done.is_set():
+            self.app.notify("Wait for installed MOD details to finish loading", severity="warning")
+            return
+        if self.prepare_thread is not None or self.apply_thread is not None:
+            self.app.notify("Wait for the installed MOD operation to finish", severity="warning")
+            return
+        self.app.open_mod_version_browser(self.project_key, self.mod)
 
     def _run_provenance(self) -> None:
         try:
@@ -6486,10 +7077,14 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
     def _poll_provenance(self) -> None:
         if not self.provenance_done.is_set():
             return
+        thread = self.provenance_thread
+        if thread is not None:
+            thread.join(0)
+            if thread.is_alive():
+                return
         if self.provenance_timer is not None:
             self.provenance_timer.stop()
             self.provenance_timer = None
-        thread = self.provenance_thread
         worker = self.app.exact_version_workers.get(self.project_key)
         if worker is not None and worker[0] is thread:
             self.app.exact_version_workers.pop(self.project_key, None)
@@ -6504,6 +7099,10 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
         self.query_one("#mod-version-details", Static).update(
             "\n".join(self._details_lines(role))
         )
+        if self.pending_selection is not None:
+            selection = self.pending_selection
+            self.pending_selection = None
+            self.start_exact_selection(selection)
         if self.pending_destination is not None and self.transaction is None:
             destination = self.pending_destination
             self.pending_destination = None
@@ -6529,9 +7128,24 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
 
     @on(Input.Submitted, "#mod-version-artifact")
     def submit_artifact(self, event: Input.Submitted) -> None:
-        self.start_prepare(event.value.strip())
+        try:
+            selection = self._selection(event.value.strip())
+        except BaseException as error:
+            self.app.notify(str(error), severity="error")
+            return
+        self.start_exact_selection(selection)
 
     def start_prepare(self, artifact_id: str) -> None:
+        try:
+            selection = self._selection(artifact_id.strip())
+        except BaseException as error:
+            self.app.notify(str(error), severity="error")
+            return
+        self.start_exact_selection(selection)
+
+    def start_exact_selection(self, selection: core.ExactModArtifactSelection) -> None:
+        if self.provenance_thread is not None and self.provenance_done.is_set():
+            self._poll_provenance()
         if self.provenance_thread is not None and not self.provenance_done.is_set():
             self.app.notify("Wait for installed MOD details to finish loading", severity="warning")
             return
@@ -6541,10 +7155,16 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
         if self.transaction is not None:
             self.app.notify("Apply or cancel the current preview first", severity="warning")
             return
-        try:
-            selection = self._selection(artifact_id)
-        except BaseException as error:
-            self.app.notify(str(error), severity="error")
+        if self.project_key in getattr(self.app, "version_catalog_workers", {}):
+            self.app.notify(
+                "Wait for the version catalog operation to finish",
+                severity="warning",
+            )
+            return
+        if self.project_key in self.app.exact_version_workers:
+            self.app.notify(
+                "Exact version operation is already running", severity="warning"
+            )
             return
         self.cancel_event = threading.Event()
         self.deadline = time.monotonic() + core.UPDATE_OPERATION_TIMEOUT_SECONDS
@@ -6558,16 +7178,18 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             name=f"huroshiki-exact-version-{self.project_key}",
             daemon=False,
         )
-        self.app.exact_version_workers[self.project_key] = (
+        worker = (
             self.prepare_thread,
             self.prepare_done,
             self.cancel_event,
             lambda: self.transaction,
         )
+        self.app.exact_version_workers[self.project_key] = worker
         try:
             self.prepare_thread.start()
         except BaseException as error:
-            self.app.exact_version_workers.pop(self.project_key, None)
+            if self.app.exact_version_workers.get(self.project_key) is worker:
+                self.app.exact_version_workers.pop(self.project_key, None)
             self.prepare_thread = None
             self.prepare_error = error
             self.prepare_done.set()
@@ -6578,6 +7200,8 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
     def start_intent_prepare(
         self, action: Literal["automatic", "pin", "unpin"]
     ) -> None:
+        if self.provenance_thread is not None and self.provenance_done.is_set():
+            self._poll_provenance()
         if self.provenance_thread is not None and not self.provenance_done.is_set():
             self.app.notify("Wait for installed MOD details to finish loading", severity="warning")
             return
@@ -6586,6 +7210,17 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             return
         if self.transaction is not None:
             self.app.notify("Apply or cancel the current preview first", severity="warning")
+            return
+        if self.project_key in getattr(self.app, "version_catalog_workers", {}):
+            self.app.notify(
+                "Wait for the version catalog operation to finish",
+                severity="warning",
+            )
+            return
+        if self.project_key in self.app.exact_version_workers:
+            self.app.notify(
+                "Version intent operation is already running", severity="warning"
+            )
             return
         status = self.intent_status
         if status is None:
@@ -6627,16 +7262,18 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             name=f"huroshiki-version-intent-{action}-{self.project_key}",
             daemon=False,
         )
-        self.app.exact_version_workers[self.project_key] = (
+        worker = (
             self.prepare_thread,
             self.prepare_done,
             self.cancel_event,
             lambda: self.transaction,
         )
+        self.app.exact_version_workers[self.project_key] = worker
         try:
             self.prepare_thread.start()
         except BaseException as error:
-            self.app.exact_version_workers.pop(self.project_key, None)
+            if self.app.exact_version_workers.get(self.project_key) is worker:
+                self.app.exact_version_workers.pop(self.project_key, None)
             self.prepare_thread = None
             self.prepare_error = error
             self.prepare_done.set()
@@ -6743,11 +7380,18 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             self.query_one("#mod-version-status", Static).update(latest.message)
         if not self.prepare_done.is_set():
             return
+        thread = self.prepare_thread
+        if thread is not None:
+            thread.join(0)
+            if thread.is_alive():
+                return
         if self.prepare_timer is not None:
             self.prepare_timer.stop()
             self.prepare_timer = None
+        worker = self.app.exact_version_workers.get(self.project_key)
+        if worker is not None and worker[0] is thread:
+            self.app.exact_version_workers.pop(self.project_key, None)
         self.prepare_thread = None
-        self.app.exact_version_workers.pop(self.project_key, None)
         if self.transaction is not None and self.transaction.active:
             self.app.transactions[self.project_key] = self.transaction
         if self.prepare_error is not None:
@@ -6831,6 +7475,9 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             return
         if self.apply_thread is not None:
             return
+        if self.project_key in self.app.exact_version_workers:
+            self.app.notify("Exact version operation is already running", severity="warning")
+            return
         self.apply_done.clear()
         self.apply_error = None
         self.cancel_event = threading.Event()
@@ -6841,15 +7488,18 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             name=f"huroshiki-exact-version-apply-{self.project_key}",
             daemon=False,
         )
-        self.app.update_apply_workers[self.project_key] = (
+        worker = (
             self.apply_thread,
             self.apply_done,
             self.cancel_event,
+            lambda: self.transaction,
         )
+        self.app.exact_version_workers[self.project_key] = worker
         try:
             self.apply_thread.start()
         except BaseException as error:
-            self.app.update_apply_workers.pop(self.project_key, None)
+            if self.app.exact_version_workers.get(self.project_key) is worker:
+                self.app.exact_version_workers.pop(self.project_key, None)
             self.apply_thread = None
             self.apply_error = error
             self.apply_done.set()
@@ -6879,10 +7529,17 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
     def _poll_apply(self) -> None:
         if not self.apply_done.is_set():
             return
+        thread = self.apply_thread
+        if thread is not None:
+            thread.join(0)
+            if thread.is_alive():
+                return
         if self.apply_timer is not None:
             self.apply_timer.stop()
             self.apply_timer = None
-        self.app.update_apply_workers.pop(self.project_key, None)
+        worker = self.app.exact_version_workers.get(self.project_key)
+        if worker is not None and worker[0] is thread:
+            self.app.exact_version_workers.pop(self.project_key, None)
         self.apply_thread = None
         if self.apply_error is not None:
             error = self.apply_error

@@ -19,6 +19,8 @@ class _VersionApp(App[None]):
         self.transactions: dict[str, core.PackTransaction] = {}
         self.update_apply_workers: dict[str, object] = {}
         self.exact_version_workers: dict[str, object] = {}
+        self.version_catalog_workers: dict[str, huroshiki.VersionCatalogWorker] = {}
+        self._version_catalog_generation: dict[str, int] = {}
         self._shutting_down = False
 
     def on_mount(self) -> None:
@@ -27,6 +29,9 @@ class _VersionApp(App[None]):
 
     def open_list(self, _project_key: str) -> None:
         pass
+
+    def open_mod_version_browser(self, project_key: str, mod: core.ModInfo) -> None:
+        self.switch_screen(huroshiki.InstalledModVersionBrowserScreen(project_key, mod))
 
 
 def mod_info(project_id: str = "A1b2C3d4") -> core.ModInfo:
@@ -85,6 +90,49 @@ def intent_preview(action: str) -> core.ModVersionIntentPreview:
         False if action == "automatic" else (False if action == "pin" else True),
         None if action == "automatic" else (True if action == "pin" else False),
         "test", "active", (),
+    )
+
+
+def candidate(
+    artifact_id: str,
+    *,
+    version: str = "1.0",
+    release_type: str = "release",
+    filename: str = "example.jar",
+) -> core.ModVersionCandidate:
+    return core.ModVersionCandidate(
+        "modrinth",
+        core.canonical_modrinth_id("A1b2C3d4"),
+        core.canonical_modrinth_id(artifact_id),
+        version,
+        filename,
+        ("1.21.1",), ("fabric",), release_type, "2026-01-02T03:04:05Z",
+    )
+
+
+def candidate_view(
+    artifact_id: str,
+    *,
+    current: bool = False,
+    selected: bool = False,
+    pinned: bool = False,
+    compatible: bool = True,
+    notes: tuple[str, ...] = (),
+) -> core.ModVersionCandidateView:
+    return core.ModVersionCandidateView(
+        candidate(artifact_id), current, selected, pinned, compatible, notes
+    )
+
+
+def catalog(
+    *views: core.ModVersionCandidateView,
+    selection: str = "user",
+    selected: str | None = "new-id",
+    missing: bool = False,
+) -> core.ModVersionCandidateCatalog:
+    return core.ModVersionCandidateCatalog(
+        "modrinth:A1b2C3d4", "1.21.1", "fabric", tuple(views),
+        intent_status(selection=selection, selected=selected), missing,
     )
 
 
@@ -660,7 +708,7 @@ class InstalledModVersionTuiTest(unittest.IsolatedAsyncioTestCase):
                 def fail_start():
                     nonlocal worker_registered_before_start
                     worker_registered_before_start = (
-                        app.update_apply_workers.get("pack:demo", (None,))[0]
+                        app.exact_version_workers.get("pack:demo", (None,))[0]
                         is screen.apply_thread
                     )
                     raise RuntimeError("start failed")
@@ -672,7 +720,7 @@ class InstalledModVersionTuiTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.2)
 
                 self.assertTrue(worker_registered_before_start)
-                self.assertNotIn("pack:demo", app.update_apply_workers)
+                self.assertNotIn("pack:demo", app.exact_version_workers)
                 self.assertIsNone(screen.preview)
                 self.assertIsNone(screen.transaction)
                 transaction.apply.assert_not_called()
@@ -684,6 +732,639 @@ class InstalledModVersionTuiTest(unittest.IsolatedAsyncioTestCase):
                         ).render()
                     ),
                 )
+
+    async def test_modrinth_details_advertises_catalog_and_preserves_exact_id(self) -> None:
+        with patch.object(core, "project_config", return_value={}), patch.object(
+            core, "installed_mod_provenance", return_value="Explicit root"
+        ):
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                screen = app.screen
+                prompt = screen.query_one("#mod-version-prompt", huroshiki.Static)
+                self.assertIn("Compatible versions: Ctrl+V", str(prompt.render()))
+                self.assertEqual(
+                    screen.query_one("#mod-version-artifact", huroshiki.Input).placeholder,
+                    "Exact file/version ID",
+                )
+                self.assertIn("Canonical project ID: A1b2C3d4", str(
+                    screen.query_one("#mod-version-details", huroshiki.Static).render()
+                ))
+
+    async def test_curseforge_catalog_fallback_does_not_start_worker_or_transaction(self) -> None:
+        mod = core.ModInfo(Path("mods/cf.pw.toml"), "cf", "Curse MOD", "curseforge", "12345", "cf.jar", True, False)
+        with patch.object(core, "project_config", return_value={}), patch.object(
+            core, "installed_mod_provenance", return_value="Dependency"
+        ), patch.object(core, "list_mod_version_candidates") as listing, patch.object(
+            core.PackTransaction, "create"
+        ) as create:
+            app = _VersionApp(mod)
+            async with app.run_test() as pilot:
+                await pilot.pause(0.1)
+                screen = app.screen
+                screen.action_browse_versions()
+                await pilot.pause()
+                self.assertIs(app.screen, screen)
+                self.assertFalse(app.version_catalog_workers)
+                listing.assert_not_called()
+                create.assert_not_called()
+                prompt = str(
+                    screen.query_one("#mod-version-prompt", huroshiki.Static).render()
+                )
+                self.assertIn("enter an exact File ID", prompt)
+                artifact = screen.query_one("#mod-version-artifact", huroshiki.Input)
+                self.assertFalse(artifact.disabled)
+
+    async def test_url_catalog_fallback_does_not_start_worker_or_transaction(self) -> None:
+        mod = core.ModInfo(
+            Path("mods/url.pw.toml"),
+            "url",
+            "URL MOD",
+            "url",
+            "url-mod",
+            "url.jar",
+            True,
+            False,
+        )
+        with patch.object(core, "project_config", return_value={}), patch.object(
+            core, "installed_mod_provenance", return_value="Explicit root"
+        ), patch.object(core, "list_mod_version_candidates") as listing, patch.object(
+            core.PackTransaction, "create"
+        ) as create:
+            app = _VersionApp(mod)
+            async with app.run_test() as pilot:
+                await pilot.pause(0.1)
+                screen = app.screen
+                screen.action_browse_versions()
+                await pilot.pause()
+                self.assertIs(app.screen, screen)
+                self.assertFalse(app.version_catalog_workers)
+                listing.assert_not_called()
+                create.assert_not_called()
+                prompt = str(
+                    screen.query_one("#mod-version-prompt", huroshiki.Static).render()
+                )
+                self.assertIn("exact file/version selection unavailable", prompt)
+                self.assertNotIn("enter an exact file ID", prompt)
+                artifact = screen.query_one("#mod-version-artifact", huroshiki.Input)
+                self.assertTrue(artifact.disabled)
+                self.assertEqual(
+                    artifact.placeholder,
+                    "Exact provider artifact selection unavailable",
+                )
+                self.assertNotIn("exact ID", screen.help_text)
+
+    async def test_catalog_load_is_named_non_daemon_and_passes_cancel_deadline(self) -> None:
+        seen: dict[str, object] = {}
+        loaded = catalog(candidate_view("NewId001"))
+
+        def listing(project, identity, *, include_prerelease, cancel_event, deadline):
+            seen.update(project=project, identity=identity, prerelease=include_prerelease,
+                        cancel=cancel_event, deadline=deadline, thread=threading.current_thread())
+            return loaded
+
+        with patch.object(core, "list_mod_version_candidates", side_effect=listing):
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                app.switch_screen(huroshiki.InstalledModVersionBrowserScreen("pack:demo", mod_info()))
+                await pilot.pause(0.2)
+                self.assertEqual(seen["project"], "pack:demo")
+                self.assertEqual(seen["identity"], "modrinth:A1b2C3d4")
+                self.assertFalse(seen["prerelease"])
+                self.assertIsInstance(seen["cancel"], threading.Event)
+                self.assertGreater(float(seen["deadline"]), 0)
+                thread = seen["thread"]
+                self.assertFalse(thread.daemon)
+                self.assertTrue(thread.name.startswith("huroshiki-version-catalog-pack:demo"))
+
+    async def test_catalog_does_not_overlap_same_pack_exact_worker(self) -> None:
+        blocker_done = threading.Event()
+        blocker_cancel = threading.Event()
+        blocker = MagicMock()
+        with patch.object(core, "list_mod_version_candidates") as listing:
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                app.exact_version_workers["pack:demo"] = (
+                    blocker,
+                    blocker_done,
+                    blocker_cancel,
+                    lambda: None,
+                )
+                app.switch_screen(
+                    huroshiki.InstalledModVersionBrowserScreen(
+                        "pack:demo", mod_info()
+                    )
+                )
+                await pilot.pause(0.1)
+                listing.assert_not_called()
+                self.assertIn(
+                    "Wait for the installed MOD operation",
+                    str(
+                        app.screen.query_one(
+                            "#mod-version-catalog-status", huroshiki.Static
+                        ).render()
+                    ),
+                )
+                app.exact_version_workers.pop("pack:demo", None)
+
+    async def test_catalog_renders_states_order_and_missing_warning(self) -> None:
+        views = (
+            candidate_view("Curr0001", current=True),
+            candidate_view("Selc0001", selected=True, pinned=True),
+            candidate_view("Drft0001", selected=True),
+        )
+        loaded = catalog(*views, missing=True)
+        with patch.object(core, "list_mod_version_candidates", return_value=loaded):
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                app.switch_screen(huroshiki.InstalledModVersionBrowserScreen("pack:demo", mod_info()))
+                await pilot.pause(0.2)
+                screen = app.screen
+                text = str(screen.query_one("#mod-version-catalog-status", huroshiki.Static).render())
+                self.assertIn("Selection: User exact", text)
+                self.assertIn("Stored selected artifact is not present", text)
+                table = screen.query_one("#mod-version-catalog-table", huroshiki.DataTable)
+                self.assertEqual([str(screen.catalog.candidates[i].candidate.artifact_id) for i in range(3)],
+                                 ["Curr0001", "Selc0001", "Drft0001"])
+                self.assertEqual(table.row_count, 3)
+                self.assertIn("C", str(table.get_row_at(0)[0]))
+                self.assertIn("S/P", str(table.get_row_at(1)[0]))
+                self.assertIn("S", str(table.get_row_at(2)[0]))
+
+    async def test_catalog_renders_automatic_current_without_selected_state(self) -> None:
+        loaded = catalog(
+            candidate_view("Auto0001", current=True),
+            selection="automatic",
+            selected=None,
+        )
+        with patch.object(core, "list_mod_version_candidates", return_value=loaded):
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                app.switch_screen(
+                    huroshiki.InstalledModVersionBrowserScreen(
+                        "pack:demo", mod_info()
+                    )
+                )
+                await pilot.pause(0.2)
+                screen = app.screen
+                status = str(
+                    screen.query_one(
+                        "#mod-version-catalog-status", huroshiki.Static
+                    ).render()
+                )
+                self.assertIn("Selection: Automatic", status)
+                row_state = str(
+                    screen.query_one(
+                        "#mod-version-catalog-table", huroshiki.DataTable
+                    ).get_row_at(0)[0]
+                )
+                self.assertEqual(row_state, "C")
+
+    async def test_empty_catalog_is_recoverable_and_prerelease_reload_preserves_selection(self) -> None:
+        calls: list[bool] = []
+        results = [
+            catalog(),
+            catalog(candidate_view("Keep0001"), candidate_view("Othr0001")),
+            catalog(candidate_view("Othr0001"), candidate_view("Keep0001")),
+        ]
+
+        def listing(*_args, include_prerelease, **_kwargs):
+            calls.append(include_prerelease)
+            return results.pop(0)
+
+        with patch.object(core, "list_mod_version_candidates", side_effect=listing):
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                app.switch_screen(huroshiki.InstalledModVersionBrowserScreen("pack:demo", mod_info()))
+                await pilot.pause(0.15)
+                screen = app.screen
+                self.assertIn("No compatible versions found", str(screen.query_one("#mod-version-catalog-status", huroshiki.Static).render()))
+                screen.action_toggle_prerelease()
+                await pilot.pause(0.15)
+                self.assertEqual(calls, [False, True])
+                self.assertTrue(screen.include_prerelease)
+                self.assertEqual(screen._selected_artifact(), "Keep0001")
+                self.assertNotIn("pack:demo", app.version_catalog_workers)
+                screen.action_toggle_prerelease()
+                await pilot.pause(0.15)
+                self.assertEqual(calls, [False, True, False])
+                self.assertFalse(screen.include_prerelease)
+                self.assertEqual(screen._selected_artifact(), "Keep0001")
+                self.assertNotIn("pack:demo", app.version_catalog_workers)
+
+    async def _assert_reload_blocks_old_candidate_navigation(
+        self, *, prerelease: bool
+    ) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        calls: list[bool] = []
+        first = catalog(candidate_view("OldA0001"))
+        second = catalog(candidate_view("NewB0001"))
+
+        def listing(*_args, include_prerelease, **_kwargs):
+            calls.append(include_prerelease)
+            if len(calls) == 1:
+                return first
+            started.set()
+            release.wait(2)
+            return second
+
+        with patch.object(
+            core, "list_mod_version_candidates", side_effect=listing
+        ), patch.object(core.PackTransaction, "create") as create:
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                app.switch_screen(
+                    huroshiki.InstalledModVersionBrowserScreen(
+                        "pack:demo", mod_info()
+                    )
+                )
+                await pilot.pause(0.2)
+                screen = app.screen
+                table = screen.query_one(
+                    "#mod-version-catalog-table", huroshiki.DataTable
+                )
+                self.assertEqual(screen._selected_artifact(), "OldA0001")
+
+                if prerelease:
+                    screen.action_toggle_prerelease()
+                else:
+                    screen.action_reload()
+                self.assertTrue(started.wait(1))
+                self.assertEqual(table.row_count, 0)
+                worker = app.version_catalog_workers["pack:demo"]
+
+                screen.on_data_table_row_selected(MagicMock(data_table=table))
+                await pilot.pause()
+                self.assertIs(app.screen, screen)
+                create.assert_not_called()
+                self.assertIs(app.version_catalog_workers["pack:demo"], worker)
+
+                release.set()
+                await pilot.pause(0.3)
+                self.assertNotIn("pack:demo", app.version_catalog_workers)
+                self.assertEqual(screen._selected_artifact(), "NewB0001")
+                self.assertEqual(calls, [False, prerelease])
+
+                screen.on_data_table_row_selected(MagicMock(data_table=table))
+                await pilot.pause()
+                self.assertIsInstance(
+                    app.screen, huroshiki.InstalledModVersionCandidateScreen
+                )
+                self.assertEqual(
+                    app.screen.view.candidate.artifact_id, "NewB0001"
+                )
+                create.assert_not_called()
+
+    async def test_reload_blocks_old_candidate_navigation(self) -> None:
+        await self._assert_reload_blocks_old_candidate_navigation(
+            prerelease=False
+        )
+
+    async def test_prerelease_reload_blocks_old_candidate_navigation(self) -> None:
+        await self._assert_reload_blocks_old_candidate_navigation(
+            prerelease=True
+        )
+
+    async def test_candidate_details_exposes_metadata_flags_and_notes(self) -> None:
+        view = candidate_view("Cand0001", current=True, selected=True, pinned=True,
+                             compatible=True, notes=("loader match",))
+        app = _VersionApp(mod_info())
+        async with app.run_test() as pilot:
+            app.push_screen(huroshiki.InstalledModVersionCandidateScreen(
+                "pack:demo", mod_info(), catalog(view), view
+            ))
+            await pilot.pause()
+            rendered = str(app.screen.query_one("#mod-version-candidate-details", huroshiki.Static).render())
+            for expected in ("Provider: modrinth", "Project ID: A1b2C3d4", "Artifact ID: Cand0001",
+                             "Version: 1.0", "Filename: example.jar", "Channel: release",
+                             "Published: 2026-01-02T03:04:05Z", "Minecraft: 1.21.1",
+                             "Loaders: fabric", "Current: yes", "Selected: yes", "Pinned: yes",
+                             "Compatible: yes", "Note: loader match"):
+                self.assertIn(expected, rendered)
+
+    async def test_candidate_selection_uses_details_exact_selection_authority(self) -> None:
+        view = candidate_view("Cand0001")
+        app = _VersionApp(mod_info())
+        async with app.run_test() as pilot:
+            app.push_screen(huroshiki.InstalledModVersionCandidateScreen("pack:demo", mod_info(), catalog(view), view))
+            await pilot.pause()
+            with patch.object(huroshiki.InstalledModDetailsScreen, "start_exact_selection") as start:
+                app.screen.action_select_version()
+                await pilot.pause()
+                start.assert_called_once_with(view.candidate.as_exact_selection())
+                self.assertIsInstance(app.screen, huroshiki.InstalledModDetailsScreen)
+                self.assertFalse(app.transactions)
+
+    async def test_candidate_selection_rejects_active_catalog_worker(self) -> None:
+        view = candidate_view("Guard001")
+        app = _VersionApp(mod_info())
+        async with app.run_test() as pilot:
+            await pilot.pause(0.15)
+            app.push_screen(
+                huroshiki.InstalledModVersionCandidateScreen(
+                    "pack:demo", mod_info(), catalog(view), view
+                )
+            )
+            await pilot.pause()
+            candidate_screen = app.screen
+            worker = MagicMock()
+            app.version_catalog_workers["pack:demo"] = worker
+            with patch.object(core.PackTransaction, "create") as create:
+                candidate_screen.action_select_version()
+                await pilot.pause()
+            self.assertIs(app.screen, candidate_screen)
+            self.assertIs(app.version_catalog_workers["pack:demo"], worker)
+            create.assert_not_called()
+            app.version_catalog_workers.pop("pack:demo", None)
+
+    async def test_browser_selection_is_read_only_until_existing_details_prepare(self) -> None:
+        view = candidate_view("Cand0001")
+        loaded = catalog(view)
+        transaction = MagicMock(active=True)
+        transaction.prepare_exact_mod_version.return_value = preview()
+        transaction.apply.side_effect = lambda **_: setattr(transaction, "active", False)
+        with patch.object(core, "list_mod_version_candidates", return_value=loaded), patch.object(
+            core, "project_config", return_value={}
+        ), patch.object(core, "installed_mod_provenance", return_value="Dependency"), patch.object(
+            core.PackTransaction, "create", return_value=transaction
+        ):
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                app.switch_screen(huroshiki.InstalledModVersionBrowserScreen("pack:demo", mod_info()))
+                await pilot.pause(0.2)
+                screen = app.screen
+                self.assertFalse(app.transactions)
+                self.assertFalse(transaction.apply.called)
+                screen.on_data_table_row_selected(MagicMock(data_table=screen.query_one("#mod-version-catalog-table", huroshiki.DataTable)))
+                await pilot.pause()
+                candidate_screen = app.screen
+                self.assertFalse(transaction.apply.called)
+                candidate_screen.action_select_version()
+                await pilot.pause(0.1)
+                details = app.screen
+                self.assertIsInstance(details, huroshiki.InstalledModDetailsScreen)
+                await pilot.pause(0.2)
+                self.assertTrue(details.prepare_thread is not None or transaction.prepare_exact_mod_version.called)
+                self.assertEqual(transaction.prepare_exact_mod_version.call_args.args[0], view.candidate.as_exact_selection())
+                self.assertFalse(transaction.apply.called)
+                details.apply_preview()
+                await pilot.pause(0.2)
+                transaction.apply.assert_called_once()
+                self.assertNotIn("pack:demo", app.transactions)
+
+    async def test_candidate_preview_cancel_discards_without_applying(self) -> None:
+        view = candidate_view("Cncl0001")
+        transaction = MagicMock(active=True)
+        transaction.prepare_exact_mod_version.return_value = preview()
+        transaction.begin_discard.return_value = completed_discard(transaction)
+        with patch.object(core, "project_config", return_value={}), patch.object(
+            core, "installed_mod_provenance", return_value="Dependency"
+        ), patch.object(core.PackTransaction, "create", return_value=transaction):
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                app.push_screen(
+                    huroshiki.InstalledModVersionCandidateScreen(
+                        "pack:demo", mod_info(), catalog(view), view
+                    )
+                )
+                await pilot.pause()
+                app.screen.action_select_version()
+                await pilot.pause(0.3)
+                details = app.screen
+                self.assertIsInstance(details, huroshiki.InstalledModDetailsScreen)
+                self.assertIs(app.transactions["pack:demo"], transaction)
+                details.cancel_and_navigate(None)
+                await pilot.pause(0.2)
+                transaction.apply.assert_not_called()
+                transaction.begin_discard.assert_called_once_with()
+                self.assertNotIn("pack:demo", app.transactions)
+
+    async def test_catalog_cancel_defers_back_until_worker_terminates_without_transaction(self) -> None:
+        started, release = threading.Event(), threading.Event()
+        def listing(*_args, cancel_event, **_kwargs):
+            started.set()
+            release.wait(2)
+            if cancel_event.is_set():
+                raise core.ExactModVersionCancelled("cancelled")
+            return catalog(candidate_view("Late0001"))
+        with patch.object(core, "list_mod_version_candidates", side_effect=listing):
+            app = _VersionApp(mod_info())
+            with patch.object(app, "open_list") as destination:
+                async with app.run_test() as pilot:
+                    await pilot.pause(0.15)
+                    app.switch_screen(huroshiki.InstalledModVersionBrowserScreen("pack:demo", mod_info()))
+                    await pilot.pause(0.1)
+                    screen = app.screen
+                    self.assertTrue(started.is_set())
+                    screen.action_back()
+                    destination.assert_not_called()
+                    release.set()
+                    await pilot.pause(0.25)
+                    self.assertIsInstance(app.screen, huroshiki.InstalledModDetailsScreen)
+                    self.assertFalse(app.transactions)
+                    self.assertNotIn("pack:demo", app.version_catalog_workers)
+
+    async def test_back_during_reload_waits_for_join_and_registry_release(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        calls = 0
+
+        def listing(*_args, cancel_event, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return catalog(candidate_view("OldA0001"))
+            started.set()
+            release.wait(2)
+            if cancel_event.is_set():
+                raise core.ExactModVersionCancelled("cancelled reload")
+            return catalog(candidate_view("Late0001"))
+
+        with patch.object(core, "list_mod_version_candidates", side_effect=listing):
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                app.switch_screen(
+                    huroshiki.InstalledModVersionBrowserScreen(
+                        "pack:demo", mod_info()
+                    )
+                )
+                await pilot.pause(0.2)
+                screen = app.screen
+                screen.action_reload()
+                self.assertTrue(started.wait(1))
+                worker = app.version_catalog_workers["pack:demo"]
+
+                screen.action_back()
+                self.assertTrue(worker.cancel_event.is_set())
+                self.assertIs(app.screen, screen)
+                self.assertIs(app.version_catalog_workers["pack:demo"], worker)
+
+                release.set()
+                await pilot.pause(0.3)
+                self.assertIsInstance(
+                    app.screen, huroshiki.InstalledModDetailsScreen
+                )
+                self.assertNotIn("pack:demo", app.version_catalog_workers)
+                self.assertIsNone(screen.thread)
+
+    async def test_external_unmount_detaches_catalog_cleanup_from_browser(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        calls = 0
+
+        def listing(*_args, cancel_event, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return catalog(candidate_view("OldA0001"))
+            started.set()
+            release.wait(2)
+            if cancel_event.is_set():
+                raise core.ExactModVersionCancelled("external navigation")
+            return catalog(candidate_view("Late0001"))
+
+        with patch.object(core, "list_mod_version_candidates", side_effect=listing):
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                app.switch_screen(
+                    huroshiki.InstalledModVersionBrowserScreen(
+                        "pack:demo", mod_info()
+                    )
+                )
+                await pilot.pause(0.2)
+                browser = app.screen
+                browser.action_reload()
+                self.assertTrue(started.wait(1))
+                worker = app.version_catalog_workers["pack:demo"]
+
+                app.switch_screen(
+                    huroshiki.InstalledModDetailsScreen(
+                        "pack:demo", mod_info()
+                    )
+                )
+                await pilot.pause()
+                self.assertTrue(worker.cancel_event.is_set())
+                self.assertIs(app.version_catalog_workers["pack:demo"], worker)
+
+                release.set()
+                await pilot.pause(0.3)
+                self.assertFalse(worker.thread.is_alive())
+                self.assertNotIn("pack:demo", app.version_catalog_workers)
+                self.assertIsNone(browser.thread)
+
+    async def test_catalog_deadline_failure_is_recoverable_without_transaction(self) -> None:
+        with patch.object(core, "list_mod_version_candidates", side_effect=core.ExactModVersionDeadlineExceeded("deadline")):
+            app = _VersionApp(mod_info())
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                app.switch_screen(huroshiki.InstalledModVersionBrowserScreen("pack:demo", mod_info()))
+                await pilot.pause(0.2)
+                screen = app.screen
+                self.assertIn("deadline", str(screen.query_one("#mod-version-catalog-status", huroshiki.Static).render()))
+                self.assertFalse(app.transactions)
+                self.assertNotIn("pack:demo", app.version_catalog_workers)
+                screen.action_reload()
+                self.assertIsNotNone(screen.thread)
+                await pilot.pause(0.2)
+                self.assertNotIn("pack:demo", app.version_catalog_workers)
+
+    async def test_stale_catalog_completion_cannot_replace_newer_generation(self) -> None:
+        app = _VersionApp(mod_info())
+        with patch.object(core, "list_mod_version_candidates", return_value=catalog(candidate_view("Init0001"))):
+            async with app.run_test() as pilot:
+                screen = huroshiki.InstalledModVersionBrowserScreen("pack:demo", mod_info())
+                app.push_screen(screen)
+                await pilot.pause(0.1)
+                new_catalog = catalog(candidate_view("Neww0001"))
+                screen.generation = 2
+                fake_thread = MagicMock()
+                fake_thread.is_alive.return_value = False
+                screen.active_worker = huroshiki.VersionCatalogWorker(fake_thread, threading.Event(), threading.Event(), 1.0, 2)
+                app.version_catalog_workers["pack:demo"] = screen.active_worker
+                screen._load_results[1] = (catalog(candidate_view("Oldd0001")), None)
+                screen._load_results[2] = (new_catalog, None)
+                screen.done.set()
+                screen._poll_load()
+                self.assertEqual(screen.catalog.candidates[0].candidate.artifact_id, "Neww0001")
+                self.assertNotEqual(screen.catalog.candidates[0].candidate.artifact_id, "Oldd0001")
+                self.assertNotIn("pack:demo", app.version_catalog_workers)
+
+    async def test_stale_exact_completion_cannot_clear_newer_worker(self) -> None:
+        app = _VersionApp(mod_info())
+        async with app.run_test() as pilot:
+            await pilot.pause(0.15)
+            screen = app.screen
+            old_thread = MagicMock()
+            newer_thread = MagicMock()
+            newer_worker = (
+                newer_thread,
+                threading.Event(),
+                threading.Event(),
+                lambda: None,
+            )
+            screen.prepare_thread = old_thread
+            screen.prepare_done.set()
+            screen.prepare_error = core.HuroshikiError("old worker failed")
+            app.exact_version_workers["pack:demo"] = newer_worker
+            screen._poll_prepare()
+            self.assertIs(app.exact_version_workers["pack:demo"], newer_worker)
+
+    async def test_catalog_worker_shutdown_cancels_joins_and_removes_non_daemon_worker(self) -> None:
+        stopped = threading.Event()
+        cancel = threading.Event()
+        def run():
+            cancel.wait(2)
+            stopped.set()
+        thread = threading.Thread(target=run, name="catalog-test", daemon=False)
+        done = threading.Event()
+        worker = huroshiki.VersionCatalogWorker(thread, done, cancel, 99.0, 1)
+        def finish():
+            stopped.wait(2)
+            done.set()
+        threading.Thread(target=finish, daemon=False).start()
+        app = huroshiki.HuroshikiApp()
+        app.version_catalog_workers["pack:demo"] = worker
+        thread.start()
+        app.on_unmount()
+        self.assertTrue(cancel.is_set())
+        self.assertTrue(stopped.is_set())
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("pack:demo", app.version_catalog_workers)
+
+    async def test_exact_worker_shutdown_cancels_joins_non_daemon_worker(self) -> None:
+        stopped = threading.Event()
+        cancel = threading.Event()
+        done = threading.Event()
+
+        def run() -> None:
+            cancel.wait(2)
+            stopped.set()
+            done.set()
+
+        thread = threading.Thread(target=run, name="exact-test", daemon=False)
+        app = huroshiki.HuroshikiApp()
+        app.exact_version_workers["pack:demo"] = (
+            thread,
+            done,
+            cancel,
+            lambda: None,
+        )
+        thread.start()
+        app.on_unmount()
+        self.assertTrue(cancel.is_set())
+        self.assertTrue(stopped.is_set())
+        self.assertFalse(thread.is_alive())
 
 
 class InstalledModProvenanceTest(unittest.TestCase):
