@@ -222,6 +222,25 @@ class InstalledModVersionTuiTest(unittest.IsolatedAsyncioTestCase):
                     ["automatic", "pin", "unpin"],
                 )
 
+    async def test_automatic_rejects_drifted_and_stale_before_transaction(self) -> None:
+        for override_status in ("drifted", "stale"):
+            with self.subTest(status=override_status):
+                self.intent_mock.return_value = intent_status(
+                    override_status=override_status
+                )
+                with patch.object(core, "project_config", return_value={}), patch.object(
+                    core, "installed_mod_provenance", return_value="Explicit root"
+                ), patch.object(core.PackTransaction, "create") as create:
+                    app = _VersionApp(mod_info())
+                    async with app.run_test() as pilot:
+                        screen = app.screen
+                        await pilot.pause(0.1)
+                        screen.start_intent_prepare("automatic")
+                        await pilot.pause()
+                        create.assert_not_called()
+                        self.assertIsNone(screen.transaction)
+                        self.assertIsNone(screen.prepare_thread)
+
     async def test_automatic_pin_and_unpin_preview_apply_without_refresh(self) -> None:
         for action, locked, status in (
             ("automatic", None, intent_status()),

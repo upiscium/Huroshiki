@@ -191,7 +191,7 @@ class ModVersionIntentCliTest(unittest.TestCase):
             old_locked=True,
             new_locked=None,
             reason="Compatibility",
-            status="drifted",
+            status="active",
         )
         transaction.prepare_mod_version_pin.return_value = intent_preview()
         transaction.apply.side_effect = lambda **_kwargs: setattr(
@@ -218,7 +218,7 @@ class ModVersionIntentCliTest(unittest.TestCase):
         self.assertIn("Selection: User exact -> Automatic", output)
         self.assertIn("Pin: Locked -> N/A", output)
         self.assertIn("Reason: Compatibility", output)
-        self.assertIn("Status: drifted", output)
+        self.assertIn("Status: active", output)
         self.assertIn("Installed artifact will not change.", output)
         self.assertIn("Dry run only; no files were changed.", output)
 
