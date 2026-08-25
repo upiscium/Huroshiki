@@ -6444,6 +6444,12 @@ class InstalledModVersionCandidateScreen(ProjectChildScreen, BaseScreen):
         if not self.view.compatible:
             self.app.notify("This version is not compatible", severity="warning")
             return
+        if self.project_key in getattr(self.app, "version_catalog_workers", {}):
+            self.app.notify(
+                "Wait for the current version catalog load to finish",
+                severity="warning",
+            )
+            return
         # The catalog screen owns the worker; it is released before this transition.
         self.app.pop_screen()
         self.app.switch_screen(
@@ -6558,6 +6564,9 @@ class InstalledModVersionBrowserScreen(ProjectChildScreen, BaseScreen):
         )
         self.active_worker = worker
         registry[self.project_key] = worker
+        self.catalog = None
+        table = self.query_one("#mod-version-catalog-table", DataTable)
+        table.clear(columns=False)
         try:
             self.thread.start()
         except BaseException as error:
@@ -6758,6 +6767,16 @@ class InstalledModVersionBrowserScreen(ProjectChildScreen, BaseScreen):
         )
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if (
+            self.thread is not None
+            or self.project_key
+            in getattr(self.app, "version_catalog_workers", {})
+        ):
+            self.app.notify(
+                "Wait for the current version catalog load to finish",
+                severity="warning",
+            )
+            return
         if self.catalog is None or not self.catalog.candidates:
             return
         view = self.catalog.candidates[
@@ -6779,9 +6798,43 @@ class InstalledModVersionBrowserScreen(ProjectChildScreen, BaseScreen):
             return
         self.app.switch_screen(InstalledModDetailsScreen(self.project_key, self.mod))
 
+    def _begin_detached_worker_cleanup(self) -> None:
+        worker = self.active_worker
+        if worker is None or getattr(self.app, "_shutting_down", False):
+            return
+        cleanup_timer: Timer | None = None
+
+        def poll_cleanup() -> None:
+            nonlocal cleanup_timer
+            registry = getattr(self.app, "version_catalog_workers", {})
+            if registry.get(self.project_key) is not worker:
+                if cleanup_timer is not None:
+                    cleanup_timer.stop()
+                return
+            if not worker.done.is_set():
+                return
+            worker.thread.join(0)
+            if worker.thread.is_alive():
+                return
+            if registry.get(self.project_key) is worker:
+                registry.pop(self.project_key, None)
+            self._load_results.pop(worker.generation, None)
+            if self.active_worker is worker:
+                self.thread = None
+                self.active_worker = None
+            if cleanup_timer is not None:
+                cleanup_timer.stop()
+
+        cleanup_timer = self.app.set_interval(0.05, poll_cleanup)
+        if self.timer is not None:
+            self.timer.stop()
+            self.timer = None
+
     def on_unmount(self) -> None:
         if self.thread is not None and not self.done.is_set():
             self.cancel_event.set()
+        if self.thread is not None:
+            self._begin_detached_worker_cleanup()
 
 
 class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
@@ -6806,6 +6859,17 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
         self.project_key = project_key
         self.mod = mod
         self.screen_title = f"{mod.name} / Installed MOD details"
+        provider = core.canonical_provider(mod.provider)
+        if provider == "curseforge":
+            self.help_text = (
+                "Exact File ID + Enter  Ctrl+R: Automatic  Ctrl+K: Pin  "
+                "Ctrl+U: Unpin  a: Apply preview  q / Esc: Installed MODs"
+            )
+        elif provider == "url":
+            self.help_text = (
+                "Provider version catalog and exact selection unavailable  "
+                "q / Esc: Installed MODs"
+            )
         self.provenance = "Loading..."
         self.provenance_thread: threading.Thread | None = None
         self.provenance_done = threading.Event()
@@ -6845,21 +6909,38 @@ class InstalledModDetailsScreen(ProjectChildScreen, BaseScreen):
             markup=False,
         )
         provider = core.canonical_provider(self.mod.provider)
-        catalog_hint = (
-            "Compatible versions: Ctrl+V (Modrinth)"
-            if provider == "modrinth"
-            else "Compatible versions unavailable; enter an exact file ID"
-        )
+        if provider == "modrinth":
+            selection_prompt = "Select version: enter an exact provider artifact ID"
+            catalog_hint = "Compatible versions: Ctrl+V (Modrinth)"
+        elif provider == "curseforge":
+            selection_prompt = "Select version: enter an exact File ID"
+            catalog_hint = "Compatible versions unavailable for CurseForge"
+        else:
+            selection_prompt = "Provider exact file/version selection unavailable"
+            catalog_hint = "Provider version catalog unavailable for URL artifacts"
         yield Static(
-            f"Select version: enter an exact provider artifact ID\n{catalog_hint}",
+            f"{selection_prompt}\n{catalog_hint}",
             id="mod-version-prompt",
         )
-        yield Input(placeholder="Exact file/version ID", id="mod-version-artifact")
+        artifact_input = Input(
+            placeholder=(
+                "Exact file/version ID"
+                if provider != "url"
+                else "Exact provider artifact selection unavailable"
+            ),
+            id="mod-version-artifact",
+        )
+        artifact_input.disabled = provider == "url"
+        yield artifact_input
         yield Static("Idle", id="mod-version-status", markup=False)
         yield from self.compose_footer()
 
     def on_mount(self) -> None:
-        self.query_one("#mod-version-artifact", Input).focus()
+        artifact_input = self.query_one("#mod-version-artifact", Input)
+        if artifact_input.disabled:
+            self.focus()
+        else:
+            artifact_input.focus()
         catalog_workers = getattr(self.app, "version_catalog_workers", {})
         if self.project_key in catalog_workers:
             self.provenance_error = core.HuroshikiError(
