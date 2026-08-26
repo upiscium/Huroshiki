@@ -399,7 +399,7 @@ class CheckboxRenderingScreensTest(unittest.IsolatedAsyncioTestCase):
                 blocked_identity="modrinth:blocked-project",
                 blocked_artifact_id="789",
                 blocked_reason="requested artifact is unavailable",
-                version_intent_reason="user pin requires exact artifact",
+                user_pin_reason="user pin requires exact artifact",
             ),
         )
         with (
@@ -435,6 +435,23 @@ class CheckboxRenderingScreensTest(unittest.IsolatedAsyncioTestCase):
                     severity="warning",
                 )
 
+    async def test_update_blocked_technical_reason_is_not_a_pin_reason(self) -> None:
+        candidate = core.UpdateCandidate(
+            key="curseforge:1",
+            root=Path("mods/blocked.pw.toml"),
+            slug="blocked",
+            name="Blocked",
+            provider="curseforge",
+            current_version="1",
+            new_version="-",
+            status="version-blocked",
+            error="resolver transport failed",
+            blocked_reason="resolver transport failed",
+        )
+        label = huroshiki.UpdateScreen._candidate_status_label(candidate)
+        self.assertIn("resolver transport failed", label)
+        self.assertNotIn("pin reason:", label)
+
     async def test_update_screen_renders_version_locked_reason(self) -> None:
         _FakeUpdatePreparationOperation.candidates = (
             core.UpdateCandidate(
@@ -448,7 +465,7 @@ class CheckboxRenderingScreensTest(unittest.IsolatedAsyncioTestCase):
                 new_version="-",
                 status="version-locked",
                 blocked_reason="direct MOD version is locked",
-                version_intent_reason="maintain server compatibility",
+                user_pin_reason="maintain server compatibility",
             ),
         )
         with (

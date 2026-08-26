@@ -10,7 +10,11 @@ import unittest
 from unittest.mock import patch
 
 import huroshiki_core as core
-from dependency_equivalence import LoaderDependencyRequirement, SemanticJarIdentity
+from dependency_equivalence import (
+    LoaderDependencyRequirement,
+    MaterializedArtifact,
+    SemanticJarIdentity,
+)
 from mod_version_overrides import ModVersionOverride, read_mod_version_overrides, write_mod_version_overrides
 
 
@@ -218,6 +222,10 @@ class LockedDependencyUpdateTest(unittest.TestCase):
         self.other_baseline_requires_dependency = False
         self.other_update_requires_dependency = False
         self.last_graph_owners = {("curseforge", "1")}
+        self.constrained_exception: BaseException | None = None
+        self.ignore_locked_preseed = False
+        self.include_second_lock = False
+        self.ignore_second_locked_preseed = False
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -252,9 +260,27 @@ class LockedDependencyUpdateTest(unittest.TestCase):
             self.metadata(name, project_id, file_id, side=side), encoding="utf-8"
         )
 
+    def add_second_lock(self, *, reason: str | None = "second pin") -> None:
+        self.include_second_lock = True
+        self.write_mod("dependency-b", "4", "40")
+        write_mod_version_overrides(
+            self.source,
+            (
+                ModVersionOverride("curseforge", "2", "20", True, "compat"),
+                ModVersionOverride("curseforge", "4", "40", True, reason),
+            ),
+        )
+
     def fake_resolver(self, command, *, cwd, result_callback=None, **_kwargs):
         command_tuple = tuple(command)
         self.calls.append((command_tuple, cwd.name))
+        if (
+            self.constrained_exception is not None
+            and "-constrained-" in cwd.name
+            and "--file-id" in command_tuple
+            and command_tuple[command_tuple.index("--addon-id") + 1] in {"1", "3"}
+        ):
+            raise self.constrained_exception
         if command_tuple[:3] == ("packwiz", "--yes", "update"):
             slug = command_tuple[3]
             if slug == "root":
@@ -263,6 +289,8 @@ class LockedDependencyUpdateTest(unittest.TestCase):
                     (cwd / "mods" / "dependency.pw.toml").unlink(missing_ok=True)
                 else:
                     self.write_mod("dependency", "2", "21", source=cwd)
+                if self.include_second_lock:
+                    self.write_mod("dependency-b", "4", "41", source=cwd)
             elif slug == "other":
                 self.write_mod("other", "3", "31", source=cwd)
                 if self.other_update_requires_dependency:
@@ -294,8 +322,23 @@ class LockedDependencyUpdateTest(unittest.TestCase):
                         "21" if file_id == "11" else "20",
                         source=cwd,
                     )
+                if self.ignore_locked_preseed and file_id == "11":
+                    self.write_mod("dependency", "2", "21", source=cwd)
+                if self.include_second_lock and not (
+                    cwd / "mods" / "dependency-b.pw.toml"
+                ).exists():
+                    self.write_mod(
+                        "dependency-b",
+                        "4",
+                        "41" if file_id == "11" else "40",
+                        source=cwd,
+                    )
+                if self.ignore_second_locked_preseed and file_id == "11":
+                    self.write_mod("dependency-b", "4", "41", source=cwd)
             elif project_id == "2":
                 self.write_mod("dependency", "2", file_id, source=cwd)
+            elif project_id == "4":
+                self.write_mod("dependency-b", "4", file_id, source=cwd)
             elif project_id == "3":
                 self.write_mod("other", "3", file_id, source=cwd)
                 requires_dependency = (
@@ -328,8 +371,12 @@ class LockedDependencyUpdateTest(unittest.TestCase):
         *,
         verification_error: str | None = None,
         incompatible_project_id: str = "1",
+        verification_exception: BaseException | None = None,
+        on_progress=None,
     ):
         def verify(_baseline, desired, *_args, **_kwargs):
+            if verification_exception is not None:
+                raise verification_exception
             if verification_error is not None:
                 root = desired.get(("curseforge", incompatible_project_id), ())
                 if root and b"file-id = 11" in root[0][1]:
@@ -362,7 +409,7 @@ class LockedDependencyUpdateTest(unittest.TestCase):
         class Graph:
             @staticmethod
             def reachable_roots(identity):
-                if identity == ("curseforge", "2"):
+                if identity in {("curseforge", "2"), ("curseforge", "4")}:
                     return set(self.last_graph_owners)
                 return set()
 
@@ -378,9 +425,18 @@ class LockedDependencyUpdateTest(unittest.TestCase):
                 core.metadata_content_snapshot(self.source),
                 cancel_event=threading.Event(),
                 version_overrides=read_mod_version_overrides(self.source),
+                on_progress=on_progress,
             )
 
-    def reconstruct(self, selected_artifacts, *, real_graph: bool = False, omit_edges: bool = False):
+    def reconstruct(
+        self,
+        selected_artifacts,
+        *,
+        real_graph: bool = False,
+        omit_edges: bool = False,
+        materialization_exception: BaseException | None = None,
+        materialization_after: int = 0,
+    ):
         def verify(_baseline, desired, *_args, **_kwargs):
             owners = set()
             root = desired.get(("curseforge", "1"), ())
@@ -435,7 +491,7 @@ class LockedDependencyUpdateTest(unittest.TestCase):
 
         class Graph:
             def reachable_roots(_graph, identity):
-                if identity == ("curseforge", "2"):
+                if identity in {("curseforge", "2"), ("curseforge", "4")}:
                     return set(self.last_graph_owners)
                 return set()
 
@@ -452,11 +508,34 @@ class LockedDependencyUpdateTest(unittest.TestCase):
                     core, "run_resolver_process", side_effect=self.fake_resolver
                 )
             )
-            stack.enter_context(
-                patch.object(
-                    core, "_verify_exact_closure_artifacts", side_effect=verify
+            if materialization_exception is None:
+                stack.enter_context(
+                    patch.object(
+                        core, "_verify_exact_closure_artifacts", side_effect=verify
+                    )
                 )
-            )
+            else:
+                materialization_calls = 0
+
+                def materialize(candidate, *_args, **_kwargs):
+                    nonlocal materialization_calls
+                    materialization_calls += 1
+                    if materialization_calls > materialization_after:
+                        raise materialization_exception
+                    mod_id = Path(candidate.filename).stem.replace("-", "_")
+                    return MaterializedArtifact(
+                        "a" * 64,
+                        SemanticJarIdentity(((mod_id, "1"),), "fabric"),
+                        (),
+                    )
+
+                stack.enter_context(
+                    patch.object(
+                        core,
+                        "materialize_provider_artifact",
+                        side_effect=materialize,
+                    )
+                )
             if not real_graph:
                 stack.enter_context(
                     patch.object(
@@ -513,15 +592,152 @@ class LockedDependencyUpdateTest(unittest.TestCase):
             any(b"file-id = 21" in (change.after or b"") for change in by_key["curseforge:1"].changes)
         )
 
-    def test_incompatible_locked_dependency_blocks_owner_candidate(self) -> None:
+    def test_generic_semantic_failure_is_not_attributed_to_first_lock(self) -> None:
         candidates = self.prepare(verification_error="dependency range conflict")
         by_key = {candidate.key: candidate for candidate in candidates}
-        self.assertEqual(by_key["curseforge:1"].status, "version-blocked")
-        self.assertEqual(by_key["curseforge:1"].error_kind, "version-intent")
+        self.assertEqual(by_key["curseforge:1"].status, "unavailable")
+        self.assertIsNone(by_key["curseforge:1"].blocked_identity)
+        self.assertIsNone(by_key["curseforge:1"].blocked_artifact_id)
         self.assertIn(
             "dependency range conflict", by_key["curseforge:1"].error or ""
         )
         self.assertTrue(by_key["curseforge:3"].available)
+
+    def test_single_lock_preseed_mismatch_is_attributed_exactly(self) -> None:
+        self.ignore_locked_preseed = True
+        candidates = self.prepare()
+        candidate = next(item for item in candidates if item.key == "curseforge:1")
+        self.assertEqual(candidate.status, "version-blocked")
+        self.assertEqual(candidate.blocked_identity, "curseforge:2")
+        self.assertEqual(candidate.blocked_artifact_id, "20")
+        self.assertEqual(candidate.user_pin_reason, "compat")
+        self.assertIn("incompatible", candidate.blocked_reason or "")
+
+    def test_two_locks_proven_second_failure_attributes_second(self) -> None:
+        self.add_second_lock(reason="second compatibility pin")
+        self.ignore_second_locked_preseed = True
+        candidates = self.prepare()
+        candidate = next(item for item in candidates if item.key == "curseforge:1")
+        self.assertEqual(candidate.status, "version-blocked")
+        self.assertEqual(candidate.blocked_identity, "curseforge:4")
+        self.assertEqual(candidate.blocked_artifact_id, "40")
+        self.assertEqual(candidate.user_pin_reason, "second compatibility pin")
+
+    def test_two_lock_generic_resolver_failure_has_no_attribution(self) -> None:
+        self.add_second_lock()
+        self.constrained_exception = core.HuroshikiError("resolver transport failed")
+        candidates = self.prepare()
+        candidate = next(item for item in candidates if item.key == "curseforge:1")
+        self.assertEqual(candidate.status, "unavailable")
+        self.assertIsNone(candidate.blocked_identity)
+        self.assertIsNone(candidate.blocked_artifact_id)
+        self.assertIsNone(candidate.user_pin_reason)
+        self.assertIn("resolver transport failed", candidate.error or "")
+
+    def test_two_lock_generic_semantic_failure_has_no_attribution(self) -> None:
+        self.add_second_lock()
+        candidates = self.prepare(verification_error="generic semantic failure")
+        candidate = next(item for item in candidates if item.key == "curseforge:1")
+        self.assertEqual(candidate.status, "unavailable")
+        self.assertIsNone(candidate.blocked_identity)
+        self.assertIsNone(candidate.blocked_artifact_id)
+        self.assertIsNone(candidate.user_pin_reason)
+        self.assertIn("generic semantic failure", candidate.error or "")
+
+    def test_precise_failure_without_user_reason_has_no_fake_pin_reason(self) -> None:
+        self.add_second_lock(reason=None)
+        self.ignore_second_locked_preseed = True
+        candidates = self.prepare()
+        candidate = next(item for item in candidates if item.key == "curseforge:1")
+        self.assertEqual(candidate.status, "version-blocked")
+        self.assertEqual(candidate.blocked_identity, "curseforge:4")
+        self.assertIsNone(candidate.user_pin_reason)
+        self.assertIn("incompatible", candidate.blocked_reason or "")
+
+    def test_cancellation_during_constrained_resolution_aborts_preparation(self) -> None:
+        self.constrained_exception = core.UpdatePreparationCancelled("cancelled")
+        source_before = core._file_content_snapshot(self.source)
+        progress = []
+        with self.assertRaises(core.UpdatePreparationCancelled):
+            self.prepare(on_progress=progress.append)
+        self.assertEqual(core._file_content_snapshot(self.source), source_before)
+        self.assertEqual(progress[-1].phase, "cancelled")
+        normal_updates = [
+            command
+            for command, _directory in self.calls
+            if command[:3] == ("packwiz", "--yes", "update")
+        ]
+        self.assertEqual(len(normal_updates), 1)
+
+    def test_deadline_during_constrained_resolution_keeps_deadline_status(self) -> None:
+        self.constrained_exception = core.UpdatePreparationDeadlineExceeded("deadline")
+        progress = []
+        candidates = self.prepare(on_progress=progress.append)
+        self.assertFalse(any(item.status == "version-blocked" for item in candidates))
+        self.assertTrue(
+            any(item.error_kind == "operation_deadline" for item in candidates)
+        )
+        self.assertEqual(progress[-1].phase, "failed")
+
+    def test_cancellation_during_exact_verification_aborts_preparation(self) -> None:
+        progress = []
+        with self.assertRaises(core.UpdatePreparationCancelled):
+            self.prepare(
+                verification_exception=core.UpdatePreparationCancelled("cancelled"),
+                on_progress=progress.append,
+            )
+        self.assertEqual(progress[-1].phase, "cancelled")
+        self.assertFalse(any("version blocked" in item.message for item in progress))
+
+    def test_deadline_during_exact_verification_keeps_deadline_status(self) -> None:
+        progress = []
+        candidates = self.prepare(
+            verification_exception=core.UpdatePreparationDeadlineExceeded("deadline"),
+            on_progress=progress.append,
+        )
+        self.assertFalse(any(item.status == "version-blocked" for item in candidates))
+        self.assertTrue(
+            any(item.error_kind == "operation_deadline" for item in candidates)
+        )
+        self.assertEqual(progress[-1].phase, "failed")
+
+    def test_materializer_cancellation_keeps_authoritative_exception(self) -> None:
+        with self.assertRaises(core.UpdatePreparationCancelled):
+            self.reconstruct(
+                {("curseforge", "1"): "11"},
+                materialization_exception=core.UpdatePreparationCancelled(
+                    "materialization cancelled"
+                ),
+            )
+
+    def test_materializer_deadline_keeps_authoritative_exception(self) -> None:
+        with self.assertRaises(core.UpdatePreparationDeadlineExceeded):
+            self.reconstruct(
+                {("curseforge", "1"): "11"},
+                materialization_exception=core.UpdatePreparationDeadlineExceeded(
+                    "materialization deadline"
+                ),
+            )
+
+    def test_baseline_dependency_materializer_cancellation_is_authoritative(self) -> None:
+        with self.assertRaises(core.UpdatePreparationCancelled):
+            self.reconstruct(
+                {("curseforge", "1"): "11"},
+                materialization_exception=core.UpdatePreparationCancelled(
+                    "baseline dependency cancelled"
+                ),
+                materialization_after=4,
+            )
+
+    def test_baseline_dependency_materializer_deadline_is_authoritative(self) -> None:
+        with self.assertRaises(core.UpdatePreparationDeadlineExceeded):
+            self.reconstruct(
+                {("curseforge", "1"): "11"},
+                materialization_exception=core.UpdatePreparationDeadlineExceeded(
+                    "baseline dependency deadline"
+                ),
+                materialization_after=4,
+            )
 
     def test_locked_root_is_constrained_when_another_root_requires_it(self) -> None:
         self.other_depends_on_root = True
@@ -578,16 +794,16 @@ class LockedDependencyUpdateTest(unittest.TestCase):
             manifest_before,
         )
 
-    def test_new_prospective_owner_incompatible_lock_is_candidate_local(self) -> None:
+    def test_new_owner_generic_verification_failure_has_no_false_attribution(self) -> None:
         self.other_update_requires_dependency = True
         candidates = self.prepare(
             verification_error="new owner dependency conflict",
             incompatible_project_id="3",
         )
         by_key = {candidate.key: candidate for candidate in candidates}
-        self.assertEqual(by_key["curseforge:3"].status, "version-blocked")
-        self.assertEqual(by_key["curseforge:3"].blocked_identity, "curseforge:2")
-        self.assertEqual(by_key["curseforge:3"].blocked_artifact_id, "20")
+        self.assertEqual(by_key["curseforge:3"].status, "unavailable")
+        self.assertIsNone(by_key["curseforge:3"].blocked_identity)
+        self.assertIsNone(by_key["curseforge:3"].blocked_artifact_id)
         self.assertTrue(by_key["curseforge:1"].available)
 
     def test_one_of_two_owners_can_drop_locked_dependency(self) -> None:
@@ -707,7 +923,7 @@ class UpdateVersionIntentCliTest(unittest.TestCase):
             blocked_identity="curseforge:2",
             blocked_artifact_id="20",
             blocked_reason="dependency range conflict",
-            version_intent_reason="compatibility",
+            user_pin_reason="compatibility",
         )
         safe = core.UpdateCandidate(
             key="curseforge:3",
@@ -759,6 +975,42 @@ class UpdateVersionIntentCliTest(unittest.TestCase):
         self.assertEqual(partial.selected, (safe.root,))
         self.assertTrue(partial.applied)
         self.assertIn("pin reason: compatibility", stderr.getvalue())
+
+    def test_blocked_without_user_reason_prints_only_technical_failure(self) -> None:
+        candidate = core.UpdateCandidate(
+            key="curseforge:1",
+            root=Path("mods/blocked.pw.toml"),
+            slug="blocked",
+            name="Blocked",
+            provider="curseforge",
+            current_version="1",
+            new_version="-",
+            status="version-blocked",
+            error="exact locked artifact mismatch",
+            error_kind="version-intent",
+            blocked_identity="curseforge:4",
+            blocked_artifact_id="40",
+            blocked_reason="exact locked artifact mismatch",
+        )
+
+        class FakeTransaction:
+            def prepare_updates(self, **_kwargs):
+                return [candidate]
+
+            def discard(self):
+                return None
+
+        stderr = io.StringIO()
+        with (
+            patch.object(
+                core.PackTransaction, "create", return_value=FakeTransaction()
+            ),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(stderr),
+        ):
+            core.update_all("pack:demo", allow_partial=True)
+        self.assertIn("exact locked artifact mismatch", stderr.getvalue())
+        self.assertNotIn("pin reason:", stderr.getvalue())
 
 
 if __name__ == "__main__":

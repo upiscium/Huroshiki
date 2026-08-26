@@ -7826,15 +7826,15 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
             label = (
                 f"version blocked: requires {identity} artifact {artifact_id}: {reason}"
             )
-            if candidate.version_intent_reason:
-                label += f"; pin reason: {candidate.version_intent_reason}"
+            if candidate.user_pin_reason:
+                label += f"; pin reason: {candidate.user_pin_reason}"
             return label
         if candidate.status == "version-locked":
             label = cls._status_label(candidate.status)
             if candidate.blocked_reason:
                 label += f": {candidate.blocked_reason}"
-            if candidate.version_intent_reason:
-                label += f"; pin reason: {candidate.version_intent_reason}"
+            if candidate.user_pin_reason:
+                label += f"; pin reason: {candidate.user_pin_reason}"
             return label
         return cls._status_label(candidate.status)
 
@@ -7853,7 +7853,7 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
                     f"{candidate.name} is version locked and cannot be selected; "
                     "update or remove its version pin first"
                 )
-                if candidate.blocked_reason or candidate.version_intent_reason:
+                if candidate.blocked_reason or candidate.user_pin_reason:
                     message += f" ({self._candidate_status_label(candidate)})"
             elif candidate.status == "version-blocked":
                 message = (
