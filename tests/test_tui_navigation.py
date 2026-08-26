@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from textual.app import App
+from textual.css.query import NoMatches
 from textual.widgets import DataTable, Input, TextArea
 
 import huroshiki
@@ -381,6 +382,21 @@ class _NavigationApp(App[None]):
 
 
 class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
+    async def assert_project_screen_mounted(self, app, pilot) -> None:
+        for _ in range(20):
+            screen = app.screen
+            if isinstance(screen, huroshiki.ProjectScreen):
+                try:
+                    screen.query_one("#project-actions", DataTable)
+                except NoMatches:
+                    pass
+                else:
+                    await pilot.pause()
+                    self.assertIs(app.screen, screen)
+                    return
+            await pilot.pause(0.01)
+        self.fail("Project screen did not finish mounting")
+
     @contextmanager
     def patches(self):
         patches = (
@@ -530,7 +546,7 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
 
                 operation.release_cleanup.set()
                 await pilot.pause(0.15)
-                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+                await self.assert_project_screen_mounted(app, pilot)
 
     async def test_update_q_during_preparation_requests_cancel_and_navigates_after_cleanup(self) -> None:
         transaction = _BlockingUpdateTransaction()
@@ -945,7 +961,7 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
 
                 operation.release_cleanup.set()
                 await pilot.pause(0.15)
-                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+                await self.assert_project_screen_mounted(app, pilot)
 
     async def test_resolved_checkpoint_worker_defers_navigation_until_cleanup(self) -> None:
         transaction = _InstallTransaction()
@@ -970,7 +986,7 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
 
                 operation.release_cleanup.set()
                 await pilot.pause(0.15)
-                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+                await self.assert_project_screen_mounted(app, pilot)
 
     async def test_install_worker_start_failure_restores_idle_and_allows_retry(self) -> None:
         transaction = _InstallTransaction()
@@ -1223,7 +1239,7 @@ class ProjectChildNavigationTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(started.is_set())
                 await pilot.press("escape")
                 await pilot.pause(0.2)
-                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+                await self.assert_project_screen_mounted(app, pilot)
 
     async def test_curseforge_input_starts_packwiz_operation(self) -> None:
         transaction = _InstallTransaction()
