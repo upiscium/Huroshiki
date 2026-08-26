@@ -7801,9 +7801,11 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
                 self._version_label(candidate.new_version, candidate.new_file_id),
                 str(candidate.file_count) if candidate.available else "-",
                 (
-                    f"unavailable: {candidate.error}"
+                    self._candidate_status_label(candidate)
+                    if candidate.status in {"version-locked", "version-blocked"}
+                    else f"unavailable: {candidate.error}"
                     if candidate.error
-                    else self._status_label(candidate.status)
+                    else self._candidate_status_label(candidate)
                 ),
             )
 
@@ -7814,6 +7816,27 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
     @staticmethod
     def _status_label(status: str) -> str:
         return "version locked" if status == "version-locked" else status
+
+    @classmethod
+    def _candidate_status_label(cls, candidate: core.UpdateCandidate) -> str:
+        if candidate.status == "version-blocked":
+            identity = candidate.blocked_identity or "<unknown>"
+            artifact_id = candidate.blocked_artifact_id or "<unknown>"
+            reason = candidate.blocked_reason or candidate.error or "blocked"
+            label = (
+                f"version blocked: requires {identity} artifact {artifact_id}: {reason}"
+            )
+            if candidate.version_intent_reason:
+                label += f"; pin reason: {candidate.version_intent_reason}"
+            return label
+        if candidate.status == "version-locked":
+            label = cls._status_label(candidate.status)
+            if candidate.blocked_reason:
+                label += f": {candidate.blocked_reason}"
+            if candidate.version_intent_reason:
+                label += f"; pin reason: {candidate.version_intent_reason}"
+            return label
+        return cls._status_label(candidate.status)
 
     def toggle_candidate(self) -> None:
         if self.operation is not None:
@@ -7829,6 +7852,14 @@ class UpdateScreen(ProjectChildScreen, BaseScreen):
                 message = (
                     f"{candidate.name} is version locked and cannot be selected; "
                     "update or remove its version pin first"
+                )
+                if candidate.blocked_reason or candidate.version_intent_reason:
+                    message += f" ({self._candidate_status_label(candidate)})"
+            elif candidate.status == "version-blocked":
+                message = (
+                    f"{candidate.name} is {self._candidate_status_label(candidate)} "
+                    "and cannot be selected; change its version pin or choose a "
+                    "different artifact"
                 )
             else:
                 message = (
