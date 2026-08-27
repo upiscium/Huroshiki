@@ -73,6 +73,7 @@ from mod_version_overrides import (
     remove_mod_version_override,
     require_mod_version_overrides_ignored,
     set_mod_version_override,
+    write_mod_version_overrides,
 )
 
 if TYPE_CHECKING:
@@ -898,6 +899,31 @@ class ExactModVersionCancelled(HuroshikiError):
 
 class ExactModVersionDeadlineExceeded(HuroshikiError):
     pass
+
+
+class ProfileCancelled(HuroshikiError):
+    """A profile operation stopped at its shared cancellation checkpoint."""
+
+
+class ProfileDeadlineExceeded(HuroshikiError):
+    """A profile operation exceeded its one absolute deadline."""
+
+
+class ProfileVersionIntentError(HuroshikiError):
+    """A locked stored Profile artifact conflicts with a requested artifact."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        identity: str,
+        artifact_id: str,
+        user_pin_reason: str | None = None,
+    ):
+        super().__init__(message)
+        self.identity = identity
+        self.artifact_id = artifact_id
+        self.user_pin_reason = user_pin_reason
 
 
 @dataclass(frozen=True)
@@ -4928,7 +4954,12 @@ class PackTransaction:
             ensure_safe_pack_source(self.source)
         if self._version_override_mutated:
             _validate_mod_version_override_records(
-                self.source, _exact_metadata_records(self.source)
+                self.source,
+                (
+                    _profile_mod_metadata_records(self.source)
+                    if getattr(self, "_profile_mod_metadata_only", False)
+                    else _exact_metadata_records(self.source)
+                ),
             )
 
         real_root = project_root(self.project_key)
@@ -7039,6 +7070,75 @@ def _exact_metadata_records(
     return {identity: tuple(items) for identity, items in records.items()}
 
 
+def _is_profile_mod_metadata_path(relative_path: Path) -> bool:
+    return (
+        len(relative_path.parts) >= 2
+        and relative_path.parts[0] == "mods"
+        and relative_path.name.endswith(".pw.toml")
+    )
+
+
+def _profile_mod_metadata_records(
+    source: Path,
+    checkpoint: Callable[[], None] | None = None,
+) -> dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]]:
+    """Read only canonical Packwiz MOD metadata for Profile solving."""
+
+    records: dict[tuple[str, str], list[tuple[Path, bytes, ModInfo]]] = {}
+    for path in _checkpointed_paths(source / "mods", "*.pw.toml", checkpoint):
+        _run_checkpoint(checkpoint)
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(source)
+        contents = _read_file_bytes(path, checkpoint)
+        try:
+            mod = read_mod_data(relative, tomllib.loads(contents.decode("utf-8")))
+        except (UnicodeError, tomllib.TOMLDecodeError, ValueError) as error:
+            raise HuroshikiError(
+                f"Profile MOD metadata {relative} is invalid: {error}"
+            ) from error
+        identity = canonical_provider(mod.provider), mod.project_id
+        records.setdefault(identity, []).append((relative, contents, mod))
+    return {identity: tuple(items) for identity, items in records.items()}
+
+
+def _profile_non_mod_metadata_snapshot(
+    source: Path,
+    checkpoint: Callable[[], None] | None = None,
+) -> dict[Path, bytes]:
+    """Snapshot Packwiz metadata outside the canonical MOD namespace."""
+
+    snapshot: dict[Path, bytes] = {}
+    for path in _checkpointed_paths(source, "*.pw.toml", checkpoint):
+        _run_checkpoint(checkpoint)
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(source)
+        if _is_profile_mod_metadata_path(relative):
+            continue
+        snapshot[relative] = _read_file_bytes(path, checkpoint)
+    return snapshot
+
+
+def _assert_profile_non_mod_metadata_unchanged(
+    source: Path,
+    expected: Mapping[Path, bytes],
+    checkpoint: Callable[[], None],
+) -> None:
+    actual = _profile_non_mod_metadata_snapshot(source, checkpoint)
+    if actual == expected:
+        return
+    changed = sorted(
+        path.as_posix()
+        for path in expected.keys() | actual.keys()
+        if expected.get(path) != actual.get(path)
+    )
+    raise HuroshikiError(
+        "Profile refresh changed non-MOD Packwiz metadata: "
+        + ", ".join(changed)
+    )
+
+
 def _exact_source_digest(source: Path) -> tuple[tuple[Path, str], ...]:
     return tuple(sorted(tree_digest_snapshot(source).items()))
 
@@ -7187,8 +7287,14 @@ def _exact_assert_complete_metadata_graph(
     source: Path,
     desired: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
     checkpoint: Callable[[], None],
+    *,
+    profile_mod_only: bool = False,
 ) -> None:
-    actual = _exact_metadata_records(source, checkpoint)
+    actual = (
+        _profile_mod_metadata_records(source, checkpoint)
+        if profile_mod_only
+        else _exact_metadata_records(source, checkpoint)
+    )
     if actual.keys() != desired.keys():
         missing = sorted(
             f"{identity[0]}:{identity[1]}" for identity in desired.keys() - actual.keys()
@@ -7248,7 +7354,7 @@ def _exact_metadata_from_root(
 def _verify_exact_closure_artifacts(
     baseline: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
     desired: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
-    selection: ExactModArtifactSelection,
+    selection: ExactModArtifactSelection | None,
     versions: tuple[str, str, str],
     *,
     workspace: Path,
@@ -7262,6 +7368,10 @@ def _verify_exact_closure_artifacts(
     explicit_root_identities: set[tuple[str, str]],
     opaque_url_roots: set[tuple[str, str]],
     checkpoint: Callable[[], None],
+    exact_constraints: Sequence[ExactModArtifactSelection] = (),
+    dependency_constraint_identities: set[tuple[str, str]] | None = None,
+    cancellation_error: type[HuroshikiError] = UpdatePreparationCancelled,
+    deadline_error: type[HuroshikiError] = UpdatePreparationDeadlineExceeded,
 ) -> tuple[ExactArtifactVerification, ...]:
     workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
     minecraft, loader, loader_version = versions
@@ -7288,18 +7398,15 @@ def _verify_exact_closure_artifacts(
                 diagnostic_project_id=diagnostic_project_id,
                 diagnostic_callback=diagnostic_callback,
             )
-        except (
-            UpdatePreparationCancelled,
-            UpdatePreparationDeadlineExceeded,
-        ):
+        except (cancellation_error, deadline_error):
             raise
         except Exception as error:
             if cancel_event.is_set():
-                raise UpdatePreparationCancelled(
+                raise cancellation_error(
                     "Exact artifact verification was cancelled"
                 ) from error
             if time.monotonic() >= deadline:
-                raise UpdatePreparationDeadlineExceeded(
+                raise deadline_error(
                     "Exact artifact verification deadline exceeded"
                 ) from error
             raise HuroshikiError(f"{failure_message}: {error}") from error
@@ -7351,7 +7458,7 @@ def _verify_exact_closure_artifacts(
             filename=mod.filename,
             contents=contents,
             side=mod.side,
-            provenance="explicit" if identity == selection.identity else "dependency",
+            provenance="explicit" if identity in explicit_root_identities else "dependency",
             existing=identity in baseline,
         )
         materialized = materialize(
@@ -7376,48 +7483,45 @@ def _verify_exact_closure_artifacts(
             semantic,
             materialized.dependency_requirements,
         )
-    selected = results.get(selection.identity)
-    if selected is None:
-        raise HuroshikiError(
-            f"Exact selected artifact has no semantic verification: "
-            f"{selection.identity_label}"
+    if selection is not None:
+        selected = results.get(selection.identity)
+        if selected is None:
+            raise HuroshikiError(
+                f"Exact selected artifact has no semantic verification: "
+                f"{selection.identity_label}"
+            )
+        old_entries = baseline.get(selection.identity, ())
+        if len(old_entries) != 1:
+            raise HuroshikiError(
+                f"Exact selected artifact baseline is not unique: {selection.identity_label}"
+            )
+        old_relative, old_contents, old_mod = old_entries[0]
+        old_candidate = _dependency_candidate(
+            identity=selection.identity, relative_path=old_relative,
+            filename=old_mod.filename, contents=old_contents, side=old_mod.side,
+            provenance="explicit", existing=True,
         )
-    old_entries = baseline.get(selection.identity, ())
-    if len(old_entries) != 1:
-        raise HuroshikiError(
-            f"Exact selected artifact baseline is not unique: {selection.identity_label}"
+        old_materialized = materialize(
+            old_candidate,
+            f"Could not verify semantic continuity for {selection.identity_label}",
         )
-    old_relative, old_contents, old_mod = old_entries[0]
-    old_candidate = _dependency_candidate(
-        identity=selection.identity,
-        relative_path=old_relative,
-        filename=old_mod.filename,
-        contents=old_contents,
-        side=old_mod.side,
-        provenance="explicit" if selection.identity == selection.identity else "dependency",
-        existing=True,
-    )
-    old_materialized = materialize(
-        old_candidate,
-        f"Could not verify semantic continuity for {selection.identity_label}",
-    )
-    if old_materialized.semantic_identity is None:
-        raise HuroshikiError(
-            f"Installed artifact has no resolved semantic identity: {selection.identity_label}"
-        )
-    if old_materialized.semantic_identity.target_loader != loader.strip().lower():
-        raise HuroshikiError(
-            f"Installed artifact has incompatible loader metadata: "
-            f"{selection.identity_label}"
-        )
-    old_ids = {mod_id for mod_id, _version in old_materialized.semantic_identity.members}
-    new_ids = {mod_id for mod_id, _version in selected.semantic_identity.members}
-    if old_ids != new_ids:
-        raise HuroshikiError(
-            f"Exact artifact semantic MOD identity changed for {selection.identity_label}"
-        )
+        if old_materialized.semantic_identity is None:
+            raise HuroshikiError(
+                f"Installed artifact has no resolved semantic identity: {selection.identity_label}"
+            )
+        if old_materialized.semantic_identity.target_loader != loader.strip().lower():
+            raise HuroshikiError(
+                f"Installed artifact has incompatible loader metadata: "
+                f"{selection.identity_label}"
+            )
+        old_ids = {mod_id for mod_id, _version in old_materialized.semantic_identity.members}
+        new_ids = {mod_id for mod_id, _version in selected.semantic_identity.members}
+        if old_ids != new_ids:
+            raise HuroshikiError(
+                f"Exact artifact semantic MOD identity changed for {selection.identity_label}"
+            )
     for identity, old_entries in baseline.items():
-        if identity == selection.identity or identity not in results:
+        if (selection is not None and identity == selection.identity) or identity not in results:
             continue
         if len(old_entries) != 1:
             raise HuroshikiError(
@@ -7472,9 +7576,37 @@ def _verify_exact_closure_artifacts(
         checkpoint=checkpoint,
     )
     if selected_dependency_roots is not None:
+        if selection is None:
+            raise HuroshikiError("Exact dependency reachability requires a selected artifact")
         _assert_exact_selected_dependency_reachability(
             graph, selection.identity, selected_dependency_roots
         )
+    for constraint in exact_constraints:
+        checkpoint()
+        verification = results.get(constraint.identity)
+        if verification is None or verification.artifact_id != str(constraint.artifact_id):
+            raise HuroshikiError(
+                f"Exact Profile constraint artifact mismatch for {constraint.identity_label}"
+            )
+        if (
+            dependency_constraint_identities is not None
+            and constraint.identity in dependency_constraint_identities
+            and not graph.reachable_roots(constraint.identity)
+        ):
+            raise HuroshikiError(
+                f"Exact Profile dependency {constraint.identity_label} is orphaned"
+            )
+        if dependency_constraint_identities is not None and constraint.identity in dependency_constraint_identities and not any(
+            edge.child_identity == constraint.identity
+            and edge.parent_identity in {
+                item for item, _roots in graph.root_reachability
+            }
+            for edge in graph.edges
+        ):
+            raise HuroshikiError(
+                f"Exact Profile dependency {constraint.identity_label} has no "
+                "reachable machine-readable required edge"
+            )
     return verifications
 
 
@@ -10171,6 +10303,136 @@ def _apply_update_change(
     path.write_bytes(contents)
 
 
+def _apply_profile_metadata_change(
+    source: Path,
+    change: UpdateChange,
+    *,
+    expected_root_identity: tuple[int, int],
+    checkpoint: Callable[[], None],
+) -> None:
+    """Apply a verified Profile metadata delta without following links."""
+
+    checkpoint()
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    root_fd = os.open(source, directory_flags)
+    opened_directories: list[int] = []
+    current_fd = -1
+    temporary: str | None = None
+    parent_fd = root_fd
+    try:
+        root_metadata = os.fstat(root_fd)
+        if (root_metadata.st_dev, root_metadata.st_ino) != expected_root_identity:
+            raise HuroshikiError(
+                "Profile transaction source was replaced before metadata staging"
+            )
+        for part in change.relative_path.parts[:-1]:
+            checkpoint()
+            try:
+                child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                if change.after is None:
+                    raise HuroshikiError(
+                        f"Profile metadata parent is missing: {change.relative_path}"
+                    )
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            opened_directories.append(child_fd)
+            parent_fd = child_fd
+
+        name = change.relative_path.name
+        try:
+            current_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            current_contents = None
+        except OSError as error:
+            raise HuroshikiError(
+                f"Unsafe Profile metadata target {change.relative_path}: {error}"
+            ) from error
+        else:
+            metadata = os.fstat(current_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise HuroshikiError(
+                    f"Profile metadata target is not a regular file: "
+                    f"{change.relative_path}"
+                )
+            chunks: list[bytes] = []
+            remaining = metadata.st_size
+            while remaining:
+                checkpoint()
+                chunk = os.read(current_fd, min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise HuroshikiError(
+                        f"Short read from Profile metadata: {change.relative_path}"
+                    )
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            current_contents = b"".join(chunks)
+        if current_contents != change.before:
+            raise HuroshikiError(
+                f"Profile metadata changed before staging: {change.relative_path}"
+            )
+
+        checkpoint()
+        if change.after is None:
+            os.unlink(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            return
+
+        temporary = f".{name}.huroshiki-profile-{uuid4().hex}.tmp"
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            view = memoryview(change.after)
+            while view:
+                checkpoint()
+                written = os.write(descriptor, view)
+                if written == 0:
+                    raise HuroshikiError(
+                        f"Short write to Profile metadata: {change.relative_path}"
+                    )
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        checkpoint()
+        os.rename(
+            temporary,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        temporary = None
+        os.fsync(parent_fd)
+    finally:
+        if current_fd >= 0:
+            os.close(current_fd)
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        for directory_fd in reversed(opened_directories):
+            os.close(directory_fd)
+        os.close(root_fd)
+
+
 def read_mod_data(relative_path: Path, data: dict[str, object]) -> ModInfo:
     side = data.get("side")
     side_error = packctl.side_validation_error(side)
@@ -10374,6 +10636,42 @@ def set_installed_mod_side(
         raise HuroshikiError(str(error)) from error
 
 
+def _profile_checkpoint(
+    cancel_event: threading.Event, deadline: float
+) -> None:
+    if cancel_event.is_set():
+        raise ProfileCancelled("Profile operation was cancelled")
+    if time.monotonic() >= deadline:
+        raise ProfileDeadlineExceeded("Profile operation deadline exceeded")
+
+
+def _preserve_profile_authority(
+    error: Exception,
+    transaction: PackTransaction,
+    cancel_event: threading.Event,
+    deadline: float,
+) -> None:
+    if isinstance(error, (ProfileCancelled, ProfileDeadlineExceeded)):
+        raise error
+    integrity_incomplete = any(
+        result.termination_incomplete or result.orphaned_descendants
+        for result in transaction._equivalence_process_results
+    )
+    if integrity_incomplete:
+        return
+    if isinstance(
+        error, (UpdatePreparationCancelled, ExactModVersionCancelled)
+    ) or cancel_event.is_set():
+        raise ProfileCancelled("Profile operation was cancelled") from error
+    if isinstance(
+        error,
+        (UpdatePreparationDeadlineExceeded, ExactModVersionDeadlineExceeded),
+    ) or time.monotonic() >= deadline:
+        raise ProfileDeadlineExceeded(
+            "Profile operation deadline exceeded"
+        ) from error
+
+
 def _apply_profile_entry(
     transaction: PackTransaction,
     entry: Mapping[str, object],
@@ -10384,54 +10682,495 @@ def _apply_profile_entry(
     provider = entry.get("source")
     project = entry.get("project")
     requested_side = entry.get("side")
-    if provider not in {"modrinth", "curseforge"}:
-        raise HuroshikiError(f"Unsupported profile source: {provider!r}")
-    if project is None:
-        raise HuroshikiError("Profile entry is missing project")
+    if provider not in {"modrinth", "curseforge"} or project is None:
+        raise HuroshikiError(f"Unsupported profile entry: {entry!r}")
     if requested_side not in packctl.VALID_SIDES:
-        raise HuroshikiError(
-            f"Invalid/missing side for {project!r}: {requested_side!r}"
-        )
-
+        raise HuroshikiError(f"Invalid/missing side for {project!r}: {requested_side!r}")
     if provider == "modrinth":
-        project_id: str | int = (
-            resolve_project_selector("modrinth", str(project)).canonical_project_id or ""
-        )
+        project_id = resolve_project_selector(
+            "modrinth", str(project), cancel_event=cancel_event, deadline=deadline
+        ).canonical_project_id or ""
     else:
-        try:
-            project_id = int(project)
-        except (TypeError, ValueError) as error:
-            raise HuroshikiError(
-                "CurseForge profiles require numeric project IDs"
-            ) from error
+        # Packwiz/legacy metadata historically uses integer CurseForge IDs.
+        project_id = project if isinstance(project, int) else str(project)
     minecraft, loader, loader_version = packctl.project_versions(transaction.source)
     closure = resolve_mod_closure(
-        provider=str(provider),
-        selector=str(project_id),
-        minecraft=minecraft,
-        loader=loader,
-        loader_version=loader_version,
-        canonical_project_id=str(project_id),
-        cancel_event=cancel_event,
-        deadline=deadline,
+        provider=str(provider), selector=str(project_id), minecraft=minecraft,
+        loader=loader, loader_version=loader_version, canonical_project_id=str(project_id),
+        cancel_event=cancel_event, deadline=deadline,
         resolver_root=transaction.root / f"profile-resolver-{uuid4().hex}",
         process_result_callback=transaction._record_equivalence_process_result,
     )
-    changed = merge_metadata_closure(
-        transaction.source,
-        closure,
-        requested_side=str(requested_side),
-        cancel_event=cancel_event,
-        deadline=deadline,
+    merge_metadata_closure(
+        transaction.source, closure, requested_side=str(requested_side),
+        cancel_event=cancel_event, deadline=deadline,
         equivalence_workspace=transaction.root / "profile-equivalence",
         process_result_callback=transaction._record_equivalence_process_result,
     )
     metadata_path = packctl.find_metadata(transaction.source, str(provider), project_id)
     if metadata_path is None:
-        raise HuroshikiError(
-            f"Metadata not found after merging {provider}:{project_id} closure"
-        )
+        raise HuroshikiError(f"Metadata not found after merging {provider}:{project_id} closure")
     return metadata_path.relative_to(transaction.source)
+
+
+def _apply_exact_profiles(
+    transaction: PackTransaction,
+    selected: Sequence[tuple[str, int, packctl.ProfileEntry]],
+    *,
+    cancel_event: threading.Event,
+    deadline: float,
+    on_exact: Callable[[str, str, str], None] | None = None,
+    on_entry: Callable[[str, Path, str], None] | None = None,
+) -> dict[str, tuple[Path, str]]:
+    """Resolve and merge one immutable Profile constraint set.
+
+    This deliberately does not use ``prepare_exact_mod_version``: profiles are
+    reconstructed as a complete root graph in an operation-owned source.
+    """
+    checkpoint = lambda: _profile_checkpoint(cancel_event, deadline)
+    checkpoint()
+    source = transaction.source
+    baseline = _profile_mod_metadata_records(source, checkpoint)
+    non_mod_metadata = _profile_non_mod_metadata_snapshot(source, checkpoint)
+    try:
+        overrides = read_mod_version_overrides(source, checkpoint=checkpoint)
+    except ModVersionOverrideError as error:
+        raise HuroshikiError(f"Invalid stored Profile version intent: {error}") from error
+    _validate_mod_version_override_records(source, baseline, overrides=overrides)
+    baseline_scan = scan_pack_migration_source(source, checkpoint=checkpoint)
+    manifest = source / ROOT_MANIFEST_PATH
+    has_manifest = manifest.is_file() and not manifest.is_symlink()
+    if baseline and not has_manifest:
+        raise HuroshikiError(
+            "Exact Profiles require authoritative root provenance on a non-empty Pack"
+        )
+    if has_manifest:
+        try:
+            extracted_roots = extract_pack_migration_roots(
+                source,
+                expected_identity=baseline_scan.root_identity,
+                expected_snapshot_digest=baseline_scan.snapshot_digest,
+                checkpoint=checkpoint,
+                metadata_path_filter=_is_profile_mod_metadata_path,
+            )
+        except PackMigrationRootError as error:
+            raise HuroshikiError(
+                f"Exact Profiles require valid baseline root Authority: {error}"
+            ) from error
+        records = tuple(
+            PackRootRecord(root.provider, root.project_id, root.source_side)
+            for root in extracted_roots
+        )
+    else:
+        records = ()
+    roots: list[PackRootRecord] = list(records)
+    selected_root_identities: list[tuple[str, tuple[str, str]]] = []
+    root_map = {(item.provider, item.project_id): item for item in roots}
+    constraints: dict[tuple[str, str], ExactModArtifactSelection] = {}
+    root_selections: dict[tuple[str, str], ExactModArtifactSelection] = {}
+    dependency_roles: set[tuple[str, str]] = set()
+    explicit: set[tuple[str, str]] = set()
+    root_sides: dict[tuple[str, str], str] = {
+        (item.provider, item.project_id): item.side for item in roots
+    }
+    preflight_constraints: dict[tuple[str, str], str] = {}
+    preflight_root_roles: set[tuple[str, str]] = set()
+    preflight_dependency_roles: set[tuple[str, str]] = set()
+    for _name, _index, entry in selected:
+        if entry.source == "modrinth" and entry.artifact_id is None:
+            continue
+        identity = (entry.source, str(entry.project))
+        if entry.artifact_id is not None:
+            artifact_id = str(entry.artifact_id)
+            existing_artifact = preflight_constraints.get(identity)
+            if existing_artifact is not None and existing_artifact != artifact_id:
+                raise HuroshikiError(
+                    f"Profile constraint conflict for {identity[0]}:{identity[1]}: "
+                    f"artifacts {existing_artifact} and {artifact_id}"
+                )
+            preflight_constraints[identity] = artifact_id
+        if entry.scope == "root":
+            preflight_root_roles.add(identity)
+        else:
+            preflight_dependency_roles.add(identity)
+    preflight_role_conflicts = preflight_root_roles & preflight_dependency_roles
+    if preflight_role_conflicts:
+        labels = ", ".join(
+            f"{provider}:{project}"
+            for provider, project in sorted(preflight_role_conflicts)
+        )
+        raise HuroshikiError(f"Profile root/dependency role conflict: {labels}")
+    for override in overrides:
+        requested_artifact = preflight_constraints.get(
+            (override.provider, override.project_id)
+        )
+        if (
+            override.locked
+            and requested_artifact is not None
+            and requested_artifact != override.artifact_id
+        ):
+            reason = f"; pin reason: {override.reason}" if override.reason else ""
+            raise ProfileVersionIntentError(
+                f"Locked Profile intent conflict for {override.canonical_identity}: "
+                f"artifact {override.artifact_id}; requested {requested_artifact}{reason}",
+                identity=override.canonical_identity,
+                artifact_id=override.artifact_id,
+                user_pin_reason=override.reason,
+            )
+    for name, index, entry in selected:
+        checkpoint()
+        provider = entry.source
+        if provider == "modrinth":
+            if entry.artifact_id is not None:
+                # The schema validates shape; the provider boundary brands it.
+                project_id = canonical_modrinth_id(str(entry.project), "Modrinth project ID")
+            else:
+                resolved = resolve_project_selector(
+                    provider, str(entry.project), cancel_event=cancel_event, deadline=deadline
+                )
+                project_id = resolved.canonical_project_id or ""
+        else:
+            project_id = str(entry.project)
+        identity = (provider, project_id)
+        if entry.artifact_id is not None:
+            artifact_id = (
+                canonical_modrinth_id(str(entry.artifact_id), "Modrinth version ID")
+                if provider == "modrinth" else str(entry.artifact_id)
+            )
+            selection = ExactModArtifactSelection(provider, project_id, artifact_id)
+            previous = constraints.get(identity)
+            if previous is not None and previous.artifact_id != selection.artifact_id:
+                raise HuroshikiError(
+                    f"Profile constraint conflict for {selection.identity_label}: "
+                    f"artifacts {previous.artifact_id} and {selection.artifact_id}"
+                )
+            constraints[identity] = selection
+            if entry.scope == "root":
+                root_selections[identity] = selection
+            else:
+                dependency_roles.add(identity)
+        if entry.scope == "root":
+            selected_root_identities.append((name, identity))
+            explicit.add(identity)
+            root_sides[identity] = entry.side or root_sides.get(identity, "both")
+            if identity not in root_map:
+                root_map[identity] = PackRootRecord(provider, project_id, root_sides[identity])
+                roots.append(root_map[identity])
+            elif entry.side:
+                merged_side = union_side(root_map[identity].side, entry.side)
+                root_map[identity] = PackRootRecord(provider, project_id, merged_side)
+                roots[roots.index(next(item for item in roots if item.provider == provider and item.project_id == project_id))] = root_map[identity]
+        elif entry.artifact_id is not None:
+            dependency_roles.add(identity)
+            constraints.setdefault(identity, selection)
+
+    role_conflicts = dependency_roles & (explicit | set(root_map))
+    if role_conflicts:
+        labels = ", ".join(f"{provider}:{project}" for provider, project in sorted(role_conflicts))
+        raise HuroshikiError(f"Profile root/dependency role conflict: {labels}")
+
+    for override in overrides:
+        identity = (override.provider, override.project_id)
+        selection = ExactModArtifactSelection(
+            override.provider,
+            canonical_modrinth_id(override.project_id, "Modrinth project ID") if override.provider == "modrinth" else override.project_id,
+            canonical_modrinth_id(override.artifact_id, "Modrinth version ID") if override.provider == "modrinth" else override.artifact_id,
+        )
+        existing = constraints.get(identity)
+        if existing is not None and existing.artifact_id != selection.artifact_id:
+            if override.locked:
+                reason = f"; pin reason: {override.reason}" if override.reason else ""
+                raise ProfileVersionIntentError(
+                    f"Locked Profile intent conflict for {override.canonical_identity}: "
+                    f"artifact {override.artifact_id}; requested {existing.artifact_id}{reason}",
+                    identity=override.canonical_identity,
+                    artifact_id=override.artifact_id,
+                    user_pin_reason=override.reason,
+                )
+        else:
+            constraints[identity] = selection
+        if identity in root_map:
+            root_selections.setdefault(identity, selection)
+
+    minecraft, loader, loader_version = packctl.project_versions(source)
+    closures: dict[tuple[str, str], ResolvedModClosure] = {}
+    affected_baseline_identities: set[tuple[str, str]] = set()
+    for root in roots:
+        checkpoint()
+        identity = (root.provider, root.project_id)
+        selection = constraints.get(identity)
+        if selection is None and identity in root_map:
+            entries = baseline.get(identity, ())
+            if entries:
+                metadata_identity = parse_provider_metadata(entries[0][0], entries[0][1])
+                if metadata_identity.file_id:
+                    root_selections[identity] = ExactModArtifactSelection(
+                        root.provider,
+                        canonical_modrinth_id(root.project_id, "Modrinth project ID") if root.provider == "modrinth" else root.project_id,
+                        canonical_modrinth_id(metadata_identity.file_id, "Modrinth version ID") if root.provider == "modrinth" else metadata_identity.file_id,
+                    )
+                    selection = root_selections[identity]
+        if root.provider == "url":
+            closures[identity] = ResolvedModClosure(
+                identity, (_exact_metadata_from_root(
+                    PackMigrationRoot(root.canonical_identity, root.provider, root.project_id,
+                                      None, None, root.side, Path(""), "", True), baseline),)
+            )
+            continue
+        baseline_entries = baseline.get(identity, ())
+        if selection is not None and len(baseline_entries) == 1:
+            baseline_metadata = parse_provider_metadata(
+                baseline_entries[0][0], baseline_entries[0][1]
+            )
+            if (
+                baseline_metadata.file_id is not None
+                and baseline_metadata.file_id != str(selection.artifact_id)
+            ):
+                baseline_selection = ExactModArtifactSelection(
+                    root.provider,
+                    canonical_modrinth_id(
+                        root.project_id, "Modrinth project ID"
+                    )
+                    if root.provider == "modrinth"
+                    else root.project_id,
+                    canonical_modrinth_id(
+                        baseline_metadata.file_id, "Modrinth version ID"
+                    )
+                    if root.provider == "modrinth"
+                    else baseline_metadata.file_id,
+                )
+                baseline_resolver = (
+                    transaction.root
+                    / f"profile-baseline-root-{uuid4().hex}"
+                )
+                create_resolver_source(
+                    baseline_resolver,
+                    display_name=f"Inspect {root.canonical_identity}",
+                    minecraft=minecraft,
+                    loader=loader,
+                    loader_version=loader_version,
+                )
+                baseline_closure = resolve_exact_mod_closure(
+                    baseline_selection,
+                    source=baseline_resolver,
+                    cancel_event=cancel_event,
+                    deadline=deadline,
+                    checkpoint=checkpoint,
+                    process_result_callback=(
+                        transaction._record_equivalence_process_result
+                    ),
+                )
+                _verify_exact_root_metadata(
+                    baseline_selection, baseline_closure.metadata
+                )
+                affected_baseline_identities.update(
+                    item.identity for item in baseline_closure.metadata
+                )
+        resolver_root = transaction.root / f"profile-exact-root-{uuid4().hex}"
+        create_resolver_source(resolver_root, display_name=f"Resolve {root.canonical_identity}", minecraft=minecraft, loader=loader, loader_version=loader_version)
+        if selection is None:
+            closure = resolve_mod_closure(
+                provider=root.provider, selector=root.project_id, minecraft=minecraft,
+                loader=loader, loader_version=loader_version, canonical_project_id=root.project_id,
+                cancel_event=cancel_event, deadline=deadline, resolver_root=resolver_root,
+                process_result_callback=transaction._record_equivalence_process_result,
+            )
+        else:
+            closure = resolve_exact_mod_closure(
+                selection, source=resolver_root, cancel_event=cancel_event, deadline=deadline,
+                checkpoint=checkpoint, process_result_callback=transaction._record_equivalence_process_result,
+            )
+            _verify_exact_root_metadata(selection, closure.metadata)
+        closures[identity] = ResolvedModClosure(identity, closure.metadata)
+
+    # A preseed is scoped to prospective owners, then all affected roots are rebuilt.
+    owners: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    for identity, closure in closures.items():
+        for item in closure.metadata:
+            owners.setdefault(item.identity, set()).add(identity)
+    affected_baseline_identities.update(owners)
+    effective_dependency_constraints = {
+        identity for identity in constraints if identity not in root_map
+    }
+    for identity in effective_dependency_constraints:
+        constraint = constraints[identity]
+        prospective_owners = owners.get(identity, set())
+        if not prospective_owners:
+            raise HuroshikiError(
+                f"Exact Profile dependency {constraint.identity_label} has no prospective owner"
+            )
+        if any(root_map[root_identity].provider == "url" for root_identity in prospective_owners):
+            raise HuroshikiError(
+                f"Exact Profile dependency {constraint.identity_label} is owned by an opaque URL root"
+            )
+    for root in roots:
+        root_identity = (root.provider, root.project_id)
+        applicable = tuple(
+            constraints[item_identity]
+            for item_identity in sorted(effective_dependency_constraints)
+            if root_identity in owners.get(item_identity, set())
+        )
+        if not applicable:
+            continue
+        if root.provider == "url":
+            raise HuroshikiError(
+                f"Opaque URL root {root.canonical_identity} cannot own provider constraints"
+            )
+        resolver_root = transaction.root / f"profile-exact-constrained-{uuid4().hex}"
+        create_resolver_source(
+            resolver_root,
+            display_name=f"Resolve {root.canonical_identity}",
+            minecraft=minecraft,
+            loader=loader,
+            loader_version=loader_version,
+        )
+        root_selection = root_selections.get(root_identity)
+        if root_selection is None:
+            current_root = next(
+                item
+                for item in closures[root_identity].metadata
+                if item.identity == root_identity
+            )
+            current_identity = parse_provider_metadata(
+                current_root.relative_path, current_root.contents
+            )
+            if current_identity.file_id is None:
+                raise HuroshikiError(
+                    f"Exact root {root.canonical_identity} has no artifact ID"
+                )
+            root_selection = ExactModArtifactSelection(
+                root.provider,
+                canonical_modrinth_id(root.project_id, "Modrinth project ID")
+                if root.provider == "modrinth"
+                else root.project_id,
+                canonical_modrinth_id(
+                    current_identity.file_id, "Modrinth version ID"
+                )
+                if root.provider == "modrinth"
+                else current_identity.file_id,
+            )
+            root_selections[root_identity] = root_selection
+        closure = resolve_exact_mod_closure(
+            root_selection,
+            source=resolver_root,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            checkpoint=checkpoint,
+            preseed_selections=applicable,
+            process_result_callback=transaction._record_equivalence_process_result,
+        )
+        for preseed in applicable:
+            _verify_exact_root_metadata(preseed, closure.metadata)
+        closures[root_identity] = ResolvedModClosure(
+            root_identity, closure.metadata
+        )
+
+    aggregate = transaction.root / f"profile-aggregate-{uuid4().hex}"
+    create_resolver_source(aggregate, display_name="Profile aggregate", minecraft=minecraft, loader=loader, loader_version=loader_version)
+    for root in roots:
+        checkpoint()
+        merge_metadata_closure(aggregate, closures[(root.provider, root.project_id)], requested_side=root.side,
+            preserve_resolved_dependency_sides=True, explicit_root_sides={(item.provider, item.project_id): item.side for item in roots},
+            cancel_event=cancel_event, deadline=deadline, equivalence_workspace=transaction.root / "profile-equivalence",
+            process_result_callback=transaction._record_equivalence_process_result)
+    ensure_pack_root_manifest_ignored(aggregate, checkpoint=checkpoint)
+    expected_roots = tuple(
+        sorted(roots, key=lambda item: item.canonical_identity)
+    )
+    write_pack_root_manifest(aggregate, expected_roots)
+    aggregate_desired = _profile_mod_metadata_records(aggregate, checkpoint)
+    desired = dict(aggregate_desired)
+    for identity, entries in baseline.items():
+        if (
+            identity not in desired
+            and identity not in affected_baseline_identities
+        ):
+            desired[identity] = entries
+    _verify_exact_closure_artifacts(
+        baseline,
+        desired,
+        None,
+        (minecraft, loader, loader_version),
+        workspace=transaction.root / "profile-artifacts",
+        context_source=source,
+        cancel_event=cancel_event,
+        deadline=deadline,
+        process_result_callback=transaction._record_equivalence_process_result,
+        diagnostic_project_id=split_project_key(transaction.project_key)[1],
+        diagnostic_callback=None,
+        selected_dependency_roots=None,
+        explicit_root_identities={
+            (item.provider, item.project_id) for item in roots
+        },
+        opaque_url_roots={
+            identity for identity in baseline if identity[0] == "url"
+        },
+        checkpoint=checkpoint,
+        exact_constraints=tuple(constraints.values()),
+        dependency_constraint_identities=effective_dependency_constraints,
+        cancellation_error=ProfileCancelled,
+        deadline_error=ProfileDeadlineExceeded,
+    )
+    final_overrides: dict[str, ModVersionOverride] = {item.canonical_identity: item for item in overrides}
+    for _name, _index, entry in selected:
+        if entry.artifact_id is None:
+            continue
+        project_id = (
+            canonical_modrinth_id(str(entry.project), "Modrinth project ID")
+            if entry.source == "modrinth" else str(entry.project)
+        )
+        artifact_id = (
+            canonical_modrinth_id(str(entry.artifact_id), "Modrinth version ID")
+            if entry.source == "modrinth" else str(entry.artifact_id)
+        )
+        selection = ExactModArtifactSelection(entry.source, project_id, artifact_id)
+        prior = final_overrides.get(selection.identity_label)
+        final_overrides[selection.identity_label] = ModVersionOverride(entry.source, project_id, str(entry.artifact_id), prior.locked if prior else False, prior.reason if prior else None)
+        if on_exact is not None:
+            on_exact(selection.identity_label, str(entry.artifact_id), entry.scope)
+    current_scan = scan_pack_migration_source(source, checkpoint=checkpoint)
+    if (
+        current_scan.root_identity != baseline_scan.root_identity
+        or current_scan.snapshot_digest != baseline_scan.snapshot_digest
+    ):
+        raise HuroshikiError(
+            "Transaction source changed while exact Profiles were resolved"
+        )
+    for change in _exact_metadata_changes(baseline, desired):
+        checkpoint()
+        _apply_profile_metadata_change(
+            source,
+            change,
+            expected_root_identity=baseline_scan.root_identity,
+            checkpoint=checkpoint,
+        )
+    ensure_pack_root_manifest_ignored(source, checkpoint=checkpoint)
+    write_pack_root_manifest(source, expected_roots)
+    ensure_mod_version_overrides_ignored(source, checkpoint=checkpoint)
+    write_mod_version_overrides(
+        source, tuple(final_overrides.values()), checkpoint=checkpoint
+    )
+    ensure_safe_pack_source(source, checkpoint=checkpoint)
+    checkpoint()
+    transaction._profile_expected_records = desired
+    transaction._profile_expected_non_mod_metadata = non_mod_metadata
+    transaction._profile_expected_roots = expected_roots
+    transaction._profile_expected_versions = (minecraft, loader, loader_version)
+    transaction._profile_mod_metadata_only = True
+    transaction._record_source_mutation()
+    transaction._version_override_mutated = True
+    result: dict[str, tuple[Path, str]] = {}
+    for entries in _profile_mod_metadata_records(
+        transaction.source, checkpoint
+    ).values():
+        for relative, _contents, mod in entries:
+            result[f"{canonical_provider(mod.provider)}:{mod.project_id}"] = (relative, mod.side)
+    if on_entry is not None:
+        for name, identity in selected_root_identities:
+            value = result.get(f"{identity[0]}:{identity[1]}")
+            if value is not None:
+                on_entry(name, value[0], value[1])
+    return result
 
 
 def apply_profiles(
@@ -10441,55 +11180,186 @@ def apply_profiles(
     *,
     on_profile: Callable[[str], None] | None = None,
     on_entry: Callable[[str, Path, str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    on_exact: Callable[[str, str, str], None] | None = None,
+    on_exact_constraint: Callable[[str, str, str], None] | None = None,
 ) -> None:
     """Apply selected profiles in order as one all-or-nothing pack transaction."""
     kind, _ = split_project_key(project_key_value)
     if kind != "pack":
         raise HuroshikiError("Profiles can only be applied to MODPACK projects")
     selected_names = tuple(names)
-    transaction = PackTransaction.create(project_key_value)
-    cancel_event = threading.Event()
-    deadline = time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
-    try:
-        for name in selected_names:
-            if name not in profiles:
-                available = ", ".join(sorted(profiles))
+    # Normalize the complete selection before taking a lock or doing provider work.
+    normalized: list[tuple[str, int, packctl.ProfileEntry]] = []
+    for name in selected_names:
+        if name not in profiles:
+            available = ", ".join(sorted(profiles))
+            raise HuroshikiError(f"Unknown profile {name!r}; available: {available}")
+        entries = profiles[name]
+        if entries is None:
+            entries = []
+        if not isinstance(entries, list):
+            raise HuroshikiError(f"Profile {name!r} must be a list")
+        for index, entry in enumerate(entries, start=1):
+            if not isinstance(entry, Mapping):
                 raise HuroshikiError(
-                    f"Unknown profile {name!r}; available: {available}"
+                    f"Profile {name!r} entry {index} {entry!r}: expected a mapping"
                 )
-            entries = profiles[name] or []
-            if not isinstance(entries, list):
-                raise HuroshikiError(f"Profile {name!r} must be a list")
-            if on_profile is not None:
-                on_profile(name)
-            for index, entry in enumerate(entries, start=1):
-                if not isinstance(entry, dict):
-                    raise HuroshikiError(
-                        f"Profile {name!r} entry {index} {entry!r}: expected a mapping"
-                    )
-                try:
-                    relative_path = _apply_profile_entry(
-                        transaction,
-                        entry,
-                        cancel_event=cancel_event,
-                        deadline=deadline,
-                    )
-                    side = str(packctl.read_toml(transaction.source / relative_path)["side"])
-                except Exception as error:
-                    raise HuroshikiError(
-                        f"Profile {name!r} entry {index} {entry!r}: {error}"
-                    ) from error
-                if on_entry is not None:
-                    on_entry(name, relative_path, side)
+            try:
+                item = packctl.normalize_profile_entry(entry)
+            except packctl.ConfigError as error:
+                raise HuroshikiError(
+                    f"Profile {name!r} entry {index} {entry!r}: {error}"
+                ) from error
+            normalized.append((name, index, item))
+    operation_cancel = cancel_event or threading.Event()
+    operation_deadline = deadline if deadline is not None else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+    _profile_checkpoint(operation_cancel, operation_deadline)
+    profile_exact_mode = any(
+        item.artifact_id is not None or item.scope == "dependency"
+        for _, _, item in normalized
+    )
+    transaction = PackTransaction.create(
+        project_key_value,
+        checkpoint=lambda: _profile_checkpoint(
+            operation_cancel, operation_deadline
+        ),
+    )
+    try:
+        # The caller-owned event/deadline remain the sole operation controls.
+        cancel_event = operation_cancel
+        deadline = operation_deadline
+        exact_mode = profile_exact_mode or (
+            transaction.source / VERSION_OVERRIDE_MANIFEST_PATH
+        ).is_file()
+        if exact_mode:
+            for name in selected_names:
+                if on_profile is not None:
+                    on_profile(name)
+            try:
+                _apply_exact_profiles(
+                    transaction,
+                    normalized,
+                    cancel_event=cancel_event,
+                    deadline=deadline,
+                    on_exact=on_exact or on_exact_constraint,
+                    on_entry=on_entry,
+                )
+            except Exception as error:
+                _preserve_profile_authority(
+                    error, transaction, cancel_event, deadline
+                )
+                raise
+        else:
+            for name in selected_names:
+                entries = profiles[name] or []
+                if on_profile is not None:
+                    on_profile(name)
+                for index, entry in enumerate(entries, start=1):
+                    try:
+                        relative_path = _apply_profile_entry(
+                            transaction, entry,
+                            cancel_event=cancel_event, deadline=deadline,
+                        )
+                        side = str(packctl.read_toml(transaction.source / relative_path)["side"])
+                    except (ProfileCancelled, ProfileDeadlineExceeded):
+                        raise
+                    except Exception as error:
+                        _preserve_profile_authority(
+                            error, transaction, cancel_event, deadline
+                        )
+                        raise HuroshikiError(
+                            f"Profile {name!r} entry {index} {entry!r}: {error}"
+                        ) from error
+                    if on_entry is not None:
+                        on_entry(name, relative_path, side)
         try:
-            transaction.apply()
+            if exact_mode:
+                _run_noninteractive_packwiz(
+                    ["packwiz", "refresh"], cwd=transaction.source,
+                    cancel_event=cancel_event, deadline=deadline, label="Profile refresh",
+                    process_result_callback=transaction._record_equivalence_process_result,
+                    project_id=split_project_key(project_key_value)[1], operation="refresh",
+                )
+                ensure_safe_pack_source(transaction.source, checkpoint=lambda: _profile_checkpoint(cancel_event, deadline))
+                expected_versions = getattr(transaction, "_profile_expected_versions", None)
+                if expected_versions is not None and packctl.project_versions(transaction.source) != expected_versions:
+                    raise HuroshikiError("Profile refresh changed the fixed Pack versions")
+                expected_records = getattr(transaction, "_profile_expected_records", None)
+                if expected_records is not None:
+                    final_checkpoint = lambda: _profile_checkpoint(
+                        cancel_event, deadline
+                    )
+                    _exact_assert_complete_metadata_graph(
+                        transaction.source,
+                        expected_records,
+                        final_checkpoint,
+                        profile_mod_only=True,
+                    )
+                    expected_non_mod_metadata = getattr(
+                        transaction,
+                        "_profile_expected_non_mod_metadata",
+                        None,
+                    )
+                    if expected_non_mod_metadata is not None:
+                        _assert_profile_non_mod_metadata_unchanged(
+                            transaction.source,
+                            expected_non_mod_metadata,
+                            final_checkpoint,
+                        )
+                    expected_roots = getattr(transaction, "_profile_expected_roots", None)
+                    if expected_roots is not None:
+                        require_mod_version_overrides_ignored(
+                            transaction.source, checkpoint=final_checkpoint
+                        )
+                        final_scan = scan_pack_migration_source(
+                            transaction.source, checkpoint=final_checkpoint
+                        )
+                        try:
+                            final_extracted = extract_pack_migration_roots(
+                                transaction.source,
+                                expected_identity=final_scan.root_identity,
+                                expected_snapshot_digest=final_scan.snapshot_digest,
+                                checkpoint=final_checkpoint,
+                                metadata_path_filter=(
+                                    _is_profile_mod_metadata_path
+                                ),
+                            )
+                        except PackMigrationRootError as error:
+                            raise HuroshikiError(
+                                "Profile refresh invalidated root Authority: "
+                                f"{error}"
+                            ) from error
+                        final_roots = tuple(
+                            PackRootRecord(
+                                root.provider,
+                                root.project_id,
+                                root.source_side,
+                            )
+                            for root in final_extracted
+                        )
+                        if final_roots != expected_roots:
+                            raise HuroshikiError(
+                                "Profile refresh changed authoritative root provenance"
+                            )
+                transaction.apply(refresh=False, cancel_event=cancel_event, deadline=deadline)
+            else:
+                transaction.apply(cancel_event=cancel_event, deadline=deadline)
+        except (ProfileCancelled, ProfileDeadlineExceeded):
+            raise
         except Exception as error:
+            _preserve_profile_authority(
+                error, transaction, cancel_event, deadline
+            )
             profile_list = ", ".join(repr(name) for name in selected_names)
             raise HuroshikiError(
                 f"Profiles {profile_list} could not be applied: {error}"
             ) from error
     finally:
-        transaction.discard()
+        transaction.discard(
+            deadline=time.monotonic() + TRANSACTION_DISCARD_TIMEOUT_SECONDS
+        )
 
 
 def add_mod_transactionally(

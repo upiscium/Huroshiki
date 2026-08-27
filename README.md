@@ -185,6 +185,14 @@ packctl update demo --build
 Multiple profile names are applied in the declared order as one transaction. A
 failed resolve, closure merge, or refresh leaves the pack's real `source/` unchanged.
 
+Profiles preserve legacy ordered `{source, project, side}` entries and also accept optional
+`artifact_id` and `scope` (`root`, the default, or `dependency`). Root entries require a valid
+side; dependency entries require an artifact and must not specify a side. CurseForge IDs are
+positive canonical decimal IDs, while exact Modrinth entries use immutable 8-character project
+and artifact IDs. Validation is local configuration validation only: it performs no provider
+catalog lookup and does not synchronize Packwiz pins. This schema does not cover Template Import,
+candidate browsing, or Packwiz pin synchronization.
+
 `packctl update` is fail-closed: if any resolver fails, it applies no candidates and returns the
 first resolver error code (or `1`). `--allow-partial` explicitly applies only resolvable candidates
 and returns `2`; `--build` is skipped after that partial result. The TUI keeps resolver failures

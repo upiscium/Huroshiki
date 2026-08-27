@@ -348,8 +348,14 @@ def write_pack_control_file(
 _atomic_write_relative = write_pack_control_file
 
 
-def ensure_pack_root_manifest_ignored(source_root: Path) -> None:
-    scan = scan_pack_migration_source(source_root, checkpoint=lambda: None)
+def ensure_pack_root_manifest_ignored(
+    source_root: Path,
+    checkpoint: Callable[[], None] | None = None,
+) -> None:
+    effective_checkpoint = checkpoint or (lambda: None)
+    scan = scan_pack_migration_source(
+        source_root, checkpoint=effective_checkpoint
+    )
     ignore_entry = next(
         (
             entry
@@ -366,6 +372,7 @@ def ensure_pack_root_manifest_ignored(source_root: Path) -> None:
             scan,
             Path(".packwizignore"),
             max_bytes=1024 * 1024,
+            checkpoint=effective_checkpoint,
         )
     )
     try:
@@ -381,6 +388,7 @@ def ensure_pack_root_manifest_ignored(source_root: Path) -> None:
         Path(".packwizignore"),
         (text + "/.huroshiki-roots.json\n").encode("utf-8"),
         expected_root_identity=scan.root_identity,
+        checkpoint=effective_checkpoint,
     )
 
 
@@ -552,6 +560,7 @@ def extract_pack_migration_roots(
     expected_identity: tuple[int, int],
     checkpoint: Callable[[], None],
     expected_snapshot_digest: str | None = None,
+    metadata_path_filter: Callable[[Path], bool] | None = None,
 ) -> tuple[PackMigrationRoot, ...]:
     checkpoint()
     scan = scan_pack_migration_source(detached_source_root, checkpoint=checkpoint)
@@ -599,6 +608,11 @@ def extract_pack_migration_roots(
     for entry in scan.entries:
         checkpoint()
         if entry.kind != "file" or not entry.relative_path.name.endswith(".pw.toml"):
+            continue
+        if (
+            metadata_path_filter is not None
+            and not metadata_path_filter(entry.relative_path)
+        ):
             continue
         contents = _read_relative_file(
             detached_source_root,

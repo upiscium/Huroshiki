@@ -235,8 +235,8 @@ class ProfileTransactionTest(unittest.TestCase):
         original_copy = core.copy_transaction_source
         local = self.packs / "demo" / "pack.local.yaml"
 
-        def racing_copy(source, destination):
-            result = original_copy(source, destination)
+        def racing_copy(source, destination, **kwargs):
+            result = original_copy(source, destination, **kwargs)
             local.write_text("url_max_jar_size_bytes: 1024\n", encoding="utf-8")
             return result
 

@@ -1,8 +1,14 @@
-# Reusable MOD groups shared by all packs.
+# Reusable MOD intent groups shared by all packs. These are Huroshiki intents,
+# not Packwiz version pins or a provider catalog.
 #
-# Modrinth: project accepts a slug or project ID.
-# CurseForge: use the numeric project ID for reproducibility.
-# side must be client, server, or both.
+# Automatic root (legacy form; provider lookup chooses the compatible artifact):
+#   - {source: modrinth, project: create, side: both}
+# Exact root (immutable project and artifact IDs):
+#   - {source: modrinth, project: AbCd1234, artifact_id: EfGh5678, side: both}
+#   - {source: curseforge, project: 123456, artifact_id: "789012", side: client}
+# Dependency constraint (artifact required; side is intentionally absent):
+#   - {source: curseforge, project: 123456, artifact_id: "789012", scope: dependency}
+# Providers are only modrinth and curseforge; no provider catalog is maintained here.
 profiles:
   base: []
   client-performance: []
