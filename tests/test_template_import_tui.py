@@ -166,6 +166,26 @@ PREVIEW = core.TemplateImportPreview(
     unchanged=(pack_candidate("Unchanged", "unchanged"),),
     changes=(core.UpdateChange(Path("mods/root.pw.toml"), None, b"new"),),
     warnings=("duplicate MOD risk acknowledged",),
+    version_constraints=(
+        core.TemplateVersionConstraintPreview(
+            "modrinth:root",
+            "modrinth",
+            "root",
+            "artifact-root",
+            "root",
+            ("base", "Pack"),
+            True,
+            "maintain compatibility",
+        ),
+        core.TemplateVersionConstraintPreview(
+            "modrinth:dependency",
+            "modrinth",
+            "dependency",
+            "artifact-dependency",
+            "dependency",
+            ("base",),
+        ),
+    ),
 )
 
 
@@ -176,6 +196,7 @@ class FakeImportOperation:
         *,
         delayed: bool = False,
         preview: core.TemplateImportPreview | None = PREVIEW,
+        error: BaseException | None = None,
     ) -> None:
         self.session = session
         self.delayed = delayed
@@ -184,7 +205,7 @@ class FakeImportOperation:
         self.done = threading.Event()
         self.started = threading.Event()
         self.release = threading.Event()
-        self.error: BaseException | None = None
+        self.error = error
         self.cancelled = False
         self.progress: queue.SimpleQueue[str] = queue.SimpleQueue()
         self.run_thread_id: int | None = None
@@ -198,7 +219,9 @@ class FakeImportOperation:
         self.progress.put("Resolving 1/1: Root")
         if self.delayed:
             self.release.wait(3)
-        if self.cancel_calls:
+        if self.error is not None:
+            pass
+        elif self.cancel_calls:
             self.cancelled = True
             self.session.discard()
         else:
@@ -607,6 +630,9 @@ class TemplateImportTuiTest(unittest.IsolatedAsyncioTestCase):
                     self.assertNotEqual(operation.run_thread_id, main_thread)
                     rendered = str(screen.query_one("#template-import-preview", Static).content)
                     for expected in (
+                        "Version constraints",
+                        "modrinth:root | artifact ID: artifact-root | role: root | origins: base, Pack | lock state: locked | pin reason: maintain compatibility",
+                        "modrinth:dependency | artifact ID: artifact-dependency | role: dependency | origins: base | lock state: unlocked",
                         "Explicit roots",
                         "Dependencies",
                         "Side changes",
@@ -616,6 +642,7 @@ class TemplateImportTuiTest(unittest.IsolatedAsyncioTestCase):
                         "No persistent Template association",
                     ):
                         self.assertIn(expected, rendered)
+                    self.assertNotIn("artifact-dependency | role: dependency | origins: base | lock state: unlocked | pin reason:", rendered)
                     self.assertEqual(operation.apply_calls, 0)
                     await pilot.press("enter")
                     await pilot.pause()
@@ -680,6 +707,33 @@ class TemplateImportTuiTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(operation.apply_calls, 0)
                 self.assertEqual(operation.discard_calls, 1)
                 self.assertEqual(app.opened_projects, ["pack:demo"])
+
+    async def test_execution_error_renders_technical_text_without_pin_reason(self) -> None:
+        session = FakeSession()
+        resolved = resolve_template_import_plan(session.plan)
+        error = core.ProfileVersionIntentError(
+            "Locked Template Import intent conflict for modrinth:root: "
+            "artifact old; requested new",
+            identity="modrinth:root",
+            artifact_id="old",
+        )
+        operation = FakeImportOperation(session, error=error)
+        with (
+            patch.object(core, "project_info", return_value=PACK),
+            patch.object(core, "TemplateImportOperation", return_value=operation),
+        ):
+            app = _ScreenApp(
+                huroshiki.TemplateImportExecutionScreen("pack:demo", session, resolved)
+            )
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                rendered = str(
+                    app.screen.query_one("#template-import-execution-status", Static).content
+                )
+                self.assertIn(f"Technical failure: {error}", rendered)
+                self.assertIn("Blocked identity: modrinth:root", rendered)
+                self.assertIn("Pinned artifact: old", rendered)
+                self.assertNotIn("Pin reason:", rendered)
 
 
 if __name__ == "__main__":

@@ -4409,7 +4409,18 @@ class TemplateImportExecutionScreen(BaseScreen):
         self.worker_thread = None
         if operation.error is not None:
             self.ownership_finished = True
-            message = str(operation.error)
+            error = operation.error
+            if isinstance(error, core.ProfileVersionIntentError):
+                details = [
+                    f"Technical failure: {error}",
+                    f"Blocked identity: {error.identity}",
+                    f"Pinned artifact: {error.artifact_id}",
+                ]
+                if error.user_pin_reason:
+                    details.append(f"Pin reason: {error.user_pin_reason}")
+                message = "\n".join(details)
+            else:
+                message = str(error)
             self.query_one("#template-import-execution-status", Static).update(message)
             self.app.notify(message, severity="error")
             if self.leave_after_cancel:
@@ -4448,6 +4459,20 @@ class TemplateImportExecutionScreen(BaseScreen):
             f"  {index}. {template_id}"
             for index, template_id in enumerate(self.session.template_ids, 1)
         )
+        lines.extend(["", "Version constraints:"])
+        for constraint in preview.version_constraints:
+            origins = ", ".join(constraint.origins) or "none"
+            line = (
+                f"  {constraint.canonical_identity} | artifact ID: "
+                f"{constraint.artifact_id} | role: {constraint.scope} | "
+                f"origins: {origins} | lock state: "
+                f"{'locked' if constraint.locked else 'unlocked'}"
+            )
+            if constraint.reason:
+                line += f" | pin reason: {constraint.reason}"
+            lines.append(line)
+        if not preview.version_constraints:
+            lines.append("  none")
         lines.extend(["", "Explicit roots:"])
         lines.extend(
             f"  {item.requested_name} [{item.candidate_key}] -> "

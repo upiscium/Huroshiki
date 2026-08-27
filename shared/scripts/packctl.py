@@ -1587,14 +1587,17 @@ def load_template_config(template_id: str) -> dict[str, Any]:
         raise ConfigError(
             f"templates/{template_id}/template.yaml must contain id: {template_id}"
         )
-    mods = config.get("mods")
-    if not isinstance(mods, list):
-        raise ConfigError(f"templates/{template_id}/template.yaml mods must be a list")
-    normalize_template_mod_version_overrides(
-        config.get("mod_version_overrides", []),
-        f"templates/{template_id}/template.yaml",
-        mods,
-    )
+    if "mod_version_overrides" in config:
+        mods = config.get("mods")
+        if not isinstance(mods, list):
+            raise ConfigError(
+                f"templates/{template_id}/template.yaml mods must be a list"
+            )
+        normalize_template_mod_version_overrides(
+            config["mod_version_overrides"],
+            f"templates/{template_id}/template.yaml",
+            mods,
+        )
     return config
 
 
@@ -1872,8 +1875,6 @@ def normalize_template_mod_version_override(
 def normalize_template_mod_version_overrides(
     value: object, context: str, mods: list[object]
 ) -> list[dict[str, str]]:
-    if value is None:
-        return []
     entries = value
     if not isinstance(entries, list):
         raise ConfigError(f"{context}.mod_version_overrides must be a list")
@@ -3743,6 +3744,40 @@ def _template_import_candidate_payload(plan: Any, candidate: Any) -> dict[str, A
     }
 
 
+def _template_import_version_constraint_payload(constraint: Any) -> dict[str, Any]:
+    """Serialize the stable, public shape of a Template version constraint."""
+    origins = getattr(constraint, "origins", None)
+    if origins is None:
+        origins = (getattr(constraint, "template_id"),)
+    return {
+        "canonical_identity": constraint.canonical_identity
+        if hasattr(constraint, "canonical_identity")
+        else f"{constraint.provider}:{constraint.project_id}",
+        "provider": constraint.provider,
+        "project_id": constraint.project_id,
+        "artifact_id": constraint.artifact_id,
+        "scope": constraint.scope,
+        "origins": list(origins),
+        **(
+            {
+                "locked": constraint.locked,
+                "reason": constraint.reason,
+            }
+            if hasattr(constraint, "locked")
+            else {}
+        ),
+    }
+
+
+def _template_import_version_constraints_payload(
+    constraints: Any,
+) -> list[dict[str, Any]]:
+    return [
+        _template_import_version_constraint_payload(constraint)
+        for constraint in constraints
+    ]
+
+
 def _template_import_conflict_payload(plan: Any) -> dict[str, list[dict[str, Any]]]:
     return {
         label: [
@@ -3777,6 +3812,7 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
 
     session = None
     operation = None
+    plan = None
     try:
         session = huroshiki_core.TemplateImportSession.create(
             huroshiki_core.project_key("pack", args.pack),
@@ -3800,6 +3836,11 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                                 "removed": [],
                                 "side_changes": [],
                                 "conflicts": conflict_payload,
+                                "version_constraints": (
+                                    _template_import_version_constraints_payload(
+                                        plan.version_constraints
+                                    )
+                                ),
                             },
                             ensure_ascii=False,
                         )
@@ -3851,6 +3892,14 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                 for conflict in plan.side_conflicts:
                     key = f"{conflict.identity[0]}:{conflict.identity[1]}"
                     print(f'  "{key}": keep_pack', file=sys.stderr)
+                if plan.version_constraints:
+                    print("Active exact version constraints:", file=sys.stderr)
+                    for constraint in plan.version_constraints:
+                        print(
+                            f"  {constraint.provider}:{constraint.project_id} -> "
+                            f"{constraint.artifact_id} ({constraint.scope})",
+                            file=sys.stderr,
+                        )
                 return 2
             resolved = resolve_template_import_plan(plan)
         else:
@@ -3896,12 +3945,24 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                         ],
                         "warnings": preview.warnings,
                         "conflicts": _template_import_conflict_payload(plan),
+                        "version_constraints": (
+                            _template_import_version_constraints_payload(
+                                preview.version_constraints
+                            )
+                        ),
                     },
                     ensure_ascii=False,
                 )
             )
         else:
             print(f"Template import plan: {plan.plan_digest}")
+            if preview.version_constraints:
+                print("Exact version constraints:")
+                for constraint in preview.version_constraints:
+                    print(
+                        f"  {constraint.canonical_identity} -> "
+                        f"{constraint.artifact_id} ({constraint.scope})"
+                    )
             print("Added roots:")
             for item in preview.added_roots:
                 print(
@@ -3934,6 +3995,32 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
         print("Template import cancelled.", file=sys.stderr)
         return 130
     except (huroshiki_core.HuroshikiError, ConfigError, TemplateMergeError) as error:
+        if args.json and isinstance(
+            error, huroshiki_core.ProfileVersionIntentError
+        ):
+            print(
+                json.dumps(
+                    {
+                        "error": str(error),
+                        "version_constraints": (
+                            _template_import_version_constraints_payload(
+                                plan.version_constraints
+                            )
+                            if plan is not None
+                            else []
+                        ),
+                        "version_block": {
+                            "technical_failure": str(error),
+                            "identity": error.identity,
+                            "pinned_artifact": error.artifact_id,
+                            "user_pin_reason": error.user_pin_reason,
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            return 1
         print(f"error: {error}", file=sys.stderr)
         return 1
     finally:

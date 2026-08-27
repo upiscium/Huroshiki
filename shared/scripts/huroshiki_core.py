@@ -177,10 +177,12 @@ from template_import import (
     SideDecision,
     TemplateCompatibility,
     TemplateImportPlan,
+    TemplateVersionConstraint,
     build_template_import_plan,
     merge_template_import_candidates,
     resolve_template_import_plan,
     template_candidate,
+    validate_resolved_template_import_plan,
 )
 from packwiz_parser import ParserEvent
 from packwiz_pty import PackwizPtySession, PtyResult
@@ -10713,6 +10715,400 @@ def _apply_profile_entry(
     return metadata_path.relative_to(transaction.source)
 
 
+@dataclass(frozen=True)
+class _ExactModGraphResult:
+    desired: dict[
+        tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]
+    ]
+    roots: tuple[PackRootRecord, ...]
+    dependency_constraint_identities: frozenset[tuple[str, str]]
+
+
+def _solve_exact_mod_graph(
+    transaction: PackTransaction,
+    *,
+    source: Path,
+    baseline: dict[
+        tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]
+    ],
+    roots: Sequence[PackRootRecord],
+    constraints: Mapping[tuple[str, str], ExactModArtifactSelection],
+    root_selections: Mapping[tuple[str, str], ExactModArtifactSelection],
+    versions: tuple[str, str, str],
+    checkpoint: Callable[[], None],
+    cancel_event: threading.Event,
+    deadline: float,
+    seeded_closures: Mapping[tuple[str, str], ResolvedModClosure] | None = None,
+    forbidden_identities: frozenset[tuple[str, str]] = frozenset(),
+    operation_label: str,
+    cancellation_error: type[BaseException],
+    deadline_error: type[BaseException],
+) -> _ExactModGraphResult:
+    """Solve and semantically verify one complete exact-aware MOD graph."""
+
+    minecraft, loader, loader_version = versions
+    ordered_roots = tuple(
+        sorted(roots, key=lambda item: item.canonical_identity)
+    )
+    root_map = {
+        (item.provider, item.project_id): item for item in ordered_roots
+    }
+    if len(root_map) != len(ordered_roots):
+        raise HuroshikiError(f"{operation_label} contains duplicate roots")
+    forbidden_roots = set(root_map) & forbidden_identities
+    if forbidden_roots:
+        labels = ", ".join(
+            f"{provider}:{project}" for provider, project in sorted(forbidden_roots)
+        )
+        raise HuroshikiError(
+            f"{operation_label} retains roots removed by conflict resolution: {labels}"
+        )
+
+    effective_root_selections = dict(root_selections)
+    closures: dict[tuple[str, str], ResolvedModClosure] = {}
+    affected_baseline_identities: set[tuple[str, str]] = set()
+    seeds = dict(seeded_closures or {})
+    for root in ordered_roots:
+        checkpoint()
+        identity = (root.provider, root.project_id)
+        selection = effective_root_selections.get(identity)
+        if selection is None:
+            entries = baseline.get(identity, ())
+            if entries:
+                metadata_identity = parse_provider_metadata(
+                    entries[0][0], entries[0][1]
+                )
+                if metadata_identity.file_id:
+                    selection = ExactModArtifactSelection(
+                        root.provider,
+                        canonical_modrinth_id(
+                            root.project_id, "Modrinth project ID"
+                        )
+                        if root.provider == "modrinth"
+                        else root.project_id,
+                        canonical_modrinth_id(
+                            metadata_identity.file_id, "Modrinth version ID"
+                        )
+                        if root.provider == "modrinth"
+                        else metadata_identity.file_id,
+                    )
+                    effective_root_selections[identity] = selection
+
+        if root.provider == "url":
+            seeded = seeds.get(identity)
+            if seeded is not None:
+                closure = seeded
+            else:
+                closure = ResolvedModClosure(
+                    identity,
+                    (
+                        _exact_metadata_from_root(
+                            PackMigrationRoot(
+                                root.canonical_identity,
+                                root.provider,
+                                root.project_id,
+                                None,
+                                None,
+                                root.side,
+                                Path(""),
+                                "",
+                                True,
+                            ),
+                            baseline,
+                        ),
+                    ),
+                )
+            closures[identity] = closure
+            continue
+
+        baseline_entries = baseline.get(identity, ())
+        if selection is not None and len(baseline_entries) == 1:
+            baseline_metadata = parse_provider_metadata(
+                baseline_entries[0][0], baseline_entries[0][1]
+            )
+            if (
+                baseline_metadata.file_id is not None
+                and baseline_metadata.file_id != str(selection.artifact_id)
+            ):
+                baseline_selection = ExactModArtifactSelection(
+                    root.provider,
+                    canonical_modrinth_id(
+                        root.project_id, "Modrinth project ID"
+                    )
+                    if root.provider == "modrinth"
+                    else root.project_id,
+                    canonical_modrinth_id(
+                        baseline_metadata.file_id, "Modrinth version ID"
+                    )
+                    if root.provider == "modrinth"
+                    else baseline_metadata.file_id,
+                )
+                baseline_resolver = (
+                    transaction.root
+                    / f"{operation_label}-baseline-root-{uuid4().hex}"
+                )
+                create_resolver_source(
+                    baseline_resolver,
+                    display_name=f"Inspect {root.canonical_identity}",
+                    minecraft=minecraft,
+                    loader=loader,
+                    loader_version=loader_version,
+                )
+                baseline_closure = resolve_exact_mod_closure(
+                    baseline_selection,
+                    source=baseline_resolver,
+                    cancel_event=cancel_event,
+                    deadline=deadline,
+                    checkpoint=checkpoint,
+                    process_result_callback=(
+                        transaction._record_equivalence_process_result
+                    ),
+                )
+                _verify_exact_root_metadata(
+                    baseline_selection, baseline_closure.metadata
+                )
+                affected_baseline_identities.update(
+                    item.identity for item in baseline_closure.metadata
+                )
+
+        seeded = seeds.get(identity)
+        if seeded is not None:
+            if seeded.root_identity != identity:
+                raise HuroshikiError(
+                    f"{operation_label} cached root identity changed for "
+                    f"{root.canonical_identity}"
+                )
+            if selection is not None:
+                _verify_exact_root_metadata(selection, seeded.metadata)
+            closure = seeded
+        else:
+            resolver_root = (
+                transaction.root
+                / f"{operation_label}-exact-root-{uuid4().hex}"
+            )
+            create_resolver_source(
+                resolver_root,
+                display_name=f"Resolve {root.canonical_identity}",
+                minecraft=minecraft,
+                loader=loader,
+                loader_version=loader_version,
+            )
+            if selection is None:
+                closure = resolve_mod_closure(
+                    provider=root.provider,
+                    selector=root.project_id,
+                    minecraft=minecraft,
+                    loader=loader,
+                    loader_version=loader_version,
+                    canonical_project_id=root.project_id,
+                    cancel_event=cancel_event,
+                    deadline=deadline,
+                    resolver_root=resolver_root,
+                    process_result_callback=(
+                        transaction._record_equivalence_process_result
+                    ),
+                )
+            else:
+                closure = resolve_exact_mod_closure(
+                    selection,
+                    source=resolver_root,
+                    cancel_event=cancel_event,
+                    deadline=deadline,
+                    checkpoint=checkpoint,
+                    process_result_callback=(
+                        transaction._record_equivalence_process_result
+                    ),
+                )
+                _verify_exact_root_metadata(selection, closure.metadata)
+        closures[identity] = ResolvedModClosure(identity, closure.metadata)
+
+    for root_identity, closure in closures.items():
+        forbidden_members = {
+            item.identity for item in closure.metadata
+        } & forbidden_identities
+        if forbidden_members:
+            labels = ", ".join(
+                f"{provider}:{project}"
+                for provider, project in sorted(forbidden_members)
+            )
+            raise HuroshikiError(
+                f"{operation_label} root {root_identity[0]}:{root_identity[1]} "
+                f"requires removed MODs: {labels}"
+            )
+
+    owners: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    for identity, closure in closures.items():
+        for item in closure.metadata:
+            owners.setdefault(item.identity, set()).add(identity)
+    affected_baseline_identities.update(owners)
+    dependency_constraints = frozenset(
+        identity for identity in constraints if identity not in root_map
+    )
+    for identity in dependency_constraints:
+        constraint = constraints[identity]
+        prospective_owners = owners.get(identity, set())
+        if not prospective_owners:
+            raise HuroshikiError(
+                f"{operation_label} dependency {constraint.identity_label} "
+                "has no prospective owner"
+            )
+        if any(
+            root_map[root_identity].provider == "url"
+            for root_identity in prospective_owners
+        ):
+            raise HuroshikiError(
+                f"{operation_label} dependency {constraint.identity_label} "
+                "is owned by an opaque URL root"
+            )
+
+    for root in ordered_roots:
+        checkpoint()
+        root_identity = (root.provider, root.project_id)
+        applicable = tuple(
+            constraints[item_identity]
+            for item_identity in sorted(dependency_constraints)
+            if root_identity in owners.get(item_identity, set())
+        )
+        if not applicable:
+            continue
+        resolver_root = (
+            transaction.root
+            / f"{operation_label}-exact-constrained-{uuid4().hex}"
+        )
+        create_resolver_source(
+            resolver_root,
+            display_name=f"Resolve {root.canonical_identity}",
+            minecraft=minecraft,
+            loader=loader,
+            loader_version=loader_version,
+        )
+        root_selection = effective_root_selections.get(root_identity)
+        if root_selection is None:
+            current_root = next(
+                item
+                for item in closures[root_identity].metadata
+                if item.identity == root_identity
+            )
+            current_identity = parse_provider_metadata(
+                current_root.relative_path, current_root.contents
+            )
+            if current_identity.file_id is None:
+                raise HuroshikiError(
+                    f"Exact root {root.canonical_identity} has no artifact ID"
+                )
+            root_selection = ExactModArtifactSelection(
+                root.provider,
+                canonical_modrinth_id(
+                    root.project_id, "Modrinth project ID"
+                )
+                if root.provider == "modrinth"
+                else root.project_id,
+                canonical_modrinth_id(
+                    current_identity.file_id, "Modrinth version ID"
+                )
+                if root.provider == "modrinth"
+                else current_identity.file_id,
+            )
+            effective_root_selections[root_identity] = root_selection
+        closure = resolve_exact_mod_closure(
+            root_selection,
+            source=resolver_root,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            checkpoint=checkpoint,
+            preseed_selections=applicable,
+            process_result_callback=(
+                transaction._record_equivalence_process_result
+            ),
+        )
+        for preseed in applicable:
+            _verify_exact_root_metadata(preseed, closure.metadata)
+        forbidden_members = {
+            item.identity for item in closure.metadata
+        } & forbidden_identities
+        if forbidden_members:
+            raise HuroshikiError(
+                f"{operation_label} constrained closure reintroduced removed MODs"
+            )
+        closures[root_identity] = ResolvedModClosure(
+            root_identity, closure.metadata
+        )
+
+    aggregate = transaction.root / f"{operation_label}-aggregate-{uuid4().hex}"
+    create_resolver_source(
+        aggregate,
+        display_name=f"{operation_label} aggregate",
+        minecraft=minecraft,
+        loader=loader,
+        loader_version=loader_version,
+    )
+    explicit_sides = {
+        (item.provider, item.project_id): item.side for item in ordered_roots
+    }
+    for root in ordered_roots:
+        checkpoint()
+        merge_metadata_closure(
+            aggregate,
+            closures[(root.provider, root.project_id)],
+            requested_side=root.side,
+            preserve_resolved_dependency_sides=True,
+            explicit_root_sides=explicit_sides,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            equivalence_workspace=(
+                transaction.root / f"{operation_label}-equivalence"
+            ),
+            process_result_callback=(
+                transaction._record_equivalence_process_result
+            ),
+        )
+    aggregate_desired = _profile_mod_metadata_records(aggregate, checkpoint)
+    desired = dict(aggregate_desired)
+    for identity, entries in baseline.items():
+        if (
+            identity not in desired
+            and identity not in affected_baseline_identities
+            and identity not in forbidden_identities
+        ):
+            desired[identity] = entries
+    forbidden_present = set(desired) & forbidden_identities
+    if forbidden_present:
+        raise HuroshikiError(
+            f"{operation_label} resulting graph contains removed MODs"
+        )
+    _verify_exact_closure_artifacts(
+        baseline,
+        desired,
+        None,
+        versions,
+        workspace=transaction.root / f"{operation_label}-artifacts",
+        context_source=source,
+        cancel_event=cancel_event,
+        deadline=deadline,
+        process_result_callback=(
+            transaction._record_equivalence_process_result
+        ),
+        diagnostic_project_id=split_project_key(transaction.project_key)[1],
+        diagnostic_callback=None,
+        selected_dependency_roots=None,
+        explicit_root_identities=set(root_map),
+        opaque_url_roots={
+            identity for identity in set(baseline) | set(root_map)
+            if identity[0] == "url"
+        },
+        checkpoint=checkpoint,
+        exact_constraints=tuple(constraints.values()),
+        dependency_constraint_identities=set(dependency_constraints),
+        cancellation_error=cancellation_error,
+        deadline_error=deadline_error,
+    )
+    return _ExactModGraphResult(
+        desired,
+        ordered_roots,
+        dependency_constraints,
+    )
+
+
 def _apply_exact_profiles(
     transaction: PackTransaction,
     selected: Sequence[tuple[str, int, packctl.ProfileEntry]],
@@ -10892,225 +11288,28 @@ def _apply_exact_profiles(
         if identity in root_map:
             root_selections.setdefault(identity, selection)
 
-    minecraft, loader, loader_version = packctl.project_versions(source)
-    closures: dict[tuple[str, str], ResolvedModClosure] = {}
-    affected_baseline_identities: set[tuple[str, str]] = set()
-    for root in roots:
-        checkpoint()
-        identity = (root.provider, root.project_id)
-        selection = constraints.get(identity)
-        if selection is None and identity in root_map:
-            entries = baseline.get(identity, ())
-            if entries:
-                metadata_identity = parse_provider_metadata(entries[0][0], entries[0][1])
-                if metadata_identity.file_id:
-                    root_selections[identity] = ExactModArtifactSelection(
-                        root.provider,
-                        canonical_modrinth_id(root.project_id, "Modrinth project ID") if root.provider == "modrinth" else root.project_id,
-                        canonical_modrinth_id(metadata_identity.file_id, "Modrinth version ID") if root.provider == "modrinth" else metadata_identity.file_id,
-                    )
-                    selection = root_selections[identity]
-        if root.provider == "url":
-            closures[identity] = ResolvedModClosure(
-                identity, (_exact_metadata_from_root(
-                    PackMigrationRoot(root.canonical_identity, root.provider, root.project_id,
-                                      None, None, root.side, Path(""), "", True), baseline),)
-            )
-            continue
-        baseline_entries = baseline.get(identity, ())
-        if selection is not None and len(baseline_entries) == 1:
-            baseline_metadata = parse_provider_metadata(
-                baseline_entries[0][0], baseline_entries[0][1]
-            )
-            if (
-                baseline_metadata.file_id is not None
-                and baseline_metadata.file_id != str(selection.artifact_id)
-            ):
-                baseline_selection = ExactModArtifactSelection(
-                    root.provider,
-                    canonical_modrinth_id(
-                        root.project_id, "Modrinth project ID"
-                    )
-                    if root.provider == "modrinth"
-                    else root.project_id,
-                    canonical_modrinth_id(
-                        baseline_metadata.file_id, "Modrinth version ID"
-                    )
-                    if root.provider == "modrinth"
-                    else baseline_metadata.file_id,
-                )
-                baseline_resolver = (
-                    transaction.root
-                    / f"profile-baseline-root-{uuid4().hex}"
-                )
-                create_resolver_source(
-                    baseline_resolver,
-                    display_name=f"Inspect {root.canonical_identity}",
-                    minecraft=minecraft,
-                    loader=loader,
-                    loader_version=loader_version,
-                )
-                baseline_closure = resolve_exact_mod_closure(
-                    baseline_selection,
-                    source=baseline_resolver,
-                    cancel_event=cancel_event,
-                    deadline=deadline,
-                    checkpoint=checkpoint,
-                    process_result_callback=(
-                        transaction._record_equivalence_process_result
-                    ),
-                )
-                _verify_exact_root_metadata(
-                    baseline_selection, baseline_closure.metadata
-                )
-                affected_baseline_identities.update(
-                    item.identity for item in baseline_closure.metadata
-                )
-        resolver_root = transaction.root / f"profile-exact-root-{uuid4().hex}"
-        create_resolver_source(resolver_root, display_name=f"Resolve {root.canonical_identity}", minecraft=minecraft, loader=loader, loader_version=loader_version)
-        if selection is None:
-            closure = resolve_mod_closure(
-                provider=root.provider, selector=root.project_id, minecraft=minecraft,
-                loader=loader, loader_version=loader_version, canonical_project_id=root.project_id,
-                cancel_event=cancel_event, deadline=deadline, resolver_root=resolver_root,
-                process_result_callback=transaction._record_equivalence_process_result,
-            )
-        else:
-            closure = resolve_exact_mod_closure(
-                selection, source=resolver_root, cancel_event=cancel_event, deadline=deadline,
-                checkpoint=checkpoint, process_result_callback=transaction._record_equivalence_process_result,
-            )
-            _verify_exact_root_metadata(selection, closure.metadata)
-        closures[identity] = ResolvedModClosure(identity, closure.metadata)
-
-    # A preseed is scoped to prospective owners, then all affected roots are rebuilt.
-    owners: dict[tuple[str, str], set[tuple[str, str]]] = {}
-    for identity, closure in closures.items():
-        for item in closure.metadata:
-            owners.setdefault(item.identity, set()).add(identity)
-    affected_baseline_identities.update(owners)
-    effective_dependency_constraints = {
-        identity for identity in constraints if identity not in root_map
-    }
-    for identity in effective_dependency_constraints:
-        constraint = constraints[identity]
-        prospective_owners = owners.get(identity, set())
-        if not prospective_owners:
-            raise HuroshikiError(
-                f"Exact Profile dependency {constraint.identity_label} has no prospective owner"
-            )
-        if any(root_map[root_identity].provider == "url" for root_identity in prospective_owners):
-            raise HuroshikiError(
-                f"Exact Profile dependency {constraint.identity_label} is owned by an opaque URL root"
-            )
-    for root in roots:
-        root_identity = (root.provider, root.project_id)
-        applicable = tuple(
-            constraints[item_identity]
-            for item_identity in sorted(effective_dependency_constraints)
-            if root_identity in owners.get(item_identity, set())
-        )
-        if not applicable:
-            continue
-        if root.provider == "url":
-            raise HuroshikiError(
-                f"Opaque URL root {root.canonical_identity} cannot own provider constraints"
-            )
-        resolver_root = transaction.root / f"profile-exact-constrained-{uuid4().hex}"
-        create_resolver_source(
-            resolver_root,
-            display_name=f"Resolve {root.canonical_identity}",
-            minecraft=minecraft,
-            loader=loader,
-            loader_version=loader_version,
-        )
-        root_selection = root_selections.get(root_identity)
-        if root_selection is None:
-            current_root = next(
-                item
-                for item in closures[root_identity].metadata
-                if item.identity == root_identity
-            )
-            current_identity = parse_provider_metadata(
-                current_root.relative_path, current_root.contents
-            )
-            if current_identity.file_id is None:
-                raise HuroshikiError(
-                    f"Exact root {root.canonical_identity} has no artifact ID"
-                )
-            root_selection = ExactModArtifactSelection(
-                root.provider,
-                canonical_modrinth_id(root.project_id, "Modrinth project ID")
-                if root.provider == "modrinth"
-                else root.project_id,
-                canonical_modrinth_id(
-                    current_identity.file_id, "Modrinth version ID"
-                )
-                if root.provider == "modrinth"
-                else current_identity.file_id,
-            )
-            root_selections[root_identity] = root_selection
-        closure = resolve_exact_mod_closure(
-            root_selection,
-            source=resolver_root,
-            cancel_event=cancel_event,
-            deadline=deadline,
-            checkpoint=checkpoint,
-            preseed_selections=applicable,
-            process_result_callback=transaction._record_equivalence_process_result,
-        )
-        for preseed in applicable:
-            _verify_exact_root_metadata(preseed, closure.metadata)
-        closures[root_identity] = ResolvedModClosure(
-            root_identity, closure.metadata
-        )
-
-    aggregate = transaction.root / f"profile-aggregate-{uuid4().hex}"
-    create_resolver_source(aggregate, display_name="Profile aggregate", minecraft=minecraft, loader=loader, loader_version=loader_version)
-    for root in roots:
-        checkpoint()
-        merge_metadata_closure(aggregate, closures[(root.provider, root.project_id)], requested_side=root.side,
-            preserve_resolved_dependency_sides=True, explicit_root_sides={(item.provider, item.project_id): item.side for item in roots},
-            cancel_event=cancel_event, deadline=deadline, equivalence_workspace=transaction.root / "profile-equivalence",
-            process_result_callback=transaction._record_equivalence_process_result)
-    ensure_pack_root_manifest_ignored(aggregate, checkpoint=checkpoint)
-    expected_roots = tuple(
-        sorted(roots, key=lambda item: item.canonical_identity)
-    )
-    write_pack_root_manifest(aggregate, expected_roots)
-    aggregate_desired = _profile_mod_metadata_records(aggregate, checkpoint)
-    desired = dict(aggregate_desired)
-    for identity, entries in baseline.items():
-        if (
-            identity not in desired
-            and identity not in affected_baseline_identities
-        ):
-            desired[identity] = entries
-    _verify_exact_closure_artifacts(
-        baseline,
-        desired,
-        None,
-        (minecraft, loader, loader_version),
-        workspace=transaction.root / "profile-artifacts",
-        context_source=source,
+    versions = packctl.project_versions(source)
+    minecraft, loader, loader_version = versions
+    # Keep the Profile-specific constraint and callback orchestration below,
+    # while taking the canonical graph result from the shared solver.
+    graph = _solve_exact_mod_graph(
+        transaction,
+        source=source,
+        baseline=baseline,
+        roots=roots,
+        constraints=constraints,
+        root_selections=root_selections,
+        versions=(minecraft, loader, loader_version),
+        checkpoint=checkpoint,
         cancel_event=cancel_event,
         deadline=deadline,
-        process_result_callback=transaction._record_equivalence_process_result,
-        diagnostic_project_id=split_project_key(transaction.project_key)[1],
-        diagnostic_callback=None,
-        selected_dependency_roots=None,
-        explicit_root_identities={
-            (item.provider, item.project_id) for item in roots
-        },
-        opaque_url_roots={
-            identity for identity in baseline if identity[0] == "url"
-        },
-        checkpoint=checkpoint,
-        exact_constraints=tuple(constraints.values()),
-        dependency_constraint_identities=effective_dependency_constraints,
+        operation_label="profile",
         cancellation_error=ProfileCancelled,
         deadline_error=ProfileDeadlineExceeded,
     )
+    desired = graph.desired
+    expected_roots = graph.roots
+    effective_dependency_constraints = graph.dependency_constraint_identities
     final_overrides: dict[str, ModVersionOverride] = {item.canonical_identity: item for item in overrides}
     for _name, _index, entry in selected:
         if entry.artifact_id is None:
@@ -13148,6 +13347,18 @@ class ImportedRootPreview:
 
 
 @dataclass(frozen=True)
+class TemplateVersionConstraintPreview:
+    canonical_identity: str
+    provider: str
+    project_id: str
+    artifact_id: str
+    scope: str
+    origins: tuple[str, ...]
+    locked: bool = False
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
 class TemplateImportPreview:
     added_roots: tuple[ImportedRootPreview, ...]
     added_dependencies: tuple[ModInfo, ...]
@@ -13156,6 +13367,8 @@ class TemplateImportPreview:
     unchanged: tuple[ModCandidate, ...]
     changes: tuple[UpdateChange, ...]
     warnings: tuple[str, ...]
+    # Kept as an optional trailing field for callers that construct previews.
+    version_constraints: tuple[TemplateVersionConstraintPreview, ...] = ()
 
 
 def _resolved_unchanged_pack_candidates(
@@ -13193,7 +13406,8 @@ def pack_import_candidates(source: Path, pack_id: str) -> tuple[ModCandidate, ..
             actual_provider=canonical_provider(mod.provider),
             actual_project_id=mod.project_id,
         )
-        for mod in list_mods_from_source(source)
+        for entries in _profile_mod_metadata_records(source).values()
+        for _relative, _contents, mod in entries
     )
 
 
@@ -13203,14 +13417,26 @@ def _template_import_inputs(
     dict[str, TemplateCompatibility],
     tuple[ModCandidate, ...],
     dict[str, dict[str, str]],
+    tuple[TemplateVersionConstraint, ...],
 ]:
     compatibilities: dict[str, TemplateCompatibility] = {}
     candidates: list[ModCandidate] = []
     baselines: dict[str, dict[str, str]] = {}
+    constraints: list[TemplateVersionConstraint] = []
     for template_id in template_ids:
         root = packctl.get_template_root(template_id)
         baselines[template_id] = template_config_snapshot(root)
         config = packctl.load_template_config(template_id)
+        for override in packctl.template_mod_version_overrides(template_id):
+            constraints.append(
+                TemplateVersionConstraint(
+                    template_id,
+                    canonical_provider(str(override["provider"])),
+                    str(override["project_id"]),
+                    str(override["artifact_id"]),
+                    str(override["scope"]),
+                )
+            )
         template_minecraft, template_loader, _ = packctl.template_versions(template_id)
         compatibilities[template_id] = TemplateCompatibility(
             template_id,
@@ -13243,7 +13469,7 @@ def _template_import_inputs(
                     url_allow_private_networks=allow_private,
                 )
             )
-    return compatibilities, tuple(candidates), baselines
+    return compatibilities, tuple(candidates), baselines, tuple(constraints)
 
 
 def resolved_closure_fingerprint(closure: ResolvedModClosure) -> str:
@@ -13276,7 +13502,18 @@ def verify_import_candidates(
     loader_version: str,
     cancel_event: threading.Event,
     deadline: float,
+    exact_constraints: Sequence[TemplateVersionConstraint] = (),
+    pack_overrides: Sequence[ModVersionOverride] = (),
+    retained_root_artifacts: Mapping[tuple[str, str], str] | None = None,
+    resolver_root: Path | None = None,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> tuple[ImportCandidateVerification, ...]:
+    def checkpoint() -> None:
+        if cancel_event.is_set():
+            raise LoaderMigrationCancelled("Template import was cancelled")
+        if time.monotonic() >= deadline:
+            raise LoaderMigrationDeadlineExceeded("Template import deadline exceeded")
+
     verified: list[ImportCandidateVerification] = []
     for candidate in candidates:
         if cancel_event.is_set():
@@ -13372,16 +13609,104 @@ def verify_import_candidates(
                 )
             )
         else:
-            verified.append(
-                ImportCandidateVerification(
-                    candidate.selector_identity,
-                    candidate.logical_identity,
-                    candidate.metadata_path,
-                    candidate.filename,
-                    None,
+            candidate_constraints = tuple(
+                item
+                for item in exact_constraints
+                if item.scope == "root"
+                and item.template_id in candidate.template_origin_ids
+                and (item.provider, item.project_id)
+                == candidate.logical_identity
+            )
+            artifacts = {item.artifact_id for item in candidate_constraints}
+            if len(artifacts) > 1:
+                verified.append(
+                    ImportCandidateVerification(
+                        candidate.selector_identity,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "Merged Template roots request conflicting exact artifacts",
+                        None,
+                    )
+                )
+                continue
+            requested_artifact = next(iter(artifacts), None)
+            if requested_artifact is None:
+                prior = next(
+                    (
+                        item
+                        for item in pack_overrides
+                        if (item.provider, item.project_id)
+                        == candidate.logical_identity
+                    ),
                     None,
                 )
-            )
+                if prior is not None:
+                    requested_artifact = prior.artifact_id
+            if requested_artifact is None:
+                requested_artifact = (retained_root_artifacts or {}).get(
+                    candidate.logical_identity
+                )
+            if resolver_root is None and (
+                requested_artifact is not None or exact_constraints
+            ):
+                raise HuroshikiError("Exact Template planning requires resolver state")
+            if resolver_root is None:
+                verified.append(ImportCandidateVerification(
+                    candidate.selector_identity, candidate.logical_identity,
+                    candidate.metadata_path, candidate.filename, None, None,
+                ))
+                continue
+            try:
+                workspace = resolver_root / f"template-import-plan-{uuid4().hex}"
+                create_resolver_source(
+                    workspace, display_name=f"Verify {candidate.candidate_key}",
+                    minecraft=minecraft, loader=loader, loader_version=loader_version,
+                )
+                if requested_artifact is not None:
+                    selection = ExactModArtifactSelection(
+                        candidate.provider,
+                        canonical_modrinth_id(
+                            candidate.project_id, "Modrinth project ID"
+                        )
+                        if candidate.provider == "modrinth"
+                        else candidate.project_id,
+                        canonical_modrinth_id(
+                            requested_artifact, "Modrinth version ID"
+                        )
+                        if candidate.provider == "modrinth"
+                        else requested_artifact,
+                    )
+                    closure = resolve_exact_mod_closure(
+                        selection, source=workspace, cancel_event=cancel_event,
+                        deadline=deadline, checkpoint=checkpoint,
+                        process_result_callback=process_result_callback,
+                    )
+                    _verify_exact_root_metadata(selection, closure.metadata)
+                else:
+                    closure = resolve_mod_closure(
+                        provider=candidate.provider, selector=candidate.project_id,
+                        minecraft=minecraft, loader=loader, loader_version=loader_version,
+                        canonical_project_id=candidate.project_id,
+                        cancel_event=cancel_event, deadline=deadline,
+                        resolver_root=workspace,
+                        process_result_callback=process_result_callback,
+                    )
+                actual_identity = closure.root_identity
+                roots = [item for item in closure.metadata if item.identity == actual_identity]
+                if len(roots) != 1:
+                    raise HuroshikiError("Verified Template closure must contain exactly one root")
+                verified.append(ImportCandidateVerification(
+                    candidate.selector_identity, actual_identity, roots[0].relative_path,
+                    roots[0].filename, resolved_closure_fingerprint(closure), None, closure,
+                ))
+            except (LoaderMigrationCancelled, LoaderMigrationDeadlineExceeded):
+                raise
+            except HuroshikiError as error:
+                verified.append(ImportCandidateVerification(
+                    candidate.selector_identity, None, None, None, None, str(error), None
+                ))
     return tuple(verified)
 
 
@@ -13394,6 +13719,7 @@ def build_verified_template_import_plan(
     pack_candidates: Sequence[ModCandidate],
     template_candidates: Sequence[ModCandidate],
     verifications: Sequence[ImportCandidateVerification],
+    constraints: Sequence[TemplateVersionConstraint] = (),
 ) -> TemplateImportPlan:
     verification_by_selector = {
         item.selector_identity: item for item in verifications
@@ -13428,6 +13754,7 @@ def build_verified_template_import_plan(
             pack_candidates=pack_candidates,
             template_candidates=final_candidates,
             verifications=verifications,
+            constraints=constraints,
         )
     except TemplateMergeError as error:
         raise HuroshikiError(str(error)) from error
@@ -13483,9 +13810,56 @@ class TemplateImportSession:
             checkpoint()
             pack_versions = packctl.project_versions(transaction.source)
             pack_candidates = pack_import_candidates(transaction.source, pack_id)
-            compatibilities, raw_candidates, baselines = _template_import_inputs(
+            compatibilities, raw_candidates, baselines, version_constraints = _template_import_inputs(
                 template_ids
             )
+            # Version intent makes Pack root provenance part of the planning
+            # input.  Validate it before any provider resolver is started.
+            exact_aware = bool(version_constraints) or (
+                transaction.source / VERSION_OVERRIDE_MANIFEST_PATH
+            ).is_file()
+            baseline_records = _profile_mod_metadata_records(
+                transaction.source, checkpoint
+            )
+            try:
+                pack_overrides = read_mod_version_overrides(
+                    transaction.source, checkpoint=checkpoint
+                )
+            except ModVersionOverrideError as error:
+                raise HuroshikiError(
+                    f"Invalid stored Template Import version intent: {error}"
+                ) from error
+            _validate_mod_version_override_records(
+                transaction.source,
+                baseline_records,
+                overrides=pack_overrides,
+            )
+            retained_root_artifacts: dict[tuple[str, str], str] = {}
+            if exact_aware and baseline_records:
+                scan = scan_pack_migration_source(transaction.source, checkpoint=checkpoint)
+                manifest = transaction.source / ROOT_MANIFEST_PATH
+                if not manifest.is_file() or manifest.is_symlink():
+                    raise HuroshikiError(
+                        "Exact Template import requires authoritative root provenance "
+                        "on a non-empty Pack"
+                    )
+                try:
+                    planned_roots = extract_pack_migration_roots(
+                        transaction.source,
+                        expected_identity=scan.root_identity,
+                        expected_snapshot_digest=scan.snapshot_digest,
+                        checkpoint=checkpoint,
+                        metadata_path_filter=_is_profile_mod_metadata_path,
+                    )
+                    retained_root_artifacts = {
+                        (root.provider, root.project_id): root.source_file_id
+                        for root in planned_roots
+                        if root.source_file_id is not None
+                    }
+                except PackMigrationRootError as error:
+                    raise HuroshikiError(
+                        f"Exact Template import requires valid baseline root Authority: {error}"
+                    ) from error
             ordered_candidates = tuple(
                 candidate
                 for template_id in template_ids
@@ -13500,6 +13874,13 @@ class TemplateImportSession:
                 loader_version=pack_versions[2],
                 cancel_event=operation_cancel,
                 deadline=operation_deadline,
+                exact_constraints=version_constraints,
+                pack_overrides=pack_overrides,
+                retained_root_artifacts=retained_root_artifacts,
+                resolver_root=transaction.root if exact_aware else None,
+                process_result_callback=(
+                    transaction._record_equivalence_process_result
+                ),
             )
             if not all(
                 template_config_snapshot(packctl.get_template_root(template_id))
@@ -13515,6 +13896,7 @@ class TemplateImportSession:
                 pack_candidates=pack_candidates,
                 template_candidates=raw_candidates,
                 verifications=verifications,
+                constraints=version_constraints,
             )
             return cls(
                 transaction,
@@ -13574,7 +13956,8 @@ def _apply_import_side_changes(
     for identity, _old, new_side in side_changes:
         matching = [
             mod
-            for mod in list_mods_from_source(source)
+            for entries in _profile_mod_metadata_records(source).values()
+            for _relative, _contents, mod in entries
             if (canonical_provider(mod.provider), mod.project_id) == identity
         ]
         if len(matching) != 1:
@@ -13644,6 +14027,8 @@ def _removed_identity_requirements(
 def _assert_removed_identities_absent(
     source: Path,
     removed: Sequence[ModCandidate],
+    *,
+    allowed_dependency_identities: frozenset[tuple[str, str]] = frozenset(),
 ) -> None:
     ensure_safe_pack_source(source)
     removed_identities = {
@@ -13653,9 +14038,12 @@ def _assert_removed_identities_absent(
     }
     present = {
         (canonical_provider(mod.provider), mod.project_id)
-        for mod in list_mods_from_source(source)
+        for entries in _profile_mod_metadata_records(source).values()
+        for _relative, _contents, mod in entries
     }
-    reintroduced = removed_identities & present
+    reintroduced = (
+        removed_identities & present
+    ) - allowed_dependency_identities
     if reintroduced:
         details = ", ".join(
             f"{provider}:{project_id}"
@@ -13737,6 +14125,426 @@ def _preflight_import_closures(
             shutil.rmtree(preflight_source, ignore_errors=True)
 
 
+@dataclass(frozen=True)
+class _ExactTemplateImportResult:
+    graph: _ExactModGraphResult
+    overrides: tuple[ModVersionOverride, ...]
+    preview_constraints: tuple[TemplateVersionConstraintPreview, ...]
+    retained_removed_dependencies: frozenset[tuple[str, str]]
+
+
+def _template_exact_selection(
+    provider: str, project_id: str, artifact_id: str
+) -> ExactModArtifactSelection:
+    return ExactModArtifactSelection(
+        provider,
+        canonical_modrinth_id(project_id, "Modrinth project ID")
+        if provider == "modrinth"
+        else project_id,
+        canonical_modrinth_id(artifact_id, "Modrinth version ID")
+        if provider == "modrinth"
+        else artifact_id,
+    )
+
+
+def _template_import_final_roots(
+    baseline_roots: Sequence[PackRootRecord],
+    resolved: ResolvedTemplateImportPlan,
+) -> tuple[PackRootRecord, ...]:
+    removed = {
+        candidate.actual_identity
+        for candidate in resolved.removed_pack_candidates
+        if candidate.actual_identity is not None
+    }
+    roots: dict[tuple[str, str], PackRootRecord] = {
+        (item.provider, item.project_id): item
+        for item in baseline_roots
+        if (item.provider, item.project_id) not in removed
+    }
+    side_results = {
+        identity: new_side for identity, _old, new_side in resolved.side_changes
+    }
+    for candidate in resolved.selected_template_candidates:
+        if candidate.actual_identity is None:
+            raise HuroshikiError(
+                "Selected Template root has no verified actual identity"
+            )
+        identity = candidate.actual_identity
+        existing = roots.get(identity)
+        if existing is None:
+            side = candidate.side
+        else:
+            side = side_results.get(identity, existing.side)
+        roots[identity] = PackRootRecord(identity[0], identity[1], side)
+    return tuple(sorted(roots.values(), key=lambda item: item.canonical_identity))
+
+
+def _stage_exact_template_import_result(
+    source: Path,
+    *,
+    baseline: dict[
+        tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]
+    ],
+    non_mod_metadata: Mapping[Path, bytes],
+    expected_pack_toml: bytes,
+    graph: _ExactModGraphResult,
+    overrides: tuple[ModVersionOverride, ...],
+    removed: Sequence[ModCandidate],
+    allowed_removed_dependencies: frozenset[tuple[str, str]],
+    checkpoint: Callable[[], None],
+    cancel_event: threading.Event,
+    deadline: float,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None,
+    diagnostic_project_id: str,
+    versions: tuple[str, str, str],
+) -> None:
+    checkpoint()
+    current = _profile_mod_metadata_records(source, checkpoint)
+    if current != baseline:
+        raise HuroshikiError(
+            "Template Import MOD baseline changed before exact staging"
+        )
+    scan = scan_pack_migration_source(source, checkpoint=checkpoint)
+    for change in _exact_metadata_changes(baseline, graph.desired):
+        checkpoint()
+        _apply_profile_metadata_change(
+            source,
+            change,
+            expected_root_identity=scan.root_identity,
+            checkpoint=checkpoint,
+        )
+    ensure_pack_root_manifest_ignored(source, checkpoint=checkpoint)
+    write_pack_root_manifest(source, graph.roots)
+    ensure_mod_version_overrides_ignored(source, checkpoint=checkpoint)
+    write_mod_version_overrides(source, overrides, checkpoint=checkpoint)
+    ensure_safe_pack_source(source, checkpoint=checkpoint)
+    _assert_removed_identities_absent(
+        source,
+        removed,
+        allowed_dependency_identities=allowed_removed_dependencies,
+    )
+    _run_template_import_refresh(
+        source,
+        cancel_event=cancel_event,
+        deadline=deadline,
+        process_result_callback=process_result_callback,
+        diagnostic_project_id=diagnostic_project_id,
+    )
+    ensure_safe_pack_source(source, checkpoint=checkpoint)
+    if packctl.project_versions(source) != versions:
+        raise HuroshikiError(
+            "Template Import refresh changed the fixed Pack versions"
+        )
+    if (source / "pack.toml").read_bytes() != expected_pack_toml:
+        raise HuroshikiError(
+            "Template Import refresh changed pack.toml"
+        )
+    _exact_assert_complete_metadata_graph(
+        source,
+        graph.desired,
+        checkpoint,
+        profile_mod_only=True,
+    )
+    _assert_profile_non_mod_metadata_unchanged(
+        source, non_mod_metadata, checkpoint
+    )
+    require_mod_version_overrides_ignored(source, checkpoint=checkpoint)
+    final_overrides = read_mod_version_overrides(source, checkpoint=checkpoint)
+    if final_overrides != overrides:
+        raise HuroshikiError(
+            "Template Import refresh changed exact version Authority"
+        )
+    _validate_mod_version_override_records(
+        source,
+        graph.desired,
+        overrides=final_overrides,
+    )
+    final_scan = scan_pack_migration_source(source, checkpoint=checkpoint)
+    try:
+        extracted = extract_pack_migration_roots(
+            source,
+            expected_identity=final_scan.root_identity,
+            expected_snapshot_digest=final_scan.snapshot_digest,
+            checkpoint=checkpoint,
+            metadata_path_filter=_is_profile_mod_metadata_path,
+        )
+    except PackMigrationRootError as error:
+        raise HuroshikiError(
+            f"Template Import refresh invalidated root Authority: {error}"
+        ) from error
+    final_roots = tuple(
+        PackRootRecord(root.provider, root.project_id, root.source_side)
+        for root in extracted
+    )
+    if final_roots != graph.roots:
+        raise HuroshikiError(
+            "Template Import refresh changed authoritative root provenance"
+        )
+    _assert_removed_identities_absent(
+        source,
+        removed,
+        allowed_dependency_identities=allowed_removed_dependencies,
+    )
+
+
+def _execute_exact_template_import(
+    operation: "TemplateImportOperation",
+) -> _ExactTemplateImportResult:
+    transaction = operation.transaction
+    source = transaction.source
+    checkpoint = operation._checkpoint
+    checkpoint()
+    versions = packctl.project_versions(source)
+    expected_pack_toml = (source / "pack.toml").read_bytes()
+    baseline = _profile_mod_metadata_records(source, checkpoint)
+    non_mod_metadata = _profile_non_mod_metadata_snapshot(source, checkpoint)
+    try:
+        stored_overrides = read_mod_version_overrides(
+            source, checkpoint=checkpoint
+        )
+    except ModVersionOverrideError as error:
+        raise HuroshikiError(
+            f"Invalid stored Template Import version intent: {error}"
+        ) from error
+    _validate_mod_version_override_records(
+        source, baseline, overrides=stored_overrides
+    )
+    baseline_scan = scan_pack_migration_source(source, checkpoint=checkpoint)
+    manifest = source / ROOT_MANIFEST_PATH
+    if baseline and (not manifest.is_file() or manifest.is_symlink()):
+        raise HuroshikiError(
+            "Exact Template Import requires authoritative root provenance "
+            "on a non-empty Pack"
+        )
+    if manifest.is_file() and not manifest.is_symlink():
+        try:
+            extracted = extract_pack_migration_roots(
+                source,
+                expected_identity=baseline_scan.root_identity,
+                expected_snapshot_digest=baseline_scan.snapshot_digest,
+                checkpoint=checkpoint,
+                metadata_path_filter=_is_profile_mod_metadata_path,
+            )
+        except PackMigrationRootError as error:
+            raise HuroshikiError(
+                f"Exact Template Import requires valid root Authority: {error}"
+            ) from error
+        baseline_roots = tuple(
+            PackRootRecord(root.provider, root.project_id, root.source_side)
+            for root in extracted
+        )
+    else:
+        baseline_roots = ()
+
+    roots = _template_import_final_roots(baseline_roots, operation.resolved)
+    root_map = {(item.provider, item.project_id): item for item in roots}
+    active = operation.resolved.version_constraints
+    requested: dict[tuple[str, str], TemplateVersionConstraint] = {}
+    origins: dict[tuple[str, str], set[str]] = {}
+    for item in active:
+        checkpoint()
+        identity = (item.provider, item.project_id)
+        previous = requested.get(identity)
+        if previous is not None and (
+            previous.artifact_id != item.artifact_id
+            or previous.scope != item.scope
+        ):
+            raise HuroshikiError(
+                f"Conflicting active Template version intent for "
+                f"{identity[0]}:{identity[1]}"
+            )
+        requested[identity] = item
+        origins.setdefault(identity, set()).add(item.template_id)
+        if item.scope == "root" and identity not in root_map:
+            raise HuroshikiError(
+                f"Template root version intent is inactive: "
+                f"{identity[0]}:{identity[1]}"
+            )
+        if item.scope == "dependency" and identity in root_map:
+            raise HuroshikiError(
+                f"Template dependency intent conflicts with an explicit root: "
+                f"{identity[0]}:{identity[1]}"
+            )
+
+    constraints: dict[tuple[str, str], ExactModArtifactSelection] = {}
+    root_selections: dict[tuple[str, str], ExactModArtifactSelection] = {}
+    for override in stored_overrides:
+        identity = (override.provider, override.project_id)
+        selection = _template_exact_selection(
+            override.provider, override.project_id, override.artifact_id
+        )
+        constraints[identity] = selection
+        if identity in root_map:
+            root_selections[identity] = selection
+
+    final_overrides = {
+        item.canonical_identity: item for item in stored_overrides
+    }
+    preview_constraints: list[TemplateVersionConstraintPreview] = []
+    for identity, item in requested.items():
+        selection = _template_exact_selection(
+            item.provider, item.project_id, item.artifact_id
+        )
+        prior = final_overrides.get(selection.identity_label)
+        if (
+            prior is not None
+            and prior.locked
+            and prior.artifact_id != item.artifact_id
+        ):
+            reason = f"; pin reason: {prior.reason}" if prior.reason else ""
+            raise ProfileVersionIntentError(
+                f"Locked Template Import intent conflict for "
+                f"{selection.identity_label}: artifact {prior.artifact_id}; "
+                f"requested {item.artifact_id}{reason}",
+                identity=selection.identity_label,
+                artifact_id=prior.artifact_id,
+                user_pin_reason=prior.reason,
+            )
+        constraints[identity] = selection
+        if item.scope == "root":
+            root_selections[identity] = selection
+        final = ModVersionOverride(
+            item.provider,
+            item.project_id,
+            item.artifact_id,
+            prior.locked if prior is not None else False,
+            prior.reason if prior is not None else None,
+        )
+        final_overrides[selection.identity_label] = final
+        preview_constraints.append(
+            TemplateVersionConstraintPreview(
+                selection.identity_label,
+                item.provider,
+                item.project_id,
+                item.artifact_id,
+                item.scope,
+                tuple(sorted(origins[identity])),
+                final.locked,
+                final.reason,
+            )
+        )
+    for override in stored_overrides:
+        identity = (override.provider, override.project_id)
+        if identity in requested:
+            continue
+        preview_constraints.append(
+            TemplateVersionConstraintPreview(
+                override.canonical_identity,
+                override.provider,
+                override.project_id,
+                override.artifact_id,
+                "root" if identity in root_map else "dependency",
+                ("Pack",),
+                override.locked,
+                override.reason,
+            )
+        )
+
+    seeds: dict[tuple[str, str], ResolvedModClosure] = {}
+    for candidate in operation.resolved.selected_template_candidates:
+        verification = operation._verification(candidate)
+        if isinstance(verification.cached_closure, ResolvedModClosure):
+            if candidate.actual_identity is None:
+                raise HuroshikiError(
+                    "Verified Template root has no actual identity"
+                )
+            seeds[candidate.actual_identity] = verification.cached_closure
+    removed_identities = frozenset(
+        candidate.actual_identity
+        for candidate in operation.resolved.removed_pack_candidates
+        if candidate.actual_identity is not None
+    )
+    stored_override_identities = {
+        (item.provider, item.project_id) for item in stored_overrides
+    }
+    allowed_removed_dependencies = frozenset(
+        identity
+        for identity in removed_identities & stored_override_identities
+        if identity not in root_map
+    )
+    forbidden = removed_identities - allowed_removed_dependencies
+    graph = _solve_exact_mod_graph(
+        transaction,
+        source=source,
+        baseline=baseline,
+        roots=roots,
+        constraints=constraints,
+        root_selections=root_selections,
+        versions=versions,
+        checkpoint=checkpoint,
+        cancel_event=operation.cancel_event,
+        deadline=operation.deadline,
+        seeded_closures=seeds,
+        forbidden_identities=forbidden,
+        operation_label="template-import",
+        cancellation_error=LoaderMigrationCancelled,
+        deadline_error=LoaderMigrationDeadlineExceeded,
+    )
+    current_scan = scan_pack_migration_source(source, checkpoint=checkpoint)
+    if (
+        current_scan.root_identity != baseline_scan.root_identity
+        or current_scan.snapshot_digest != baseline_scan.snapshot_digest
+    ):
+        raise HuroshikiError(
+            "Template Import source changed during exact reconstruction"
+        )
+
+    ordered_overrides = tuple(
+        sorted(final_overrides.values(), key=lambda item: item.canonical_identity)
+    )
+    preflight = transaction.root / "import-exact-preflight"
+    try:
+        copy_transaction_source(source, preflight, checkpoint=checkpoint)
+        _stage_exact_template_import_result(
+            preflight,
+            baseline=baseline,
+            non_mod_metadata=non_mod_metadata,
+            expected_pack_toml=expected_pack_toml,
+            graph=graph,
+            overrides=ordered_overrides,
+            removed=operation.resolved.removed_pack_candidates,
+            allowed_removed_dependencies=allowed_removed_dependencies,
+            checkpoint=checkpoint,
+            cancel_event=operation.cancel_event,
+            deadline=operation.deadline,
+            process_result_callback=(
+                transaction._record_equivalence_process_result
+            ),
+            diagnostic_project_id=transaction.project_key.partition(":")[2],
+            versions=versions,
+        )
+    finally:
+        if not transaction._equivalence_process_results:
+            shutil.rmtree(preflight, ignore_errors=True)
+    _stage_exact_template_import_result(
+        source,
+        baseline=baseline,
+        non_mod_metadata=non_mod_metadata,
+        expected_pack_toml=expected_pack_toml,
+        graph=graph,
+        overrides=ordered_overrides,
+        removed=operation.resolved.removed_pack_candidates,
+        allowed_removed_dependencies=allowed_removed_dependencies,
+        checkpoint=checkpoint,
+        cancel_event=operation.cancel_event,
+        deadline=operation.deadline,
+        process_result_callback=(
+            transaction._record_equivalence_process_result
+        ),
+        diagnostic_project_id=transaction.project_key.partition(":")[2],
+        versions=versions,
+    )
+    transaction._profile_mod_metadata_only = True
+    transaction._version_override_mutated = True
+    transaction._record_source_mutation()
+    return _ExactTemplateImportResult(
+        graph,
+        ordered_overrides,
+        tuple(preview_constraints),
+        allowed_removed_dependencies,
+    )
+
+
 class TemplateImportOperation:
     def __init__(
         self,
@@ -13745,8 +14553,10 @@ class TemplateImportOperation:
         *,
         deadline: float | None = None,
     ) -> None:
-        if resolved.plan_digest != session.plan.plan_digest:
-            raise HuroshikiError("Template import resolution has a stale plan digest")
+        try:
+            validate_resolved_template_import_plan(session.plan, resolved)
+        except TemplateMergeError as error:
+            raise HuroshikiError(str(error)) from error
         self.session = session
         self.plan = session.plan
         self.resolved = resolved
@@ -13787,6 +14597,107 @@ class TemplateImportOperation:
             raise HuroshikiError("Template import URL verification cache is inconsistent")
         return matches[0]
 
+    def _set_exact_preview(
+        self,
+        before_files: Mapping[Path, bytes],
+        before_identities: set[tuple[str, str]],
+        version_constraints: tuple[TemplateVersionConstraintPreview, ...],
+        retained_removed_dependencies: frozenset[tuple[str, str]],
+    ) -> None:
+        after_mods = tuple(
+            mod
+            for entries in _profile_mod_metadata_records(
+                self.transaction.source, self._checkpoint
+            ).values()
+            for _relative, _contents, mod in entries
+        )
+        selected_by_actual = {
+            candidate.actual_identity: candidate
+            for candidate in self.resolved.selected_new_roots
+            if candidate.actual_identity is not None
+        }
+        imported_roots: list[ImportedRootPreview] = []
+        for actual_identity, candidate in selected_by_actual.items():
+            matching = [
+                mod
+                for mod in after_mods
+                if (canonical_provider(mod.provider), mod.project_id)
+                == actual_identity
+            ]
+            if len(matching) != 1:
+                raise HuroshikiError(
+                    f"Imported root must resolve exactly once: "
+                    f"{actual_identity[0]}:{actual_identity[1]}"
+                )
+            mod = matching[0]
+            imported_roots.append(
+                ImportedRootPreview(
+                    candidate.selection_key,
+                    candidate.candidate_key,
+                    candidate.name,
+                    candidate.logical_identity,
+                    actual_identity,
+                    mod.relative_path,
+                    mod.filename,
+                )
+            )
+        added = tuple(
+            mod
+            for mod in after_mods
+            if (canonical_provider(mod.provider), mod.project_id)
+            not in before_identities
+            and (canonical_provider(mod.provider), mod.project_id)
+            not in selected_by_actual
+        )
+        unchanged = _resolved_unchanged_pack_candidates(
+            self.plan, self.resolved
+        )
+        preview_removed = tuple(
+            candidate
+            for candidate in self.resolved.removed_pack_candidates
+            if candidate.actual_identity not in retained_removed_dependencies
+        )
+        removed_keys = {
+            candidate.selection_key
+            for candidate in preview_removed
+        }
+        unchanged_keys = {candidate.selection_key for candidate in unchanged}
+        if removed_keys & unchanged_keys:
+            raise HuroshikiError(
+                "Template import preview classifies a Pack candidate as both "
+                "removed and unchanged"
+            )
+        side_changed_identities = {
+            identity for identity, _old, _new in self.resolved.side_changes
+        }
+        if any(
+            candidate.actual_identity in side_changed_identities
+            for candidate in unchanged
+        ):
+            raise HuroshikiError(
+                "Template import preview classifies a side-modified candidate "
+                "as unchanged"
+            )
+        self.preview = TemplateImportPreview(
+            tuple(imported_roots),
+            added,
+            self.resolved.side_changes,
+            preview_removed,
+            unchanged,
+            _content_changes(
+                before_files,
+                _file_content_snapshot(
+                    self.transaction.source, self._checkpoint
+                ),
+            ),
+            self.resolved.warnings
+            + tuple(
+                f"{provider}:{project} retained as a dependency by exact intent"
+                for provider, project in sorted(retained_removed_dependencies)
+            ),
+            version_constraints,
+        )
+
     def run(self) -> None:
         with self._lock:
             if self._started or self.done.is_set():
@@ -13795,18 +14706,42 @@ class TemplateImportOperation:
         try:
             self.transaction.ensure_active()
             self._checkpoint()
-            if self.resolved.plan_digest != self.session.plan.plan_digest:
-                raise HuroshikiError("Template import resolution has a stale plan digest")
+            try:
+                validate_resolved_template_import_plan(
+                    self.session.plan, self.resolved
+                )
+            except TemplateMergeError as error:
+                raise HuroshikiError(str(error)) from error
             if not self.session.templates_unchanged():
                 raise HuroshikiError("Template manifest changed before import execution")
             before_files = _file_content_snapshot(self.transaction.source, self._checkpoint)
             before_identities = {
                 (canonical_provider(mod.provider), mod.project_id)
-                for mod in list_mods_from_source(self.transaction.source)
+                for entries in _profile_mod_metadata_records(
+                    self.transaction.source, self._checkpoint
+                ).values()
+                for _relative, _contents, mod in entries
             }
             minecraft, loader, loader_version = packctl.project_versions(
                 self.transaction.source
             )
+            exact_aware = bool(self.plan.version_constraints) or (
+                self.transaction.source / VERSION_OVERRIDE_MANIFEST_PATH
+            ).is_file()
+            if exact_aware:
+                exact_result = _execute_exact_template_import(self)
+                if not self.session.templates_unchanged():
+                    raise HuroshikiError(
+                        "Template manifest changed during import"
+                    )
+                self._set_exact_preview(
+                    before_files,
+                    before_identities,
+                    exact_result.preview_constraints,
+                    exact_result.retained_removed_dependencies,
+                )
+                self.progress_queue.put("Preview ready")
+                return
             selected_actual_identities = [
                 candidate.actual_identity
                 for candidate in self.resolved.selected_new_roots
@@ -13830,6 +14765,11 @@ class TemplateImportOperation:
                     closure = verification.cached_closure
                     if not isinstance(closure, ResolvedModClosure):
                         raise HuroshikiError("Verified URL closure is unavailable")
+                elif isinstance(verification.cached_closure, ResolvedModClosure):
+                    # Planning verified provider output in exact-aware mode;
+                    # execution must consume that immutable closure rather than
+                    # observing provider drift a second time.
+                    closure = verification.cached_closure
                 else:
                     closure = resolve_mod_closure(
                         provider=candidate.provider,
@@ -13894,7 +14834,13 @@ class TemplateImportOperation:
             )
             if not self.session.templates_unchanged():
                 raise HuroshikiError("Template manifest changed during import")
-            after_mods = list_mods_from_source(self.transaction.source)
+            after_mods = tuple(
+                mod
+                for entries in _profile_mod_metadata_records(
+                    self.transaction.source, self._checkpoint
+                ).values()
+                for _relative, _contents, mod in entries
+            )
             selected_by_actual = {
                 candidate.actual_identity: candidate
                 for candidate in self.resolved.selected_new_roots
@@ -13957,6 +14903,45 @@ class TemplateImportOperation:
                     "Template import preview classifies a side-modified candidate "
                     "as unchanged"
                 )
+            existing_overrides = {
+                item.canonical_identity: item
+                for item in read_mod_version_overrides(self.transaction.source)
+            }
+            version_preview = tuple(
+                TemplateVersionConstraintPreview(
+                    f"{constraint.provider}:{constraint.project_id}",
+                    constraint.provider,
+                    constraint.project_id,
+                    constraint.artifact_id,
+                    constraint.scope,
+                    tuple(
+                        sorted(
+                            {
+                                candidate.origin_id
+                                for candidate in self.resolved.selected_template_candidates
+                                if constraint.template_id in candidate.template_origin_ids
+                            }
+                        )
+                    ) or (constraint.template_id,),
+                    (
+                        existing_overrides[
+                            f"{constraint.provider}:{constraint.project_id}"
+                        ].locked
+                        if f"{constraint.provider}:{constraint.project_id}"
+                        in existing_overrides
+                        else False
+                    ),
+                    (
+                        existing_overrides[
+                            f"{constraint.provider}:{constraint.project_id}"
+                        ].reason
+                        if f"{constraint.provider}:{constraint.project_id}"
+                        in existing_overrides
+                        else None
+                    ),
+                )
+                for constraint in self.resolved.version_constraints
+            )
             self.preview = TemplateImportPreview(
                 tuple(imported_roots),
                 added,
@@ -13968,6 +14953,7 @@ class TemplateImportOperation:
                     _file_content_snapshot(self.transaction.source, self._checkpoint),
                 ),
                 self.resolved.warnings,
+                version_preview,
             )
             self.progress_queue.put("Preview ready")
         except LoaderMigrationCancelled:
@@ -14003,8 +14989,13 @@ class TemplateImportOperation:
                 "Template manifest changed or import plan became stale after preview"
             )
         try:
+            self._checkpoint()
             self.transaction.ensure_active()
-            self.transaction.apply(refresh=False)
+            self.transaction.apply(
+                refresh=False,
+                cancel_event=self.cancel_event,
+                deadline=self.deadline,
+            )
             self.session.finished = True
         except BaseException:
             self.session.discard()

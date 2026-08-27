@@ -372,6 +372,41 @@ and deletion always use and update committed semantic data in `template.yaml`; t
 is used only for bounded downloads. Changing either template configuration file while a staged
 template transaction is open prevents that transaction from being applied.
 
+### Template version intent
+
+Committed Templates may also declare `mod_version_overrides`. Entries use immutable provider IDs
+and an exact artifact/version ID; the scope is either `root` or `dependency`:
+
+```yaml
+mod_version_overrides:
+  # No entry: this Template root is automatic (the compatible version is resolved).
+  - provider: modrinth
+    project_id: Abcd1234
+    artifact_id: Efgh5678
+    scope: root                 # exact root version
+  - provider: curseforge
+    project_id: "238222"
+    artifact_id: "123456"
+    scope: dependency            # exact required non-root dependency version
+```
+
+Modrinth project and artifact IDs must be immutable eight-character IDs. CurseForge project and
+artifact IDs must be canonical positive decimal IDs. URL entries cannot carry version intent:
+URLs have no provider artifact identity and remain bounded URL selections. A root override must
+match exactly one Template `mods` entry; a dependency override must not appear in `mods` and is
+valid only when that MOD is a required non-root dependency of a selected root.
+
+During **Apply Template**, conflicts are resolved first. Only then are active root intents derived
+from the selected candidates; dependency intents are retained only for required dependency edges.
+The import reconstructs one final constraint set and resolves the complete selected root graph from
+that set. It does not open a candidate browser or picker, and it does not synchronize Packwiz pins.
+
+The Pack source file `.huroshiki-version-overrides.json` remains the Authority after import. Existing
+locked Pack intent wins as a hard constraint: a conflicting Template exact artifact fails closed.
+Newly imported intent is unlocked by default. Non-MOD metadata and Pack-only MODs are preserved;
+Template Import does not infer ownership or remove them. The separate #80 migration work is out of
+scope for this feature.
+
 Any `templates/<id>/source` entry, including a symlink, is a validation error. Legacy Packwiz
 template fallback and migration commands have been removed. Before upgrading, extract required
 provider IDs and sides into `template.yaml`, add all required fields shown above, remove `source/`,

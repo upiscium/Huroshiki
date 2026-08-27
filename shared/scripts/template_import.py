@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, replace
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import TYPE_CHECKING, Literal, Mapping, Sequence
 
 if TYPE_CHECKING:
@@ -18,6 +19,8 @@ from template_merge import (
 
 
 SideDecision = Literal["keep_pack", "use_template", "union"]
+_CANONICAL_DECIMAL_ID = re.compile(r"^[1-9][0-9]*$")
+_IMMUTABLE_MODRINTH_ID = re.compile(r"^[A-Za-z0-9]{8}$")
 
 
 @dataclass(frozen=True)
@@ -282,6 +285,141 @@ class ResolvedTemplateImportPlan:
     version_constraints: tuple[TemplateVersionConstraint, ...] = ()
 
 
+def validate_resolved_template_import_plan(
+    plan: TemplateImportPlan,
+    resolved: ResolvedTemplateImportPlan,
+) -> None:
+    """Re-derive execution-bearing resolution fields from the fixed plan."""
+
+    if resolved.plan_digest != plan.plan_digest:
+        raise TemplateMergeError("Template import resolution has a stale plan digest")
+    selected_option_keys = tuple(resolved.selected_option_keys)
+    if len(selected_option_keys) != len(set(selected_option_keys)):
+        raise TemplateMergeError("Template import resolution repeats an option key")
+    selected_set = set(selected_option_keys)
+    available = {option.option_key for option in plan.selection_options}
+    if not selected_set <= available:
+        raise TemplateMergeError("Template import resolution contains an unknown option")
+    expected_order = tuple(
+        option.option_key
+        for option in plan.selection_options
+        if option.option_key in selected_set
+    )
+    if selected_option_keys != expected_order:
+        raise TemplateMergeError("Template import resolution option order is stale")
+    for conflicts, exactly_one in (
+        (plan.name_conflicts, False),
+        (plan.url_selector_conflicts, False),
+        (plan.logical_identity_conflicts, True),
+        (plan.actual_identity_conflicts, True),
+    ):
+        for conflict in conflicts:
+            count = sum(
+                option.option_key in selected_set for option in conflict.options
+            )
+            if (exactly_one and count != 1) or (not exactly_one and count < 1):
+                raise TemplateMergeError(
+                    f"Template import resolution violates conflict {conflict.key!r}"
+                )
+
+    selected_candidate_keys = {
+        candidate.selection_key
+        for option in plan.selection_options
+        if option.option_key in selected_set
+        for candidate in option.candidates
+    }
+    expected_templates = tuple(
+        candidate
+        for candidate in plan.template_candidates
+        if candidate.selection_key in selected_candidate_keys
+    )
+    expected_pack = tuple(
+        candidate
+        for candidate in plan.pack_candidates
+        if candidate.selection_key in selected_candidate_keys
+    )
+    retained_actual = {candidate.actual_identity for candidate in expected_pack}
+    expected_new = tuple(
+        candidate
+        for candidate in expected_templates
+        if candidate.actual_identity is not None
+        and candidate.actual_identity not in retained_actual
+    )
+    expected_removed = tuple(
+        candidate
+        for candidate in plan.pack_candidates
+        if candidate.selection_key not in selected_candidate_keys
+    )
+    if (
+        resolved.selected_template_candidates != expected_templates
+        or resolved.retained_pack_candidates != expected_pack
+        or resolved.selected_new_roots != expected_new
+        or resolved.removed_pack_candidates != expected_removed
+    ):
+        raise TemplateMergeError(
+            "Template import resolution candidate membership is stale"
+        )
+    verification_by_selector = {
+        item.selector_identity: item for item in plan.verifications
+    }
+    if any(
+        not verification_by_selector[candidate.selector_identity].succeeded
+        for candidate in expected_templates
+    ):
+        raise TemplateMergeError(
+            "Template import resolution selects an unverified candidate"
+        )
+    all_conflicts = (
+        *plan.name_conflicts,
+        *plan.url_selector_conflicts,
+        *plan.logical_identity_conflicts,
+        *plan.actual_identity_conflicts,
+    )
+    for removed in expected_removed:
+        if not any(
+            removed in conflict.candidates
+            and any(
+                option.option_key in selected_set
+                and any(candidate in expected_new for candidate in option.candidates)
+                for option in conflict.options
+            )
+            for conflict in all_conflicts
+        ):
+            raise TemplateMergeError(
+                f"Removing {removed.candidate_key} leaves no selected replacement"
+            )
+    expected_constraints = _active_version_constraints(plan, expected_templates)
+    if resolved.version_constraints != expected_constraints:
+        raise TemplateMergeError(
+            "Template import resolution version constraints are stale"
+        )
+
+    side_conflicts = {item.identity: item for item in plan.side_conflicts}
+    seen_sides: set[tuple[str, str]] = set()
+    selected_template_actual = {
+        candidate.actual_identity for candidate in expected_templates
+    }
+    for identity, old_side, new_side in resolved.side_changes:
+        conflict = side_conflicts.get(identity)
+        if (
+            conflict is None
+            or identity in seen_sides
+            or identity not in retained_actual
+            or identity not in selected_template_actual
+            or old_side != conflict.pack_side
+            or new_side
+            not in {
+                conflict.template_side,
+                union_side(conflict.pack_side, conflict.template_side),
+            }
+            or new_side == old_side
+        ):
+            raise TemplateMergeError(
+                "Template import resolution side changes are stale"
+            )
+        seen_sides.add(identity)
+
+
 def _active_version_constraints(
     plan: TemplateImportPlan,
     selected_candidates: Sequence[ModCandidate],
@@ -439,6 +577,27 @@ def _canonical_version_constraints(
         scope = values["scope"].strip().lower()
         if not template_id or not provider or not project_id or not artifact_id:
             raise TemplateMergeError("Template version constraint fields cannot be empty")
+        if provider == "curseforge":
+            if (
+                _CANONICAL_DECIMAL_ID.fullmatch(project_id) is None
+                or _CANONICAL_DECIMAL_ID.fullmatch(artifact_id) is None
+            ):
+                raise TemplateMergeError(
+                    "CurseForge Template version constraints require canonical "
+                    "positive decimal IDs"
+                )
+        elif provider == "modrinth":
+            if (
+                _IMMUTABLE_MODRINTH_ID.fullmatch(project_id) is None
+                or _IMMUTABLE_MODRINTH_ID.fullmatch(artifact_id) is None
+            ):
+                raise TemplateMergeError(
+                    "Modrinth Template version constraints require immutable IDs"
+                )
+        else:
+            raise TemplateMergeError(
+                "Template version constraints support only CurseForge or Modrinth"
+            )
         if scope not in {"root", "dependency"}:
             raise TemplateMergeError(f"Invalid Template version constraint scope: {scope}")
         normalized.append(
@@ -724,6 +883,40 @@ def build_template_import_plan(
     ]
     if len(ordered_templates) != len(template_candidates):
         raise TemplateMergeError("Template candidate references an unselected template")
+    constraints_by_template_identity: dict[
+        tuple[str, str, str], TemplateVersionConstraint
+    ] = {}
+    for constraint in normalized_constraints:
+        key = (
+            constraint.template_id,
+            constraint.provider,
+            constraint.project_id,
+        )
+        previous = constraints_by_template_identity.get(key)
+        if previous is not None and (
+            previous.artifact_id != constraint.artifact_id
+            or previous.scope != constraint.scope
+        ):
+            raise TemplateMergeError(
+                "One Template requests conflicting version intent for "
+                f"{constraint.provider}:{constraint.project_id}"
+            )
+        constraints_by_template_identity[key] = constraint
+        matching_roots = [
+            candidate
+            for candidate in ordered_templates
+            if candidate.origin_id == constraint.template_id
+            and candidate.logical_identity
+            == (constraint.provider, constraint.project_id)
+        ]
+        if constraint.scope == "root" and len(matching_roots) != 1:
+            raise TemplateMergeError(
+                "Template root version constraint must match exactly one root"
+            )
+        if constraint.scope == "dependency" and matching_roots:
+            raise TemplateMergeError(
+                "Template dependency version constraint cannot also be a root"
+            )
     merged_templates = merge_template_import_candidates(ordered_templates)
     selection_keys = [
         candidate.selection_key
@@ -1059,7 +1252,7 @@ def resolve_template_import_plan(
         if result != conflict.pack_side:
             side_changes.append((conflict.identity, conflict.pack_side, result))
     active_version_constraints = _active_version_constraints(plan, selected_templates)
-    return ResolvedTemplateImportPlan(
+    resolved = ResolvedTemplateImportPlan(
         plan.plan_digest,
         tuple(
             option.option_key
@@ -1074,3 +1267,5 @@ def resolve_template_import_plan(
         tuple(warnings),
         active_version_constraints,
     )
+    validate_resolved_template_import_plan(plan, resolved)
+    return resolved
