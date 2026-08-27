@@ -340,3 +340,151 @@ class CheckboxRenderingScreensTest(unittest.IsolatedAsyncioTestCase):
                 _assert_checkbox_cell(self, row[0], row[1])
                 app.screen.toggle_candidate()
                 self.assertEqual(table.get_row_at(0)[0].plain, "[ ]")
+
+    async def test_update_screen_renders_version_locked_as_non_toggleable(self) -> None:
+        _FakeUpdatePreparationOperation.candidates = (
+            core.UpdateCandidate(
+                key="mods/locked.pw.toml",
+                root=Path("mods/locked.pw.toml"),
+                slug="locked",
+                name="Locked Mod",
+                provider="curseforge",
+                current_version="1.2.3",
+                current_file_id="456",
+                new_version="1.2.4",
+                status="version-locked",
+            ),
+        )
+        with (
+            patch.object(core, "project_config", return_value={"display_name": "Demo"}),
+            patch.object(
+                huroshiki.core,
+                "UpdatePreparationOperation",
+                _FakeUpdatePreparationOperation,
+            ),
+        ):
+            app = _ScreenApp(huroshiki.UpdateScreen("pack:demo"))
+            async with app.run_test() as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.05)
+                    if app.screen.query_one("#update-options", DataTable).row_count:
+                        break
+                table = app.screen.query_one("#update-options", DataTable)
+                row = table.get_row_at(0)
+                self.assertEqual(row[0].plain, "[ ]")
+                self.assertEqual(str(row[3]), "1.2.3 (456)")
+                self.assertEqual(str(row[6]), "version locked")
+                with patch.object(app, "notify") as notify:
+                    app.screen.toggle_candidate()
+                self.assertEqual(table.get_row_at(0)[0].plain, "[ ]")
+                notify.assert_called_once_with(
+                    "Locked Mod is version locked and cannot be selected; "
+                    "update or remove its version pin first",
+                    severity="warning",
+                )
+
+    async def test_update_screen_renders_version_blocked_details_as_non_toggleable(self) -> None:
+        _FakeUpdatePreparationOperation.candidates = (
+            core.UpdateCandidate(
+                key="mods/blocked.pw.toml",
+                root=Path("mods/blocked.pw.toml"),
+                slug="blocked",
+                name="Blocked Mod",
+                provider="modrinth",
+                current_version="1.2.3",
+                current_file_id="456",
+                new_version="-",
+                status="version-blocked",
+                error="requested artifact is unavailable",
+                blocked_identity="modrinth:blocked-project",
+                blocked_artifact_id="789",
+                blocked_reason="requested artifact is unavailable",
+                user_pin_reason="user pin requires exact artifact",
+            ),
+        )
+        with (
+            patch.object(core, "project_config", return_value={"display_name": "Demo"}),
+            patch.object(
+                huroshiki.core,
+                "UpdatePreparationOperation",
+                _FakeUpdatePreparationOperation,
+            ),
+        ):
+            app = _ScreenApp(huroshiki.UpdateScreen("pack:demo"))
+            async with app.run_test() as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.05)
+                    if app.screen.query_one("#update-options", DataTable).row_count:
+                        break
+                table = app.screen.query_one("#update-options", DataTable)
+                row = table.get_row_at(0)
+                self.assertEqual(row[0].plain, "[ ]")
+                self.assertIn(
+                    "version blocked: requires modrinth:blocked-project artifact 789: "
+                    "requested artifact is unavailable; pin reason: user pin requires exact artifact",
+                    str(row[6]),
+                )
+                with patch.object(app, "notify") as notify:
+                    app.screen.toggle_candidate()
+                self.assertEqual(table.get_row_at(0)[0].plain, "[ ]")
+                notify.assert_called_once_with(
+                    "Blocked Mod is version blocked: requires modrinth:blocked-project "
+                    "artifact 789: requested artifact is unavailable; pin reason: user pin "
+                    "requires exact artifact and cannot be selected; change its version pin "
+                    "or choose a different artifact",
+                    severity="warning",
+                )
+
+    async def test_update_blocked_technical_reason_is_not_a_pin_reason(self) -> None:
+        candidate = core.UpdateCandidate(
+            key="curseforge:1",
+            root=Path("mods/blocked.pw.toml"),
+            slug="blocked",
+            name="Blocked",
+            provider="curseforge",
+            current_version="1",
+            new_version="-",
+            status="version-blocked",
+            error="resolver transport failed",
+            blocked_reason="resolver transport failed",
+        )
+        label = huroshiki.UpdateScreen._candidate_status_label(candidate)
+        self.assertIn("resolver transport failed", label)
+        self.assertNotIn("pin reason:", label)
+
+    async def test_update_screen_renders_version_locked_reason(self) -> None:
+        _FakeUpdatePreparationOperation.candidates = (
+            core.UpdateCandidate(
+                key="mods/locked-reason.pw.toml",
+                root=Path("mods/locked-reason.pw.toml"),
+                slug="locked-reason",
+                name="Reasoned Lock",
+                provider="curseforge",
+                current_version="1.2.3",
+                current_file_id="456",
+                new_version="-",
+                status="version-locked",
+                blocked_reason="direct MOD version is locked",
+                user_pin_reason="maintain server compatibility",
+            ),
+        )
+        with (
+            patch.object(core, "project_config", return_value={"display_name": "Demo"}),
+            patch.object(
+                huroshiki.core,
+                "UpdatePreparationOperation",
+                _FakeUpdatePreparationOperation,
+            ),
+        ):
+            app = _ScreenApp(huroshiki.UpdateScreen("pack:demo"))
+            async with app.run_test() as pilot:
+                for _ in range(20):
+                    await pilot.pause(0.05)
+                    if app.screen.query_one("#update-options", DataTable).row_count:
+                        break
+                row = app.screen.query_one("#update-options", DataTable).get_row_at(0)
+                self.assertEqual(
+                    str(row[6]),
+                    "version locked: direct MOD version is locked; "
+                    "pin reason: maintain server compatibility",
+                )

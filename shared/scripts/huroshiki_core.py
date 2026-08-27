@@ -633,6 +633,12 @@ class UpdateCandidate:
     error: str | None = None
     error_returncode: int | None = None
     error_kind: str | None = None
+    target_identity: tuple[str, str] | None = None
+    target_artifact_id: str | None = None
+    blocked_identity: str | None = None
+    blocked_artifact_id: str | None = None
+    blocked_reason: str | None = None
+    user_pin_reason: str | None = None
 
     @property
     def relative_path(self) -> Path:
@@ -919,6 +925,24 @@ class UpdatePreparationCancelled(HuroshikiError):
 
 class UpdatePreparationDeadlineExceeded(HuroshikiError):
     pass
+
+
+class UpdateVersionIntentError(HuroshikiError):
+    """An authoritative version constraint made Update unsafe to continue."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        identity: str | None = None,
+        artifact_id: str | None = None,
+        user_pin_reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.identity = identity
+        self.artifact_id = artifact_id
+        self.failure_reason = message
+        self.user_pin_reason = user_pin_reason
 
 
 class UpdatePreparationOperation:
@@ -2038,6 +2062,12 @@ class PackTransaction:
     batches: list[TransactionBatch] = field(default_factory=list)
     update_candidates: tuple[UpdateCandidate, ...] = field(default_factory=tuple)
     selected_update_changes: tuple[UpdateChange, ...] = field(default_factory=tuple)
+    _update_selection_baseline: dict[Path, bytes] | None = field(
+        default=None, init=False, repr=False
+    )
+    _update_override_baseline: tuple[ModVersionOverride, ...] | None = field(
+        default=None, init=False, repr=False
+    )
     _exact_selection_prepared: bool = field(default=False, init=False, repr=False)
     _pending_exact_evidence: ExactStageEvidence | None = field(
         default=None, init=False, repr=False
@@ -4451,6 +4481,11 @@ class PackTransaction:
             raise HuroshikiError(
                 "Updates must be prepared before other transaction changes are staged"
             )
+        # Version intent is authoritative for the whole update operation.  Do
+        # this against the transaction's fixed baseline, before normalization
+        # can start or partial candidates can be selected.
+        overrides = self._validated_version_overrides()
+        self._update_override_baseline = overrides
         candidates = _prepare_update_candidates(
             self.source,
             self.root,
@@ -4460,6 +4495,7 @@ class PackTransaction:
             on_progress=on_progress,
             process_result_callback=self._record_equivalence_process_result,
             diagnostic_project_id=self.project_key.partition(":")[2],
+            version_overrides=overrides,
         )
         self.update_candidates = tuple(candidates)
         return candidates
@@ -4500,34 +4536,173 @@ class PackTransaction:
             raise HuroshikiError(
                 f"Unknown update selection: {', '.join(map(str, sorted(unknown)))}"
             )
-        previous_changes = self.selected_update_changes
-        for change in reversed(previous_changes):
-            _apply_update_change(self.source, change, use_after=False)
+        prior_state = _file_content_snapshot(self.source)
+
+        def restore_prior_state() -> None:
+            current = _file_content_snapshot(self.source)
+            for change in _content_changes(current, prior_state):
+                _apply_update_change(self.source, change, use_after=True)
+
+        if self._update_selection_baseline is None:
+            self._update_selection_baseline = prior_state
+            self._update_override_baseline = self._validated_version_overrides()
+        selection_baseline = self._update_selection_baseline
+        overrides_before = self._update_override_baseline
+        assert overrides_before is not None
         try:
-            merged = _merge_update_closures(
-                (available[path] for path in sorted(selected)),
-                source=self.source,
-                workspace=self.root / "update-equivalence",
-                cancel_event=cancel_event,
-                deadline=(
-                    deadline
-                    if deadline is not None
-                    else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
-                ),
-                process_result_callback=self._record_equivalence_process_result,
+            current = _file_content_snapshot(self.source)
+            for change in _content_changes(current, selection_baseline):
+                _apply_update_change(self.source, change, use_after=True)
+            operation_deadline = (
+                deadline
+                if deadline is not None
+                else time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
             )
+            locked_overrides = tuple(
+                override for override in overrides_before if override.locked
+            )
+            if locked_overrides:
+                operation_cancel = (
+                    cancel_event if cancel_event is not None else threading.Event()
+                )
+
+                def checkpoint() -> None:
+                    if operation_cancel.is_set():
+                        raise UpdatePreparationCancelled(
+                            "Update selection was cancelled"
+                        )
+                    if time.monotonic() >= operation_deadline:
+                        raise UpdatePreparationDeadlineExceeded(
+                            "Update selection deadline exceeded"
+                        )
+
+                scan = scan_pack_migration_source(
+                    self.source, checkpoint=checkpoint
+                )
+                try:
+                    roots = extract_pack_migration_roots(
+                        self.source,
+                        expected_identity=scan.root_identity,
+                        expected_snapshot_digest=scan.snapshot_digest,
+                        checkpoint=checkpoint,
+                    )
+                except PackMigrationRootError as root_error:
+                    raise HuroshikiError(
+                        "Locked Update selection requires authoritative root "
+                        f"provenance: {root_error}"
+                    ) from root_error
+                selected_artifacts: dict[tuple[str, str], str] = {}
+                for path in selected:
+                    candidate = available[path]
+                    identity = candidate.target_identity or (
+                        canonical_provider(candidate.provider),
+                        candidate.key.split(":", 1)[1],
+                    )
+                    artifact_id = (
+                        candidate.target_artifact_id
+                        if candidate.target_artifact_id is not None
+                        else candidate.new_file_id
+                    )
+                    if artifact_id in {"", "-"}:
+                        raise HuroshikiError(
+                            f"Selected update has no exact artifact: {candidate.key}"
+                        )
+                    selected_artifacts[identity] = artifact_id
+                merged = _reconstruct_locked_update_selection(
+                    self.source,
+                    roots,
+                    selected_artifacts,
+                    overrides_before,
+                    workspace=(
+                        self.root / f"update-selection-{uuid4().hex}"
+                    ),
+                    cancel_event=operation_cancel,
+                    deadline=operation_deadline,
+                    process_result_callback=self._record_equivalence_process_result,
+                    diagnostic_project_id=self.project_key.partition(":")[2],
+                )
+            else:
+                merged = _merge_update_closures(
+                    (available[path] for path in sorted(selected)),
+                    source=self.source,
+                    workspace=self.root / "update-equivalence",
+                    cancel_event=cancel_event,
+                    deadline=operation_deadline,
+                    process_result_callback=self._record_equivalence_process_result,
+                )
         except BaseException as error:
             try:
-                for change in previous_changes:
-                    _apply_update_change(self.source, change, use_after=True)
+                restore_prior_state()
             except BaseException as restore_error:
                 raise HuroshikiError(
                     f"{error}; failed to restore previously selected updates: "
                     f"{restore_error}"
                 ) from error
             raise
-        for change in merged:
-            _apply_update_change(self.source, change, use_after=True)
+        try:
+            for change in merged:
+                _apply_update_change(self.source, change, use_after=True)
+            # An unlocked user intent follows the selected artifact.  Locked
+            # intents are checked by candidate preparation and remain exact.
+            final_records = _exact_metadata_records(self.source)
+            selected_identities: set[str] = set()
+            for change in merged:
+                if not change.relative_path.name.endswith(".pw.toml"):
+                    continue
+                for contents in (change.before, change.after):
+                    if contents is not None:
+                        record = _update_metadata_record(change.relative_path, contents)
+                        selected_identities.add(
+                            f"{record.provider}:{record.project_id}"
+                        )
+            prospective: list[ModVersionOverride] = []
+            for override in overrides_before:
+                if override.canonical_identity not in selected_identities:
+                    prospective.append(override)
+                    continue
+                entries = final_records.get((override.provider, override.project_id), ())
+                if len(entries) != 1:
+                    raise HuroshikiError(
+                        f"Selected update would orphan version intent: {override.canonical_identity}"
+                    )
+                actual = parse_provider_metadata(entries[0][0], entries[0][1]).file_id
+                if override.locked and actual != override.artifact_id:
+                    raise HuroshikiError(
+                        f"Selected update would drift locked version intent: "
+                        f"{override.canonical_identity}"
+                    )
+                prospective.append(
+                    override
+                    if override.locked or actual == override.artifact_id
+                    else ModVersionOverride(
+                        override.provider,
+                        override.project_id,
+                        actual,
+                        False,
+                        override.reason,
+                    )
+                )
+            changed_overrides = tuple(
+                after
+                for before, after in zip(overrides_before, prospective)
+                if before != after
+            )
+            if changed_overrides:
+                ensure_mod_version_overrides_ignored(self.source)
+            for override in changed_overrides:
+                set_mod_version_override(self.source, override)
+            _validate_mod_version_override_records(
+                self.source, final_records, overrides=tuple(prospective)
+            )
+        except BaseException as error:
+            try:
+                restore_prior_state()
+            except BaseException as restore_error:
+                raise HuroshikiError(
+                    f"{error}; failed to restore update source and version intent: "
+                    f"{restore_error}"
+                ) from error
+            raise
         self.selected_update_changes = merged
         self._record_source_mutation()
 
@@ -7097,6 +7272,43 @@ def _verify_exact_closure_artifacts(
         _equivalence_snapshot_digest(context_source, checkpoint),
         EQUIVALENCE_POLICY_VERSION,
     )
+
+    def materialize(
+        candidate: DependencyCandidate,
+        failure_message: str,
+    ) -> MaterializedArtifact:
+        try:
+            result = materialize_provider_artifact(
+                candidate,
+                context,
+                workspace=workspace,
+                cancel_event=cancel_event,
+                deadline=deadline,
+                process_result_callback=process_result_callback,
+                diagnostic_project_id=diagnostic_project_id,
+                diagnostic_callback=diagnostic_callback,
+            )
+        except (
+            UpdatePreparationCancelled,
+            UpdatePreparationDeadlineExceeded,
+        ):
+            raise
+        except Exception as error:
+            if cancel_event.is_set():
+                raise UpdatePreparationCancelled(
+                    "Exact artifact verification was cancelled"
+                ) from error
+            if time.monotonic() >= deadline:
+                raise UpdatePreparationDeadlineExceeded(
+                    "Exact artifact verification deadline exceeded"
+                ) from error
+            raise HuroshikiError(f"{failure_message}: {error}") from error
+        if not isinstance(result, MaterializedArtifact):
+            raise HuroshikiError(
+                f"{failure_message}: materializer returned invalid evidence"
+            )
+        return result
+
     results: dict[tuple[str, str], ExactArtifactVerification] = {}
     for identity in sorted(desired):
         checkpoint()
@@ -7142,26 +7354,10 @@ def _verify_exact_closure_artifacts(
             provenance="explicit" if identity == selection.identity else "dependency",
             existing=identity in baseline,
         )
-        try:
-            materialized = materialize_provider_artifact(
-                candidate,
-                context,
-                workspace=workspace,
-                cancel_event=cancel_event,
-                deadline=deadline,
-                process_result_callback=process_result_callback,
-                diagnostic_project_id=diagnostic_project_id,
-                diagnostic_callback=diagnostic_callback,
-            )
-        except Exception as error:
-            raise HuroshikiError(
-                f"Exact artifact materialization failed for {identity[0]}:{identity[1]}: {error}"
-            ) from error
-        if not isinstance(materialized, MaterializedArtifact):
-            raise HuroshikiError(
-                f"Exact artifact materialization returned invalid evidence for "
-                f"{identity[0]}:{identity[1]}"
-            )
+        materialized = materialize(
+            candidate,
+            f"Exact artifact materialization failed for {identity[0]}:{identity[1]}",
+        )
         semantic = materialized.semantic_identity
         if semantic is None:
             raise HuroshikiError(
@@ -7201,21 +7397,10 @@ def _verify_exact_closure_artifacts(
         provenance="explicit" if selection.identity == selection.identity else "dependency",
         existing=True,
     )
-    try:
-        old_materialized = materialize_provider_artifact(
-            old_candidate,
-            context,
-            workspace=workspace,
-            cancel_event=cancel_event,
-            deadline=deadline,
-            process_result_callback=process_result_callback,
-            diagnostic_project_id=diagnostic_project_id,
-            diagnostic_callback=diagnostic_callback,
-        )
-    except Exception as error:
-        raise HuroshikiError(
-            f"Could not verify semantic continuity for {selection.identity_label}: {error}"
-        ) from error
+    old_materialized = materialize(
+        old_candidate,
+        f"Could not verify semantic continuity for {selection.identity_label}",
+    )
     if old_materialized.semantic_identity is None:
         raise HuroshikiError(
             f"Installed artifact has no resolved semantic identity: {selection.identity_label}"
@@ -7248,15 +7433,9 @@ def _verify_exact_closure_artifacts(
             provenance="dependency",
             existing=True,
         )
-        old_materialized = materialize_provider_artifact(
+        old_materialized = materialize(
             old_candidate,
-            context,
-            workspace=workspace,
-            cancel_event=cancel_event,
-            deadline=deadline,
-            process_result_callback=process_result_callback,
-            diagnostic_project_id=diagnostic_project_id,
-            diagnostic_callback=diagnostic_callback,
+            f"Could not verify installed dependency {identity[0]}:{identity[1]}",
         )
         if old_materialized.semantic_identity is None:
             raise HuroshikiError(
@@ -8629,6 +8808,420 @@ def _candidate_error(
     )
 
 
+def _update_exact_selection(
+    provider: str,
+    project_id: str,
+    artifact_id: str,
+) -> ExactModArtifactSelection:
+    project: str | CanonicalModrinthId = project_id
+    artifact: str | CanonicalModrinthId = artifact_id
+    if provider == "modrinth":
+        project = canonical_modrinth_id(project_id, "Modrinth project ID")
+        artifact = canonical_modrinth_id(artifact_id, "Modrinth version ID")
+    return ExactModArtifactSelection(provider, project, artifact)
+
+
+def _prospective_update_reachability(
+    root_closures: Sequence[tuple[PackMigrationRoot, ResolvedModClosure]],
+    checkpoint: Callable[[], None],
+) -> dict[tuple[str, str], set[str]]:
+    """Map prospective closure membership without freezing selected artifacts."""
+
+    owners: dict[tuple[str, str], set[str]] = {}
+    for root, closure in root_closures:
+        checkpoint()
+        identity = (root.provider, root.project_id)
+        if closure.root_identity != identity:
+            raise HuroshikiError(
+                f"Prospective closure root mismatch for {root.canonical_identity}"
+            )
+        seen: set[tuple[str, str]] = set()
+        for item in closure.metadata:
+            checkpoint()
+            if item.identity in seen:
+                raise HuroshikiError(
+                    f"Prospective closure for {root.canonical_identity} contains "
+                    f"duplicate identity {item.provider}:{item.project_id}"
+                )
+            seen.add(item.identity)
+            metadata_identity = parse_provider_metadata(
+                item.relative_path, item.contents
+            )
+            if (
+                metadata_identity.provider,
+                metadata_identity.project_id,
+            ) != item.identity:
+                raise HuroshikiError(
+                    f"Prospective closure identity mismatch for "
+                    f"{item.provider}:{item.project_id}"
+                )
+            owners.setdefault(item.identity, set()).add(root.canonical_identity)
+        if identity not in seen:
+            raise HuroshikiError(
+                f"Prospective closure does not contain explicit root "
+                f"{root.canonical_identity}"
+            )
+    return owners
+
+
+def _reconstruct_locked_update_selection(
+    source: Path,
+    roots: Sequence[PackMigrationRoot],
+    selected_artifacts: Mapping[tuple[str, str], str],
+    overrides: Sequence[ModVersionOverride],
+    *,
+    workspace: Path,
+    cancel_event: threading.Event,
+    deadline: float,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None,
+    diagnostic_project_id: str | None,
+) -> tuple[UpdateChange, ...]:
+    """Rebuild the prospective Pack graph under exact locked constraints."""
+
+    locked = tuple(item for item in overrides if item.locked)
+    if not locked:
+        raise HuroshikiError("Locked Update reconstruction requires a version lock")
+    workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+    versions = packctl.project_versions(source)
+    baseline_records = _exact_metadata_records(source)
+    explicit_identities = {
+        (root.provider, root.project_id) for root in roots
+    }
+    root_by_identity = {
+        (root.provider, root.project_id): root for root in roots
+    }
+
+    def checkpoint() -> None:
+        if cancel_event.is_set():
+            raise UpdatePreparationCancelled("Update reconstruction was cancelled")
+        if time.monotonic() >= deadline:
+            raise UpdatePreparationDeadlineExceeded(
+                "Update reconstruction deadline exceeded"
+            )
+
+    def preserve_authority(error: HuroshikiError) -> None:
+        if isinstance(
+            error,
+            (UpdatePreparationCancelled, UpdatePreparationDeadlineExceeded),
+        ):
+            raise error
+        if cancel_event.is_set():
+            raise UpdatePreparationCancelled(
+                "Update reconstruction was cancelled"
+            ) from error
+        if time.monotonic() >= deadline:
+            raise UpdatePreparationDeadlineExceeded(
+                "Update reconstruction deadline exceeded"
+            ) from error
+
+    def resolve_root(
+        root: PackMigrationRoot,
+        artifact_id: str,
+        *,
+        preseeds: Sequence[ExactModArtifactSelection] = (),
+        suffix: str,
+    ) -> ResolvedModClosure:
+        checkpoint()
+        if root.provider == "url":
+            if preseeds:
+                raise HuroshikiError(
+                    f"Opaque URL root {root.canonical_identity} cannot own provider constraints"
+                )
+            return ResolvedModClosure(
+                (root.provider, root.project_id),
+                (_exact_metadata_from_root(root, baseline_records),),
+            )
+        resolver = workspace / f"root-{suffix}-{uuid4().hex}"
+        create_resolver_source(
+            resolver,
+            display_name=f"Reconstruct Update {root.canonical_identity}",
+            minecraft=versions[0],
+            loader=versions[1],
+            loader_version=versions[2],
+        )
+        selection = _update_exact_selection(
+            root.provider, root.project_id, artifact_id
+        )
+        try:
+            closure = resolve_exact_mod_closure(
+                selection,
+                source=resolver,
+                cancel_event=cancel_event,
+                deadline=deadline,
+                checkpoint=checkpoint,
+                preseed_selections=preseeds,
+                process_result_callback=process_result_callback,
+                diagnostic_project_id=diagnostic_project_id,
+            )
+        except HuroshikiError as error:
+            preserve_authority(error)
+            raise
+        _verify_exact_root_metadata(selection, closure.metadata)
+        return ResolvedModClosure(selection.identity, closure.metadata)
+
+    root_artifacts: dict[tuple[str, str], str] = {}
+    dependency_constraints: dict[
+        tuple[str, str], ExactModArtifactSelection
+    ] = {}
+    constraint_locks: dict[tuple[str, str], ModVersionOverride] = {}
+    for root in roots:
+        identity = (root.provider, root.project_id)
+        artifact = selected_artifacts.get(identity, root.source_file_id)
+        if root.provider != "url" and not artifact:
+            raise HuroshikiError(
+                f"Update root {root.canonical_identity} has no exact artifact ID"
+            )
+        root_artifacts[identity] = artifact or ""
+    for override in locked:
+        identity = (override.provider, override.project_id)
+        constraint_locks[identity] = override
+        dependency_constraints[identity] = _update_exact_selection(
+            override.provider, override.project_id, override.artifact_id
+        )
+        if identity in explicit_identities and identity in selected_artifacts and (
+            selected_artifacts[identity] != override.artifact_id
+        ):
+            raise UpdateVersionIntentError(
+                f"Locked root {override.canonical_identity} cannot update from "
+                f"artifact {override.artifact_id}",
+                identity=override.canonical_identity,
+                artifact_id=override.artifact_id,
+                user_pin_reason=override.reason,
+            )
+    for identity, artifact_id in selected_artifacts.items():
+        if identity in explicit_identities:
+            continue
+        existing = dependency_constraints.get(identity)
+        selection = _update_exact_selection(identity[0], identity[1], artifact_id)
+        if existing is not None and existing.artifact_id != selection.artifact_id:
+            override = constraint_locks[identity]
+            raise UpdateVersionIntentError(
+                f"Selected update conflicts with locked artifact for "
+                f"{override.canonical_identity}",
+                identity=override.canonical_identity,
+                artifact_id=override.artifact_id,
+                user_pin_reason=override.reason,
+            )
+        dependency_constraints[identity] = selection
+
+    prospective: list[tuple[PackMigrationRoot, ResolvedModClosure]] = []
+    for index, root in enumerate(roots):
+        identity = (root.provider, root.project_id)
+        prospective.append(
+            (
+                root,
+                resolve_root(
+                    root,
+                    root_artifacts[identity],
+                    suffix=f"{index}-prospective",
+                ),
+            )
+        )
+    prospective_reachability = _prospective_update_reachability(
+        prospective, checkpoint
+    )
+    for identity, selection in dependency_constraints.items():
+        if prospective_reachability.get(identity):
+            continue
+        override = constraint_locks.get(identity)
+        if override is not None:
+            raise UpdateVersionIntentError(
+                f"Locked dependency {override.canonical_identity} is no longer required",
+                identity=override.canonical_identity,
+                artifact_id=override.artifact_id,
+                user_pin_reason=override.reason,
+            )
+        raise HuroshikiError(
+            f"Selected dependency {selection.identity_label} is no longer required"
+        )
+
+    constrained: list[tuple[PackMigrationRoot, ResolvedModClosure]] = []
+    for index, (root, closure) in enumerate(prospective):
+        identity = (root.provider, root.project_id)
+        applicable = tuple(
+            dependency_constraints[item]
+            for item in sorted(dependency_constraints)
+            if root.canonical_identity in prospective_reachability[item]
+            and item != identity
+        )
+        if applicable:
+            closure = resolve_root(
+                root,
+                root_artifacts[identity],
+                preseeds=applicable,
+                suffix=f"{index}-constrained",
+            )
+            for selection in applicable:
+                try:
+                    _verify_exact_root_metadata(selection, closure.metadata)
+                except (
+                    UpdatePreparationCancelled,
+                    UpdatePreparationDeadlineExceeded,
+                ):
+                    raise
+                except HuroshikiError as error:
+                    locked_selection = constraint_locks.get(selection.identity)
+                    if locked_selection is None:
+                        raise
+                    raise UpdateVersionIntentError(
+                        f"Locked dependency {locked_selection.canonical_identity} is "
+                        f"incompatible with {root.canonical_identity}: {error}",
+                        identity=locked_selection.canonical_identity,
+                        artifact_id=locked_selection.artifact_id,
+                        user_pin_reason=locked_selection.reason,
+                    ) from error
+        constrained.append((root, closure))
+
+    aggregate = workspace / "aggregate"
+    create_resolver_source(
+        aggregate,
+        display_name="Reconstruct selected Updates",
+        minecraft=versions[0],
+        loader=versions[1],
+        loader_version=versions[2],
+    )
+    ensure_pack_root_manifest_ignored(aggregate)
+    write_pack_root_manifest(aggregate, ())
+    explicit_sides = {
+        (root.provider, root.project_id): root.source_side for root in roots
+    }
+    for root, closure in constrained:
+        checkpoint()
+        try:
+            merge_metadata_closure(
+                aggregate,
+                closure,
+                requested_side=root.source_side,
+                preserve_resolved_dependency_sides=True,
+                explicit_root_sides=explicit_sides,
+                cancel_event=cancel_event,
+                deadline=deadline,
+                equivalence_workspace=workspace / "equivalence",
+                process_result_callback=process_result_callback,
+            )
+        except HuroshikiError as error:
+            preserve_authority(error)
+            raise
+    _merge_exact_existing_dependency_sides(
+        aggregate,
+        baseline_records,
+        ("", ""),
+        explicit_identities,
+        checkpoint,
+    )
+    expected_roots = tuple(
+        PackRootRecord(root.provider, root.project_id, root.source_side)
+        for root in roots
+    )
+    if read_pack_root_manifest(aggregate) != expected_roots:
+        raise HuroshikiError(
+            "Update reconstruction changed authoritative root provenance"
+        )
+    desired_records = _exact_metadata_records(aggregate, checkpoint)
+    _exact_assert_root_manifest_identities(aggregate, desired_records)
+
+    verification_identity = next(iter(selected_artifacts), None)
+    if verification_identity is None or verification_identity not in desired_records:
+        verification_identity = next(
+            identity
+            for identity in explicit_identities
+            if identity[0] in {"modrinth", "curseforge"}
+        )
+    verification_entry = desired_records[verification_identity]
+    if len(verification_entry) != 1:
+        raise HuroshikiError(
+            "Update reconstruction verification identity is not unique"
+        )
+    verification_artifact = parse_provider_metadata(
+        verification_entry[0][0], verification_entry[0][1]
+    ).file_id
+    if verification_artifact is None:
+        raise HuroshikiError(
+            "Update reconstruction verification identity has no artifact ID"
+        )
+    verification_selection = _update_exact_selection(
+        verification_identity[0],
+        verification_identity[1],
+        verification_artifact,
+    )
+    try:
+        verifications = _verify_exact_closure_artifacts(
+            baseline_records,
+            desired_records,
+            verification_selection,
+            versions,
+            workspace=workspace / "artifacts",
+            context_source=source,
+            cancel_event=cancel_event,
+            deadline=deadline,
+            process_result_callback=process_result_callback,
+            diagnostic_project_id=diagnostic_project_id,
+            diagnostic_callback=None,
+            selected_dependency_roots=None,
+            explicit_root_identities=explicit_identities,
+            opaque_url_roots={
+                (root.provider, root.project_id)
+                for root in roots
+                if root.provider == "url"
+            },
+            checkpoint=checkpoint,
+        )
+    except HuroshikiError as error:
+        preserve_authority(error)
+        raise
+    graph = _build_exact_dependency_graph(
+        verifications, explicit_identities, checkpoint
+    )
+    for override in locked:
+        identity = (override.provider, override.project_id)
+        entries = desired_records.get(identity, ())
+        actual = (
+            parse_provider_metadata(entries[0][0], entries[0][1]).file_id
+            if len(entries) == 1
+            else None
+        )
+        if actual != override.artifact_id:
+            raise UpdateVersionIntentError(
+                f"Locked artifact drifted for {override.canonical_identity}: "
+                f"expected {override.artifact_id}, found {actual or '<missing>'}",
+                identity=override.canonical_identity,
+                artifact_id=override.artifact_id,
+                user_pin_reason=override.reason,
+            )
+        if identity not in explicit_identities:
+            owners = graph.reachable_roots(identity)
+            if not owners:
+                raise UpdateVersionIntentError(
+                    f"Locked dependency {override.canonical_identity} has no "
+                    "required-edge owner",
+                    identity=override.canonical_identity,
+                    artifact_id=override.artifact_id,
+                    user_pin_reason=override.reason,
+                )
+            try:
+                _assert_exact_selected_dependency_reachability(
+                    graph, identity, owners
+                )
+            except HuroshikiError as error:
+                raise UpdateVersionIntentError(
+                    f"Locked dependency reachability failed for "
+                    f"{override.canonical_identity}: {error}",
+                    identity=override.canonical_identity,
+                    artifact_id=override.artifact_id,
+                    user_pin_reason=override.reason,
+                ) from error
+    for identity in selected_artifacts:
+        if identity in explicit_identities:
+            continue
+        owners = graph.reachable_roots(identity)
+        if not owners:
+            raise HuroshikiError(
+                f"Selected dependency {identity[0]}:{identity[1]} has no required-edge owner"
+            )
+        _assert_exact_selected_dependency_reachability(graph, identity, owners)
+    return _exact_metadata_changes(baseline_records, desired_records)
+
+
 def _prepare_update_candidates(
     source: Path,
     transaction_root: Path,
@@ -8639,12 +9232,14 @@ def _prepare_update_candidates(
     on_progress: Callable[[UpdateProgress], None] | None = None,
     process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
     diagnostic_project_id: str | None = None,
+    version_overrides: Sequence[ModVersionOverride] = (),
 ) -> list[UpdateCandidate]:
     effective_deadline = (
         deadline
         if deadline is not None
         else time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS
     )
+    operation_cancel = cancel_event if cancel_event is not None else threading.Event()
     process_incomplete = False
 
     def record_process_result(result: BoundedProcessResult) -> None:
@@ -8708,6 +9303,29 @@ def _prepare_update_candidates(
         if metadata_is_pinned(old_data):
             candidates.append(
                 UpdateCandidate(**common, new_version="-", status="pinned")
+            )
+            continue
+        override = next(
+            (
+                item
+                for item in version_overrides
+                if item.provider == provider and item.project_id == old_mod.project_id
+            ),
+            None,
+        )
+        if override is not None and override.locked:
+            candidates.append(
+                UpdateCandidate(
+                    **common,
+                    new_version="-",
+                    status="version-locked",
+                    target_identity=(provider, old_mod.project_id),
+                    target_artifact_id=override.artifact_id,
+                    blocked_identity=override.canonical_identity,
+                    blocked_artifact_id=override.artifact_id,
+                    blocked_reason="direct MOD version is locked",
+                    user_pin_reason=override.reason,
+                )
             )
             continue
         if provider not in {"modrinth", "curseforge"} or not old_mod.project_id:
@@ -8838,6 +9456,25 @@ def _prepare_update_candidates(
             normalized,
             lambda: copy_checkpoint(len(candidates), total),
         )
+        locked_overrides = tuple(item for item in version_overrides if item.locked)
+        explicit_roots: tuple[PackMigrationRoot, ...] = ()
+        if locked_overrides:
+            scan = scan_pack_migration_source(
+                normalized,
+                checkpoint=lambda: copy_checkpoint(len(candidates), total),
+            )
+            try:
+                explicit_roots = extract_pack_migration_roots(
+                    normalized,
+                    expected_identity=scan.root_identity,
+                    expected_snapshot_digest=scan.snapshot_digest,
+                    checkpoint=lambda: copy_checkpoint(len(candidates), total),
+                )
+            except PackMigrationRootError as error:
+                raise HuroshikiError(
+                    "Version-locked dependency intent requires authoritative root "
+                    f"provenance: {error}"
+                ) from error
     except UpdatePreparationCancelled:
         if not process_incomplete:
             shutil.rmtree(resolver_root, ignore_errors=True)
@@ -8910,6 +9547,7 @@ def _prepare_update_candidates(
             provider=old_mod.provider,
             current_version=metadata_version(old_data, old_mod.provider),
         )
+        target_artifact_id: str | None = None
 
         try:
             with nullcontext(
@@ -9068,6 +9706,50 @@ def _prepare_update_candidates(
                         lambda: copy_checkpoint(completed, total),
                     ),
                 )
+                if locked_overrides:
+                    root_record = resolved_records.get((provider, old_mod.project_id))
+                    if root_record is None:
+                        raise HuroshikiError(
+                            f"Update resolver removed target {key}"
+                        )
+                    root_data = tomllib.loads(root_record.contents.decode("utf-8"))
+                    target_artifact_id = metadata_file_id(
+                        root_data, old_mod.provider
+                    )
+                    if target_artifact_id in {"", "-"}:
+                        raise HuroshikiError(
+                            f"Update resolver produced no exact artifact for {key}"
+                        )
+                    try:
+                        changes = _reconstruct_locked_update_selection(
+                            normalized,
+                            explicit_roots,
+                            {
+                                (provider, old_mod.project_id): target_artifact_id
+                            },
+                            version_overrides,
+                            workspace=Path(directory) / "prospective-selection",
+                            cancel_event=operation_cancel,
+                            deadline=effective_deadline,
+                            process_result_callback=record_process_result,
+                            diagnostic_project_id=diagnostic_project_id,
+                        )
+                    except (
+                        UpdatePreparationCancelled,
+                        UpdatePreparationDeadlineExceeded,
+                        UpdateVersionIntentError,
+                    ):
+                        raise
+                    except HuroshikiError as error:
+                        if operation_cancel.is_set():
+                            raise UpdatePreparationCancelled(
+                                "Update preparation was cancelled"
+                            ) from error
+                        if time.monotonic() >= effective_deadline:
+                            raise UpdatePreparationDeadlineExceeded(
+                                "Update preparation operation deadline exceeded"
+                            ) from error
+                        raise
         except UpdatePreparationCancelled:
             progress(UpdateProgress("cancelled", completed, total))
             if not process_incomplete:
@@ -9087,7 +9769,31 @@ def _prepare_update_candidates(
                 )
             progress(UpdateProgress("failed", completed, total, message=message))
             break
-        except (OSError, HuroshikiError) as error:
+        except UpdateVersionIntentError as error:
+            candidates.append(
+                UpdateCandidate(
+                    **common,
+                    current_file_id=metadata_file_id(old_data, old_mod.provider),
+                    new_version="-",
+                    new_file_id="-",
+                    status="version-blocked",
+                    error=str(error),
+                    error_kind="version-intent",
+                    target_identity=(provider, old_mod.project_id),
+                    target_artifact_id=target_artifact_id,
+                    blocked_identity=error.identity,
+                    blocked_artifact_id=error.artifact_id,
+                    blocked_reason=error.failure_reason,
+                    user_pin_reason=error.user_pin_reason,
+                )
+            )
+            continue
+        except HuroshikiError as error:
+            candidates.append(
+                _candidate_error(relative_path, old_mod, old_data, str(error))
+            )
+            continue
+        except OSError as error:
             candidates.append(
                 _candidate_error(relative_path, old_mod, old_data, str(error))
             )
@@ -9121,6 +9827,12 @@ def _prepare_update_candidates(
                 status="update",
                 changes=changes,
                 added_dependencies=added_dependencies,
+                target_identity=(provider, old_mod.project_id),
+                target_artifact_id=(
+                    target_artifact_id
+                    if target_artifact_id is not None
+                    else new_file_id
+                ),
             )
         )
     try:
@@ -10163,12 +10875,42 @@ def update_all(
         )
         available = tuple(candidate for candidate in candidates if candidate.available)
         failures = tuple(candidate for candidate in candidates if candidate.error)
-        for candidate in failures:
+        version_locked = tuple(
+            candidate
+            for candidate in candidates
+            if candidate.status == "version-locked"
+        )
+        for candidate in version_locked:
             print(
-                f"Unable to resolve {candidate.name} [{candidate.provider}]: "
-                f"{candidate.error}",
-                file=sys.stderr,
+                f"Version locked: {candidate.name} [{candidate.provider}] at "
+                f"{update_version_label(candidate.current_version, candidate.current_file_id)}; "
+                f"{candidate.blocked_reason or 'skipped'}"
+                + (
+                    f"; reason: {candidate.user_pin_reason}"
+                    if candidate.user_pin_reason
+                    else ""
+                )
             )
+        for candidate in failures:
+            if candidate.status == "version-blocked":
+                print(
+                    f"Version blocked: {candidate.name} [{candidate.provider}] "
+                    f"requires {candidate.blocked_identity or '<unknown>'} artifact "
+                    f"{candidate.blocked_artifact_id or '<unknown>'}: "
+                    f"{candidate.blocked_reason or candidate.error}"
+                    + (
+                        f"; pin reason: {candidate.user_pin_reason}"
+                        if candidate.user_pin_reason
+                        else ""
+                    ),
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"Unable to resolve {candidate.name} [{candidate.provider}]: "
+                    f"{candidate.error}",
+                    file=sys.stderr,
+                )
         if failures and not allow_partial:
             return UpdateRunReport(candidates, (), failures, False, False)
         if not available:
