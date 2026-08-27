@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from typing import Any, Callable, Iterable, Literal, Sequence
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 import unicodedata
 from urllib.parse import parse_qsl, urlencode, unquote, urlparse
 from uuid import uuid4
@@ -92,6 +92,10 @@ _LOG_SECRET_QUERY_RE = re.compile(
     re.IGNORECASE,
 )
 VALID_SIDES = {"client", "server", "both"}
+PROFILE_FIELDS = {"source", "project", "side", "artifact_id", "scope"}
+PROFILE_SCOPES = {"root", "dependency"}
+_IMMUTABLE_PROVIDER_ID_RE = re.compile(r"^[A-Za-z0-9]{8}$")
+_CANONICAL_DECIMAL_RE = re.compile(r"^[1-9][0-9]*$")
 SIDE_ALIASES = {
     "b": "both",
     "both": "both",
@@ -3893,6 +3897,87 @@ def find_metadata(source: Path, provider: str, project_id: str | int) -> Path | 
     return None
 
 
+@dataclass(frozen=True)
+class ProfileEntry:
+    """Validated profile intent, without resolving provider catalog data."""
+
+    source: str
+    project: str | int
+    side: str | None = None
+    artifact_id: str | None = None
+    scope: str = "root"
+
+
+def _canonical_curseforge_id(value: object, field: str) -> str | int:
+    if isinstance(value, bool) or isinstance(value, float) or not isinstance(value, (str, int)):
+        raise ConfigError(f"{field} must be a positive decimal ID")
+    if isinstance(value, int):
+        if value <= 0:
+            raise ConfigError(f"{field} must be a positive decimal ID")
+        return value
+    if not _CANONICAL_DECIMAL_RE.fullmatch(value):
+        raise ConfigError(f"{field} must be a positive canonical decimal ID")
+    return value
+
+
+def _canonical_curseforge_artifact_id(value: object) -> str:
+    if not isinstance(value, str) or not _CANONICAL_DECIMAL_RE.fullmatch(value):
+        raise ConfigError("artifact_id must be a positive canonical decimal ID string")
+    return value
+
+
+def normalize_profile_entry(entry: Mapping[object, object]) -> ProfileEntry:
+    """Validate and normalize one profile entry without provider/network lookup."""
+    unknown = set(entry) - PROFILE_FIELDS
+    if unknown:
+        raise ConfigError(f"unknown field(s): {', '.join(repr(str(k)) for k in sorted(unknown, key=str))}")
+    source = entry.get("source")
+    if not isinstance(source, str) or source not in {"modrinth", "curseforge"}:
+        raise ConfigError("source must be modrinth or curseforge")
+    project = entry.get("project")
+    has_artifact = "artifact_id" in entry
+    artifact = entry.get("artifact_id")
+    scope = entry.get("scope", "root")
+    if not isinstance(scope, str) or scope not in PROFILE_SCOPES:
+        raise ConfigError("scope must be root or dependency")
+
+    if source == "curseforge":
+        project = _canonical_curseforge_id(project, "project")
+        if has_artifact:
+            artifact = _canonical_curseforge_artifact_id(artifact)
+    else:
+        if not isinstance(project, str) or not project:
+            raise ConfigError("project must be a Modrinth selector string")
+        if has_artifact:
+            if not isinstance(artifact, str) or not _IMMUTABLE_PROVIDER_ID_RE.fullmatch(project):
+                raise ConfigError("exact Modrinth entries require an 8-character project ID")
+            if not _IMMUTABLE_PROVIDER_ID_RE.fullmatch(artifact):
+                raise ConfigError("artifact_id must be an 8-character Modrinth ID")
+
+    side = entry.get("side")
+    if scope == "root":
+        if not isinstance(side, str) or side not in VALID_SIDES:
+            raise ConfigError("root entries require side client, server, or both")
+    elif "side" in entry:
+        raise ConfigError("dependency entries must not specify side")
+    if scope == "dependency" and not has_artifact:
+        raise ConfigError("dependency entries require artifact_id")
+    return ProfileEntry(source, project, side, artifact, scope)
+
+
+def _profile_entry_dict(normalized: ProfileEntry) -> dict[str, object]:
+    result: dict[str, object] = {
+        "source": normalized.source,
+        "project": normalized.project,
+        "scope": normalized.scope,
+    }
+    if normalized.side is not None:
+        result["side"] = normalized.side
+    if normalized.artifact_id is not None:
+        result["artifact_id"] = normalized.artifact_id
+    return result
+
+
 def load_profiles(pack_root: Path) -> dict[str, Any]:
     profiles = load_yaml(PACKAGE_DATA / "profiles.yaml")
     managed_profiles = SHARED / "profiles.yaml"
@@ -3903,7 +3988,26 @@ def load_profiles(pack_root: Path) -> dict[str, Any]:
     )
     if not isinstance(profiles, dict):
         raise ConfigError("Merged profiles must be a mapping")
-    return profiles
+    normalized: dict[str, list[dict[str, object]]] = {}
+    for name, entries in profiles.items():
+        if not isinstance(name, str):
+            raise ConfigError(f"Profile name {name!r} must be a string")
+        if not isinstance(entries, list):
+            raise ConfigError(f"Profile {name!r} must be a list")
+        normalized[name] = []
+        for index, entry in enumerate(entries, start=1):
+            if not isinstance(entry, Mapping):
+                raise ConfigError(
+                    f"Profile {name!r} entry {index} {entry!r}: expected a mapping"
+                )
+            try:
+                parsed = normalize_profile_entry(entry)
+            except ConfigError as error:
+                raise ConfigError(
+                    f"Profile {name!r} entry {index} {entry!r}: {error}"
+                ) from error
+            normalized[name].append(_profile_entry_dict(parsed))
+    return normalized
 
 
 def cmd_profile(args: argparse.Namespace) -> int:
@@ -3917,6 +4021,9 @@ def cmd_profile(args: argparse.Namespace) -> int:
             args.names,
             on_profile=lambda name: print(f"== Applying {name} to {args.pack} =="),
             on_entry=lambda _name, path, side: print(f"  {path} -> {side}"),
+            on_exact=lambda identity, artifact_id, role: print(
+                f"  exact {role}: {identity} -> artifact {artifact_id}"
+            ),
         )
     except huroshiki_core.HuroshikiError as error:
         raise ConfigError(str(error)) from error
