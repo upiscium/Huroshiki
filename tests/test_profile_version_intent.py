@@ -12,6 +12,7 @@ from contextlib import redirect_stdout
 import io
 from pathlib import Path
 import threading
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -192,6 +193,221 @@ class ProfileVersionIntentOrchestrationTest(unittest.TestCase):
         self.run(self.profiles({"source": "curseforge", "project": 101, "artifact_id": "7", "side": "both"}))
         item = read_mod_version_overrides(self.source)[0]
         self.assertEqual((item.artifact_id, item.locked, item.reason), ("7", False, None))
+
+    def test_exact_profile_preserves_unrelated_transaction_source_state(self):
+        pack_contents = (
+            'name = "Custom Pack"\n'
+            'author = "Pack Author"\n'
+            'version = "9.4.2"\n'
+            '[versions]\n'
+            'minecraft = "1.21.1"\n'
+            'fabric = "0.16.0"\n'
+        )
+        self.source.joinpath("pack.toml").write_text(
+            pack_contents, encoding="utf-8"
+        )
+        unrelated_file = self.source / "notes" / "keep.bin"
+        unrelated_file.parent.mkdir()
+        unrelated_file.write_bytes(b"unrelated\x00source\n")
+        unrelated_metadata = self.source / "resourcepacks" / "unrelated.pw.toml"
+        unrelated_metadata.parent.mkdir()
+        unrelated_metadata.write_text(
+            self.metadata(
+                "curseforge", "999", "4", filename="unrelated.jar"
+            ),
+            encoding="utf-8",
+        )
+        custom_ignore = (
+            "/custom-cache/\n"
+            "/.huroshiki-roots.json\n"
+            "/.huroshiki-version-overrides.json\n"
+        )
+        self.source.joinpath(".packwizignore").write_text(
+            custom_ignore, encoding="utf-8"
+        )
+        core.write_pack_root_manifest(self.source, ())
+        metadata_before = unrelated_metadata.read_bytes()
+        observed_sources: list[Path] = []
+        original_apply = core.PackTransaction.apply
+
+        def apply(transaction, **kwargs):
+            observed_sources.append(transaction.source)
+            return original_apply(transaction, **kwargs)
+
+        def refresh_with_custom_ignore(command, *, cwd, **kwargs):
+            result = self.fixture.run_fake_resolver(
+                command, cwd=cwd, **kwargs
+            )
+            if command == ["packwiz", "refresh"] and cwd.name == "source":
+                path = cwd / ".packwizignore"
+                text = path.read_text(encoding="utf-8")
+                path.write_text(
+                    text + "/refresh-generated/\n", encoding="utf-8"
+                )
+            return result
+
+        with patch.object(
+            core.PackTransaction, "apply", new=apply
+        ), patch.object(
+            core,
+            "run_resolver_process",
+            side_effect=refresh_with_custom_ignore,
+        ):
+            self.run(
+                self.profiles(
+                    {
+                        "source": "curseforge",
+                        "project": 101,
+                        "artifact_id": "7",
+                        "side": "both",
+                    }
+                )
+            )
+
+        self.assertEqual(self.source.joinpath("pack.toml").read_text(), pack_contents)
+        self.assertEqual(unrelated_file.read_bytes(), b"unrelated\x00source\n")
+        self.assertEqual(unrelated_metadata.read_bytes(), metadata_before)
+        ignore_after = self.source.joinpath(".packwizignore").read_text()
+        self.assertIn("/custom-cache/", ignore_after.splitlines())
+        self.assertIn("/.huroshiki-roots.json", ignore_after.splitlines())
+        self.assertIn(
+            "/.huroshiki-version-overrides.json", ignore_after.splitlines()
+        )
+        self.assertIn("/refresh-generated/", ignore_after.splitlines())
+        self.assertTrue(observed_sources)
+        self.assertEqual(observed_sources[0].name, "source")
+        self.assertNotIn("profile-aggregate", str(observed_sources[0]))
+        parsed_pack = tomllib.loads(self.source.joinpath("pack.toml").read_text())
+        self.assertEqual(parsed_pack["name"], "Custom Pack")
+        self.assertEqual(parsed_pack["author"], "Pack Author")
+        self.assertEqual(parsed_pack["version"], "9.4.2")
+        self.assertEqual(parsed_pack["versions"]["minecraft"], "1.21.1")
+        self.assertEqual(parsed_pack["versions"]["fabric"], "0.16.0")
+        self.assertTrue(
+            tomllib.loads(self.source.joinpath("index.toml").read_text())[
+                "refreshed"
+            ]
+        )
+
+    def assert_baseline_root_authority_fails_before_resolver(self, message: str):
+        profile = self.profiles(
+            {
+                "source": "curseforge",
+                "project": 101,
+                "artifact_id": "7",
+                "side": "both",
+            }
+        )
+        with patch.object(core, "resolve_exact_mod_closure") as exact, patch.object(
+            core, "resolve_mod_closure"
+        ) as automatic, self.assertRaisesRegex(core.HuroshikiError, message):
+            self.run(profile)
+        exact.assert_not_called()
+        automatic.assert_not_called()
+
+    def test_missing_declared_root_fails_before_resolver(self):
+        self.seed(("modrinth", "ProjA001", "both"))
+        self.source.joinpath("mods/root.pw.toml").unlink()
+        self.assert_baseline_root_authority_fails_before_resolver(
+            "baseline root Authority.*Root metadata is missing"
+        )
+
+    def test_duplicate_declared_root_metadata_fails_before_resolver(self):
+        self.seed(("modrinth", "ProjA001", "both"))
+        self.source.joinpath("mods/duplicate.pw.toml").write_bytes(
+            self.source.joinpath("mods/root.pw.toml").read_bytes()
+        )
+        self.assert_baseline_root_authority_fails_before_resolver(
+            "duplicate identity|Duplicate metadata identity"
+        )
+
+    def test_declared_root_identity_disagreement_fails_before_resolver(self):
+        self.seed(("modrinth", "ProjA001", "both"))
+        self.source.joinpath("mods/root.pw.toml").write_text(
+            self.metadata("modrinth", "ProjB002", "VersB001"),
+            encoding="utf-8",
+        )
+        self.assert_baseline_root_authority_fails_before_resolver(
+            "baseline root Authority.*Root metadata is missing"
+        )
+
+    def test_exact_root_change_removes_only_affected_dependency_metadata(self):
+        self.seed(("modrinth", "ProjA001", "both"))
+        dependency = self.source / "mods" / "dependency.pw.toml"
+        dependency.write_text(
+            self.metadata(
+                "curseforge",
+                "987654",
+                "987656",
+                filename="dependency.jar",
+            ),
+            encoding="utf-8",
+        )
+        unrelated = self.source / "notes" / "unrelated.txt"
+        unrelated.parent.mkdir()
+        unrelated.write_text("preserve me\n", encoding="utf-8")
+
+        def closure(selection, **_kwargs):
+            root = core.ResolvedMetadata(
+                selection.identity,
+                Path("mods/root.pw.toml"),
+                "root.jar",
+                self.metadata(
+                    "modrinth",
+                    "ProjA001",
+                    str(selection.artifact_id),
+                ).encode(),
+                "modrinth",
+                "ProjA001",
+            )
+            entries = [root]
+            if str(selection.artifact_id) == "VersR001":
+                entries.append(
+                    core.ResolvedMetadata(
+                        ("curseforge", "987654"),
+                        Path("mods/dependency.pw.toml"),
+                        "dependency.jar",
+                        dependency.read_bytes(),
+                        "curseforge",
+                        "987654",
+                    )
+                )
+            return core.ResolvedModClosure(selection.identity, tuple(entries))
+
+        def materialize_without_dependency(candidate, *args, **kwargs):
+            result = self.fixture.materialize(candidate, *args, **kwargs)
+            if candidate.provider_identity == "modrinth:ProjA001":
+                return MaterializedArtifact(
+                    result.sha256,
+                    result.semantic_identity,
+                    (),
+                )
+            return result
+
+        with patch.object(
+            core, "resolve_exact_mod_closure", side_effect=closure
+        ), patch.object(
+            core,
+            "materialize_provider_artifact",
+            side_effect=materialize_without_dependency,
+        ):
+            self.run(
+                self.profiles(
+                    {
+                        "source": "modrinth",
+                        "project": "ProjA001",
+                        "artifact_id": "VersR002",
+                        "side": "both",
+                    }
+                )
+            )
+
+        self.assertFalse(dependency.exists())
+        self.assertEqual(unrelated.read_text(encoding="utf-8"), "preserve me\n")
+        self.assertIn(
+            'version = "VersR002"',
+            self.source.joinpath("mods/root.pw.toml").read_text(),
+        )
 
     def test_resolver_artifact_mismatch_rolls_back_source_and_intent(self):
         original = self.snapshot()
@@ -506,6 +722,75 @@ class ProfileVersionIntentOrchestrationTest(unittest.TestCase):
             with self.assertRaises(core.HuroshikiError):
                 self.run(self.profiles({"source": "curseforge", "project": 101, "artifact_id": "7", "side": "both"}))
         self.assertEqual(self.snapshot(), before)
+
+    def test_refresh_cannot_remove_required_ignore_authority(self):
+        before = self.snapshot()
+        for removed_line in (
+            "/.huroshiki-roots.json",
+            "/.huroshiki-version-overrides.json",
+        ):
+            with self.subTest(removed_line=removed_line):
+                def mutate_ignore(command, *, cwd, **kwargs):
+                    result = self.fixture.run_fake_resolver(
+                        command, cwd=cwd, **kwargs
+                    )
+                    if command == ["packwiz", "refresh"] and cwd.name == "source":
+                        path = cwd / ".packwizignore"
+                        lines = [
+                            line
+                            for line in path.read_text(
+                                encoding="utf-8"
+                            ).splitlines()
+                            if line != removed_line
+                        ]
+                        path.write_text(
+                            "\n".join(lines) + "\n", encoding="utf-8"
+                        )
+                    return result
+
+                with patch.object(
+                    core, "run_resolver_process", side_effect=mutate_ignore
+                ):
+                    with self.assertRaisesRegex(
+                        core.HuroshikiError, "canonically excluded"
+                    ):
+                        self.run(
+                            self.profiles(
+                                {
+                                    "source": "curseforge",
+                                    "project": 101,
+                                    "artifact_id": "7",
+                                    "side": "both",
+                                }
+                            )
+                        )
+                self.assertEqual(self.snapshot(), before)
+
+    def test_profile_metadata_delta_never_follows_parent_symlink(self):
+        original = self.source / "mods" / "original.pw.toml"
+        original.write_bytes(b"before")
+        real_mods = self.source / "mods-real"
+        self.source.joinpath("mods").rename(real_mods)
+        external = self.fixture.root / "external"
+        external.mkdir()
+        external_target = external / "original.pw.toml"
+        external_target.write_bytes(b"outside")
+        self.source.joinpath("mods").symlink_to(external, target_is_directory=True)
+        source_metadata = self.source.stat(follow_symlinks=False)
+
+        with self.assertRaises(OSError):
+            core._apply_profile_metadata_change(
+                self.source,
+                core.UpdateChange(
+                    Path("mods/original.pw.toml"), b"before", b"after"
+                ),
+                expected_root_identity=(
+                    source_metadata.st_dev,
+                    source_metadata.st_ino,
+                ),
+                checkpoint=lambda: None,
+            )
+        self.assertEqual(external_target.read_bytes(), b"outside")
 
     def test_external_source_mutation_is_not_overwritten(self):
         def mutate(command, *, cwd, **kwargs):

@@ -10223,6 +10223,136 @@ def _apply_update_change(
     path.write_bytes(contents)
 
 
+def _apply_profile_metadata_change(
+    source: Path,
+    change: UpdateChange,
+    *,
+    expected_root_identity: tuple[int, int],
+    checkpoint: Callable[[], None],
+) -> None:
+    """Apply a verified Profile metadata delta without following links."""
+
+    checkpoint()
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    root_fd = os.open(source, directory_flags)
+    opened_directories: list[int] = []
+    current_fd = -1
+    temporary: str | None = None
+    parent_fd = root_fd
+    try:
+        root_metadata = os.fstat(root_fd)
+        if (root_metadata.st_dev, root_metadata.st_ino) != expected_root_identity:
+            raise HuroshikiError(
+                "Profile transaction source was replaced before metadata staging"
+            )
+        for part in change.relative_path.parts[:-1]:
+            checkpoint()
+            try:
+                child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                if change.after is None:
+                    raise HuroshikiError(
+                        f"Profile metadata parent is missing: {change.relative_path}"
+                    )
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            opened_directories.append(child_fd)
+            parent_fd = child_fd
+
+        name = change.relative_path.name
+        try:
+            current_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            current_contents = None
+        except OSError as error:
+            raise HuroshikiError(
+                f"Unsafe Profile metadata target {change.relative_path}: {error}"
+            ) from error
+        else:
+            metadata = os.fstat(current_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise HuroshikiError(
+                    f"Profile metadata target is not a regular file: "
+                    f"{change.relative_path}"
+                )
+            chunks: list[bytes] = []
+            remaining = metadata.st_size
+            while remaining:
+                checkpoint()
+                chunk = os.read(current_fd, min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise HuroshikiError(
+                        f"Short read from Profile metadata: {change.relative_path}"
+                    )
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            current_contents = b"".join(chunks)
+        if current_contents != change.before:
+            raise HuroshikiError(
+                f"Profile metadata changed before staging: {change.relative_path}"
+            )
+
+        checkpoint()
+        if change.after is None:
+            os.unlink(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            return
+
+        temporary = f".{name}.huroshiki-profile-{uuid4().hex}.tmp"
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            view = memoryview(change.after)
+            while view:
+                checkpoint()
+                written = os.write(descriptor, view)
+                if written == 0:
+                    raise HuroshikiError(
+                        f"Short write to Profile metadata: {change.relative_path}"
+                    )
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        checkpoint()
+        os.rename(
+            temporary,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        temporary = None
+        os.fsync(parent_fd)
+    finally:
+        if current_fd >= 0:
+            os.close(current_fd)
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        for directory_fd in reversed(opened_directories):
+            os.close(directory_fd)
+        os.close(root_fd)
+
+
 def read_mod_data(relative_path: Path, data: dict[str, object]) -> ModInfo:
     side = data.get("side")
     side_error = packctl.side_validation_error(side)
@@ -10526,13 +10656,31 @@ def _apply_exact_profiles(
     except ModVersionOverrideError as error:
         raise HuroshikiError(f"Invalid stored Profile version intent: {error}") from error
     _validate_mod_version_override_records(source, baseline, overrides=overrides)
+    baseline_scan = scan_pack_migration_source(source, checkpoint=checkpoint)
     manifest = source / ROOT_MANIFEST_PATH
     has_manifest = manifest.is_file() and not manifest.is_symlink()
     if baseline and not has_manifest:
         raise HuroshikiError(
             "Exact Profiles require authoritative root provenance on a non-empty Pack"
         )
-    records = read_pack_root_manifest(source, checkpoint=checkpoint) if has_manifest else ()
+    if has_manifest:
+        try:
+            extracted_roots = extract_pack_migration_roots(
+                source,
+                expected_identity=baseline_scan.root_identity,
+                expected_snapshot_digest=baseline_scan.snapshot_digest,
+                checkpoint=checkpoint,
+            )
+        except PackMigrationRootError as error:
+            raise HuroshikiError(
+                f"Exact Profiles require valid baseline root Authority: {error}"
+            ) from error
+        records = tuple(
+            PackRootRecord(root.provider, root.project_id, root.source_side)
+            for root in extracted_roots
+        )
+    else:
+        records = ()
     roots: list[PackRootRecord] = list(records)
     selected_root_identities: list[tuple[str, tuple[str, str]]] = []
     root_map = {(item.provider, item.project_id): item for item in roots}
@@ -10664,6 +10812,7 @@ def _apply_exact_profiles(
 
     minecraft, loader, loader_version = packctl.project_versions(source)
     closures: dict[tuple[str, str], ResolvedModClosure] = {}
+    affected_baseline_identities: set[tuple[str, str]] = set()
     for root in roots:
         checkpoint()
         identity = (root.provider, root.project_id)
@@ -10686,6 +10835,55 @@ def _apply_exact_profiles(
                                       None, None, root.side, Path(""), "", True), baseline),)
             )
             continue
+        baseline_entries = baseline.get(identity, ())
+        if selection is not None and len(baseline_entries) == 1:
+            baseline_metadata = parse_provider_metadata(
+                baseline_entries[0][0], baseline_entries[0][1]
+            )
+            if (
+                baseline_metadata.file_id is not None
+                and baseline_metadata.file_id != str(selection.artifact_id)
+            ):
+                baseline_selection = ExactModArtifactSelection(
+                    root.provider,
+                    canonical_modrinth_id(
+                        root.project_id, "Modrinth project ID"
+                    )
+                    if root.provider == "modrinth"
+                    else root.project_id,
+                    canonical_modrinth_id(
+                        baseline_metadata.file_id, "Modrinth version ID"
+                    )
+                    if root.provider == "modrinth"
+                    else baseline_metadata.file_id,
+                )
+                baseline_resolver = (
+                    transaction.root
+                    / f"profile-baseline-root-{uuid4().hex}"
+                )
+                create_resolver_source(
+                    baseline_resolver,
+                    display_name=f"Inspect {root.canonical_identity}",
+                    minecraft=minecraft,
+                    loader=loader,
+                    loader_version=loader_version,
+                )
+                baseline_closure = resolve_exact_mod_closure(
+                    baseline_selection,
+                    source=baseline_resolver,
+                    cancel_event=cancel_event,
+                    deadline=deadline,
+                    checkpoint=checkpoint,
+                    process_result_callback=(
+                        transaction._record_equivalence_process_result
+                    ),
+                )
+                _verify_exact_root_metadata(
+                    baseline_selection, baseline_closure.metadata
+                )
+                affected_baseline_identities.update(
+                    item.identity for item in baseline_closure.metadata
+                )
         resolver_root = transaction.root / f"profile-exact-root-{uuid4().hex}"
         create_resolver_source(resolver_root, display_name=f"Resolve {root.canonical_identity}", minecraft=minecraft, loader=loader, loader_version=loader_version)
         if selection is None:
@@ -10708,6 +10906,7 @@ def _apply_exact_profiles(
     for identity, closure in closures.items():
         for item in closure.metadata:
             owners.setdefault(item.identity, set()).add(identity)
+    affected_baseline_identities.update(owners)
     effective_dependency_constraints = {
         identity for identity in constraints if identity not in root_map
     }
@@ -10792,12 +10991,19 @@ def _apply_exact_profiles(
             preserve_resolved_dependency_sides=True, explicit_root_sides={(item.provider, item.project_id): item.side for item in roots},
             cancel_event=cancel_event, deadline=deadline, equivalence_workspace=transaction.root / "profile-equivalence",
             process_result_callback=transaction._record_equivalence_process_result)
-    ensure_pack_root_manifest_ignored(aggregate)
+    ensure_pack_root_manifest_ignored(aggregate, checkpoint=checkpoint)
     expected_roots = tuple(
         sorted(roots, key=lambda item: item.canonical_identity)
     )
     write_pack_root_manifest(aggregate, expected_roots)
-    desired = _exact_metadata_records(aggregate, checkpoint)
+    aggregate_desired = _exact_metadata_records(aggregate, checkpoint)
+    desired = dict(aggregate_desired)
+    for identity, entries in baseline.items():
+        if (
+            identity not in desired
+            and identity not in affected_baseline_identities
+        ):
+            desired[identity] = entries
     _verify_exact_closure_artifacts(
         baseline,
         desired,
@@ -10840,13 +11046,33 @@ def _apply_exact_profiles(
         final_overrides[selection.identity_label] = ModVersionOverride(entry.source, project_id, str(entry.artifact_id), prior.locked if prior else False, prior.reason if prior else None)
         if on_exact is not None:
             on_exact(selection.identity_label, str(entry.artifact_id), entry.scope)
-    write_mod_version_overrides(aggregate, tuple(final_overrides.values()), checkpoint=checkpoint)
-    ensure_mod_version_overrides_ignored(aggregate, checkpoint=checkpoint)
+    current_scan = scan_pack_migration_source(source, checkpoint=checkpoint)
+    if (
+        current_scan.root_identity != baseline_scan.root_identity
+        or current_scan.snapshot_digest != baseline_scan.snapshot_digest
+    ):
+        raise HuroshikiError(
+            "Transaction source changed while exact Profiles were resolved"
+        )
+    for change in _exact_metadata_changes(baseline, desired):
+        checkpoint()
+        _apply_profile_metadata_change(
+            source,
+            change,
+            expected_root_identity=baseline_scan.root_identity,
+            checkpoint=checkpoint,
+        )
+    ensure_pack_root_manifest_ignored(source, checkpoint=checkpoint)
+    write_pack_root_manifest(source, expected_roots)
+    ensure_mod_version_overrides_ignored(source, checkpoint=checkpoint)
+    write_mod_version_overrides(
+        source, tuple(final_overrides.values()), checkpoint=checkpoint
+    )
+    ensure_safe_pack_source(source, checkpoint=checkpoint)
     checkpoint()
     transaction._profile_expected_records = desired
     transaction._profile_expected_roots = expected_roots
     transaction._profile_expected_versions = (minecraft, loader, loader_version)
-    transaction.source = aggregate
     transaction._record_source_mutation()
     transaction._version_override_mutated = True
     result: dict[str, tuple[Path, str]] = {}
@@ -10976,10 +11202,44 @@ def apply_profiles(
                     raise HuroshikiError("Profile refresh changed the fixed Pack versions")
                 expected_records = getattr(transaction, "_profile_expected_records", None)
                 if expected_records is not None:
-                    _exact_assert_complete_metadata_graph(transaction.source, expected_records, lambda: _profile_checkpoint(cancel_event, deadline))
+                    final_checkpoint = lambda: _profile_checkpoint(
+                        cancel_event, deadline
+                    )
+                    _exact_assert_complete_metadata_graph(
+                        transaction.source, expected_records, final_checkpoint
+                    )
                     expected_roots = getattr(transaction, "_profile_expected_roots", None)
-                    if expected_roots is not None and read_pack_root_manifest(transaction.source, lambda: _profile_checkpoint(cancel_event, deadline)) != expected_roots:
-                        raise HuroshikiError("Profile refresh changed authoritative root provenance")
+                    if expected_roots is not None:
+                        require_mod_version_overrides_ignored(
+                            transaction.source, checkpoint=final_checkpoint
+                        )
+                        final_scan = scan_pack_migration_source(
+                            transaction.source, checkpoint=final_checkpoint
+                        )
+                        try:
+                            final_extracted = extract_pack_migration_roots(
+                                transaction.source,
+                                expected_identity=final_scan.root_identity,
+                                expected_snapshot_digest=final_scan.snapshot_digest,
+                                checkpoint=final_checkpoint,
+                            )
+                        except PackMigrationRootError as error:
+                            raise HuroshikiError(
+                                "Profile refresh invalidated root Authority: "
+                                f"{error}"
+                            ) from error
+                        final_roots = tuple(
+                            PackRootRecord(
+                                root.provider,
+                                root.project_id,
+                                root.source_side,
+                            )
+                            for root in final_extracted
+                        )
+                        if final_roots != expected_roots:
+                            raise HuroshikiError(
+                                "Profile refresh changed authoritative root provenance"
+                            )
                 transaction.apply(refresh=False, cancel_event=cancel_event, deadline=deadline)
             else:
                 transaction.apply(cancel_event=cancel_event, deadline=deadline)

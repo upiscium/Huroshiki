@@ -348,8 +348,14 @@ def write_pack_control_file(
 _atomic_write_relative = write_pack_control_file
 
 
-def ensure_pack_root_manifest_ignored(source_root: Path) -> None:
-    scan = scan_pack_migration_source(source_root, checkpoint=lambda: None)
+def ensure_pack_root_manifest_ignored(
+    source_root: Path,
+    checkpoint: Callable[[], None] | None = None,
+) -> None:
+    effective_checkpoint = checkpoint or (lambda: None)
+    scan = scan_pack_migration_source(
+        source_root, checkpoint=effective_checkpoint
+    )
     ignore_entry = next(
         (
             entry
@@ -366,6 +372,7 @@ def ensure_pack_root_manifest_ignored(source_root: Path) -> None:
             scan,
             Path(".packwizignore"),
             max_bytes=1024 * 1024,
+            checkpoint=effective_checkpoint,
         )
     )
     try:
@@ -381,6 +388,7 @@ def ensure_pack_root_manifest_ignored(source_root: Path) -> None:
         Path(".packwizignore"),
         (text + "/.huroshiki-roots.json\n").encode("utf-8"),
         expected_root_identity=scan.root_identity,
+        checkpoint=effective_checkpoint,
     )
 
 
