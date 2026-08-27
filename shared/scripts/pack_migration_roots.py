@@ -560,6 +560,7 @@ def extract_pack_migration_roots(
     expected_identity: tuple[int, int],
     checkpoint: Callable[[], None],
     expected_snapshot_digest: str | None = None,
+    metadata_path_filter: Callable[[Path], bool] | None = None,
 ) -> tuple[PackMigrationRoot, ...]:
     checkpoint()
     scan = scan_pack_migration_source(detached_source_root, checkpoint=checkpoint)
@@ -607,6 +608,11 @@ def extract_pack_migration_roots(
     for entry in scan.entries:
         checkpoint()
         if entry.kind != "file" or not entry.relative_path.name.endswith(".pw.toml"):
+            continue
+        if (
+            metadata_path_filter is not None
+            and not metadata_path_filter(entry.relative_path)
+        ):
             continue
         contents = _read_relative_file(
             detached_source_root,

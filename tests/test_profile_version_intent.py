@@ -209,11 +209,19 @@ class ProfileVersionIntentOrchestrationTest(unittest.TestCase):
         unrelated_file = self.source / "notes" / "keep.bin"
         unrelated_file.parent.mkdir()
         unrelated_file.write_bytes(b"unrelated\x00source\n")
-        unrelated_metadata = self.source / "resourcepacks" / "unrelated.pw.toml"
-        unrelated_metadata.parent.mkdir()
-        unrelated_metadata.write_text(
+        resource_metadata = self.source / "resourcepacks" / "example.pw.toml"
+        resource_metadata.parent.mkdir()
+        resource_metadata.write_text(
             self.metadata(
-                "curseforge", "999", "4", filename="unrelated.jar"
+                "curseforge", "101", "900", filename="example.zip"
+            ),
+            encoding="utf-8",
+        )
+        shader_metadata = self.source / "shaderpacks" / "example.pw.toml"
+        shader_metadata.parent.mkdir()
+        shader_metadata.write_text(
+            self.metadata(
+                "curseforge", "998", "3", filename="example.zip"
             ),
             encoding="utf-8",
         )
@@ -226,8 +234,10 @@ class ProfileVersionIntentOrchestrationTest(unittest.TestCase):
             custom_ignore, encoding="utf-8"
         )
         core.write_pack_root_manifest(self.source, ())
-        metadata_before = unrelated_metadata.read_bytes()
+        resource_before = resource_metadata.read_bytes()
+        shader_before = shader_metadata.read_bytes()
         observed_sources: list[Path] = []
+        materialized_metadata: list[Path] = []
         original_apply = core.PackTransaction.apply
 
         def apply(transaction, **kwargs):
@@ -246,12 +256,20 @@ class ProfileVersionIntentOrchestrationTest(unittest.TestCase):
                 )
             return result
 
+        def materialize(candidate, *args, **kwargs):
+            materialized_metadata.append(Path(candidate.relative_metadata_path))
+            return self.fixture.materialize(candidate, *args, **kwargs)
+
         with patch.object(
             core.PackTransaction, "apply", new=apply
         ), patch.object(
             core,
             "run_resolver_process",
             side_effect=refresh_with_custom_ignore,
+        ), patch.object(
+            core,
+            "materialize_provider_artifact",
+            side_effect=materialize,
         ):
             self.run(
                 self.profiles(
@@ -266,7 +284,23 @@ class ProfileVersionIntentOrchestrationTest(unittest.TestCase):
 
         self.assertEqual(self.source.joinpath("pack.toml").read_text(), pack_contents)
         self.assertEqual(unrelated_file.read_bytes(), b"unrelated\x00source\n")
-        self.assertEqual(unrelated_metadata.read_bytes(), metadata_before)
+        self.assertEqual(resource_metadata.read_bytes(), resource_before)
+        self.assertEqual(shader_metadata.read_bytes(), shader_before)
+        self.assertTrue(resource_metadata.is_file())
+        self.assertTrue(shader_metadata.is_file())
+        self.assertTrue(materialized_metadata)
+        self.assertTrue(
+            all(path.parts[0] == "mods" for path in materialized_metadata)
+        )
+        mod_graph = core._profile_mod_metadata_records(self.source)
+        self.assertNotIn(("curseforge", "998"), mod_graph)
+        self.assertTrue(
+            all(
+                relative.parts[0] == "mods"
+                for entries in mod_graph.values()
+                for relative, _contents, _mod in entries
+            )
+        )
         ignore_after = self.source.joinpath(".packwizignore").read_text()
         self.assertIn("/custom-cache/", ignore_after.splitlines())
         self.assertIn("/.huroshiki-roots.json", ignore_after.splitlines())
@@ -288,6 +322,49 @@ class ProfileVersionIntentOrchestrationTest(unittest.TestCase):
                 "refreshed"
             ]
         )
+
+    def test_refresh_cannot_change_non_mod_packwiz_metadata(self):
+        resource_metadata = self.source / "resourcepacks" / "example.pw.toml"
+        resource_metadata.parent.mkdir()
+        resource_metadata.write_text(
+            self.metadata(
+                "curseforge", "999", "4", filename="example.zip"
+            ),
+            encoding="utf-8",
+        )
+        self.source.joinpath(".packwizignore").write_text(
+            "/.huroshiki-roots.json\n/.huroshiki-version-overrides.json\n",
+            encoding="utf-8",
+        )
+        core.write_pack_root_manifest(self.source, ())
+        before = self.snapshot()
+
+        def mutate_resource(command, *, cwd, **kwargs):
+            result = self.fixture.run_fake_resolver(command, cwd=cwd, **kwargs)
+            if command == ["packwiz", "refresh"] and cwd.name == "source":
+                (cwd / "resourcepacks" / "example.pw.toml").write_bytes(
+                    b"changed by refresh\n"
+                )
+            return result
+
+        with patch.object(
+            core, "run_resolver_process", side_effect=mutate_resource
+        ), self.assertRaisesRegex(
+            core.HuroshikiError,
+            "refresh changed non-MOD Packwiz metadata.*resourcepacks/example.pw.toml",
+        ):
+            self.run(
+                self.profiles(
+                    {
+                        "source": "curseforge",
+                        "project": 101,
+                        "artifact_id": "7",
+                        "side": "both",
+                    }
+                )
+            )
+
+        self.assertEqual(self.snapshot(), before)
 
     def assert_baseline_root_authority_fails_before_resolver(self, message: str):
         profile = self.profiles(

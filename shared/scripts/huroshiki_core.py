@@ -4954,7 +4954,12 @@ class PackTransaction:
             ensure_safe_pack_source(self.source)
         if self._version_override_mutated:
             _validate_mod_version_override_records(
-                self.source, _exact_metadata_records(self.source)
+                self.source,
+                (
+                    _profile_mod_metadata_records(self.source)
+                    if getattr(self, "_profile_mod_metadata_only", False)
+                    else _exact_metadata_records(self.source)
+                ),
             )
 
         real_root = project_root(self.project_key)
@@ -7065,6 +7070,75 @@ def _exact_metadata_records(
     return {identity: tuple(items) for identity, items in records.items()}
 
 
+def _is_profile_mod_metadata_path(relative_path: Path) -> bool:
+    return (
+        len(relative_path.parts) >= 2
+        and relative_path.parts[0] == "mods"
+        and relative_path.name.endswith(".pw.toml")
+    )
+
+
+def _profile_mod_metadata_records(
+    source: Path,
+    checkpoint: Callable[[], None] | None = None,
+) -> dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]]:
+    """Read only canonical Packwiz MOD metadata for Profile solving."""
+
+    records: dict[tuple[str, str], list[tuple[Path, bytes, ModInfo]]] = {}
+    for path in _checkpointed_paths(source / "mods", "*.pw.toml", checkpoint):
+        _run_checkpoint(checkpoint)
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(source)
+        contents = _read_file_bytes(path, checkpoint)
+        try:
+            mod = read_mod_data(relative, tomllib.loads(contents.decode("utf-8")))
+        except (UnicodeError, tomllib.TOMLDecodeError, ValueError) as error:
+            raise HuroshikiError(
+                f"Profile MOD metadata {relative} is invalid: {error}"
+            ) from error
+        identity = canonical_provider(mod.provider), mod.project_id
+        records.setdefault(identity, []).append((relative, contents, mod))
+    return {identity: tuple(items) for identity, items in records.items()}
+
+
+def _profile_non_mod_metadata_snapshot(
+    source: Path,
+    checkpoint: Callable[[], None] | None = None,
+) -> dict[Path, bytes]:
+    """Snapshot Packwiz metadata outside the canonical MOD namespace."""
+
+    snapshot: dict[Path, bytes] = {}
+    for path in _checkpointed_paths(source, "*.pw.toml", checkpoint):
+        _run_checkpoint(checkpoint)
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(source)
+        if _is_profile_mod_metadata_path(relative):
+            continue
+        snapshot[relative] = _read_file_bytes(path, checkpoint)
+    return snapshot
+
+
+def _assert_profile_non_mod_metadata_unchanged(
+    source: Path,
+    expected: Mapping[Path, bytes],
+    checkpoint: Callable[[], None],
+) -> None:
+    actual = _profile_non_mod_metadata_snapshot(source, checkpoint)
+    if actual == expected:
+        return
+    changed = sorted(
+        path.as_posix()
+        for path in expected.keys() | actual.keys()
+        if expected.get(path) != actual.get(path)
+    )
+    raise HuroshikiError(
+        "Profile refresh changed non-MOD Packwiz metadata: "
+        + ", ".join(changed)
+    )
+
+
 def _exact_source_digest(source: Path) -> tuple[tuple[Path, str], ...]:
     return tuple(sorted(tree_digest_snapshot(source).items()))
 
@@ -7213,8 +7287,14 @@ def _exact_assert_complete_metadata_graph(
     source: Path,
     desired: dict[tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]],
     checkpoint: Callable[[], None],
+    *,
+    profile_mod_only: bool = False,
 ) -> None:
-    actual = _exact_metadata_records(source, checkpoint)
+    actual = (
+        _profile_mod_metadata_records(source, checkpoint)
+        if profile_mod_only
+        else _exact_metadata_records(source, checkpoint)
+    )
     if actual.keys() != desired.keys():
         missing = sorted(
             f"{identity[0]}:{identity[1]}" for identity in desired.keys() - actual.keys()
@@ -10650,7 +10730,8 @@ def _apply_exact_profiles(
     checkpoint = lambda: _profile_checkpoint(cancel_event, deadline)
     checkpoint()
     source = transaction.source
-    baseline = _exact_metadata_records(source, checkpoint)
+    baseline = _profile_mod_metadata_records(source, checkpoint)
+    non_mod_metadata = _profile_non_mod_metadata_snapshot(source, checkpoint)
     try:
         overrides = read_mod_version_overrides(source, checkpoint=checkpoint)
     except ModVersionOverrideError as error:
@@ -10670,6 +10751,7 @@ def _apply_exact_profiles(
                 expected_identity=baseline_scan.root_identity,
                 expected_snapshot_digest=baseline_scan.snapshot_digest,
                 checkpoint=checkpoint,
+                metadata_path_filter=_is_profile_mod_metadata_path,
             )
         except PackMigrationRootError as error:
             raise HuroshikiError(
@@ -10996,7 +11078,7 @@ def _apply_exact_profiles(
         sorted(roots, key=lambda item: item.canonical_identity)
     )
     write_pack_root_manifest(aggregate, expected_roots)
-    aggregate_desired = _exact_metadata_records(aggregate, checkpoint)
+    aggregate_desired = _profile_mod_metadata_records(aggregate, checkpoint)
     desired = dict(aggregate_desired)
     for identity, entries in baseline.items():
         if (
@@ -11071,12 +11153,16 @@ def _apply_exact_profiles(
     ensure_safe_pack_source(source, checkpoint=checkpoint)
     checkpoint()
     transaction._profile_expected_records = desired
+    transaction._profile_expected_non_mod_metadata = non_mod_metadata
     transaction._profile_expected_roots = expected_roots
     transaction._profile_expected_versions = (minecraft, loader, loader_version)
+    transaction._profile_mod_metadata_only = True
     transaction._record_source_mutation()
     transaction._version_override_mutated = True
     result: dict[str, tuple[Path, str]] = {}
-    for entries in _exact_metadata_records(transaction.source, checkpoint).values():
+    for entries in _profile_mod_metadata_records(
+        transaction.source, checkpoint
+    ).values():
         for relative, _contents, mod in entries:
             result[f"{canonical_provider(mod.provider)}:{mod.project_id}"] = (relative, mod.side)
     if on_entry is not None:
@@ -11206,8 +11292,22 @@ def apply_profiles(
                         cancel_event, deadline
                     )
                     _exact_assert_complete_metadata_graph(
-                        transaction.source, expected_records, final_checkpoint
+                        transaction.source,
+                        expected_records,
+                        final_checkpoint,
+                        profile_mod_only=True,
                     )
+                    expected_non_mod_metadata = getattr(
+                        transaction,
+                        "_profile_expected_non_mod_metadata",
+                        None,
+                    )
+                    if expected_non_mod_metadata is not None:
+                        _assert_profile_non_mod_metadata_unchanged(
+                            transaction.source,
+                            expected_non_mod_metadata,
+                            final_checkpoint,
+                        )
                     expected_roots = getattr(transaction, "_profile_expected_roots", None)
                     if expected_roots is not None:
                         require_mod_version_overrides_ignored(
@@ -11222,6 +11322,9 @@ def apply_profiles(
                                 expected_identity=final_scan.root_identity,
                                 expected_snapshot_digest=final_scan.snapshot_digest,
                                 checkpoint=final_checkpoint,
+                                metadata_path_filter=(
+                                    _is_profile_mod_metadata_path
+                                ),
                             )
                         except PackMigrationRootError as error:
                             raise HuroshikiError(
