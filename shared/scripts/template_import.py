@@ -21,6 +21,17 @@ SideDecision = Literal["keep_pack", "use_template", "union"]
 
 
 @dataclass(frozen=True)
+class TemplateVersionConstraint:
+    """A version/artifact requirement contributed by one Template."""
+
+    template_id: str
+    provider: str
+    project_id: str
+    artifact_id: str
+    scope: Literal["root", "dependency"]
+
+
+@dataclass(frozen=True)
 class ModCandidate:
     origin_kind: Literal["pack", "template"]
     origin_id: str
@@ -35,6 +46,10 @@ class ModCandidate:
     url_allow_private_networks: bool = False
     actual_provider: str | None = None
     actual_project_id: str | None = None
+    # A merged selector can be supplied by more than one Template.  Keep this
+    # separate from origin_id: the latter is intentionally the stable display
+    # and selection identity of the first contributor.
+    template_origin_ids: tuple[str, ...] = ()
 
     @property
     def logical_identity(self) -> tuple[str, str]:
@@ -231,6 +246,7 @@ class TemplateImportPlan:
     actual_identity_conflicts: tuple[ActualIdentityConflict, ...]
     verifications: tuple[ImportCandidateVerification, ...]
     plan_digest: str
+    version_constraints: tuple[TemplateVersionConstraint, ...] = ()
 
     @property
     def requires_resolution(self) -> bool:
@@ -240,6 +256,17 @@ class TemplateImportPlan:
             or self.logical_identity_conflicts
             or self.actual_identity_conflicts
         )
+
+    def active_version_constraints(
+        self,
+        selected_template_candidates: Sequence[ModCandidate] | None = None,
+    ) -> tuple[TemplateVersionConstraint, ...]:
+        candidates = (
+            self.template_candidates
+            if selected_template_candidates is None
+            else selected_template_candidates
+        )
+        return _active_version_constraints(self, candidates)
 
 
 @dataclass(frozen=True)
@@ -252,6 +279,48 @@ class ResolvedTemplateImportPlan:
     removed_pack_candidates: tuple[ModCandidate, ...]
     side_changes: tuple[tuple[tuple[str, str], str, str], ...]
     warnings: tuple[str, ...]
+    version_constraints: tuple[TemplateVersionConstraint, ...] = ()
+
+
+def _active_version_constraints(
+    plan: TemplateImportPlan,
+    selected_candidates: Sequence[ModCandidate],
+) -> tuple[TemplateVersionConstraint, ...]:
+    active: list[TemplateVersionConstraint] = []
+    for constraint in plan.version_constraints:
+        if constraint.scope == "dependency":
+            active.append(constraint)
+            continue
+        if any(
+            constraint.template_id in candidate.template_origin_ids
+            and candidate.logical_identity
+            == (constraint.provider, constraint.project_id)
+            for candidate in selected_candidates
+        ):
+            active.append(constraint)
+
+    # Constraints are ordered input, but consistency is independent of that
+    # order.  Never silently let a later Template replace an earlier intent.
+    artifacts: dict[tuple[str, str], str] = {}
+    roles: dict[tuple[str, str, str], str] = {}
+    for constraint in active:
+        identity = (constraint.provider, constraint.project_id)
+        previous_artifact = artifacts.get(identity)
+        if previous_artifact is not None and previous_artifact != constraint.artifact_id:
+            raise TemplateMergeError(
+                "Conflicting active Template version artifacts for "
+                f"{identity[0]}:{identity[1]}"
+            )
+        artifacts[identity] = constraint.artifact_id
+        role_key = (*identity, constraint.artifact_id)
+        previous_scope = roles.get(role_key)
+        if previous_scope is not None and previous_scope != constraint.scope:
+            raise TemplateMergeError(
+                "Conflicting active Template version constraint roles for "
+                f"{identity[0]}:{identity[1]}"
+            )
+        roles[role_key] = constraint.scope
+    return tuple(active)
 
 
 def template_candidate(
@@ -279,6 +348,7 @@ def template_candidate(
         url_allow_private_networks=url_allow_private_networks,
         actual_provider=actual_provider,
         actual_project_id=actual_project_id,
+        template_origin_ids=(template_id,),
     )
 
 
@@ -301,6 +371,8 @@ def merge_template_import_candidates(
     merged: list[ModCandidate] = []
     indexes: dict[tuple[str, str, str | None], int] = {}
     for candidate in candidates:
+        if candidate.origin_kind == "template" and not candidate.template_origin_ids:
+            candidate = replace(candidate, template_origin_ids=(candidate.origin_id,))
         index = indexes.get(candidate.selector_identity)
         if index is None:
             indexes[candidate.selector_identity] = len(merged)
@@ -323,8 +395,58 @@ def merge_template_import_candidates(
                     current.url_allow_private_networks
                     and candidate.url_allow_private_networks
                 ),
+                template_origin_ids=tuple(
+                    dict.fromkeys(
+                        (*current.template_origin_ids, *candidate.template_origin_ids)
+                    )
+                ),
             )
     return tuple(merged)
+
+
+def _canonical_version_constraints(
+    constraints: Sequence[TemplateVersionConstraint | Mapping[str, object]],
+) -> tuple[TemplateVersionConstraint, ...]:
+    """Normalize the public input without trusting mutable/malformed records."""
+    normalized: list[TemplateVersionConstraint] = []
+    for item in constraints:
+        if isinstance(item, TemplateVersionConstraint):
+            values = {
+                "template_id": item.template_id,
+                "provider": item.provider,
+                "project_id": item.project_id,
+                "artifact_id": item.artifact_id,
+                "scope": item.scope,
+            }
+        elif isinstance(item, Mapping):
+            if set(item) != {
+                "template_id",
+                "provider",
+                "project_id",
+                "artifact_id",
+                "scope",
+            }:
+                raise TemplateMergeError("Malformed Template version constraint")
+            values = dict(item)
+        else:
+            raise TemplateMergeError("Template version constraints must be records")
+        if any(not isinstance(values[key], str) for key in values):
+            raise TemplateMergeError("Template version constraint fields must be strings")
+        template_id = values["template_id"].strip()
+        provider = values["provider"].strip().lower()
+        project_id = values["project_id"].strip()
+        artifact_id = values["artifact_id"].strip()
+        scope = values["scope"].strip().lower()
+        if not template_id or not provider or not project_id or not artifact_id:
+            raise TemplateMergeError("Template version constraint fields cannot be empty")
+        if scope not in {"root", "dependency"}:
+            raise TemplateMergeError(f"Invalid Template version constraint scope: {scope}")
+        normalized.append(
+            TemplateVersionConstraint(
+                template_id, provider, project_id, artifact_id, scope  # type: ignore[arg-type]
+            )
+        )
+    return tuple(normalized)
 
 
 def _selection_option_key(candidates: Sequence[ModCandidate]) -> str:
@@ -471,6 +593,7 @@ def _plan_digest_payload(
     template_candidates: Sequence[ModCandidate],
     selection_options: Sequence[ImportSelectionOption],
     verifications: Sequence[ImportCandidateVerification],
+    version_constraints: Sequence[TemplateVersionConstraint],
 ) -> str:
     def record(candidate: ModCandidate) -> dict[str, object]:
         return {
@@ -491,12 +614,13 @@ def _plan_digest_payload(
             "url_allow_private_networks": candidate.url_allow_private_networks,
             "actual_provider": candidate.actual_provider,
             "actual_project_id": candidate.actual_project_id,
+            "template_origin_ids": candidate.template_origin_ids,
             "candidate_key": candidate.candidate_key,
             "selection_key": candidate.selection_key,
         }
 
     payload = {
-        "version": 4,
+        "version": 5,
         "pack_key": pack_key,
         "template_ids": template_ids,
         "pack_candidates": [record(item) for item in pack_candidates],
@@ -525,6 +649,16 @@ def _plan_digest_payload(
             }
             for item in verifications
         ],
+        "version_constraints": [
+            {
+                "template_id": item.template_id,
+                "provider": item.provider,
+                "project_id": item.project_id,
+                "artifact_id": item.artifact_id,
+                "scope": item.scope,
+            }
+            for item in version_constraints
+        ],
     }
     serialized = json.dumps(
         payload,
@@ -545,12 +679,19 @@ def build_template_import_plan(
     pack_candidates: Sequence[ModCandidate],
     template_candidates: Sequence[ModCandidate],
     verifications: Sequence[ImportCandidateVerification],
+    constraints: Sequence[
+        TemplateVersionConstraint | Mapping[str, object]
+    ] = (),
 ) -> TemplateImportPlan:
     ordered_ids = tuple(template_ids)
     if not ordered_ids:
         raise TemplateMergeError("At least one template must be selected")
     if len(set(ordered_ids)) != len(ordered_ids):
         raise TemplateMergeError("Template selection contains duplicate IDs")
+    normalized_constraints = _canonical_version_constraints(constraints)
+    selected_id_set = set(ordered_ids)
+    if any(item.template_id not in selected_id_set for item in normalized_constraints):
+        raise TemplateMergeError("Template version constraint references an unselected template")
     for template_id in ordered_ids:
         compatibility = compatibilities.get(template_id)
         if compatibility is None:
@@ -677,10 +818,12 @@ def build_template_import_plan(
             pack_key,
             ordered_ids,
             pack_candidates,
-            ordered_templates,
+            merged_templates,
             selection_options,
             verifications,
+            normalized_constraints,
         ),
+        normalized_constraints,
     )
 
 
@@ -915,6 +1058,7 @@ def resolve_template_import_plan(
             raise TemplateMergeError(f"Invalid side decision: {decision}")
         if result != conflict.pack_side:
             side_changes.append((conflict.identity, conflict.pack_side, result))
+    active_version_constraints = _active_version_constraints(plan, selected_templates)
     return ResolvedTemplateImportPlan(
         plan.plan_digest,
         tuple(
@@ -928,4 +1072,5 @@ def resolve_template_import_plan(
         removed_pack,
         tuple(side_changes),
         tuple(warnings),
+        active_version_constraints,
     )
