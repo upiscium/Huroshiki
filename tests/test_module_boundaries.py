@@ -4,6 +4,7 @@ import deploy_support
 import huroshiki_core
 import packctl
 import publish_activation
+import publish_orchestration
 import publish_restart
 import publish_transfer
 import project_locks
@@ -103,6 +104,56 @@ class ModuleBoundaryTest(unittest.TestCase):
         self.assertIs(
             huroshiki_core.restart_activated_publish,
             publish_restart.restart_activated_publish,
+        )
+
+    def test_core_reexports_publish_orchestration_api(self) -> None:
+        self.assertIs(
+            huroshiki_core.PackPublishPlan,
+            publish_orchestration.PackPublishPlan,
+        )
+        self.assertIs(
+            huroshiki_core.PackPublishResult,
+            publish_orchestration.PackPublishResult,
+        )
+        self.assertIs(
+            huroshiki_core.PackPublishProgress,
+            publish_orchestration.PackPublishProgress,
+        )
+        self.assertIs(
+            huroshiki_core.PackPublishExecutionError,
+            publish_orchestration.PackPublishExecutionError,
+        )
+        self.assertIs(
+            huroshiki_core.PackPublishCancelled,
+            publish_orchestration.PackPublishCancelled,
+        )
+        self.assertIs(
+            huroshiki_core.PackPublishDeadlineExceeded,
+            publish_orchestration.PackPublishDeadlineExceeded,
+        )
+        self.assertIs(
+            huroshiki_core.PackPublishCleanupError,
+            publish_orchestration.PackPublishCleanupError,
+        )
+        self.assertIs(
+            huroshiki_core.PackPublishRestartError,
+            publish_orchestration.PackPublishRestartError,
+        )
+        self.assertIs(
+            huroshiki_core.PackPublishRestartUncertainError,
+            publish_orchestration.PackPublishRestartUncertainError,
+        )
+        self.assertIs(
+            huroshiki_core.plan_pack_publish,
+            publish_orchestration.plan_pack_publish,
+        )
+        self.assertIs(
+            huroshiki_core.execute_pack_publish,
+            publish_orchestration.execute_pack_publish,
+        )
+        self.assertIs(
+            huroshiki_core.retry_pack_publish_cleanup,
+            publish_orchestration.retry_pack_publish_cleanup,
         )
 
 

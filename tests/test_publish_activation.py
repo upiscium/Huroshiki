@@ -483,11 +483,19 @@ class PublishSemanticVerificationTest(PackPublishManifestTest):
                     context.exception.operation_id,
                     context.exception.recovery_path.name.removeprefix(".huroshiki-activation-").removesuffix(".json"),
                 )
+                self.assertIsNotNone(context.exception.activated)
+                self.assertEqual(
+                    context.exception.activated.generation_id,
+                    staged.generation_id,
+                )
+                self.assertEqual(context.exception.expected_status, "activated")
                 activation.retry_publish_activation_cleanup(
                     staged,
                     manifest,
                     target,
                     context.exception.operation_id,
+                    finalize_receipt=True,
+                    expected_status=context.exception.expected_status,
                 )
             self.assertEqual(
                 Path(target.publication_root, "current").readlink().as_posix(),
