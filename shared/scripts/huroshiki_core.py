@@ -274,6 +274,14 @@ from publish_activation import (
     retry_publish_activation_cleanup,
     verify_publish_generation,
 )
+from publish_restart import (
+    PublishRestartCancelled,
+    PublishRestartDeadlineExceeded,
+    PublishRestartError,
+    PublishRestartIntegrityError,
+    PublishRestartResult,
+    restart_activated_publish,
+)
 
 ROOT = packctl.ROOT
 PACKS = packctl.PACKS
