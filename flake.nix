@@ -95,6 +95,7 @@
              test -f ${huroshiki}/lib/huroshiki/publish_target.py
              test -f ${huroshiki}/lib/huroshiki/publish_transfer.py
              test -f ${huroshiki}/lib/huroshiki/publish_activation.py
+             test -f ${huroshiki}/lib/huroshiki/publish_restart.py
              test -f ${huroshiki}/lib/huroshiki/url_artifacts.py
             test -f ${huroshiki}/lib/huroshiki/project_locks.py
             test -f ${huroshiki}/lib/huroshiki/pack_migration.py

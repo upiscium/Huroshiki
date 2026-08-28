@@ -4,6 +4,7 @@ import deploy_support
 import huroshiki_core
 import packctl
 import publish_activation
+import publish_restart
 import publish_transfer
 import project_locks
 import publish_target
@@ -88,6 +89,20 @@ class ModuleBoundaryTest(unittest.TestCase):
         self.assertIs(
             huroshiki_core.retry_publish_activation_cleanup,
             publish_activation.retry_publish_activation_cleanup,
+        )
+
+    def test_core_reexports_publish_restart_api(self) -> None:
+        self.assertIs(
+            huroshiki_core.PublishRestartResult,
+            publish_restart.PublishRestartResult,
+        )
+        self.assertIs(
+            huroshiki_core.PublishRestartIntegrityError,
+            publish_restart.PublishRestartIntegrityError,
+        )
+        self.assertIs(
+            huroshiki_core.restart_activated_publish,
+            publish_restart.restart_activated_publish,
         )
 
 
