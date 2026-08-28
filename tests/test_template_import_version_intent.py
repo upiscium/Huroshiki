@@ -126,6 +126,65 @@ class TemplateImportVersionIntentTest(unittest.TestCase):
         operation.run()
         return operation
 
+    def run_same_identity_slug_pack_intent(
+        self,
+        *,
+        locked: bool,
+        reason: str | None,
+    ) -> tuple[
+        exact_selection.ExactModVersionSelectionTest,
+        core.TemplateImportSession,
+        core.TemplateImportOperation,
+        str,
+        str,
+    ]:
+        fixture = self.exact_fixture()
+        project_id = exact_selection.MR_PROJECT_IDS["root"]
+        artifact_id = exact_selection.MR_VERSION_IDS["r1"]
+        self.seed_installed_modrinth_root(
+            fixture,
+            artifact_id=artifact_id,
+            locked=locked,
+            reason=reason,
+        )
+        self.write_exact_template(
+            fixture,
+            provider="modrinth",
+            project_id="create",
+            artifact_id=None,
+        )
+        automatic = core.ResolvedModClosure(
+            ("modrinth", project_id),
+            (fixture.resolved_metadata("root", "r2"),),
+        )
+        with patch.object(core, "resolve_mod_closure", return_value=automatic):
+            session = core.TemplateImportSession.create(fixture.key, ["base"])
+        verification = session.verifications[0]
+        verified_root = next(
+            item
+            for item in verification.cached_closure.metadata
+            if item.identity == ("modrinth", project_id)
+        )
+        self.assertEqual(
+            core.parse_provider_metadata(
+                verified_root.relative_path, verified_root.contents
+            ).file_id,
+            artifact_id,
+        )
+        incoming = session.plan.template_candidates[0]
+        resolved = resolve_template_import_plan(
+            session.plan,
+            actual_identity_resolutions={
+                f"modrinth:{project_id}": ImportConflictResolution(
+                    (incoming.selection_key,)
+                )
+            },
+        )
+        operation = core.TemplateImportOperation(session, resolved)
+        operation.run()
+        self.assertIsNone(operation.error)
+        return fixture, session, operation, project_id, artifact_id
+
     def seed_installed_modrinth_root(
         self,
         fixture: exact_selection.ExactModVersionSelectionTest,
@@ -659,13 +718,115 @@ class TemplateImportVersionIntentTest(unittest.TestCase):
             project_id=project_id,
             artifact_id=None,
         )
-        operation = self.run_exact_import(fixture)
+        automatic = core.ResolvedModClosure(
+            ("modrinth", project_id),
+            (fixture.resolved_metadata("root", "r2"),),
+        )
+        with patch.object(core, "resolve_mod_closure", return_value=automatic):
+            operation = self.run_exact_import(fixture)
         self.assertIsNone(operation.error)
         self.assertEqual(
             read_mod_version_overrides(operation.transaction.source)[0].artifact_id,
             artifact_id,
         )
         operation.discard()
+
+    def test_slug_root_rebinds_to_unlocked_same_identity_pack_intent(self) -> None:
+        fixture, _session, operation, project_id, artifact_id = (
+            self.run_same_identity_slug_pack_intent(
+                locked=False,
+                reason=None,
+            )
+        )
+        preview = next(
+            item
+            for item in operation.preview.version_constraints
+            if item.canonical_identity == f"modrinth:{project_id}"
+        )
+        self.assertEqual(preview.artifact_id, artifact_id)
+        self.assertEqual(preview.origins, ("Pack",))
+        self.assertFalse(preview.locked)
+        operation.apply()
+        applied = core.parse_provider_metadata(
+            Path("mods/root.pw.toml"),
+            fixture.source.joinpath("mods/root.pw.toml").read_bytes(),
+        )
+        self.assertEqual(applied.file_id, artifact_id)
+        self.assertEqual(
+            read_mod_version_overrides(fixture.source)[0].artifact_id,
+            artifact_id,
+        )
+
+    def test_slug_root_rebinds_to_locked_same_identity_pack_intent(self) -> None:
+        fixture, _session, operation, project_id, artifact_id = (
+            self.run_same_identity_slug_pack_intent(
+                locked=True,
+                reason="compatibility",
+            )
+        )
+        preview = next(
+            item
+            for item in operation.preview.version_constraints
+            if item.canonical_identity == f"modrinth:{project_id}"
+        )
+        self.assertEqual(preview.artifact_id, artifact_id)
+        self.assertTrue(preview.locked)
+        self.assertEqual(preview.reason, "compatibility")
+        operation.apply()
+        applied_override = read_mod_version_overrides(fixture.source)[0]
+        self.assertEqual(applied_override.artifact_id, artifact_id)
+        self.assertTrue(applied_override.locked)
+        self.assertEqual(applied_override.reason, "compatibility")
+
+    def test_slug_root_pack_intent_artifact_is_plan_fingerprint_bound(self) -> None:
+        states: list[tuple[str, str, str]] = []
+        for artifact_key in ("r1", "r2"):
+            fixture = self.exact_fixture()
+            project_id = exact_selection.MR_PROJECT_IDS["root"]
+            artifact_id = exact_selection.MR_VERSION_IDS[artifact_key]
+            self.seed_installed_modrinth_root(
+                fixture,
+                artifact_id=artifact_id,
+            )
+            self.write_exact_template(
+                fixture,
+                provider="modrinth",
+                project_id="create",
+                artifact_id=None,
+            )
+            automatic = core.ResolvedModClosure(
+                ("modrinth", project_id),
+                (fixture.resolved_metadata("root", "r2"),),
+            )
+            with patch.object(
+                core, "resolve_mod_closure", return_value=automatic
+            ):
+                session = core.TemplateImportSession.create(
+                    fixture.key, ["base"]
+                )
+            verification = session.verifications[0]
+            root = next(
+                item
+                for item in verification.cached_closure.metadata
+                if item.identity == ("modrinth", project_id)
+            )
+            states.append((
+                session.plan.plan_digest,
+                verification.closure_fingerprint,
+                core.parse_provider_metadata(
+                    root.relative_path, root.contents
+                ).file_id,
+            ))
+            session.discard()
+        self.assertEqual(
+            [state[2] for state in states],
+            [
+                exact_selection.MR_VERSION_IDS["r1"],
+                exact_selection.MR_VERSION_IDS["r2"],
+            ],
+        )
+        self.assertNotEqual(states[0][0], states[1][0])
+        self.assertNotEqual(states[0][1], states[1][1])
 
     def test_retained_unconstrained_pack_root_uses_fixed_baseline_artifact(self) -> None:
         fixture = self.exact_fixture()
@@ -692,7 +853,12 @@ class TemplateImportVersionIntentTest(unittest.TestCase):
             artifact_id=None,
             dependency=("curseforge", "987654", "987656"),
         )
-        operation = self.run_exact_import(fixture)
+        automatic = core.ResolvedModClosure(
+            ("modrinth", project_id),
+            (fixture.resolved_metadata("root", "r2"),),
+        )
+        with patch.object(core, "resolve_mod_closure", return_value=automatic):
+            operation = self.run_exact_import(fixture)
         self.assertIsNone(operation.error)
         root_metadata = core.parse_provider_metadata(
             Path("mods/root.pw.toml"),
@@ -982,7 +1148,7 @@ class TemplateImportVersionIntentTest(unittest.TestCase):
         )
         with patch.object(core, "resolve_mod_closure", return_value=closure) as resolver:
             session = core.TemplateImportSession.create(fixture.key, ["base"])
-        self.assertNotIn("canonical_project_id", resolver.call_args.kwargs)
+        self.assertIsNone(resolver.call_args.kwargs["canonical_project_id"])
         self.assertEqual(session.plan.template_candidates[0].actual_identity, closure.root_identity)
         operation = core.TemplateImportOperation(
             session, resolve_template_import_plan(session.plan)
@@ -1015,7 +1181,7 @@ class TemplateImportVersionIntentTest(unittest.TestCase):
             core, "resolve_mod_closure", return_value=closure
         ) as resolver:
             operation = self.run_exact_import(fixture)
-        self.assertNotIn("canonical_project_id", resolver.call_args.kwargs)
+        self.assertIsNone(resolver.call_args.kwargs["canonical_project_id"])
         self.assertIsNone(operation.error)
         self.assertEqual(
             operation.preview.added_roots[0].actual_identity,

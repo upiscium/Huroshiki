@@ -13683,22 +13683,6 @@ def verify_import_candidates(
                 )
                 continue
             requested_artifact = next(iter(artifacts), None)
-            if requested_artifact is None:
-                prior = next(
-                    (
-                        item
-                        for item in pack_overrides
-                        if (item.provider, item.project_id)
-                        == candidate.logical_identity
-                    ),
-                    None,
-                )
-                if prior is not None:
-                    requested_artifact = prior.artifact_id
-            if requested_artifact is None:
-                requested_artifact = (retained_root_artifacts or {}).get(
-                    candidate.logical_identity
-                )
             if resolver_root is None and (
                 requested_artifact is not None or exact_constraints
             ):
@@ -13718,11 +13702,14 @@ def verify_import_candidates(
 
             try:
                 workspace = resolver_root / f"template-import-plan-{uuid4().hex}"
-                create_resolver_source(
-                    workspace, display_name=f"Verify {candidate.candidate_key}",
-                    minecraft=minecraft, loader=loader, loader_version=loader_version,
-                )
                 if requested_artifact is not None:
+                    create_resolver_source(
+                        workspace,
+                        display_name=f"Verify {candidate.candidate_key}",
+                        minecraft=minecraft,
+                        loader=loader,
+                        loader_version=loader_version,
+                    )
                     selection = ExactModArtifactSelection(
                         candidate.provider,
                         canonical_modrinth_id(
@@ -13743,13 +13730,82 @@ def verify_import_candidates(
                     )
                     _verify_exact_root_metadata(selection, closure.metadata)
                 else:
+                    canonical_project_id: str | None = None
+                    try:
+                        if candidate.provider == "modrinth":
+                            canonical_project_id = str(canonical_modrinth_id(
+                                candidate.project_id, "Modrinth project ID"
+                            ))
+                        elif candidate.provider == "curseforge":
+                            canonical_project_id = canonical_curseforge_project_id(
+                                candidate.project_id
+                            )
+                    except HuroshikiError:
+                        # Automatic Modrinth slugs/URLs require normal selector
+                        # resolution before Pack intent can be matched by identity.
+                        canonical_project_id = None
                     closure = resolve_mod_closure(
                         provider=candidate.provider, selector=candidate.project_id,
                         minecraft=minecraft, loader=loader, loader_version=loader_version,
+                        canonical_project_id=canonical_project_id,
                         cancel_event=cancel_event, deadline=deadline,
                         resolver_root=workspace,
                         process_result_callback=record_candidate_process_result,
                     )
+                    enforce_process_authority(candidate_process_results)
+                    actual_identity = closure.root_identity
+                    prior = next(
+                        (
+                            item
+                            for item in pack_overrides
+                            if (item.provider, item.project_id) == actual_identity
+                        ),
+                        None,
+                    )
+                    requested_artifact = (
+                        prior.artifact_id
+                        if prior is not None
+                        else (retained_root_artifacts or {}).get(actual_identity)
+                    )
+                    if requested_artifact is not None:
+                        exact_workspace = (
+                            resolver_root
+                            / f"template-import-plan-exact-{uuid4().hex}"
+                        )
+                        create_resolver_source(
+                            exact_workspace,
+                            display_name=f"Verify {candidate.candidate_key}",
+                            minecraft=minecraft,
+                            loader=loader,
+                            loader_version=loader_version,
+                        )
+                        selection = ExactModArtifactSelection(
+                            actual_identity[0],
+                            canonical_modrinth_id(
+                                actual_identity[1], "Modrinth project ID"
+                            )
+                            if actual_identity[0] == "modrinth"
+                            else actual_identity[1],
+                            canonical_modrinth_id(
+                                requested_artifact, "Modrinth version ID"
+                            )
+                            if actual_identity[0] == "modrinth"
+                            else requested_artifact,
+                        )
+                        closure = resolve_exact_mod_closure(
+                            selection,
+                            source=exact_workspace,
+                            cancel_event=cancel_event,
+                            deadline=deadline,
+                            checkpoint=checkpoint,
+                            process_result_callback=record_candidate_process_result,
+                        )
+                        _verify_exact_root_metadata(selection, closure.metadata)
+                        if closure.root_identity != actual_identity:
+                            raise HuroshikiError(
+                                "Automatic Template root canonical identity changed "
+                                "during exact Pack-intent resolution"
+                            )
                 enforce_process_authority(candidate_process_results)
                 actual_identity = closure.root_identity
                 roots = [item for item in closure.metadata if item.identity == actual_identity]
