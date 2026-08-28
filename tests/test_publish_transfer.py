@@ -93,6 +93,31 @@ class PublishTransferTest(PackPublishManifestTest):
             transfer.discard_publish_transfer_plan(plan)
         self.assertEqual(plan.state, "discarded")
 
+    def test_prepare_cleanup_failure_retains_retryable_plan(self) -> None:
+        manifest, target = self._manifest_and_target()
+        primary = transfer.PublishTransferPlanningError("verification failed")
+        with patch.object(
+            transfer, "_verify_workspace", side_effect=primary
+        ), patch.object(
+            transfer, "_remove_tree", side_effect=OSError("cleanup failed")
+        ):
+            with self.assertRaises(transfer.PublishTransferCleanupError) as error:
+                transfer.prepare_publish_transfer("demo", manifest, target)
+        retained = error.exception.plan
+        self.assertIsNotNone(retained)
+        self.assertIs(error.exception.primary_error, primary)
+        self.assertEqual(retained.state, "cleanup-pending")
+        transfer.retry_discard_publish_transfer_plan(retained)
+        self.assertEqual(retained.state, "discarded")
+
+    def test_prepare_interrupt_cleans_workspace_and_preserves_interrupt(self) -> None:
+        manifest, target = self._manifest_and_target()
+        with patch.object(
+            transfer, "_verify_workspace", side_effect=KeyboardInterrupt()
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                transfer.prepare_publish_transfer("demo", manifest, target)
+
     def test_generation_id_is_deterministic_and_target_bound(self) -> None:
         manifest, target = self._manifest_and_target()
         other = self._target(remote_path=str(self.root / "other-remote"))

@@ -63,7 +63,16 @@ class PublishTransferUncertainError(PublishTransferExecutionError):
 
 
 class PublishTransferCleanupError(PublishTransferError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        plan: PublishTransferPlan | None = None,
+        primary_error: BaseException | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.plan = plan
+        self.primary_error = primary_error
 
 
 @dataclass(frozen=True)
@@ -1186,11 +1195,16 @@ def process_activation_cleanup(header):
         receipt = None
         if finalize_receipt:
             receipt = read_activation_receipt(root, header)
-            if receipt is None:
-                raise RuntimeError("activation cleanup requires a causal receipt")
             generations = open_child_dir(root, "generations", create=False)
             current = current_generation(root, generations)
-            if expected_status == "reused":
+            if receipt is None:
+                if (
+                    expected_status not in {"activated", "reused"}
+                    or current != header["generation_id"]
+                ):
+                    raise RuntimeError("activation cleanup requires a causal receipt")
+                open_verified_generation(header, generations)
+            elif expected_status == "reused":
                 if (
                     not receipt["preexisting_expected"]
                     or current != header["generation_id"]
@@ -1573,6 +1587,7 @@ def prepare_publish_transfer(
 
     operation_id = uuid4().hex
     workspace: Path | None = None
+    cleanup_owner: PublishTransferPlan | None = None
     lock_set = None
     try:
         _emit(progress, PublishTransferProgress("acquiring-lock", 0, len(manifest.files), 0, manifest.total_bytes))
@@ -1588,6 +1603,17 @@ def prepare_publish_transfer(
         if scan.content_digest != manifest.source_snapshot_digest:
             raise PublishTransferPlanningError("stale source snapshot")
         workspace, payload_root, workspace_identity = _allocate_workspace(operation_id)
+        cleanup_owner = PublishTransferPlan(
+            pack_id=pack_id,
+            manifest=manifest,
+            target=target,
+            operation_id=operation_id,
+            workspace=workspace,
+            payload_root=payload_root,
+            workspace_identity=workspace_identity,
+            workspace_digest="",
+            generation_id=compute_publish_generation_id(manifest, target),
+        )
         total_files = len(manifest.files)
         completed_bytes = 0
         entries = {entry.relative_path: entry for entry in scan.entries}
@@ -1657,26 +1683,30 @@ def prepare_publish_transfer(
         )
         if final.manifest_digest != manifest.manifest_digest:
             raise PublishTransferPlanningError("Pack changed while materializing transfer")
-        return PublishTransferPlan(
-            pack_id=pack_id,
-            manifest=manifest,
-            target=target,
-            operation_id=operation_id,
-            workspace=workspace,
-            payload_root=payload_root,
-            workspace_identity=workspace_identity,
-            workspace_digest=workspace_digest,
-            generation_id=compute_publish_generation_id(manifest, target),
-        )
+        with cleanup_owner._lock:
+            cleanup_owner._workspace_digest = workspace_digest
+        return cleanup_owner
     except BaseException as error:
-        if workspace is not None and _workspace_exists(workspace):
+        primary_error: BaseException = error
+        if isinstance(error, Exception) and not isinstance(error, PublishTransferError):
+            primary_error = PublishTransferPlanningError(str(error))
+        if cleanup_owner is not None and workspace is not None and _workspace_exists(workspace):
+            with cleanup_owner._lock:
+                cleanup_owner._state = "failed"
             try:
-                _remove_tree(workspace, time.monotonic() + 10.0)
-            except BaseException:
-                pass
-        if isinstance(error, PublishTransferError):
+                discard_publish_transfer_plan(
+                    cleanup_owner,
+                    deadline=time.monotonic() + 10.0,
+                )
+            except BaseException as cleanup_error:
+                raise PublishTransferCleanupError(
+                    "Publish transfer preparation cleanup is pending",
+                    plan=cleanup_owner,
+                    primary_error=primary_error,
+                ) from cleanup_error
+        if primary_error is error:
             raise
-        raise PublishTransferPlanningError(str(error)) from error
+        raise primary_error from error
     finally:
         if lock_set is not None:
             try:
@@ -1730,9 +1760,7 @@ def discard_publish_transfer_plan(
             return
         if plan._state == "discarding":
             raise PublishTransferCleanupError("publish transfer cleanup is already running")
-        remote_cleanup_pending = (
-            plan._state == "cleanup-pending" or plan._recovery_path is not None
-        )
+        remote_cleanup_pending = plan._recovery_path is not None
         plan._state = "discarding"
     try:
         if remote_cleanup_pending:
@@ -1741,9 +1769,17 @@ def discard_publish_transfer_plan(
     except BaseException as error:
         with plan._lock:
             plan._state = "cleanup-pending"
-        if isinstance(error, PublishTransferCleanupError):
+        if isinstance(error, PublishTransferCleanupError) and error.plan is plan:
             raise
-        raise PublishTransferCleanupError(str(error)) from error
+        raise PublishTransferCleanupError(
+            str(error),
+            plan=plan,
+            primary_error=(
+                error.primary_error
+                if isinstance(error, PublishTransferCleanupError)
+                else None
+            ),
+        ) from error
     with plan._lock:
         plan._state = "discarded"
 

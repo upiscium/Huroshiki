@@ -58,6 +58,19 @@ class PublishActivationUncertainError(PublishActivationError):
 class PublishActivationCleanupError(PublishActivationError):
     """Activation temporary-entry cleanup is pending."""
 
+    def __init__(
+        self,
+        message: str,
+        recovery_path: PurePosixPath | None = None,
+        operation_id: str | None = None,
+        *,
+        activated: PublishActivatedGeneration | None = None,
+        expected_status: str | None = None,
+    ) -> None:
+        super().__init__(message, recovery_path, operation_id)
+        self.activated = activated
+        self.expected_status = expected_status
+
 
 @dataclass(frozen=True)
 class PublishSemanticVerification:
@@ -606,15 +619,7 @@ def activate_publish_generation(
                 pack_digest=pack_digest,
                 index_digest=index_digest,
             )
-            _activation_cleanup(
-                target,
-                header,
-                deadline=operation_deadline,
-                finalize_receipt=True,
-                expected_status=str(status),
-            )
-            _emit(progress, "activated")
-            return PublishActivatedGeneration(
+            activated = PublishActivatedGeneration(
                 manifest.manifest_digest,
                 target.config_digest,
                 staged.generation_id,
@@ -623,6 +628,24 @@ def activate_publish_generation(
                 previous,
                 reused,
             )
+            try:
+                _activation_cleanup(
+                    target,
+                    header,
+                    deadline=operation_deadline,
+                    finalize_receipt=True,
+                    expected_status=str(status),
+                )
+            except PublishActivationCleanupError as error:
+                raise PublishActivationCleanupError(
+                    str(error),
+                    error.recovery_path,
+                    error.operation_id,
+                    activated=activated,
+                    expected_status=str(status),
+                ) from error
+            _emit(progress, "activated")
+            return activated
 
     activation_failure = process_failure_message(result, label="Publish activation")
     if response is not None and response.get("error") is not None:
@@ -683,14 +706,7 @@ def activate_publish_generation(
                 pack_digest=pack_digest,
                 index_digest=index_digest,
             )
-            _activation_cleanup(
-                target,
-                status_header,
-                deadline=operation_deadline,
-                finalize_receipt=True,
-                expected_status=str(status),
-            )
-            return PublishActivatedGeneration(
+            activated = PublishActivatedGeneration(
                 manifest.manifest_digest,
                 target.config_digest,
                 staged.generation_id,
@@ -699,6 +715,23 @@ def activate_publish_generation(
                 previous,
                 reused,
             )
+            try:
+                _activation_cleanup(
+                    target,
+                    status_header,
+                    deadline=operation_deadline,
+                    finalize_receipt=True,
+                    expected_status=str(status),
+                )
+            except PublishActivationCleanupError as error:
+                raise PublishActivationCleanupError(
+                    str(error),
+                    error.recovery_path,
+                    error.operation_id,
+                    activated=activated,
+                    expected_status=str(status),
+                ) from error
+            return activated
         if status in {"not_activated", "uncertain"}:
             if status == "not_activated":
                 _validate_activation_response(
