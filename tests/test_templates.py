@@ -41,6 +41,20 @@ mods:
     provider: curseforge
     project_id: "238222"
     side: client
+ '''
+
+
+def override_yaml() -> str:
+    return '''
+mod_version_overrides:
+  - provider: modrinth
+    project_id: Abcd1234
+    artifact_id: Efgh5678
+    scope: root
+  - provider: curseforge
+    project_id: "238222"
+    artifact_id: "123456"
+    scope: root
 '''
 
 
@@ -93,6 +107,45 @@ class TemplateManifestTest(unittest.TestCase):
         self.assertEqual([mod.name for mod in mods], ["Create", "JEI"])
         self.assertTrue(mods[0].client and mods[0].server)
         self.assertTrue(mods[1].client and not mods[1].server)
+
+    def test_template_version_overrides_are_normalized_and_preserved(self) -> None:
+        (self.template_root / "template.yaml").write_text(
+            template_yaml().replace("project_id: create-id", "project_id: Abcd1234")
+            + override_yaml(),
+            encoding="utf-8",
+        )
+        expected = [
+            {
+                "provider": "modrinth",
+                "project_id": "Abcd1234",
+                "artifact_id": "Efgh5678",
+                "scope": "root",
+            },
+            {
+                "provider": "curseforge",
+                "project_id": "238222",
+                "artifact_id": "123456",
+                "scope": "root",
+            },
+        ]
+        self.assertEqual(packctl.template_mod_version_overrides("base"), expected)
+        packctl.save_template_mods("base", packctl.template_mods("base"))
+        saved = packctl.load_yaml(self.template_root / "template.yaml")
+        self.assertEqual(saved["mod_version_overrides"], expected)
+
+    def test_template_version_override_schema_rejects_unresolved_or_locked_intent(self) -> None:
+        cases = [
+            {"provider": "url", "project_id": "x", "artifact_id": "y", "scope": "root"},
+            {"provider": "curseforge", "project_id": "01", "artifact_id": "2", "scope": "root"},
+            {"provider": "modrinth", "project_id": "slug", "artifact_id": "Efgh5678", "scope": "root"},
+            {"provider": "modrinth", "project_id": "Abcd1234", "artifact_id": "Efgh5678", "scope": "root", "locked": True},
+        ]
+        for override in cases:
+            with self.subTest(override=override):
+                config = packctl.load_yaml(self.template_root / "template.yaml")
+                config["mod_version_overrides"] = [override]
+                with self.assertRaises(packctl.ConfigError):
+                    packctl.prospective_template_config("base", config, {})
 
     def test_template_side_edit_and_delete_update_yaml(self) -> None:
         key = core.project_key("template", "base")

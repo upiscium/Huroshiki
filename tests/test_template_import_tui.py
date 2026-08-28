@@ -166,6 +166,26 @@ PREVIEW = core.TemplateImportPreview(
     unchanged=(pack_candidate("Unchanged", "unchanged"),),
     changes=(core.UpdateChange(Path("mods/root.pw.toml"), None, b"new"),),
     warnings=("duplicate MOD risk acknowledged",),
+    version_constraints=(
+        core.TemplateVersionConstraintPreview(
+            "modrinth:root",
+            "modrinth",
+            "root",
+            "artifact-root",
+            "root",
+            ("base", "Pack"),
+            True,
+            "maintain compatibility",
+        ),
+        core.TemplateVersionConstraintPreview(
+            "modrinth:dependency",
+            "modrinth",
+            "dependency",
+            "artifact-dependency",
+            "dependency",
+            ("base",),
+        ),
+    ),
 )
 
 
@@ -176,6 +196,7 @@ class FakeImportOperation:
         *,
         delayed: bool = False,
         preview: core.TemplateImportPreview | None = PREVIEW,
+        error: BaseException | None = None,
     ) -> None:
         self.session = session
         self.delayed = delayed
@@ -184,8 +205,9 @@ class FakeImportOperation:
         self.done = threading.Event()
         self.started = threading.Event()
         self.release = threading.Event()
-        self.error: BaseException | None = None
+        self.error = error
         self.cancelled = False
+        self.cancel_event = threading.Event()
         self.progress: queue.SimpleQueue[str] = queue.SimpleQueue()
         self.run_thread_id: int | None = None
         self.cancel_calls = 0
@@ -198,7 +220,9 @@ class FakeImportOperation:
         self.progress.put("Resolving 1/1: Root")
         if self.delayed:
             self.release.wait(3)
-        if self.cancel_calls:
+        if self.error is not None:
+            pass
+        elif self.cancel_calls:
             self.cancelled = True
             self.session.discard()
         else:
@@ -222,6 +246,35 @@ class FakeImportOperation:
                 values.append(self.progress.get_nowait())
             except queue.Empty:
                 return tuple(values)
+
+
+class DelayedApplyOperation(FakeImportOperation):
+    def __init__(
+        self,
+        session: FakeSession,
+        *,
+        apply_error: BaseException | None = None,
+        cleanup_finished: bool = True,
+    ) -> None:
+        super().__init__(session)
+        self.apply_started = threading.Event()
+        self.apply_release = threading.Event()
+        self.apply_error_result = apply_error
+        self.cleanup_finished = cleanup_finished
+        self.discard_during_apply = False
+
+    def apply(self) -> None:
+        self.apply_calls += 1
+        self.apply_started.set()
+        self.apply_release.wait(3)
+        setattr(self.session, "finished", self.cleanup_finished)
+        if self.apply_error_result is not None:
+            raise self.apply_error_result
+
+    def discard(self) -> None:
+        if self.apply_started.is_set() and not self.apply_release.is_set():
+            self.discard_during_apply = True
+        super().discard()
 
 
 class _ScreenApp(App[None]):
@@ -363,6 +416,45 @@ class TemplateImportTuiTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(app.screen, screen)
                 cleanup_release.set()
                 await pilot.pause(0.15)
+                self.assertEqual(app.opened_projects, ["pack:demo"])
+
+    async def test_planning_cancel_retains_failed_session_cleanup_for_retry(self) -> None:
+        started = threading.Event()
+
+        class RetryingSession(FakeSession):
+            def discard(self) -> None:
+                self.discard_calls += 1
+                if self.discard_calls < 3:
+                    raise core.TransactionDiscardIntegrityError(
+                        "cleanup incomplete"
+                    )
+
+        session = RetryingSession()
+
+        def create(_project_key: str, _template_ids: tuple[str, ...], **kwargs: object):
+            started.set()
+            kwargs["cancel_event"].wait(2)
+            return session
+
+        with (
+            patch.object(core, "project_info", return_value=PACK),
+            patch.object(core, "compatible_templates", return_value=[template_project("base")]),
+            patch.object(core.TemplateImportSession, "create", side_effect=create),
+        ):
+            app = _ScreenApp(huroshiki.TemplateImportSelectionScreen("pack:demo"))
+            async with app.run_test() as pilot:
+                await pilot.press("space", "enter")
+                self.assertTrue(started.wait(1))
+                screen = app.screen
+                await pilot.press("escape")
+                await pilot.pause(0.2)
+                self.assertIs(app.screen, screen)
+                self.assertEqual(app.opened_projects, [])
+                self.assertEqual(session.discard_calls, 2)
+                self.assertIs(screen.session, session)
+                await pilot.press("escape")
+                await pilot.pause(0.1)
+                self.assertEqual(session.discard_calls, 3)
                 self.assertEqual(app.opened_projects, ["pack:demo"])
 
     async def test_planning_failure_stays_on_selection_without_navigation(self) -> None:
@@ -607,6 +699,9 @@ class TemplateImportTuiTest(unittest.IsolatedAsyncioTestCase):
                     self.assertNotEqual(operation.run_thread_id, main_thread)
                     rendered = str(screen.query_one("#template-import-preview", Static).content)
                     for expected in (
+                        "Version constraints",
+                        "modrinth:root | artifact ID: artifact-root | role: root | origins: base, Pack | lock state: locked | pin reason: maintain compatibility",
+                        "modrinth:dependency | artifact ID: artifact-dependency | role: dependency | origins: base | lock state: unlocked",
                         "Explicit roots",
                         "Dependencies",
                         "Side changes",
@@ -616,6 +711,7 @@ class TemplateImportTuiTest(unittest.IsolatedAsyncioTestCase):
                         "No persistent Template association",
                     ):
                         self.assertIn(expected, rendered)
+                    self.assertNotIn("artifact-dependency | role: dependency | origins: base | lock state: unlocked | pin reason:", rendered)
                     self.assertEqual(operation.apply_calls, 0)
                     await pilot.press("enter")
                     await pilot.pause()
@@ -680,6 +776,216 @@ class TemplateImportTuiTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(operation.apply_calls, 0)
                 self.assertEqual(operation.discard_calls, 1)
                 self.assertEqual(app.opened_projects, ["pack:demo"])
+
+    async def test_failed_apply_cleanup_retains_screen_until_discard_retry(self) -> None:
+        class RetainedSession(FakeSession):
+            def __init__(self) -> None:
+                super().__init__()
+                self.finished = False
+
+            def discard(self) -> None:
+                self.discard_calls += 1
+                self.finished = True
+
+        class FailedApplyOperation(FakeImportOperation):
+            def apply(self) -> None:
+                self.apply_calls += 1
+                raise core.TransactionDiscardIntegrityError(
+                    "apply cleanup incomplete"
+                )
+
+        session = RetainedSession()
+        resolved = resolve_template_import_plan(session.plan)
+        operation = FailedApplyOperation(session)
+        with (
+            patch.object(core, "project_info", return_value=PACK),
+            patch.object(core, "TemplateImportOperation", return_value=operation),
+        ):
+            app = _ScreenApp(
+                huroshiki.TemplateImportExecutionScreen(
+                    "pack:demo", session, resolved
+                )
+            )
+            with patch.object(app, "suspend", return_value=nullcontext()):
+                async with app.run_test() as pilot:
+                    await pilot.pause(0.15)
+                    screen = app.screen
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    self.assertIs(app.screen, screen)
+                    self.assertFalse(screen.ownership_finished)
+                    self.assertEqual(app.opened_projects, [])
+                    await pilot.press("escape")
+                    await pilot.pause()
+                    self.assertEqual(operation.discard_calls, 1)
+                    self.assertEqual(app.opened_projects, ["pack:demo"])
+
+    async def test_active_apply_defers_q_and_escape_without_concurrent_discard(self) -> None:
+        for key in ("q", "escape"):
+            with self.subTest(key=key):
+                session = FakeSession()
+                session.finished = False
+                resolved = resolve_template_import_plan(session.plan)
+                operation = DelayedApplyOperation(session)
+                with (
+                    patch.object(core, "project_info", return_value=PACK),
+                    patch.object(
+                        core, "TemplateImportOperation", return_value=operation
+                    ),
+                ):
+                    app = _ScreenApp(
+                        huroshiki.TemplateImportExecutionScreen(
+                            "pack:demo", session, resolved
+                        )
+                    )
+                    async with app.run_test() as pilot:
+                        await pilot.pause(0.15)
+                        await pilot.press("enter")
+                        await pilot.pause()
+                        await pilot.press("enter")
+                        self.assertTrue(operation.apply_started.wait(1))
+                        screen = app.screen
+                        self.assertTrue(screen.apply_in_progress)
+                        self.assertFalse(screen.worker_thread.daemon)
+                        self.assertIn(
+                            "template-import-apply", screen.worker_thread.name
+                        )
+                        await pilot.press(key)
+                        await pilot.pause(0.1)
+                        self.assertEqual(app.opened_projects, [])
+                        self.assertTrue(operation.cancel_event.is_set())
+                        self.assertEqual(operation.discard_calls, 0)
+                        self.assertFalse(operation.discard_during_apply)
+                        operation.apply_release.set()
+                        await pilot.pause(0.15)
+                        self.assertEqual(app.opened_projects, ["pack:demo"])
+
+    async def test_apply_failure_after_deferred_leave_remains_recoverable(self) -> None:
+        session = FakeSession()
+        session.finished = False
+        resolved = resolve_template_import_plan(session.plan)
+        operation = DelayedApplyOperation(
+            session,
+            apply_error=core.HuroshikiError("apply failed"),
+            cleanup_finished=False,
+        )
+        with (
+            patch.object(core, "project_info", return_value=PACK),
+            patch.object(core, "TemplateImportOperation", return_value=operation),
+        ):
+            app = _ScreenApp(
+                huroshiki.TemplateImportExecutionScreen(
+                    "pack:demo", session, resolved
+                )
+            )
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")
+                self.assertTrue(operation.apply_started.wait(1))
+                screen = app.screen
+                await pilot.press("escape")
+                operation.apply_release.set()
+                await pilot.pause(0.15)
+                self.assertIs(app.screen, screen)
+                self.assertEqual(app.opened_projects, [])
+                self.assertFalse(screen.ownership_finished)
+                self.assertIs(screen.operation, operation)
+                self.assertIn(
+                    "apply failed",
+                    str(
+                        screen.query_one(
+                            "#template-import-execution-status", Static
+                        ).content
+                    ),
+                )
+
+    async def test_unmount_during_apply_transfers_recoverable_owner(self) -> None:
+        session = FakeSession()
+        session.finished = False
+        resolved = resolve_template_import_plan(session.plan)
+        operation = DelayedApplyOperation(session)
+        with (
+            patch.object(core, "project_info", return_value=PACK),
+            patch.object(core, "TemplateImportOperation", return_value=operation),
+        ):
+            screen = huroshiki.TemplateImportExecutionScreen(
+                "pack:demo", session, resolved
+            )
+            app = _ScreenApp(screen)
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")
+                self.assertTrue(operation.apply_started.wait(1))
+                app.switch_screen(Screen())
+                await pilot.pause(0.1)
+                self.assertTrue(operation.cancel_event.is_set())
+                owner = app.template_import_apply_workers["pack:demo"]
+                self.assertIs(owner.operation, operation)
+                self.assertTrue(owner.thread.is_alive())
+                operation.apply_release.set()
+                self.assertTrue(owner.done.wait(1))
+                owner.thread.join(1)
+                self.assertFalse(owner.thread.is_alive())
+
+    def test_app_shutdown_boundedly_joins_template_apply_owner(self) -> None:
+        session = FakeSession()
+        session.finished = True
+        operation = DelayedApplyOperation(session)
+        done = threading.Event()
+
+        def worker() -> None:
+            operation.cancel_event.wait(1)
+            done.set()
+
+        thread = threading.Thread(
+            target=worker,
+            name="huroshiki-template-import-apply-pack:demo",
+            daemon=False,
+        )
+        app = huroshiki.HuroshikiApp()
+        app.template_import_apply_workers["pack:demo"] = (
+            huroshiki.TemplateImportApplyOwner(
+                thread, done, operation, object()
+            )
+        )
+        thread.start()
+        app.on_unmount()
+        self.assertTrue(operation.cancel_event.is_set())
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("pack:demo", app.template_import_apply_workers)
+
+    async def test_execution_error_renders_technical_text_without_pin_reason(self) -> None:
+        session = FakeSession()
+        resolved = resolve_template_import_plan(session.plan)
+        error = core.ProfileVersionIntentError(
+            "Locked Template Import intent conflict for modrinth:root: "
+            "artifact old; requested new",
+            identity="modrinth:root",
+            artifact_id="old",
+        )
+        operation = FakeImportOperation(session, error=error)
+        with (
+            patch.object(core, "project_info", return_value=PACK),
+            patch.object(core, "TemplateImportOperation", return_value=operation),
+        ):
+            app = _ScreenApp(
+                huroshiki.TemplateImportExecutionScreen("pack:demo", session, resolved)
+            )
+            async with app.run_test() as pilot:
+                await pilot.pause(0.15)
+                rendered = str(
+                    app.screen.query_one("#template-import-execution-status", Static).content
+                )
+                self.assertIn(f"Technical failure: {error}", rendered)
+                self.assertIn("Blocked identity: modrinth:root", rendered)
+                self.assertIn("Pinned artifact: old", rendered)
+                self.assertNotIn("Pin reason:", rendered)
 
 
 if __name__ == "__main__":

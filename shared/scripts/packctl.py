@@ -127,6 +127,7 @@ TEMPLATE_COMMITTED_KEYS = frozenset(
         "loader",
         "reference_loader_version",
         "mods",
+        "mod_version_overrides",
     }
 )
 TEMPLATE_LOCAL_KEYS = frozenset(
@@ -1523,6 +1524,11 @@ def prospective_template_config(
         raise ConfigError(f"{committed_path}: mods must be a list")
     for index, entry in enumerate(mods):
         normalize_template_mod(entry, f"{committed_path}: mods[{index}]")
+    normalize_template_mod_version_overrides(
+        committed.get("mod_version_overrides", []),
+        str(committed_path),
+        mods,
+    )
     config = merge(committed, local)
     validate_url_policy(config, str(committed_path))
     return config
@@ -1580,6 +1586,17 @@ def load_template_config(template_id: str) -> dict[str, Any]:
     if config.get("id") != template_id:
         raise ConfigError(
             f"templates/{template_id}/template.yaml must contain id: {template_id}"
+        )
+    if "mod_version_overrides" in config:
+        mods = config.get("mods")
+        if not isinstance(mods, list):
+            raise ConfigError(
+                f"templates/{template_id}/template.yaml mods must be a list"
+            )
+        normalize_template_mod_version_overrides(
+            config["mod_version_overrides"],
+            f"templates/{template_id}/template.yaml",
+            mods,
         )
     return config
 
@@ -1804,6 +1821,127 @@ def normalize_template_mod(
             raise ConfigError(f"{context}.url must point to a .jar file")
         result["url"] = url
     return result
+
+
+TEMPLATE_MOD_VERSION_OVERRIDE_FIELDS = frozenset(
+    {"provider", "project_id", "artifact_id", "scope"}
+)
+
+
+def normalize_template_mod_version_override(
+    entry: object, context: str
+) -> dict[str, str]:
+    """Validate one committed template version override without resolution."""
+    if not isinstance(entry, dict):
+        raise ConfigError(f"{context} must be a mapping")
+    unknown = set(entry) - TEMPLATE_MOD_VERSION_OVERRIDE_FIELDS
+    if unknown:
+        names = ", ".join(repr(str(key)) for key in sorted(unknown, key=str))
+        raise ConfigError(f"{context} unknown field(s): {names}")
+    provider = entry.get("provider")
+    if not isinstance(provider, str) or provider not in {"modrinth", "curseforge"}:
+        raise ConfigError(f"{context}.provider must be modrinth or curseforge")
+    project_id = entry.get("project_id")
+    artifact_id = entry.get("artifact_id")
+    if provider == "curseforge":
+        if not isinstance(project_id, str) or not _CANONICAL_DECIMAL_RE.fullmatch(project_id):
+            raise ConfigError(
+                f"{context}.project_id must be a positive canonical decimal ID string"
+            )
+        if not isinstance(artifact_id, str) or not _CANONICAL_DECIMAL_RE.fullmatch(artifact_id):
+            raise ConfigError(
+                f"{context}.artifact_id must be a positive canonical decimal ID string"
+            )
+    else:
+        if not isinstance(project_id, str) or not _IMMUTABLE_PROVIDER_ID_RE.fullmatch(project_id):
+            raise ConfigError(
+                f"{context}.project_id must be an 8-character immutable Modrinth ID"
+            )
+        if not isinstance(artifact_id, str) or not _IMMUTABLE_PROVIDER_ID_RE.fullmatch(artifact_id):
+            raise ConfigError(
+                f"{context}.artifact_id must be an 8-character immutable Modrinth ID"
+            )
+    scope = entry.get("scope")
+    if not isinstance(scope, str) or scope not in PROFILE_SCOPES:
+        raise ConfigError(f"{context}.scope must be root or dependency")
+    return {
+        "provider": provider,
+        "project_id": project_id,
+        "artifact_id": artifact_id,
+        "scope": scope,
+    }
+
+
+def normalize_template_mod_version_overrides(
+    value: object, context: str, mods: list[object]
+) -> list[dict[str, str]]:
+    entries = value
+    if not isinstance(entries, list):
+        raise ConfigError(f"{context}.mod_version_overrides must be a list")
+    if not entries:
+        return []
+    normalized = [
+        normalize_template_mod_version_override(
+            entry, f"{context}.mod_version_overrides[{index}]"
+        )
+        for index, entry in enumerate(entries)
+    ]
+    identities: dict[tuple[str, str], dict[str, str]] = {}
+    for entry in normalized:
+        identity = (entry["provider"], entry["project_id"])
+        previous = identities.get(identity)
+        if previous is not None:
+            if previous["artifact_id"] != entry["artifact_id"]:
+                raise ConfigError(
+                    f"{context}.mod_version_overrides has conflicting artifact_id "
+                    f"for {identity[0]}:{identity[1]}"
+                )
+            if previous["scope"] != entry["scope"]:
+                raise ConfigError(
+                    f"{context}.mod_version_overrides has conflicting scope "
+                    f"for {identity[0]}:{identity[1]}"
+                )
+            raise ConfigError(
+                f"{context}.mod_version_overrides contains duplicate artifact "
+                f"for {identity[0]}:{identity[1]}"
+            )
+        identities[identity] = entry
+
+    roots: list[tuple[str, str]] = []
+    for index, raw in enumerate(mods):
+        mod = normalize_template_mod(raw, f"{context}.mods[{index}]")
+        if mod["provider"] == "url":
+            continue
+        project = mod["project_id"]
+        if mod["provider"] == "modrinth" and not _IMMUTABLE_PROVIDER_ID_RE.fullmatch(project):
+            continue
+        if mod["provider"] == "curseforge" and not _CANONICAL_DECIMAL_RE.fullmatch(project):
+            continue
+        roots.append((mod["provider"], project))
+    for entry in normalized:
+        identity = (entry["provider"], entry["project_id"])
+        matches = roots.count(identity)
+        if entry["scope"] == "root" and matches != 1:
+            raise ConfigError(
+                f"{context}.mod_version_overrides root must match exactly one "
+                f"mods entry for {identity[0]}:{identity[1]}"
+            )
+        if entry["scope"] == "dependency" and matches:
+            raise ConfigError(
+                f"{context}.mod_version_overrides dependency must not have a mods "
+                f"entry for {identity[0]}:{identity[1]}"
+            )
+    return normalized
+
+
+def template_mod_version_overrides(template_id: str) -> list[dict[str, str]]:
+    config = load_template_config(template_id)
+    mods = config.get("mods", [])
+    return normalize_template_mod_version_overrides(
+        config.get("mod_version_overrides", []),
+        f"templates/{template_id}/template.yaml",
+        mods,
+    )
 
 
 def template_mods(
@@ -3606,6 +3744,40 @@ def _template_import_candidate_payload(plan: Any, candidate: Any) -> dict[str, A
     }
 
 
+def _template_import_version_constraint_payload(constraint: Any) -> dict[str, Any]:
+    """Serialize the stable, public shape of a Template version constraint."""
+    origins = getattr(constraint, "origins", None)
+    if origins is None:
+        origins = (getattr(constraint, "template_id"),)
+    return {
+        "canonical_identity": constraint.canonical_identity
+        if hasattr(constraint, "canonical_identity")
+        else f"{constraint.provider}:{constraint.project_id}",
+        "provider": constraint.provider,
+        "project_id": constraint.project_id,
+        "artifact_id": constraint.artifact_id,
+        "scope": constraint.scope,
+        "origins": list(origins),
+        **(
+            {
+                "locked": constraint.locked,
+                "reason": constraint.reason,
+            }
+            if hasattr(constraint, "locked")
+            else {}
+        ),
+    }
+
+
+def _template_import_version_constraints_payload(
+    constraints: Any,
+) -> list[dict[str, Any]]:
+    return [
+        _template_import_version_constraint_payload(constraint)
+        for constraint in constraints
+    ]
+
+
 def _template_import_conflict_payload(plan: Any) -> dict[str, list[dict[str, Any]]]:
     return {
         label: [
@@ -3640,6 +3812,7 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
 
     session = None
     operation = None
+    plan = None
     try:
         session = huroshiki_core.TemplateImportSession.create(
             huroshiki_core.project_key("pack", args.pack),
@@ -3663,6 +3836,11 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                                 "removed": [],
                                 "side_changes": [],
                                 "conflicts": conflict_payload,
+                                "version_constraints": (
+                                    _template_import_version_constraints_payload(
+                                        plan.version_constraints
+                                    )
+                                ),
                             },
                             ensure_ascii=False,
                         )
@@ -3714,6 +3892,14 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                 for conflict in plan.side_conflicts:
                     key = f"{conflict.identity[0]}:{conflict.identity[1]}"
                     print(f'  "{key}": keep_pack', file=sys.stderr)
+                if plan.version_constraints:
+                    print("Active exact version constraints:", file=sys.stderr)
+                    for constraint in plan.version_constraints:
+                        print(
+                            f"  {constraint.provider}:{constraint.project_id} -> "
+                            f"{constraint.artifact_id} ({constraint.scope})",
+                            file=sys.stderr,
+                        )
                 return 2
             resolved = resolve_template_import_plan(plan)
         else:
@@ -3759,12 +3945,24 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
                         ],
                         "warnings": preview.warnings,
                         "conflicts": _template_import_conflict_payload(plan),
+                        "version_constraints": (
+                            _template_import_version_constraints_payload(
+                                preview.version_constraints
+                            )
+                        ),
                     },
                     ensure_ascii=False,
                 )
             )
         else:
             print(f"Template import plan: {plan.plan_digest}")
+            if preview.version_constraints:
+                print("Exact version constraints:")
+                for constraint in preview.version_constraints:
+                    print(
+                        f"  {constraint.canonical_identity} -> "
+                        f"{constraint.artifact_id} ({constraint.scope})"
+                    )
             print("Added roots:")
             for item in preview.added_roots:
                 print(
@@ -3797,6 +3995,32 @@ def cmd_apply_template(args: argparse.Namespace) -> int:
         print("Template import cancelled.", file=sys.stderr)
         return 130
     except (huroshiki_core.HuroshikiError, ConfigError, TemplateMergeError) as error:
+        if args.json and isinstance(
+            error, huroshiki_core.ProfileVersionIntentError
+        ):
+            print(
+                json.dumps(
+                    {
+                        "error": str(error),
+                        "version_constraints": (
+                            _template_import_version_constraints_payload(
+                                plan.version_constraints
+                            )
+                            if plan is not None
+                            else []
+                        ),
+                        "version_block": {
+                            "technical_failure": str(error),
+                            "identity": error.identity,
+                            "pinned_artifact": error.artifact_id,
+                            "user_pin_reason": error.user_pin_reason,
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            return 1
         print(f"error: {error}", file=sys.stderr)
         return 1
     finally:
@@ -4537,6 +4761,14 @@ def validate_template_directory(root: Path) -> list[str]:
                 errors.append(
                     f"{display_path(manifest)}: {context}.url must point to a .jar file"
                 )
+    try:
+        normalize_template_mod_version_overrides(
+            committed.get("mod_version_overrides", []),
+            str(manifest),
+            mods,
+        )
+    except ConfigError as error:
+        errors.append(str(error))
     return errors
 
 
