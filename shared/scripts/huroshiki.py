@@ -3920,9 +3920,8 @@ class TemplateImportSelectionScreen(ProjectChildScreen, BaseScreen):
             self.worker_timer = None
         self.worker_thread = None
         if self.leave_after_cancel:
-            if self.session is not None:
-                self.session.discard()
-                self.session = None
+            if not self._discard_planning_owner():
+                return
             self.session_transferred = True
             self.return_to_project()
             return
@@ -3941,6 +3940,34 @@ class TemplateImportSelectionScreen(ProjectChildScreen, BaseScreen):
         self.session_transferred = True
         self.app.switch_screen(TemplateImportConflictScreen(self.project_key, session))
 
+    def _discard_planning_owner(self) -> bool:
+        if self.session is not None:
+            try:
+                self.session.discard()
+            except Exception as error:
+                self.worker_error = error
+                self.query_one("#template-import-status", Static).update(
+                    f"Template import planning cleanup is still incomplete: {error}"
+                )
+                self.app.notify(str(error), severity="error")
+                return False
+            self.session = None
+            self.worker_error = None
+            return True
+        if isinstance(
+            self.worker_error, core.TemplateImportPlanningIntegrityError
+        ):
+            try:
+                self.worker_error.transaction.discard()
+            except Exception as error:
+                self.query_one("#template-import-status", Static).update(
+                    f"Template import planning cleanup is still incomplete: {error}"
+                )
+                self.app.notify(str(error), severity="error")
+                return False
+            self.worker_error = None
+        return True
+
     def leave(self) -> None:
         if self.planning:
             self.leave_after_cancel = True
@@ -3950,9 +3977,8 @@ class TemplateImportSelectionScreen(ProjectChildScreen, BaseScreen):
                 "Cancelling planning and cleaning up..."
             )
             return
-        if self.session is not None:
-            self.session.discard()
-            self.session = None
+        if not self._discard_planning_owner():
+            return
         self.session_transferred = True
         self.return_to_project()
 
@@ -3964,9 +3990,8 @@ class TemplateImportSelectionScreen(ProjectChildScreen, BaseScreen):
             return
         if self.worker_thread is not None and self.cancel_event is not None:
             self.cancel_event.set()
-        elif self.session is not None:
-            self.session.discard()
-            self.session = None
+        else:
+            self._discard_planning_owner()
 
     def on_key(self, event: events.Key) -> None:
         table = self.query_one("#template-import-candidates", DataTable)
@@ -4369,6 +4394,8 @@ class TemplateImportExecutionScreen(BaseScreen):
         self.leave_after_cancel = False
         self.ownership_finished = False
         self.preview_lines: list[str] = []
+        self.apply_done = threading.Event()
+        self.apply_error: BaseException | None = None
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -4408,7 +4435,10 @@ class TemplateImportExecutionScreen(BaseScreen):
             self.worker_timer = None
         self.worker_thread = None
         if operation.error is not None:
-            self.ownership_finished = True
+            cleanup_incomplete = not getattr(
+                operation.session, "finished", True
+            )
+            self.ownership_finished = not cleanup_incomplete
             error = operation.error
             if isinstance(error, core.ProfileVersionIntentError):
                 details = [
@@ -4423,7 +4453,7 @@ class TemplateImportExecutionScreen(BaseScreen):
                 message = str(error)
             self.query_one("#template-import-execution-status", Static).update(message)
             self.app.notify(message, severity="error")
-            if self.leave_after_cancel:
+            if self.leave_after_cancel and not cleanup_incomplete:
                 self.ownership_finished = True
                 self.operation = None
                 self.app.open_project(self.project_key)
@@ -4552,19 +4582,62 @@ class TemplateImportExecutionScreen(BaseScreen):
         if not confirmed:
             self.discard_and_leave()
             return
+        operation = self.operation
+        if operation is None or self.worker_thread is not None:
+            self.app.notify(
+                "Template import operation is unavailable or busy",
+                severity="warning",
+            )
+            return
+
+        self.apply_done.clear()
+        self.apply_error = None
+
+        def apply_operation() -> None:
+            try:
+                operation.apply()
+            except BaseException as error:
+                self.apply_error = error
+            finally:
+                self.apply_done.set()
+
+        self.query_one("#template-import-execution-status", Static).update(
+            "Applying Template import atomically..."
+        )
+        self.worker_thread = threading.Thread(
+            target=apply_operation,
+            name=f"huroshiki-template-import-apply-{self.project_key}",
+            daemon=False,
+        )
         try:
-            if self.operation is None:
-                raise core.HuroshikiError("Template import operation is unavailable")
-            with self.app.suspend():
-                self.operation.apply()
-            self.ownership_finished = True
-            self.operation = None
-            self.app.notify("Template import applied atomically")
-            self.app.open_project(self.project_key)
+            self.worker_thread.start()
+            self.worker_timer = self.set_interval(0.05, self._poll_apply)
         except Exception as error:
-            self.ownership_finished = True
+            self.worker_thread = None
             self.app.notify(str(error), severity="error")
             self.query_one("#template-import-execution-status", Static).update(str(error))
+
+    def _poll_apply(self) -> None:
+        if not self.apply_done.is_set():
+            return
+        if self.worker_timer is not None:
+            self.worker_timer.stop()
+            self.worker_timer = None
+        self.worker_thread = None
+        if self.apply_error is not None:
+            cleanup_incomplete = (
+                self.operation is not None
+                and not getattr(self.operation.session, "finished", True)
+            )
+            self.ownership_finished = not cleanup_incomplete
+            message = str(self.apply_error)
+            self.query_one("#template-import-execution-status", Static).update(message)
+            self.app.notify(message, severity="error")
+            return
+        self.ownership_finished = True
+        self.operation = None
+        self.app.notify("Template import applied atomically")
+        self.app.open_project(self.project_key)
 
     def discard_and_leave(self) -> None:
         operation = self.operation
@@ -4573,14 +4646,28 @@ class TemplateImportExecutionScreen(BaseScreen):
             if not self.app.open_project(self.project_key):
                 self.app.go_main()
             return
-        if self.worker_thread is not None and not operation.done.is_set():
-            self.leave_after_cancel = True
-            operation.cancel()
-            self.query_one("#template-import-execution-status", Static).update(
-                "Cancelling execution and cleaning up..."
-            )
+        if self.worker_thread is not None:
+            if not operation.done.is_set():
+                self.leave_after_cancel = True
+                operation.cancel()
+                self.query_one("#template-import-execution-status", Static).update(
+                    "Cancelling execution and cleaning up..."
+                )
+            else:
+                self.app.notify(
+                    "Wait for Template import apply to finish",
+                    severity="warning",
+                )
             return
-        operation.discard()
+        try:
+            operation.discard()
+        except Exception as error:
+            self.ownership_finished = False
+            self.query_one("#template-import-execution-status", Static).update(
+                f"Template import cleanup is still incomplete: {error}"
+            )
+            self.app.notify(str(error), severity="error")
+            return
         self.ownership_finished = True
         self.operation = None
         if not self.app.open_project(self.project_key):
@@ -4592,17 +4679,14 @@ class TemplateImportExecutionScreen(BaseScreen):
             self.worker_timer = None
         if self.ownership_finished or self.operation is None:
             return
-        if self.worker_thread is not None and not self.operation.done.is_set():
-            self.operation.cancel()
+        if self.worker_thread is not None:
+            if not self.operation.done.is_set():
+                self.operation.cancel()
         else:
             self.operation.discard()
 
     def on_key(self, event: events.Key) -> None:
-        if (
-            self.worker_thread is not None
-            and self.operation is not None
-            and not self.operation.done.is_set()
-        ):
+        if self.worker_thread is not None and self.operation is not None:
             if event.key in {"q", "escape"}:
                 self.discard_and_leave()
             else:

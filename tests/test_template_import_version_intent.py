@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
+import hashlib
 from io import StringIO
 import json
 from pathlib import Path
 import threading
 import time
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -856,7 +858,14 @@ class TemplateImportVersionIntentTest(unittest.TestCase):
     def test_transaction_dry_run_preserves_source_and_apply_is_atomic(self) -> None:
         fixture = self.core_fixture()
         before = core.tree_digest_snapshot(fixture.source)
-        operation = fixture.operation()
+        with patch.object(
+            core,
+            "resolve_project_selector",
+            return_value=core.ResolvedSelector(
+                "modrinth", "root", "root", "Root"
+            ),
+        ):
+            operation = fixture.operation()
         with patch.object(core, "resolve_mod_closure", return_value=fixture.closure()), patch.object(core, "run_resolver_process", side_effect=fixture.refresh_ok):
             operation.run()
         self.assertIsNone(operation.error)
@@ -872,6 +881,487 @@ class TemplateImportVersionIntentTest(unittest.TestCase):
             operation.run()
         self.assertIsNotNone(operation.error)
         self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+
+    def test_realistic_exact_refresh_updates_index_binding_and_rejects_semantic_changes(self) -> None:
+        fixture = self.exact_fixture()
+        project_id = exact_selection.MR_PROJECT_IDS["root"]
+        artifact_id = exact_selection.MR_VERSION_IDS["r2"]
+        self.write_exact_template(fixture, provider="modrinth", project_id=project_id, artifact_id=artifact_id)
+        pack_text = (
+            'name = "Custom Pack"\nauthor = "Custom Author"\n'
+            'version = "1.0.0"\n'
+            'pack-format = "packwiz:1.1.0"\n[index]\nfile = "index.toml"\n'
+            'hash-format = "sha256"\nhash = "stale"\n'
+            '[versions]\nminecraft = "1.21.1"\nfabric = "0.16.0"\n'
+        )
+        fixture.source.joinpath("pack.toml").write_text(pack_text, encoding="utf-8")
+
+        def refresh_with(pack_mutation=lambda contents: contents):
+            def refresh(command, *, cwd, **kwargs):
+                result = fixture.run_fake_resolver(command, cwd=cwd, **kwargs)
+                if command == ["packwiz", "refresh"]:
+                    index = 'hash-format = "sha256"\n\n[mods]\n'
+                    (cwd / "index.toml").write_text(index, encoding="utf-8")
+                    digest = hashlib.sha256(index.encode()).hexdigest()
+                    refreshed = pack_text.replace(
+                        'hash = "stale"', f'hash = "{digest}"'
+                    )
+                    (cwd / "pack.toml").write_text(
+                        pack_mutation(refreshed), encoding="utf-8"
+                    )
+                return result
+            return refresh
+
+        before = core.tree_digest_snapshot(fixture.source)
+        with patch.object(
+            core, "run_resolver_process", side_effect=refresh_with()
+        ):
+            operation = self.run_exact_import(fixture)
+        self.assertIsNone(operation.error)
+        staged = tomllib.loads(operation.transaction.source.joinpath("pack.toml").read_text())
+        self.assertEqual((staged["name"], staged["author"]), ("Custom Pack", "Custom Author"))
+        self.assertEqual(staged["version"], "1.0.0")
+        self.assertEqual(
+            staged["versions"],
+            {"minecraft": "1.21.1", "fabric": "0.16.0"},
+        )
+        self.assertEqual(staged["index"]["hash"], hashlib.sha256(operation.transaction.source.joinpath("index.toml").read_bytes()).hexdigest())
+        operation.discard()
+        self.assertEqual(core.tree_digest_snapshot(fixture.source), before)
+
+        for label, old, new in (
+            ("name", 'name = "Custom Pack"', 'name = "Changed"'),
+            ("author", 'author = "Custom Author"', 'author = "Changed"'),
+            ("version", 'version = "1.0.0"', 'version = "2.0.0"'),
+            (
+                "pack-format",
+                'pack-format = "packwiz:1.1.0"',
+                'pack-format = "packwiz:1.0.0"',
+            ),
+            ("minecraft", 'minecraft = "1.21.1"', 'minecraft = "1.21.2"'),
+            ("loader-version", 'fabric = "0.16.0"', 'fabric = "0.17.0"'),
+            ("loader", 'fabric = "0.16.0"', 'neoforge = "21.1.0"'),
+        ):
+            with self.subTest(label=label):
+                fixture.source.joinpath("pack.toml").write_text(pack_text, encoding="utf-8")
+                unchanged = core.tree_digest_snapshot(fixture.source)
+                with patch.object(
+                    core,
+                    "run_resolver_process",
+                    side_effect=refresh_with(lambda contents, old=old, new=new: contents.replace(old, new)),
+                ):
+                    failed = self.run_exact_import(fixture)
+                self.assertIsNotNone(failed.error)
+                self.assertEqual(core.tree_digest_snapshot(fixture.source), unchanged)
+
+    def test_automatic_modrinth_slug_planning_binds_actual_identity_without_canonical_id(self) -> None:
+        fixture = self.exact_fixture()
+        self.write_exact_template(
+            fixture,
+            provider="modrinth",
+            project_id="root-slug",
+            artifact_id=None,
+            dependency=("curseforge", "987654", "987656"),
+        )
+        closure = core.ResolvedModClosure(
+            ("modrinth", exact_selection.MR_PROJECT_IDS["root"]),
+            (
+                fixture.resolved_metadata("root", "r1"),
+                core.ResolvedMetadata(
+                    ("curseforge", "987654"),
+                    Path("mods/dependency.pw.toml"),
+                    "dependency.jar",
+                    fixture.metadata(
+                        "curseforge", "987654", "987656",
+                        filename="dependency.jar",
+                    ).encode(),
+                    "curseforge",
+                    "987654",
+                ),
+            ),
+        )
+        with patch.object(core, "resolve_mod_closure", return_value=closure) as resolver:
+            session = core.TemplateImportSession.create(fixture.key, ["base"])
+        self.assertNotIn("canonical_project_id", resolver.call_args.kwargs)
+        self.assertEqual(session.plan.template_candidates[0].actual_identity, closure.root_identity)
+        operation = core.TemplateImportOperation(
+            session, resolve_template_import_plan(session.plan)
+        )
+        operation.run()
+        self.assertIsNone(operation.error)
+        self.assertEqual(
+            operation.preview.added_roots[0].actual_identity,
+            closure.root_identity,
+        )
+        operation.discard()
+
+    def test_automatic_modrinth_slug_import_succeeds_with_unrelated_pack_override(self) -> None:
+        fixture = self.exact_fixture()
+        self.seed_installed_modrinth_root(
+            fixture,
+            artifact_id=exact_selection.MR_VERSION_IDS["r1"],
+        )
+        self.write_exact_template(
+            fixture,
+            provider="modrinth",
+            project_id="create",
+            artifact_id=None,
+        )
+        closure = core.ResolvedModClosure(
+            ("modrinth", exact_selection.MR_PROJECT_IDS["root-a"]),
+            (fixture.resolved_metadata("root-a", "r1"),),
+        )
+        with patch.object(
+            core, "resolve_mod_closure", return_value=closure
+        ) as resolver:
+            operation = self.run_exact_import(fixture)
+        self.assertNotIn("canonical_project_id", resolver.call_args.kwargs)
+        self.assertIsNone(operation.error)
+        self.assertEqual(
+            operation.preview.added_roots[0].actual_identity,
+            closure.root_identity,
+        )
+        operation.discard()
+
+    def test_url_actual_identity_replacement_is_not_duplicate_or_unchanged(self) -> None:
+        fixture = self.exact_fixture()
+        project_id = exact_selection.MR_PROJECT_IDS["root"]
+        artifact_id = exact_selection.MR_VERSION_IDS["r1"]
+        fixture.root.joinpath("templates/base/template.yaml").write_text(
+            "id: base\ndisplay_name: Base\nenabled: true\n"
+            "minecraft: 1.21.1\nloader: fabric\n"
+            "reference_loader_version: 0.16.0\nmods:\n"
+            "  - name: Requested\n    provider: url\n"
+            "    project_id: logical\n    side: client\n"
+            "    url: https://mods.example/requested.jar\n",
+            encoding="utf-8",
+        )
+        mods = fixture.source / "mods"
+        (mods / "root.pw.toml").write_text(
+            fixture.metadata("modrinth", project_id, artifact_id),
+            encoding="utf-8",
+        )
+        installed_url = (
+            import_core.url_metadata(
+                "Installed", "actual.jar", "https://mods.example/installed.jar"
+            )
+            + b'\n[huroshiki]\nproject-id = "actual"\nloaders = ["fabric"]\n'
+            + b'minecraft-versions = ["1.21.1"]\n'
+        )
+        (mods / "actual.pw.toml").write_bytes(installed_url)
+        core.ensure_pack_root_manifest_ignored(fixture.source)
+        core.ensure_mod_version_overrides_ignored(fixture.source)
+        core.write_pack_root_manifest(
+            fixture.source,
+            (
+                PackRootRecord("url", "actual", "both"),
+                PackRootRecord("modrinth", project_id, "both"),
+            ),
+        )
+        core.write_mod_version_overrides(
+            fixture.source,
+            (ModVersionOverride("modrinth", project_id, artifact_id),),
+        )
+        before = core.tree_digest_snapshot(fixture.source)
+        incoming_contents = (
+            import_core.url_metadata(
+                "Requested", "actual.jar", "https://mods.example/requested.jar"
+            )
+            + b'\n[huroshiki]\nproject-id = "actual"\nloaders = ["fabric"]\n'
+            + b'minecraft-versions = ["1.21.1"]\n'
+        )
+        incoming_closure = core.ResolvedModClosure(
+            ("url", "actual"),
+            (
+                core.ResolvedMetadata(
+                    ("url", "actual"),
+                    Path("mods/actual.pw.toml"),
+                    "actual.jar",
+                    incoming_contents,
+                    "url",
+                    "actual",
+                ),
+            ),
+        )
+        with patch.object(
+            core, "resolve_mod_closure", return_value=incoming_closure
+        ):
+            session = core.TemplateImportSession.create(fixture.key, ["base"])
+            incoming = session.plan.template_candidates[0]
+            resolved = resolve_template_import_plan(
+                session.plan,
+                actual_identity_resolutions={
+                    "url:actual": ImportConflictResolution(
+                        (incoming.selection_key,)
+                    )
+                },
+            )
+            operation = core.TemplateImportOperation(session, resolved)
+            operation.run()
+        self.assertIsNone(operation.error)
+        self.assertEqual(len(operation.preview.added_roots), 1)
+        self.assertEqual(len(operation.preview.removed), 1)
+        self.assertEqual(len(operation.preview.unchanged), 0)
+        final_url_entries = core._profile_mod_metadata_records(
+            operation.transaction.source
+        )[("url", "actual")]
+        self.assertEqual(len(final_url_entries), 1)
+        self.assertEqual(final_url_entries[0][0], Path("mods/actual.pw.toml"))
+        self.assertEqual(core.tree_digest_snapshot(fixture.source), before)
+        operation.discard()
+
+    def test_url_identity_replacement_survives_unrelated_template_exact_root(self) -> None:
+        fixture = self.exact_fixture()
+        project_id = exact_selection.MR_PROJECT_IDS["root"]
+        artifact_id = exact_selection.MR_VERSION_IDS["r1"]
+        fixture.root.joinpath("templates/base/template.yaml").write_text(
+            "id: base\ndisplay_name: Base\nenabled: true\n"
+            "minecraft: 1.21.1\nloader: fabric\n"
+            "reference_loader_version: 0.16.0\nmods:\n"
+            "  - name: Requested\n    provider: url\n"
+            "    project_id: logical\n    side: client\n"
+            "    url: https://mods.example/requested.jar\n"
+            "  - name: Provider Root\n    provider: modrinth\n"
+            f'    project_id: "{project_id}"\n    side: both\n'
+            "mod_version_overrides:\n"
+            "  - provider: modrinth\n"
+            f'    project_id: "{project_id}"\n'
+            f'    artifact_id: "{artifact_id}"\n'
+            "    scope: root\n",
+            encoding="utf-8",
+        )
+        installed_contents = (
+            import_core.url_metadata(
+                "Installed", "actual.jar", "https://mods.example/installed.jar"
+            )
+            + b'\n[huroshiki]\nproject-id = "actual"\nloaders = ["fabric"]\n'
+            + b'minecraft-versions = ["1.21.1"]\n'
+        )
+        fixture.source.joinpath("mods/actual.pw.toml").write_bytes(
+            installed_contents
+        )
+        core.ensure_pack_root_manifest_ignored(fixture.source)
+        core.write_pack_root_manifest(
+            fixture.source, (PackRootRecord("url", "actual", "both"),)
+        )
+        incoming_contents = (
+            import_core.url_metadata(
+                "Requested", "actual.jar", "https://mods.example/requested.jar"
+            )
+            + b'\n[huroshiki]\nproject-id = "actual"\nloaders = ["fabric"]\n'
+            + b'minecraft-versions = ["1.21.1"]\n'
+        )
+        incoming_closure = core.ResolvedModClosure(
+            ("url", "actual"),
+            (
+                core.ResolvedMetadata(
+                    ("url", "actual"),
+                    Path("mods/actual.pw.toml"),
+                    "actual.jar",
+                    incoming_contents,
+                    "url",
+                    "actual",
+                ),
+            ),
+        )
+        with patch.object(
+            core, "resolve_mod_closure", return_value=incoming_closure
+        ):
+            session = core.TemplateImportSession.create(fixture.key, ["base"])
+            incoming = next(
+                candidate
+                for candidate in session.plan.template_candidates
+                if candidate.provider == "url"
+            )
+            resolved = resolve_template_import_plan(
+                session.plan,
+                actual_identity_resolutions={
+                    "url:actual": ImportConflictResolution(
+                        (incoming.selection_key,)
+                    )
+                },
+            )
+            operation = core.TemplateImportOperation(session, resolved)
+            operation.run()
+        self.assertIsNone(operation.error)
+        self.assertEqual(len(operation.preview.removed), 1)
+        self.assertEqual(len(operation.preview.unchanged), 0)
+        self.assertEqual(
+            len(core._profile_mod_metadata_records(operation.transaction.source)[
+                ("url", "actual")
+            ]),
+            1,
+        )
+        operation.discard()
+
+    def test_provider_planning_lifecycle_results_fail_closed_and_preserve_source(self) -> None:
+        fixture = self.exact_fixture()
+        self.write_exact_template(
+            fixture,
+            provider="modrinth",
+            project_id="root-slug",
+            artifact_id=None,
+            dependency=("curseforge", "987654", "987656"),
+        )
+        before = core.tree_digest_snapshot(fixture.source)
+        for result in (
+            core.ResolverProcessResult(0, "", "", True, False),
+            core.ResolverProcessResult(0, "", "", False, True),
+            core.ResolverProcessResult(0, "", "", False, False, False, True),
+            core.ResolverProcessResult(0, "", "", False, False, True, False),
+        ):
+            with self.subTest(result=result):
+                def runner(*_args, result_callback=None, **_kwargs):
+                    if result_callback is not None:
+                        result_callback(result)
+                    return result
+
+                with patch.object(core, "run_resolver_process", side_effect=runner):
+                    with self.assertRaises(Exception) as raised:
+                        core.TemplateImportSession.create(fixture.key, ["base"])
+                self.assertEqual(core.tree_digest_snapshot(fixture.source), before)
+                retained = getattr(raised.exception, "transaction", None)
+                if retained is not None:
+                    self.assertTrue(retained.process_cleanup_pending)
+                    retained._equivalence_process_results.clear()
+                    retained.discard()
+
+    def test_exact_root_planning_lifecycle_results_never_become_candidate_failures(self) -> None:
+        fixture = self.exact_fixture()
+        project_id = exact_selection.MR_PROJECT_IDS["root"]
+        artifact_id = exact_selection.MR_VERSION_IDS["r1"]
+        self.write_exact_template(
+            fixture,
+            provider="modrinth",
+            project_id=project_id,
+            artifact_id=artifact_id,
+        )
+        before = core.tree_digest_snapshot(fixture.source)
+        cases = (
+            core.ResolverProcessResult(0, "", "", True, False),
+            core.ResolverProcessResult(0, "", "", False, True),
+            core.ResolverProcessResult(0, "", "", False, False, False, True),
+            core.ResolverProcessResult(0, "", "", False, False, True, False),
+        )
+        for result in cases:
+            with self.subTest(result=result):
+                def resolver(*, process_result_callback, **_kwargs):
+                    process_result_callback(result)
+                    return core.ResolvedModClosure(
+                        ("modrinth", project_id),
+                        (fixture.resolved_metadata("root", "r1"),),
+                    )
+
+                with patch.object(
+                    core, "resolve_exact_mod_closure", side_effect=resolver
+                ):
+                    with self.assertRaises(Exception) as raised:
+                        core.TemplateImportSession.create(fixture.key, ["base"])
+                self.assertEqual(core.tree_digest_snapshot(fixture.source), before)
+                retained = getattr(raised.exception, "transaction", None)
+                if retained is not None:
+                    self.assertTrue(retained.process_cleanup_pending)
+                    retained._equivalence_process_results.clear()
+                    retained.discard()
+
+    def test_exact_execution_rechecks_cached_closure_fingerprint(self) -> None:
+        fixture = self.exact_fixture()
+        project_id = exact_selection.MR_PROJECT_IDS["root"]
+        artifact_id = exact_selection.MR_VERSION_IDS["r1"]
+        self.write_exact_template(
+            fixture,
+            provider="modrinth",
+            project_id=project_id,
+            artifact_id=artifact_id,
+        )
+        before = core.tree_digest_snapshot(fixture.source)
+        session = core.TemplateImportSession.create(fixture.key, ["base"])
+        verification = session.verifications[0]
+        self.assertIsInstance(verification.cached_closure, core.ResolvedModClosure)
+        cached = verification.cached_closure
+        changed_metadata = replace(
+            cached.metadata[0],
+            contents=cached.metadata[0].contents + b"\n# changed after planning\n",
+        )
+        session.verifications = (
+            replace(
+                verification,
+                cached_closure=core.ResolvedModClosure(
+                    cached.root_identity,
+                    (changed_metadata, *cached.metadata[1:]),
+                ),
+            ),
+        )
+        operation = core.TemplateImportOperation(
+            session, resolve_template_import_plan(session.plan)
+        )
+        operation.run()
+        self.assertIsNotNone(operation.error)
+        self.assertIn("closure changed after planning", str(operation.error))
+        self.assertEqual(core.tree_digest_snapshot(fixture.source), before)
+
+    def test_execution_cleanup_failure_has_priority_and_remains_retryable(self) -> None:
+        fixture = self.exact_fixture()
+        project_id = exact_selection.MR_PROJECT_IDS["root"]
+        artifact_id = exact_selection.MR_VERSION_IDS["r1"]
+        self.write_exact_template(
+            fixture,
+            provider="modrinth",
+            project_id=project_id,
+            artifact_id=artifact_id,
+        )
+        session = core.TemplateImportSession.create(fixture.key, ["base"])
+        operation = core.TemplateImportOperation(
+            session, resolve_template_import_plan(session.plan)
+        )
+        cleanup_error = core.TransactionDiscardIntegrityError(
+            "process cleanup is incomplete"
+        )
+        with (
+            patch.object(
+                core,
+                "_execute_exact_template_import",
+                side_effect=core.HuroshikiError("candidate failed"),
+            ),
+            patch.object(session, "discard", side_effect=cleanup_error),
+        ):
+            operation.run()
+        self.assertIs(operation.error, cleanup_error)
+        self.assertFalse(operation._finished)
+        self.assertFalse(session.finished)
+        operation.discard()
+        self.assertTrue(session.finished)
+
+    def test_apply_cleanup_failure_retains_retryable_operation_ownership(self) -> None:
+        fixture = self.exact_fixture()
+        project_id = exact_selection.MR_PROJECT_IDS["root"]
+        artifact_id = exact_selection.MR_VERSION_IDS["r1"]
+        self.write_exact_template(
+            fixture,
+            provider="modrinth",
+            project_id=project_id,
+            artifact_id=artifact_id,
+        )
+        operation = self.run_exact_import(fixture)
+        self.assertIsNone(operation.error)
+        cleanup_error = core.TransactionDiscardIntegrityError(
+            "apply cleanup incomplete"
+        )
+        with (
+            patch.object(
+                operation.transaction,
+                "apply",
+                side_effect=core.HuroshikiError("publication failed"),
+            ),
+            patch.object(operation.session, "discard", side_effect=cleanup_error),
+        ):
+            with self.assertRaises(core.TransactionDiscardIntegrityError):
+                operation.apply()
+        self.assertFalse(operation._finished)
+        self.assertFalse(operation._applying)
+        self.assertFalse(operation.session.finished)
+        operation.discard()
+        self.assertTrue(operation.session.finished)
 
 
 if __name__ == "__main__":

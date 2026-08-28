@@ -5433,6 +5433,7 @@ def _run_provider_lookup(
     *,
     cancel_event: threading.Event | None,
     deadline: float | None,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> object:
     request_id = uuid4().hex
     effective_deadline = (
@@ -5451,6 +5452,7 @@ def _run_provider_lookup(
         cwd=ROOT,
         cancel_event=cancel_event,
         deadline=effective_deadline,
+        result_callback=process_result_callback,
     )
     if result.cancelled:
         raise HuroshikiError("Provider lookup was cancelled")
@@ -5491,6 +5493,7 @@ def resolve_project_selector(
     *,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
 ) -> ResolvedSelector:
     if cancel_event is not None and cancel_event.is_set():
         raise HuroshikiError("Provider lookup was cancelled")
@@ -5508,6 +5511,7 @@ def resolve_project_selector(
             [normalized_provider, "resolve", normalized_selector],
             cancel_event=cancel_event,
             deadline=deadline,
+            process_result_callback=process_result_callback,
         )
         record = _provider_protocol_mapping(
             record,
@@ -10740,6 +10744,9 @@ def _solve_exact_mod_graph(
     deadline: float,
     seeded_closures: Mapping[tuple[str, str], ResolvedModClosure] | None = None,
     forbidden_identities: frozenset[tuple[str, str]] = frozenset(),
+    verified_url_replacement_identities: frozenset[
+        tuple[str, str]
+    ] = frozenset(),
     operation_label: str,
     cancellation_error: type[BaseException],
     deadline_error: type[BaseException],
@@ -10768,6 +10775,13 @@ def _solve_exact_mod_graph(
     closures: dict[tuple[str, str], ResolvedModClosure] = {}
     affected_baseline_identities: set[tuple[str, str]] = set()
     seeds = dict(seeded_closures or {})
+    if any(
+        identity[0] != "url" or identity not in seeds
+        for identity in verified_url_replacement_identities
+    ):
+        raise HuroshikiError(
+            f"{operation_label} URL replacements require verified cached closures"
+        )
     for root in ordered_roots:
         checkpoint()
         identity = (root.provider, root.project_id)
@@ -11076,8 +11090,16 @@ def _solve_exact_mod_graph(
         raise HuroshikiError(
             f"{operation_label} resulting graph contains removed MODs"
         )
+    artifact_baseline = dict(baseline)
+    for identity in verified_url_replacement_identities:
+        if identity not in aggregate_desired:
+            raise HuroshikiError(
+                f"{operation_label} verified URL replacement is absent from the "
+                "resulting graph"
+            )
+        artifact_baseline[identity] = aggregate_desired[identity]
     _verify_exact_closure_artifacts(
-        baseline,
+        artifact_baseline,
         desired,
         None,
         versions,
@@ -11093,7 +11115,7 @@ def _solve_exact_mod_graph(
         selected_dependency_roots=None,
         explicit_root_identities=set(root_map),
         opaque_url_roots={
-            identity for identity in set(baseline) | set(root_map)
+            identity for identity in set(artifact_baseline) | set(root_map)
             if identity[0] == "url"
         },
         checkpoint=checkpoint,
@@ -12269,6 +12291,7 @@ def resolve_mod_closure(
                 selector,
                 cancel_event=cancel_event,
                 deadline=deadline,
+                process_result_callback=process_result_callback,
             )
         except HuroshikiError as error:
             if canonical_provider(provider) == "url":
@@ -13514,6 +13537,34 @@ def verify_import_candidates(
         if time.monotonic() >= deadline:
             raise LoaderMigrationDeadlineExceeded("Template import deadline exceeded")
 
+    def enforce_process_authority(
+        results: Sequence[BoundedProcessResult],
+        error: HuroshikiError | None = None,
+    ) -> None:
+        if cancel_event.is_set() or any(result.cancelled for result in results):
+            exception: BaseException = LoaderMigrationCancelled(
+                "Template import was cancelled"
+            )
+        elif time.monotonic() >= deadline or any(result.timed_out for result in results):
+            exception = LoaderMigrationDeadlineExceeded(
+                "Template import provider verification deadline exceeded"
+            )
+        elif any(
+            result.termination_incomplete or result.orphaned_descendants
+            for result in results
+        ):
+            if error is not None:
+                raise error
+            exception = HuroshikiError(
+                "Template import provider verification process lifecycle "
+                "integrity failed"
+            )
+        else:
+            return
+        if error is not None:
+            raise exception from error
+        raise exception
+
     verified: list[ImportCandidateVerification] = []
     for candidate in candidates:
         if cancel_event.is_set():
@@ -13658,6 +13709,13 @@ def verify_import_candidates(
                     candidate.metadata_path, candidate.filename, None, None,
                 ))
                 continue
+            candidate_process_results: list[BoundedProcessResult] = []
+
+            def record_candidate_process_result(result: BoundedProcessResult) -> None:
+                candidate_process_results.append(result)
+                if process_result_callback is not None:
+                    process_result_callback(result)
+
             try:
                 workspace = resolver_root / f"template-import-plan-{uuid4().hex}"
                 create_resolver_source(
@@ -13681,18 +13739,18 @@ def verify_import_candidates(
                     closure = resolve_exact_mod_closure(
                         selection, source=workspace, cancel_event=cancel_event,
                         deadline=deadline, checkpoint=checkpoint,
-                        process_result_callback=process_result_callback,
+                        process_result_callback=record_candidate_process_result,
                     )
                     _verify_exact_root_metadata(selection, closure.metadata)
                 else:
                     closure = resolve_mod_closure(
                         provider=candidate.provider, selector=candidate.project_id,
                         minecraft=minecraft, loader=loader, loader_version=loader_version,
-                        canonical_project_id=candidate.project_id,
                         cancel_event=cancel_event, deadline=deadline,
                         resolver_root=workspace,
-                        process_result_callback=process_result_callback,
+                        process_result_callback=record_candidate_process_result,
                     )
+                enforce_process_authority(candidate_process_results)
                 actual_identity = closure.root_identity
                 roots = [item for item in closure.metadata if item.identity == actual_identity]
                 if len(roots) != 1:
@@ -13704,6 +13762,7 @@ def verify_import_candidates(
             except (LoaderMigrationCancelled, LoaderMigrationDeadlineExceeded):
                 raise
             except HuroshikiError as error:
+                enforce_process_authority(candidate_process_results, error)
                 verified.append(ImportCandidateVerification(
                     candidate.selector_identity, None, None, None, None, str(error), None
                 ))
@@ -13758,6 +13817,14 @@ def build_verified_template_import_plan(
         )
     except TemplateMergeError as error:
         raise HuroshikiError(str(error)) from error
+
+
+class TemplateImportPlanningIntegrityError(HuroshikiError):
+    """Planning failed while its transaction still owns incomplete cleanup."""
+
+    def __init__(self, message: str, transaction: PackTransaction) -> None:
+        super().__init__(message)
+        self.transaction = transaction
 
 
 class TemplateImportSession:
@@ -13907,8 +13974,14 @@ class TemplateImportSession:
                 operation_cancel,
                 operation_deadline,
             )
-        except BaseException:
-            transaction.discard()
+        except BaseException as planning_error:
+            try:
+                transaction.discard()
+            except TransactionDiscardError as cleanup_error:
+                raise TemplateImportPlanningIntegrityError(
+                    f"Template import planning cleanup is incomplete: {cleanup_error}",
+                    transaction,
+                ) from planning_error
             raise
 
     def templates_unchanged(self) -> bool:
@@ -14179,6 +14252,70 @@ def _template_import_final_roots(
     return tuple(sorted(roots.values(), key=lambda item: item.canonical_identity))
 
 
+@dataclass(frozen=True)
+class _PackTomlSemanticSnapshot:
+    document_without_index_hash: dict[str, object]
+    index_path: str | None
+    index_hash_format: str | None
+
+
+def _pack_toml_semantic_snapshot(contents: bytes) -> _PackTomlSemanticSnapshot:
+    try:
+        parsed = tomllib.loads(contents.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise HuroshikiError(f"Invalid pack.toml: {error}") from error
+    document: dict[str, object] = dict(parsed)
+    index_value = document.get("index")
+    if index_value is None:
+        return _PackTomlSemanticSnapshot(document, None, None)
+    if not isinstance(index_value, dict):
+        raise HuroshikiError("Invalid pack.toml [index] table")
+    index = dict(index_value)
+    index_path = index.get("file")
+    hash_format = index.get("hash-format")
+    index_hash = index.get("hash")
+    if not all(
+        isinstance(value, str) and value
+        for value in (index_path, hash_format, index_hash)
+    ):
+        raise HuroshikiError("Invalid pack.toml index binding")
+    del index["hash"]
+    document["index"] = index
+    return _PackTomlSemanticSnapshot(document, index_path, hash_format)
+
+
+def _assert_refreshed_pack_toml(
+    source: Path,
+    expected: _PackTomlSemanticSnapshot,
+) -> None:
+    pack_path = source / "pack.toml"
+    current_contents = pack_path.read_bytes()
+    current = _pack_toml_semantic_snapshot(current_contents)
+    if current != expected:
+        raise HuroshikiError(
+            "Template Import refresh changed semantic pack.toml configuration"
+        )
+    if current.index_path is None or current.index_hash_format is None:
+        return
+    parsed = tomllib.loads(current_contents.decode("utf-8"))
+    actual_hash = parsed["index"]["hash"]
+    try:
+        index_relative = portable_relative_path(Path(current.index_path))
+        digest = hashlib.new(current.index_hash_format.replace("-", ""))
+    except (PortablePathError, ValueError) as error:
+        raise HuroshikiError(
+            f"Invalid pack.toml index binding: {error}"
+        ) from error
+    index_path = safe_child(source, index_relative)
+    if not index_path.is_file() or index_path.is_symlink():
+        raise HuroshikiError("pack.toml index path is not an ordinary file")
+    digest.update(index_path.read_bytes())
+    if actual_hash.lower() != digest.hexdigest():
+        raise HuroshikiError(
+            "Template Import refresh produced an incorrect pack.toml index hash"
+        )
+
+
 def _stage_exact_template_import_result(
     source: Path,
     *,
@@ -14186,7 +14323,7 @@ def _stage_exact_template_import_result(
         tuple[str, str], tuple[tuple[Path, bytes, ModInfo], ...]
     ],
     non_mod_metadata: Mapping[Path, bytes],
-    expected_pack_toml: bytes,
+    expected_pack_toml: _PackTomlSemanticSnapshot,
     graph: _ExactModGraphResult,
     overrides: tuple[ModVersionOverride, ...],
     removed: Sequence[ModCandidate],
@@ -14235,10 +14372,7 @@ def _stage_exact_template_import_result(
         raise HuroshikiError(
             "Template Import refresh changed the fixed Pack versions"
         )
-    if (source / "pack.toml").read_bytes() != expected_pack_toml:
-        raise HuroshikiError(
-            "Template Import refresh changed pack.toml"
-        )
+    _assert_refreshed_pack_toml(source, expected_pack_toml)
     _exact_assert_complete_metadata_graph(
         source,
         graph.desired,
@@ -14295,7 +14429,9 @@ def _execute_exact_template_import(
     checkpoint = operation._checkpoint
     checkpoint()
     versions = packctl.project_versions(source)
-    expected_pack_toml = (source / "pack.toml").read_bytes()
+    expected_pack_toml = _pack_toml_semantic_snapshot(
+        (source / "pack.toml").read_bytes()
+    )
     baseline = _profile_mod_metadata_records(source, checkpoint)
     non_mod_metadata = _profile_non_mod_metadata_snapshot(source, checkpoint)
     try:
@@ -14448,7 +14584,20 @@ def _execute_exact_template_import(
                 raise HuroshikiError(
                     "Verified Template root has no actual identity"
                 )
-            seeds[candidate.actual_identity] = verification.cached_closure
+            cached_closure = verification.cached_closure
+            if cached_closure.root_identity != candidate.actual_identity:
+                raise HuroshikiError(
+                    "Verified Template closure root identity changed after planning"
+                )
+            if (
+                verification.closure_fingerprint is None
+                or resolved_closure_fingerprint(cached_closure)
+                != verification.closure_fingerprint
+            ):
+                raise HuroshikiError(
+                    "Verified Template closure changed after planning"
+                )
+            seeds[candidate.actual_identity] = cached_closure
     removed_identities = frozenset(
         candidate.actual_identity
         for candidate in operation.resolved.removed_pack_candidates
@@ -14462,7 +14611,11 @@ def _execute_exact_template_import(
         for identity in removed_identities & stored_override_identities
         if identity not in root_map
     )
-    forbidden = removed_identities - allowed_removed_dependencies
+    replacement_identities = removed_identities & frozenset(root_map)
+    allowed_removed_identities = (
+        allowed_removed_dependencies | replacement_identities
+    )
+    forbidden = removed_identities - allowed_removed_identities
     graph = _solve_exact_mod_graph(
         transaction,
         source=source,
@@ -14476,6 +14629,11 @@ def _execute_exact_template_import(
         deadline=operation.deadline,
         seeded_closures=seeds,
         forbidden_identities=forbidden,
+        verified_url_replacement_identities=frozenset(
+            identity
+            for identity in replacement_identities
+            if identity[0] == "url"
+        ),
         operation_label="template-import",
         cancellation_error=LoaderMigrationCancelled,
         deadline_error=LoaderMigrationDeadlineExceeded,
@@ -14503,7 +14661,7 @@ def _execute_exact_template_import(
             graph=graph,
             overrides=ordered_overrides,
             removed=operation.resolved.removed_pack_candidates,
-            allowed_removed_dependencies=allowed_removed_dependencies,
+            allowed_removed_dependencies=allowed_removed_identities,
             checkpoint=checkpoint,
             cancel_event=operation.cancel_event,
             deadline=operation.deadline,
@@ -14524,7 +14682,7 @@ def _execute_exact_template_import(
         graph=graph,
         overrides=ordered_overrides,
         removed=operation.resolved.removed_pack_candidates,
-        allowed_removed_dependencies=allowed_removed_dependencies,
+        allowed_removed_dependencies=allowed_removed_identities,
         checkpoint=checkpoint,
         cancel_event=operation.cancel_event,
         deadline=operation.deadline,
@@ -14572,6 +14730,7 @@ class TemplateImportOperation:
         self.error: BaseException | None = None
         self.cancelled = False
         self._finished = False
+        self._applying = False
         self._started = False
         self._lock = threading.Lock()
 
@@ -14964,9 +15123,8 @@ class TemplateImportOperation:
             if self.cancelled or self.error is not None or self.cancel_event.is_set():
                 try:
                     self.discard()
-                except BaseException as error:
-                    if self.error is None:
-                        self.error = error
+                except BaseException as cleanup_error:
+                    self.error = cleanup_error
             self.done.set()
 
     def apply(self) -> None:
@@ -14976,19 +15134,19 @@ class TemplateImportOperation:
                 or self.cancelled
                 or self.error is not None
                 or self._finished
+                or self._applying
                 or self.preview is None
             ):
                 raise HuroshikiError("Template import has no applicable preview")
-            self._finished = True
-        if (
-            not self.session.templates_unchanged()
-            or self.resolved.plan_digest != self.session.plan.plan_digest
-        ):
-            self.session.discard()
-            raise HuroshikiError(
-                "Template manifest changed or import plan became stale after preview"
-            )
+            self._applying = True
         try:
+            if (
+                not self.session.templates_unchanged()
+                or self.resolved.plan_digest != self.session.plan.plan_digest
+            ):
+                raise HuroshikiError(
+                    "Template manifest changed or import plan became stale after preview"
+                )
             self._checkpoint()
             self.transaction.ensure_active()
             self.transaction.apply(
@@ -14998,15 +15156,26 @@ class TemplateImportOperation:
             )
             self.session.finished = True
         except BaseException:
-            self.session.discard()
+            try:
+                self.session.discard()
+            finally:
+                with self._lock:
+                    self._applying = False
+                    self._finished = self.session.finished
             raise
+        with self._lock:
+            self._applying = False
+            self._finished = True
 
     def discard(self) -> None:
         with self._lock:
             if self._finished:
                 return
-            self._finished = True
+            if self._applying:
+                raise HuroshikiError("Template import apply is still running")
         self.session.discard()
+        with self._lock:
+            self._finished = True
 
     def cancel(self) -> None:
         self.cancelled = True

@@ -388,6 +388,45 @@ class TemplateImportTuiTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.15)
                 self.assertEqual(app.opened_projects, ["pack:demo"])
 
+    async def test_planning_cancel_retains_failed_session_cleanup_for_retry(self) -> None:
+        started = threading.Event()
+
+        class RetryingSession(FakeSession):
+            def discard(self) -> None:
+                self.discard_calls += 1
+                if self.discard_calls < 3:
+                    raise core.TransactionDiscardIntegrityError(
+                        "cleanup incomplete"
+                    )
+
+        session = RetryingSession()
+
+        def create(_project_key: str, _template_ids: tuple[str, ...], **kwargs: object):
+            started.set()
+            kwargs["cancel_event"].wait(2)
+            return session
+
+        with (
+            patch.object(core, "project_info", return_value=PACK),
+            patch.object(core, "compatible_templates", return_value=[template_project("base")]),
+            patch.object(core.TemplateImportSession, "create", side_effect=create),
+        ):
+            app = _ScreenApp(huroshiki.TemplateImportSelectionScreen("pack:demo"))
+            async with app.run_test() as pilot:
+                await pilot.press("space", "enter")
+                self.assertTrue(started.wait(1))
+                screen = app.screen
+                await pilot.press("escape")
+                await pilot.pause(0.2)
+                self.assertIs(app.screen, screen)
+                self.assertEqual(app.opened_projects, [])
+                self.assertEqual(session.discard_calls, 2)
+                self.assertIs(screen.session, session)
+                await pilot.press("escape")
+                await pilot.pause(0.1)
+                self.assertEqual(session.discard_calls, 3)
+                self.assertEqual(app.opened_projects, ["pack:demo"])
+
     async def test_planning_failure_stays_on_selection_without_navigation(self) -> None:
         with (
             patch.object(core, "project_info", return_value=PACK),
@@ -707,6 +746,51 @@ class TemplateImportTuiTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(operation.apply_calls, 0)
                 self.assertEqual(operation.discard_calls, 1)
                 self.assertEqual(app.opened_projects, ["pack:demo"])
+
+    async def test_failed_apply_cleanup_retains_screen_until_discard_retry(self) -> None:
+        class RetainedSession(FakeSession):
+            def __init__(self) -> None:
+                super().__init__()
+                self.finished = False
+
+            def discard(self) -> None:
+                self.discard_calls += 1
+                self.finished = True
+
+        class FailedApplyOperation(FakeImportOperation):
+            def apply(self) -> None:
+                self.apply_calls += 1
+                raise core.TransactionDiscardIntegrityError(
+                    "apply cleanup incomplete"
+                )
+
+        session = RetainedSession()
+        resolved = resolve_template_import_plan(session.plan)
+        operation = FailedApplyOperation(session)
+        with (
+            patch.object(core, "project_info", return_value=PACK),
+            patch.object(core, "TemplateImportOperation", return_value=operation),
+        ):
+            app = _ScreenApp(
+                huroshiki.TemplateImportExecutionScreen(
+                    "pack:demo", session, resolved
+                )
+            )
+            with patch.object(app, "suspend", return_value=nullcontext()):
+                async with app.run_test() as pilot:
+                    await pilot.pause(0.15)
+                    screen = app.screen
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    self.assertIs(app.screen, screen)
+                    self.assertFalse(screen.ownership_finished)
+                    self.assertEqual(app.opened_projects, [])
+                    await pilot.press("escape")
+                    await pilot.pause()
+                    self.assertEqual(operation.discard_calls, 1)
+                    self.assertEqual(app.opened_projects, ["pack:demo"])
 
     async def test_execution_error_renders_technical_text_without_pin_reason(self) -> None:
         session = FakeSession()
