@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from tests.test_pack_publish_manifest import PackPublishManifestTest
 
 import packctl
 import pack_publish
+import process_runner
 import publish_restart as restart
 import publish_target
 from process_runner import BoundedProcessResult
@@ -326,39 +328,156 @@ class PublishRestartTest(PackPublishManifestTest):
                 ):
                     self._run(self._bound(**flags))
 
-    def test_runner_prelaunch_cancel_and_deadline_are_not_attempts(self) -> None:
-        for result, error_type in (
-            (
-                BoundedProcessResult(None, "", "", True, False),
-                restart.PublishRestartCancelled,
-            ),
-            (
-                BoundedProcessResult(None, "", "", False, True),
-                restart.PublishRestartDeadlineExceeded,
-            ),
+    def test_real_runner_prelaunch_cancel_and_deadline_are_not_attempts(self) -> None:
+        actual_runner = process_runner.run_bounded_process
+        for race, error_type in (
+            ("cancel", restart.PublishRestartCancelled),
+            ("deadline", restart.PublishRestartDeadlineExceeded),
         ):
-            with self.subTest(error=error_type), patch.object(
+            cancel_event = threading.Event()
+            deadline = time.monotonic() + 60
+            runner_results = []
+
+            def run_with_race(command, **kwargs):
+                if race == "cancel":
+                    cancel_event.set()
+                else:
+                    kwargs["deadline"] = time.monotonic() - 1
+                result = actual_runner(command, **kwargs)
+                runner_results.append(result)
+                return result
+
+            with self.subTest(race=race), patch.object(
                 packctl, "deployment_settings", return_value=self.settings
             ), patch.object(
-                restart, "run_bounded_process", return_value=result
-            ) as run:
+                restart, "run_bounded_process", side_effect=run_with_race
+            ) as run, patch.object(process_runner.subprocess, "Popen") as popen:
                 manifest, activated = self._inputs()
                 with self.assertRaises(error_type) as error:
                     restart.restart_activated_publish(
-                        activated, manifest, self.target
+                        activated,
+                        manifest,
+                        self.target,
+                        cancel_event=cancel_event,
+                        deadline=deadline,
                     )
             self.assertFalse(hasattr(error.exception, "result"))
             run.assert_called_once()
+            popen.assert_not_called()
+            self.assertEqual(len(runner_results), 1)
+            self.assertEqual(runner_results[0].returncode, -signal.SIGTERM)
+
+    def test_local_popen_failure_is_known_launch_failure_without_retry(self) -> None:
+        manifest, activated = self._inputs()
+        with patch.object(
+            packctl, "deployment_settings", return_value=self.settings
+        ), patch.object(
+            process_runner.subprocess,
+            "Popen",
+            side_effect=OSError("local launch failed"),
+        ) as popen:
+            with self.assertRaises(restart.PublishRestartError) as error:
+                restart.restart_activated_publish(
+                    activated, manifest, self.target
+                )
+        self.assertNotIsInstance(
+            error.exception, restart.PublishRestartIntegrityError
+        )
+        self.assertIsInstance(error.exception.__cause__, OSError)
+        self.assertFalse(hasattr(error.exception, "result"))
+        popen.assert_called_once()
+
+    def test_after_launch_runner_exception_is_uncertain_without_retry(self) -> None:
+        def runner(command, *, result_callback, **kwargs):
+            result_callback(
+                BoundedProcessResult(
+                    255,
+                    "",
+                    "",
+                    False,
+                    False,
+                    process_group=1234,
+                    parent_process=object(),  # type: ignore[arg-type]
+                )
+            )
+            raise RuntimeError("control loop failed")
+
+        manifest, activated = self._inputs()
+        with patch.object(
+            packctl, "deployment_settings", return_value=self.settings
+        ), patch.object(
+            restart, "run_bounded_process", side_effect=runner
+        ) as run:
+            with self.assertRaises(restart.PublishRestartIntegrityError) as error:
+                restart.restart_activated_publish(
+                    activated, manifest, self.target
+                )
+        self.assertEqual(error.exception.result.status, "uncertain")
+        self.assertIsNone(error.exception.result.remote_returncode)
+        self.assertIsInstance(error.exception.__cause__, RuntimeError)
+        run.assert_called_once()
+
+    def test_after_launch_runner_exception_keeps_termination_priority(self) -> None:
+        def runner(command, *, result_callback, **kwargs):
+            result_callback(
+                BoundedProcessResult(
+                    -signal.SIGTERM,
+                    "",
+                    "",
+                    True,
+                    False,
+                    orphaned_descendants=True,
+                    termination_incomplete=True,
+                    process_group=1234,
+                    parent_process=object(),  # type: ignore[arg-type]
+                )
+            )
+            raise RuntimeError("cleanup failed")
+
+        manifest, activated = self._inputs()
+        with patch.object(
+            packctl, "deployment_settings", return_value=self.settings
+        ), patch.object(
+            restart, "run_bounded_process", side_effect=runner
+        ) as run:
+            with self.assertRaisesRegex(
+                restart.PublishRestartIntegrityError,
+                "termination was incomplete",
+            ) as error:
+                restart.restart_activated_publish(
+                    activated, manifest, self.target
+                )
+        self.assertEqual(error.exception.result.status, "uncertain")
+        self.assertIsNone(error.exception.result.remote_returncode)
+        run.assert_called_once()
 
     def test_connection_failure_stderr_and_nonzero_are_uncertain(self) -> None:
-        for runner in (
-            self._bound(process_returncode=255, stderr="connection lost"),
-            self._bound(stderr="x" * 60000, output_limit_exceeded=True),
-            self._bound(status="failed", returncode=3, process_returncode=1),
+        for runner, remote_returncode in (
+            (
+                lambda *args, **kwargs: BoundedProcessResult(
+                    255, "", "connection lost", False, False
+                ),
+                None,
+            ),
+            (
+                self._bound(
+                    stderr="x" * 60000, output_limit_exceeded=True
+                ),
+                0,
+            ),
+            (
+                self._bound(
+                    status="failed", returncode=3, process_returncode=1
+                ),
+                3,
+            ),
         ):
             with self.assertRaises(restart.PublishRestartIntegrityError) as error:
                 self._run(runner)
             self.assertEqual(error.exception.result.status, "uncertain")
+            self.assertEqual(
+                error.exception.result.remote_returncode, remote_returncode
+            )
 
     def test_cancel_and_deadline_before_launch(self) -> None:
         for kwargs, error_type in (

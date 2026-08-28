@@ -449,6 +449,25 @@ def _result(
     )
 
 
+def _raise_process_integrity(
+    process: BoundedProcessResult,
+    result: PublishRestartResult,
+    progress: Callable[[str], object] | None,
+    *,
+    cause: Exception | None = None,
+) -> None:
+    message = "Publish restart outcome is uncertain"
+    if process.termination_incomplete:
+        message = "Publish restart process termination was incomplete"
+    elif process.orphaned_descendants:
+        message = "Publish restart left background processes after completion"
+    error = PublishRestartIntegrityError(message, result)
+    _emit(progress, "uncertain")
+    if cause is None:
+        raise error
+    raise error from cause
+
+
 def restart_activated_publish(
     activated: PublishActivatedGeneration,
     manifest: PackPublishManifest,
@@ -486,32 +505,42 @@ def restart_activated_publish(
         raise PublishRestartError("Publish restart request is too large")
 
     _emit(progress, "restarting")
-    process = run_bounded_process(
-        _ssh_command(validated_target.restart.endpoint),
-        cwd=Path(packctl.PACKS).parent,
-        stdin=payload,
-        cancel_event=cancel_event,
-        deadline=effective_deadline,
-        max_output_bytes=_MAX_REMOTE_OUTPUT_BYTES,
-    )
+    observed_results: list[BoundedProcessResult] = []
+    try:
+        process = run_bounded_process(
+            _ssh_command(validated_target.restart.endpoint),
+            cwd=Path(packctl.PACKS).parent,
+            stdin=payload,
+            cancel_event=cancel_event,
+            deadline=effective_deadline,
+            result_callback=observed_results.append,
+            max_output_bytes=_MAX_REMOTE_OUTPUT_BYTES,
+        )
+    except Exception as error:
+        if not observed_results:
+            raise PublishRestartError(
+                "Publish restart SSH process could not be launched"
+            ) from error
+        observed = observed_results[-1]
+        if observed.process_group is None and observed.parent_process is None:
+            raise PublishRestartError(
+                "Publish restart SSH process could not be launched"
+            ) from error
+        _raise_process_integrity(
+            observed,
+            _result(manifest, validated_target, generation_id, "uncertain"),
+            progress,
+            cause=error,
+        )
     uncertain = _result(
-        manifest, validated_target, generation_id, "uncertain", process.returncode
+        manifest, validated_target, generation_id, "uncertain"
     )
-    if process.termination_incomplete:
-        _emit(progress, "uncertain")
-        raise PublishRestartIntegrityError(
-            "Publish restart process termination was incomplete", uncertain
-        )
-    if process.orphaned_descendants:
-        _emit(progress, "uncertain")
-        raise PublishRestartIntegrityError(
-            "Publish restart left background processes after completion", uncertain
-        )
-    if (
-        process.returncode is None
-        and process.process_group is None
-        and process.parent_process is None
-    ):
+    if process.termination_incomplete or process.orphaned_descendants:
+        _raise_process_integrity(process, uncertain, progress)
+    launched = process.process_group is not None or process.parent_process is not None
+    if launched and (process.cancelled or process.timed_out):
+        _raise_process_integrity(process, uncertain, progress)
+    if not launched:
         if process.cancelled:
             raise PublishRestartCancelled(
                 "Publish restart was cancelled before SSH launch"
