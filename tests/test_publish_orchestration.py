@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import threading
 import time
 import unittest
@@ -276,6 +276,54 @@ class PublishOrchestrationTest(unittest.TestCase):
         self.assertEqual(mocks["discard_publish_transfer_plan"].call_count, 1)
         mocks["restart_activated_publish"].assert_called_once()
 
+    def test_prelaunch_and_unexpected_restart_errors_preserve_exact_authority(self) -> None:
+        for lower in (
+            publish_restart.PublishRestartError("stale restart target"),
+            publish_restart.PublishRestartError("local SSH launch failed"),
+        ):
+            with self.subTest(lower=str(lower)):
+                plan = self.plan()
+                mocks, _ = self.phase_mocks(plan)
+                mocks["restart_activated_publish"].side_effect = lower
+                with self.patch_phases(mocks):
+                    with self.assertRaises(publish.PackPublishRestartError) as raised:
+                        publish.execute_pack_publish(
+                            plan,
+                            cancel_event=self.cancel,
+                            deadline=self.deadline,
+                        )
+                result = raised.exception.result
+                self.assertTrue(result.publication_succeeded)
+                self.assertTrue(result.remote_verified)
+                self.assertTrue(result.activated)
+                self.assertFalse(result.restart_attempted)
+                self.assertFalse(result.restart_succeeded)
+                self.assertEqual(result.restart_status, "not_started")
+                self.assertEqual(result.final_status, "restart_not_started")
+                mocks["restart_activated_publish"].assert_called_once()
+
+        plan = self.plan()
+        mocks, _ = self.phase_mocks(plan)
+        generic = RuntimeError("unexpected restart boundary failure")
+        mocks["restart_activated_publish"].side_effect = generic
+        with self.patch_phases(mocks):
+            with self.assertRaises(
+                publish.PackPublishRestartUncertainError
+            ) as raised:
+                publish.execute_pack_publish(
+                    plan,
+                    cancel_event=self.cancel,
+                    deadline=self.deadline,
+                )
+        result = raised.exception.result
+        self.assertTrue(result.publication_succeeded)
+        self.assertTrue(result.restart_attempted)
+        self.assertFalse(result.restart_succeeded)
+        self.assertEqual(result.restart_status, "uncertain")
+        self.assertEqual(result.final_status, "restart_uncertain")
+        self.assertIs(raised.exception.primary_error, generic)
+        mocks["restart_activated_publish"].assert_called_once()
+
     def test_uncertain_restart_result_and_prelaunch_controls_preserve_publication(self) -> None:
         plan = self.plan()
         uncertain = publish_restart.PublishRestartResult(
@@ -291,6 +339,7 @@ class PublishOrchestrationTest(unittest.TestCase):
                 publish.execute_pack_publish(plan, cancel_event=self.cancel, deadline=self.deadline)
         self.assertTrue(raised.exception.publication_succeeded)
         self.assertEqual(raised.exception.result.restart_status, "uncertain")
+        self.assertTrue(raised.exception.result.restart_attempted)
 
         for lower, expected in (
             (publish_restart.PublishRestartCancelled("cancelled"), publish.PackPublishCancelled),
@@ -303,6 +352,63 @@ class PublishOrchestrationTest(unittest.TestCase):
                 with self.assertRaises(expected) as raised:
                     publish.execute_pack_publish(plan, cancel_event=self.cancel, deadline=self.deadline)
             self.assertTrue(raised.exception.publication_succeeded)
+
+    def test_orchestration_checkpoint_before_restart_is_not_an_attempt(self) -> None:
+        plan = self.plan()
+        mocks, (_, _, _, activated, _) = self.phase_mocks(plan)
+
+        def activate_then_cancel(*args, **kwargs):
+            self.cancel.set()
+            return activated
+
+        mocks["activate_publish_generation"].side_effect = activate_then_cancel
+        with self.patch_phases(mocks):
+            with self.assertRaises(publish.PackPublishCancelled) as raised:
+                publish.execute_pack_publish(
+                    plan,
+                    cancel_event=self.cancel,
+                    deadline=self.deadline,
+                )
+        self.cancel.clear()
+        result = raised.exception.result
+        self.assertTrue(result.publication_succeeded)
+        self.assertFalse(result.restart_attempted)
+        self.assertEqual(result.restart_status, "not_started")
+        self.assertEqual(result.final_status, "cancelled")
+        mocks["restart_activated_publish"].assert_not_called()
+
+        plan = self.plan()
+        mocks, _ = self.phase_mocks(plan)
+        real_checkpoint = publish._checkpoint
+        checkpoints = 0
+
+        def expire_before_restart(cancel_event, deadline):
+            nonlocal checkpoints
+            checkpoints += 1
+            if checkpoints == 5:
+                raise publish.PackPublishDeadlineExceeded(
+                    "deadline",
+                    result=None,
+                    phase="checkpoint",
+                    primary_error=None,
+                )
+            real_checkpoint(cancel_event, deadline)
+
+        with self.patch_phases(mocks), patch.object(
+            publish, "_checkpoint", side_effect=expire_before_restart
+        ):
+            with self.assertRaises(publish.PackPublishDeadlineExceeded) as raised:
+                publish.execute_pack_publish(
+                    plan,
+                    cancel_event=self.cancel,
+                    deadline=self.deadline,
+                )
+        result = raised.exception.result
+        self.assertTrue(result.publication_succeeded)
+        self.assertFalse(result.restart_attempted)
+        self.assertEqual(result.restart_status, "not_started")
+        self.assertEqual(result.final_status, "cancelled")
+        mocks["restart_activated_publish"].assert_not_called()
 
     def test_phase_cancellation_and_deadline_keep_partial_authority(self) -> None:
         for phase, trigger, expected in (
@@ -418,7 +524,54 @@ class PublishOrchestrationTest(unittest.TestCase):
         self.assertTrue(plan.result.publication_succeeded)
         self.assertEqual(plan.result.final_status, "restart_not_started")
 
-    def test_activation_uncertainty_retains_unfinalized_cleanup(self) -> None:
+    def test_activation_uncertainty_cleanup_success_restores_terminal_failure(self) -> None:
+        plan = self.plan()
+        mocks, (_, staged, _, _, _) = self.phase_mocks(plan)
+        uncertain = publish_activation.PublishActivationUncertainError(
+            "activation uncertain",
+            plan.target.publication_root
+            / (".huroshiki-activation-" + "c" * 32 + ".json"),
+            "c" * 32,
+        )
+        mocks["activate_publish_generation"].side_effect = uncertain
+        with self.patch_phases(mocks):
+            with self.assertRaises(publish.PackPublishCleanupError):
+                publish.execute_pack_publish(
+                    plan,
+                    cancel_event=self.cancel,
+                    deadline=self.deadline,
+                )
+        phase_counts = {
+            name: mock.call_count
+            for name, mock in mocks.items()
+            if name != "discard_publish_transfer_plan"
+        }
+        with patch.object(publish, "retry_publish_activation_cleanup") as retry:
+            publish.retry_pack_publish_cleanup(plan)
+        retry.assert_called_once()
+        self.assertIs(retry.call_args.args[0], staged)
+        self.assertFalse(retry.call_args.kwargs["finalize_receipt"])
+        self.assertIsNone(retry.call_args.kwargs["expected_status"])
+        self.assertEqual(plan.state, "failed")
+        self.assertEqual(plan.result.final_status, "publication_failed")
+        self.assertFalse(plan.result.publication_succeeded)
+        self.assertFalse(plan.result.activated)
+        self.assertIs(plan._primary_error, uncertain)
+        self.assertIsNone(plan._activation_cleanup_error)
+        self.assertIsNone(plan._activation_staged)
+        self.assertIsNone(plan._cleanup_error)
+        self.assertEqual(
+            phase_counts,
+            {
+                name: mock.call_count
+                for name, mock in mocks.items()
+                if name != "discard_publish_transfer_plan"
+            },
+        )
+        with self.assertRaises(publish.PackPublishCleanupError):
+            publish.retry_pack_publish_cleanup(plan)
+
+    def test_activation_uncertainty_cleanup_failure_then_success(self) -> None:
         plan = self.plan()
         mocks, (owner, staged, _, _, _) = self.phase_mocks(plan)
         uncertain = publish_activation.PublishActivationUncertainError(
@@ -435,14 +588,42 @@ class PublishOrchestrationTest(unittest.TestCase):
                     deadline=self.deadline,
                 )
         self.assertFalse(raised.exception.result.publication_succeeded)
-        with patch.object(publish, "retry_publish_activation_cleanup") as retry:
+        phase_counts = {
+            name: mock.call_count
+            for name, mock in mocks.items()
+            if name != "discard_publish_transfer_plan"
+        }
+        retry_failure = RuntimeError("activation temp cleanup failed")
+        retry = Mock(side_effect=[retry_failure, None])
+        with patch.object(
+            publish, "retry_publish_activation_cleanup", new=retry
+        ):
             with self.assertRaises(publish.PackPublishCleanupError):
                 publish.retry_pack_publish_cleanup(plan)
-        retry.assert_called_once()
+            self.assertEqual(plan.state, "cleanup-pending")
+            publish.retry_pack_publish_cleanup(plan)
+        self.assertEqual(retry.call_count, 2)
         self.assertIs(retry.call_args.args[0], staged)
         self.assertFalse(retry.call_args.kwargs["finalize_receipt"])
         self.assertIsNone(retry.call_args.kwargs["expected_status"])
-        self.assertEqual(plan.state, "cleanup-pending")
+        self.assertEqual(plan.state, "failed")
+        self.assertEqual(plan.result.final_status, "publication_failed")
+        self.assertFalse(plan.result.publication_succeeded)
+        self.assertFalse(plan.result.activated)
+        self.assertIs(plan._primary_error, uncertain)
+        self.assertIsNone(plan._activation_cleanup_error)
+        self.assertIsNone(plan._activation_staged)
+        self.assertIsNone(plan._cleanup_error)
+        self.assertEqual(
+            phase_counts,
+            {
+                name: mock.call_count
+                for name, mock in mocks.items()
+                if name != "discard_publish_transfer_plan"
+            },
+        )
+        with self.assertRaises(publish.PackPublishCleanupError):
+            publish.retry_pack_publish_cleanup(plan)
         self.assertEqual(owner.method_calls, [])
 
     def test_prepare_cleanup_owner_and_base_exception_are_not_abandoned(self) -> None:
@@ -519,3 +700,39 @@ class PublishOrchestrationTest(unittest.TestCase):
         self.assertRaises(FrozenInstanceError, setattr, progress, "phase", "secret")
         self.assertNotIn("publisher@example.org", repr(plan))
         self.assertNotIn("secret", repr(progress))
+
+    def test_result_rejects_contradictory_restart_terminal_states(self) -> None:
+        plan = self.plan()
+        valid_failed = publish.PackPublishResult(
+            plan.pack_id,
+            plan.target_side,
+            plan.manifest_digest,
+            plan.target_config_digest,
+            plan.generation_id,
+            True,
+            True,
+            True,
+            True,
+            False,
+            "failed",
+            "restart_failed",
+        )
+        for changes in (
+            {
+                "restart_attempted": False,
+                "restart_status": "not_started",
+            },
+            {
+                "restart_attempted": False,
+                "restart_status": "not_started",
+                "final_status": "restart_uncertain",
+            },
+            {
+                "restart_attempted": True,
+                "restart_status": "failed",
+                "final_status": "restart_not_started",
+            },
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValueError):
+                    replace(valid_failed, **changes)

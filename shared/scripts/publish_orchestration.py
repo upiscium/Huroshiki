@@ -134,12 +134,20 @@ class PackPublishResult:
             raise ValueError("published Pack Publish result is incomplete")
         if self.final_status == "publication_failed" and self.publication_succeeded:
             raise ValueError("publication failure cannot contain activation success")
-        if self.final_status == "restart_failed" and not self.publication_succeeded:
-            raise ValueError("restart failure requires successful publication")
-        if self.final_status == "restart_uncertain" and (
-            not self.publication_succeeded or self.restart_status != "uncertain"
+        if self.final_status == "restart_failed" and (
+            not self.publication_succeeded
+            or not self.restart_attempted
+            or self.restart_status != "failed"
+            or self.restart_succeeded
         ):
-            raise ValueError("restart uncertainty requires successful publication")
+            raise ValueError("restart failure requires a known failed attempt")
+        if self.final_status == "restart_uncertain" and (
+            not self.publication_succeeded
+            or not self.restart_attempted
+            or self.restart_status != "uncertain"
+            or self.restart_succeeded
+        ):
+            raise ValueError("restart uncertainty requires an uncertain attempt")
         if self.final_status == "restart_not_started" and (
             not self.publication_succeeded
             or self.restart_status != "not_started"
@@ -480,10 +488,46 @@ def _classify_failure(
             plan,
             verified=verified,
             activated=activated,
-            final_status="restart_failed",
+            final_status="restart_not_started",
         )
         return result, PackPublishRestartError(
-            "Pack publication succeeded, but restart failed",
+            "Pack publication succeeded, but restart did not start",
+            result=result,
+            phase=phase,
+            primary_error=error,
+        )
+
+    if isinstance(error, PackPublishCancelled):
+        result = _partial_result(
+            plan,
+            verified=verified,
+            activated=activated,
+            final_status="cancelled",
+        )
+        return result, PackPublishCancelled(
+            str(error), result=result, phase=phase, primary_error=error
+        )
+    if isinstance(error, PackPublishDeadlineExceeded):
+        result = _partial_result(
+            plan,
+            verified=verified,
+            activated=activated,
+            final_status="cancelled",
+        )
+        return result, PackPublishDeadlineExceeded(
+            str(error), result=result, phase=phase, primary_error=error
+        )
+
+    if phase == "restarting" and activated:
+        result = _partial_result(
+            plan,
+            verified=verified,
+            activated=True,
+            restart_status="uncertain",
+            final_status="restart_uncertain",
+        )
+        return result, PackPublishRestartUncertainError(
+            "Pack publication succeeded, but restart outcome is uncertain",
             result=result,
             phase=phase,
             primary_error=error,
@@ -521,7 +565,7 @@ def _classify_failure(
         plan,
         verified=verified,
         activated=activated,
-        final_status=("restart_failed" if activated else "publication_failed"),
+        final_status=("restart_not_started" if activated else "publication_failed"),
     )
     error_type = PackPublishRestartError if activated else PackPublishExecutionError
     return result, error_type(
@@ -892,15 +936,8 @@ def retry_pack_publish_cleanup(
                 retry_error = error
             else:
                 with plan._lock:
-                    confirmed = (
-                        isinstance(activation_cleanup, PublishActivationCleanupError)
-                        and activation_cleanup.activated is not None
-                    )
-                    if confirmed:
-                        plan._activation_cleanup_error = None
-                        plan._activation_staged = None
-                    else:
-                        retry_error = activation_cleanup
+                    plan._activation_cleanup_error = None
+                    plan._activation_staged = None
     if plan._transfer_cleanup_pending:
         try:
             retry_discard_publish_transfer_plan(
