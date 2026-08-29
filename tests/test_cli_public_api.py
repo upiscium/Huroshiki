@@ -4,7 +4,9 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 import re
+import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -833,95 +835,71 @@ class PublicCliTest(unittest.TestCase):
         self.assertIn("http://127.0.0.1:9090/", stdout.getvalue())
         server.serve_forever.assert_called_once_with()
 
-    def test_publish_restarts_only_after_successful_deploy(self) -> None:
-        args = type("Args", (), {"pack": "demo"})()
-        snapshot = Path("/safe/snapshot")
-        config = {
-            "distribution": {"rsync_target": "host:/demo"},
-            "minecraft_server": {
-                "ssh_host": "server",
-                "stack_dir": "/srv/demo",
-                "service": "minecraft",
-            },
-        }
-        patches = (
-            patch.object(packctl, "ProjectLock", MagicMock()),
-            patch.object(packctl, "_build_pack", return_value=0),
-            patch.object(packctl, "load_pack_config", return_value=config),
-            patch.object(packctl, "distribution_root", return_value=Path("/dist")),
-            patch.object(packctl, "_make_deploy_snapshot", return_value=snapshot),
-            patch.object(packctl, "distribution_digest", return_value="digest"),
-            patch.object(packctl, "discard_deploy_snapshot"),
-        )
-        with patches[0], patches[1] as build, patches[2], patches[3], patches[4], patches[5], patches[6], patch.object(
-            packctl, "_deploy_pack", return_value=0
-        ) as deploy, patch.object(packctl, "run") as run:
+    def test_publish_parser_and_main_retire_legacy_commands(self) -> None:
+        parser = packctl.parser()
+        publish = parser.parse_args(["publish", "demo", "--yes"])
+        self.assertIs(publish.func, packctl.cmd_publish)
+        self.assertTrue(publish.yes)
+        self.assertFalse(publish.preview)
+        help_text = parser.format_help()
+        for command in ("build", "build-all", "deploy", "deploy-dry-run", "deploy-all", "restart"):
+            self.assertIsNone(
+                re.search(rf"(?:[{{,]){re.escape(command)}(?:[,}}])", help_text)
+            )
+
+        for command in ("build", "build-all", "deploy", "deploy-dry-run", "deploy-all", "restart"):
+            with self.subTest(command=command), patch.object(sys, "argv", ["packctl", command, "demo"]), patch.object(
+                packctl, "_build_pack", side_effect=AssertionError
+            ), patch.object(packctl, "_deploy_pack", side_effect=AssertionError), patch.object(
+                packctl, "cmd_restart", side_effect=AssertionError
+            ), patch.object(packctl, "ProjectLock", side_effect=AssertionError):
+                error = StringIO()
+                with redirect_stderr(error):
+                    self.assertEqual(packctl.main(), 2)
+                self.assertEqual(
+                    error.getvalue().strip(),
+                    f"packctl {command} has been removed. Use packctl publish <pack>.",
+                )
+
+    def _publish_plan(self):
+        plan = MagicMock()
+        plan.cancel_event = threading.Event()
+        plan.deadline = 123.0
+        plan.pack_id = "demo"
+        return plan
+
+    def test_publish_plans_then_executes_exact_plan_controls_and_no_legacy_pipeline(self) -> None:
+        import huroshiki_core as orchestration
+        plan = self._publish_plan()
+        result = MagicMock(final_status="published", pack_id="demo", generation_id="g1")
+        args = type("Args", (), {"pack": "demo", "yes": True, "preview": False})()
+        with patch.object(orchestration, "plan_pack_publish", return_value=plan) as planner, patch.object(
+            orchestration, "execute_pack_publish", return_value=result
+        ) as execute, patch.object(packctl, "_build_pack") as build, patch.object(
+            packctl, "_deploy_pack"
+        ) as deploy, patch.object(packctl, "cmd_restart") as restart, patch.object(
+            packctl, "ProjectLock"
+        ) as lock, patch.object(packctl, "_print_pack_publish_preview"), patch.object(
+            packctl, "_print_pack_publish_result"
+        ):
             self.assertEqual(packctl.cmd_publish(args), 0)
-        build.assert_called_once_with("demo")
-        self.assertEqual(deploy.call_args.kwargs["confirmed_target"], "host:/demo")
-        run.assert_called_once_with(
-            ["ssh", "--", "server", "cd /srv/demo && docker compose restart minecraft"]
-        )
+        planner.assert_called_once_with("demo", cancel_event=unittest.mock.ANY)
+        execute.assert_called_once_with(plan, cancel_event=plan.cancel_event, deadline=plan.deadline)
+        build.assert_not_called(); deploy.assert_not_called(); restart.assert_not_called(); lock.assert_not_called()
 
-        with patches[0], patch.object(packctl, "_build_pack", return_value=8), patch.object(
-            packctl, "load_pack_config"
-        ) as load_config, patch.object(packctl, "run") as run:
-            self.assertEqual(packctl.cmd_publish(args), 1)
-        load_config.assert_not_called()
-        run.assert_not_called()
-
-    def test_publish_keeps_one_locked_configuration_across_deploy_and_restart(self) -> None:
-        args = type("Args", (), {"pack": "demo"})()
-        config = {
-            "distribution": {"rsync_target": "first:/demo"},
-            "minecraft_server": {
-                "ssh_host": "first-server",
-                "stack_dir": "/srv/first",
-                "service": "first-service",
-            },
-        }
-        lock = MagicMock()
-        lock.__enter__.return_value = lock
-
-        def mutate_configuration(*args, **kwargs):
-            self.assertTrue(lock.__enter__.called)
-            self.assertFalse(lock.__exit__.called)
-            config["distribution"]["rsync_target"] = "second:/demo"
-            config["minecraft_server"] = {
-                "ssh_host": "second-server",
-                "stack_dir": "/srv/second",
-                "service": "second-service",
-            }
-            return 0
-
-        with patch.object(packctl, "ProjectLock", return_value=lock) as lock_type, patch.object(
-            packctl, "_build_pack", return_value=0
-        ), patch.object(
-            packctl, "load_pack_config", return_value=config
-        ) as load_config, patch.object(
-            packctl, "distribution_root", return_value=Path("/dist")
-        ), patch.object(
-            packctl, "_make_deploy_snapshot", return_value=Path("/snapshot")
-        ), patch.object(
-            packctl, "distribution_digest", return_value="digest"
-        ), patch.object(
-            packctl, "_deploy_pack", side_effect=mutate_configuration
-        ) as deploy, patch.object(
-            packctl, "discard_deploy_snapshot"
-        ), patch.object(packctl, "run") as run:
-            self.assertEqual(packctl.cmd_publish(args), 0)
-
-        lock_type.assert_called_once_with("pack:demo", "publish")
-        load_config.assert_called_once_with("demo")
-        self.assertEqual(deploy.call_args.kwargs["confirmed_target"], "first:/demo")
-        run.assert_called_once_with(
-            [
-                "ssh",
-                "--",
-                "first-server",
-                "cd /srv/first && docker compose restart first-service",
-            ]
-        )
+    def test_publish_preview_and_decline_do_not_execute(self) -> None:
+        import huroshiki_core as orchestration
+        for preview, stdin_tty, answer, expected in ((True, False, "", 0), (False, True, "n", 0), (False, False, "", 2)):
+            with self.subTest(preview=preview, stdin_tty=stdin_tty):
+                plan = self._publish_plan()
+                args = type("Args", (), {"pack": "demo", "yes": False, "preview": preview})()
+                with patch.object(orchestration, "plan_pack_publish", return_value=plan), patch.object(
+                    orchestration, "execute_pack_publish"
+                ) as execute, patch.object(packctl, "_print_pack_publish_preview"), patch.object(
+                    sys.stdin, "isatty", return_value=stdin_tty
+                ), patch("builtins.input", return_value=answer):
+                    self.assertEqual(packctl.cmd_publish(args), expected)
+                execute.assert_not_called()
 
     def test_justfile_contains_only_development_tasks(self) -> None:
         justfile = (Path(__file__).resolve().parents[1] / "Justfile").read_text(
