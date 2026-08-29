@@ -65,14 +65,8 @@ _packctl() {
       'set-template-loader-version:set template reference loader version'
       'side:set metadata side'
       'profile:apply profiles'
-      'build:build one pack'
-      'build-all:build enabled packs'
       'serve:build and serve one pack'
-      'deploy:build and deploy one pack'
-      'deploy-dry-run:preview one deployment'
-      'restart:restart one server'
-      'publish:build, deploy, and restart'
-      'deploy-all:build and deploy enabled packs'
+      'publish:plan and activate one pack publication'
       'trash-list:list deleted projects'
       'trash-restore:restore a deleted project'
       'trash-purge:purge deleted projects'
@@ -84,7 +78,7 @@ _packctl() {
 
   argument_index=$(( CURRENT - command_index ))
   case "$command:$argument_index" in
-    (show:1|show-deployment:1|show-pack-url:1|set-pack-url:1|clear-pack-url:1|validate-for:1|add:1|remove:1|update:1|loader-version:1|version:1|pin:1|unpin:1|apply-template:1|side:1|profile:1|build:1|serve:1|deploy:1|deploy-dry-run:1|restart:1|publish:1)
+    (show:1|show-deployment:1|show-pack-url:1|set-pack-url:1|clear-pack-url:1|validate-for:1|add:1|remove:1|update:1|loader-version:1|version:1|pin:1|unpin:1|apply-template:1|side:1|profile:1|serve:1|publish:1)
       candidates=("${(@f)$(_packctl_candidates packs)}")
       _describe pack candidates
       ;;
@@ -154,6 +148,9 @@ _packctl() {
       selected_pack="${words[command_index + 1]}"
       candidates=("${(@f)$(_packctl_candidates profiles "$selected_pack")}")
       _describe profile candidates
+      ;;
+    (publish:*)
+      _arguments '--yes[skip confirmation]' '--preview[plan without publishing]'
       ;;
     (new:4|new-template:4)
       candidates=(fabric forge neoforge quilt)

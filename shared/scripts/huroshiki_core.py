@@ -11754,45 +11754,100 @@ def clean_state(
 def project_actions(project_key_value: str) -> tuple[str, ...]:
     kind, _ = split_project_key(project_key_value)
     if kind == "pack":
-        return ("build", "publish", "deploy", "restart")
+        return ("publish",)
     return ("create MODPACK", "validate")
+
+
+def format_pack_publish_plan(plan: PackPublishPlan) -> tuple[str, ...]:
+    """Return deterministic, safe, network-free preview lines for a plan."""
+    target = plan.target
+
+    def endpoint_text(endpoint: object) -> str:
+        host = endpoint.host
+        if ":" in host:
+            host = f"[{host}]"
+        identity = f"{endpoint.user}@" if endpoint.user is not None else ""
+        return f"{identity}{host}:{endpoint.port}"
+
+    lines = [
+        f"Pack: {plan.pack_id}",
+        f"Side: {plan.target_side}",
+        f"Publication endpoint: {endpoint_text(target.publication_endpoint)}",
+        f"Publication root: {target.publication_root}",
+        f"Restart endpoint: {endpoint_text(target.restart.endpoint)}",
+        f"Restart stack/service: {target.restart.stack_dir} / {target.restart.service}",
+        f"Manifest digest: {plan.manifest_digest}",
+        f"Generation: {plan.generation_id}",
+        f"Files: {len(plan.manifest.files)} ({plan.manifest.total_bytes} bytes)",
+    ]
+    lines.extend(
+        f"Warning [{warning.code}]: {warning.message}"
+        for warning in plan.manifest.warnings
+    )
+    lines.append("Files:")
+    preview_limit = 50
+    lines.extend(
+        f"  {entry.relative_path} ({entry.size} bytes, {entry.source_kind})"
+        for entry in plan.manifest.files[:preview_limit]
+    )
+    omitted = len(plan.manifest.files) - preview_limit
+    if omitted > 0:
+        lines.append(f"  ... {omitted} additional files")
+    return tuple(lines)
+
+
+def format_pack_publish_result(
+    result: PackPublishResult | None,
+    error: BaseException | None = None,
+) -> tuple[str, ...]:
+    """Format immutable publication facts without exposing exception internals."""
+    if result is None:
+        return (f"Publication failed: {error}" if error is not None else "Publication failed",)
+    if result.final_status == "published":
+        summary = "Published: publication activated and restart succeeded"
+    elif result.final_status == "restart_failed":
+        summary = "Publication succeeded / generation activated; restart failed"
+    elif result.final_status == "restart_not_started":
+        summary = "Publication succeeded / generation activated; restart did not start"
+    elif result.final_status == "restart_uncertain":
+        summary = "Publication succeeded / generation activated; restart outcome uncertain"
+    elif result.final_status == "cleanup_pending":
+        if result.publication_succeeded:
+            summary = (
+                "Cleanup pending after publication activation; "
+                f"restart status is {result.restart_status}"
+            )
+        else:
+            summary = "Cleanup pending; publication did not complete"
+    elif result.final_status == "cancelled":
+        if result.publication_succeeded:
+            summary = (
+                "Publication cancelled or deadline exceeded after generation activation"
+            )
+        else:
+            summary = "Publication cancelled or deadline exceeded before activation"
+    else:
+        summary = (
+            "Publication did not complete; generation activation was not confirmed"
+        )
+    return (
+        summary,
+        f"Publication status: {result.final_status}",
+        f"Manifest digest: {result.manifest_digest}",
+        f"Generation: {result.generation_id}",
+        f"Restart: {result.restart_status}",
+    )
 
 
 def project_action_confirmation(
     project_key_value: str,
     action: str,
 ) -> tuple[str, ...] | None:
-    kind, project_id = split_project_key(project_key_value)
-    if kind != "pack" or action not in {"deploy", "publish", "restart"}:
+    kind, _ = split_project_key(project_key_value)
+    if kind != "pack":
         return None
-
-    lines = [f"Pack: {project_id}", f"Action: {action}"]
-    if action in {"deploy", "publish"}:
-        lines.append(f"Rsync target: {packctl.distribution_target(project_id)}")
-    if action in {"publish", "restart"}:
-        host, stack, service = packctl.minecraft_server_target(project_id)
-        lines.extend(
-            (
-                f"SSH target: {host}",
-                f"Stack directory: {stack}",
-                f"Compose service: {service}",
-            )
-        )
-    return tuple(lines)
-
-
-def _restart_confirmation(
-    project_id: str,
-    action: str,
-    target: tuple[str, str, str],
-) -> tuple[str, ...]:
-    host, stack, service = target
-    return (
-        f"Pack: {project_id}",
-        f"Action: {action}",
-        f"SSH target: {host}",
-        f"Stack directory: {stack}",
-        f"Compose service: {service}",
+    raise HuroshikiError(
+        f"Pack action {action} has been retired; use the dedicated Publish flow"
     )
 
 
@@ -11803,42 +11858,12 @@ def prepare_deploy_preview(
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
 ) -> ProjectDeployPreview:
-    kind, project_id = split_project_key(project_key_value)
-    if kind != "pack" or action not in {"deploy", "publish"}:
-        raise HuroshikiError(f"Deploy preview is not available for {action}")
-    try:
-        with packctl.ProjectLock(project_key_value, f"{action} preview"):
-            if (
-                packctl._build_pack(
-                    project_id,
-                    cancel_event=cancel_event,
-                    deadline=deadline,
-                )
-                != 0
-            ):
-                raise HuroshikiError("Build failed; deploy preview was not created")
-            preview = packctl._deploy_preview(
-                project_id,
-                cancel_event=cancel_event,
-                deadline=deadline,
-            )
-            restart_target = (
-                packctl.minecraft_server_target(project_id)
-                if action == "publish"
-                else None
-            )
-            return ProjectDeployPreview(
-                project_key_value,
-                action,
-                preview.target,
-                preview.dist_digest,
-                preview.changes,
-                preview.raw_lines,
-                restart_target,
-                preview.snapshot,
-            )
-    except packctl.ConfigError as error:
-        raise HuroshikiError(str(error)) from error
+    kind, _ = split_project_key(project_key_value)
+    if kind == "pack":
+        raise HuroshikiError(
+            f"Pack action {action} has been retired; use the dedicated Publish flow"
+        )
+    raise HuroshikiError(f"Deploy preview is not available for {action}")
 
 
 def discard_deploy_preview(preview: ProjectDeployPreview) -> None:
@@ -11874,86 +11899,9 @@ def run_project_action(
             check=False,
         ).returncode
 
-    if action not in {"build", "deploy", "restart", "publish"}:
-        raise HuroshikiError(f"Unknown project action: {action}")
-    deploy_confirmation = (
-        confirmation if isinstance(confirmation, ProjectDeployPreview) else None
+    raise HuroshikiError(
+        f"Pack action {action} has been retired; use the dedicated Publish flow"
     )
-    try:
-        with packctl.ProjectLock(project_key_value, action):
-            if action in {"deploy", "publish"}:
-                snapshot = (
-                    None
-                    if deploy_confirmation is None
-                    or deploy_confirmation.snapshot is None
-                    else packctl.ensure_safe_state_path(
-                        deploy_confirmation.snapshot,
-                        state_root=packctl.PACKS.parent / ".huroshiki",
-                        repository_root=packctl.PACKS.parent,
-                    )
-                )
-                if (
-                    deploy_confirmation is None
-                    or deploy_confirmation.project_key != project_key_value
-                    or deploy_confirmation.action != action
-                    or packctl.distribution_target(project_id)
-                    != deploy_confirmation.target
-                    or snapshot is None
-                    or packctl.distribution_digest(snapshot)
-                    != deploy_confirmation.dist_digest
-                    or (
-                        action == "publish"
-                        and packctl.minecraft_server_target(project_id)
-                        != deploy_confirmation.restart_target
-                    )
-                ):
-                    raise HuroshikiError(
-                        "Deploy target or distribution changed after preview; action aborted"
-                    )
-                result = packctl._deploy_pack(
-                    project_id,
-                    expected_target=deploy_confirmation.target,
-                    expected_dist_digest=deploy_confirmation.dist_digest,
-                    snapshot=snapshot,
-                    cancel_event=cancel_event,
-                    deadline=deadline,
-                )
-                if result != 0 or action == "deploy":
-                    return result
-                restart_target = packctl.minecraft_server_target(project_id)
-                if restart_target != deploy_confirmation.restart_target:
-                    raise HuroshikiError(
-                        "Restart target changed during deployment; restart aborted"
-                    )
-            elif action == "build":
-                return packctl._build_pack(project_id)
-            else:
-                restart_target = packctl.minecraft_server_target(project_id)
-                if _restart_confirmation(project_id, action, restart_target) != confirmation:
-                    raise HuroshikiError(
-                        "Remote configuration changed after confirmation; action aborted"
-                    )
-
-            if deploy_confirmation is not None:
-                if deploy_confirmation.restart_target is None:
-                    raise HuroshikiError("Confirmed publish has no restart target")
-                host, stack, service = deploy_confirmation.restart_target
-            else:
-                host, stack, service = restart_target
-            remote = (
-                f"cd {shlex.quote(stack)} && docker compose restart "
-                f"{shlex.quote(service)}"
-            )
-            packctl.run(["ssh", "--", host, remote])
-            return 0
-    except packctl.ConfigError as error:
-        raise HuroshikiError(str(error)) from error
-    finally:
-        if deploy_confirmation is not None and deploy_confirmation.snapshot is not None:
-            try:
-                packctl.discard_deploy_snapshot(deploy_confirmation.snapshot)
-            except packctl.ConfigError:
-                pass
 
 
 def update_all(

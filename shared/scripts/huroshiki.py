@@ -81,6 +81,8 @@ APP_TRANSACTION_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 APP_CONTENT_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 CONTENT_WORKER_TIMEOUT_SECONDS = 600.0
 CONTENT_DISCARD_TIMEOUT_SECONDS = 10.0
+PUBLISH_OPERATION_TIMEOUT_SECONDS = 600.0
+PUBLISH_CLEANUP_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass
@@ -139,6 +141,23 @@ class TemplateImportApplyOwner:
     screen: object
 
 
+@dataclass
+class PackPublishOwner:
+    """Application ownership of one publish plan and its bounded lifecycle."""
+    project_key: str
+    cancel_event: threading.Event
+    deadline: float
+    done: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+    plan: core.PackPublishPlan | None = None
+    result: core.PackPublishResult | None = None
+    error: BaseException | None = None
+    progress: core.PackPublishProgress | None = None
+    cleanup_retained: bool = False
+    navigation_pending: bool = False
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+
 class HuroshikiApp(App[None]):
     TITLE = "huroshiki"
     CSS_PATH = "huroshiki.tcss"
@@ -187,6 +206,7 @@ class HuroshikiApp(App[None]):
         self.template_import_apply_workers: dict[
             str, TemplateImportApplyOwner
         ] = {}
+        self.publish_owners: dict[str, PackPublishOwner] = {}
 
     def on_mount(self) -> None:
         if self.initial_project:
@@ -210,6 +230,21 @@ class HuroshikiApp(App[None]):
             APP_TRANSACTION_SHUTDOWN_TIMEOUT_SECONDS,
             APP_CONTENT_SHUTDOWN_TIMEOUT_SECONDS,
         )
+        for owner in tuple(self.publish_owners.values()):
+            owner.cancel_event.set()
+        for project_key, owner in tuple(self.publish_owners.items()):
+            if not owner.done.wait(max(0.0, deadline - time.monotonic())):
+                print(f"Publish worker did not stop before shutdown for {project_key}", file=sys.stderr)
+                continue
+            if owner.thread is not None:
+                owner.thread.join(max(0.0, deadline - time.monotonic()))
+            if owner.thread is not None and owner.thread.is_alive():
+                print(f"Publish worker did not join before shutdown for {project_key}", file=sys.stderr)
+                continue
+            if owner.cleanup_retained and owner.plan is not None:
+                self._retry_publish_cleanup_bounded(project_key, owner, deadline)
+            if not owner.cleanup_retained and self.publish_owners.get(project_key) is owner:
+                self.publish_owners.pop(project_key, None)
         for _thread, _done, cancel_event in tuple(
             self.update_apply_workers.values()
         ):
@@ -515,6 +550,68 @@ class HuroshikiApp(App[None]):
             return
         self.selected_project = project_key
         self.switch_screen(ContentScreen(project_key))
+
+    def open_publish(self, project_key: str, display_name: str | None = None) -> None:
+        if not self.project_is_usable(project_key):
+            return
+        if project_key in self.publish_owners:
+            self.notify("A Publish operation is already active for this pack", severity="warning")
+            return
+        self.selected_project = project_key
+        self.switch_screen(PublishScreen(project_key, display_name=display_name))
+
+    def start_publish_worker(self, owner: PackPublishOwner, target: Callable[[], object]) -> None:
+        if owner.project_key in self.publish_owners and self.publish_owners[owner.project_key] is not owner:
+            raise core.HuroshikiError("A Publish operation is already active for this pack")
+        self.publish_owners[owner.project_key] = owner
+        owner.thread = threading.Thread(
+            target=target,
+            name=f"huroshiki-publish-{owner.project_key.replace(':', '-')}",
+            daemon=False,
+        )
+        owner.thread.start()
+
+    def publish_worker_finished(self, owner: PackPublishOwner) -> bool:
+        """Join a signalled worker without blocking the Textual event loop."""
+        thread = owner.thread
+        if not owner.done.is_set() or thread is None:
+            return False
+        thread.join(0)
+        return not thread.is_alive()
+
+    def release_publish(self, owner: PackPublishOwner) -> None:
+        if not owner.cleanup_retained and self.publish_owners.get(owner.project_key) is owner:
+            self.publish_owners.pop(owner.project_key, None)
+
+    def _retry_publish_cleanup_bounded(self, project_key: str, owner: PackPublishOwner, deadline: float) -> None:
+        if owner.plan is None:
+            return
+        if time.monotonic() >= deadline:
+            print(f"Publish cleanup ownership retained for {project_key}", file=sys.stderr)
+            return
+        done = threading.Event()
+        error: list[BaseException] = []
+        def retry() -> None:
+            try:
+                core.retry_pack_publish_cleanup(owner.plan, deadline=deadline)
+                owner.cleanup_retained = False
+            except BaseException as exc:
+                error.append(exc)
+            finally:
+                done.set()
+        thread = threading.Thread(target=retry, name=f"huroshiki-publish-cleanup-{project_key.replace(':', '-')}", daemon=False)
+        owner.done = done
+        owner.thread = thread
+        thread.start()
+        finished = done.wait(max(0.0, deadline - time.monotonic()))
+        if finished:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        if not finished or thread.is_alive():
+            owner.cleanup_retained = True
+            print(f"Publish cleanup ownership retained for {project_key}", file=sys.stderr)
+        elif error:
+            owner.cleanup_retained = True
+            print(f"Publish cleanup failed for {project_key}: {error[0]}", file=sys.stderr)
 
     def start_content_worker(
         self,
@@ -1555,6 +1652,184 @@ class StateScreen(BaseScreen):
         event.stop()
 
 
+class PublishScreen(ProjectChildScreen, BaseScreen):
+    """Dedicated two-stage Publish UI; the exact plan is the confirmation authority."""
+
+    def __init__(self, project_key: str, *, display_name: str | None = None) -> None:
+        super().__init__()
+        self.project_key = project_key
+        self.display_name = display_name or project_key.split(":", 1)[-1]
+        self.screen_title = f"Publish / {project_key.split(':', 1)[-1]}"
+        self.help_text = "planning: q/Esc cancels  |  confirmation: Enter publish, q/Esc cancel"
+        self.owner = PackPublishOwner(
+            project_key,
+            threading.Event(),
+            time.monotonic() + PUBLISH_OPERATION_TIMEOUT_SECONDS,
+        )
+        self._timer: Timer | None = None
+        self._confirmation_open = False
+        self._navigation_pending = False
+
+    def compose(self) -> ComposeResult:
+        yield from self.compose_header()
+        yield Static("Starting publication planning...", id="publish-status", markup=False)
+        yield from self.compose_footer()
+
+    def on_mount(self) -> None:
+        self._timer = self.set_interval(0.05, self._poll)
+        self.app.start_publish_worker(self.owner, self._plan)
+
+    def _set_progress(self, progress: core.PackPublishProgress) -> None:
+        with self.owner.lock:
+            self.owner.progress = progress
+
+    def _plan(self) -> None:
+        try:
+            self.owner.plan = core.plan_pack_publish(
+                self.project_key.split(":", 1)[-1],
+                target_side="server",
+                cancel_event=self.owner.cancel_event,
+                deadline=self.owner.deadline,
+                progress=self._set_progress,
+            )
+        except BaseException as error:
+            self.owner.error = error
+        finally:
+            self.owner.done.set()
+
+    def _execute(self) -> None:
+        try:
+            if self.owner.plan is None:
+                raise core.HuroshikiError("Publish plan is missing")
+            self.owner.result = core.execute_pack_publish(
+                self.owner.plan,
+                cancel_event=self.owner.cancel_event,
+                deadline=self.owner.deadline,
+                progress=self._set_progress,
+            )
+        except BaseException as error:
+            self.owner.error = error
+            if isinstance(error, core.PackPublishExecutionError):
+                self.owner.result = error.result
+                self.owner.cleanup_retained = error.plan is not None
+        finally:
+            self.owner.done.set()
+
+    def _start_execution(self) -> None:
+        if not self.app.publish_worker_finished(self.owner):
+            raise core.HuroshikiError("Publish planning worker has not terminated")
+        self.owner.done.clear()
+        self.owner.error = None
+        self.owner.thread = None
+        self.app.start_publish_worker(self.owner, self._execute)
+
+    def _poll(self) -> None:
+        progress = self.owner.progress
+        status = "Planning..."
+        if progress is not None:
+            status = f"{progress.phase}{(': ' + progress.detail) if progress.detail else ''}"
+        if not self.owner.done.is_set():
+            self.query_one("#publish-status", Static).update(status)
+            return
+        if not self.app.publish_worker_finished(self.owner):
+            self.query_one("#publish-status", Static).update("Finishing worker cleanup...")
+            return
+        if (
+            self._navigation_pending
+            and self.owner.plan is not None
+            and self.owner.result is None
+            and self.owner.error is None
+        ):
+            self.app.release_publish(self.owner)
+            self.return_to_project()
+            return
+        if self.owner.plan is not None and not self._confirmation_open and self.owner.result is None and self.owner.error is None:
+            self._confirmation_open = True
+            self.query_one("#publish-status", Static).update("Plan ready; awaiting confirmation")
+            preview_lines = list(core.format_pack_publish_plan(self.owner.plan))
+            if self.display_name != self.owner.plan.pack_id:
+                preview_lines[0] = (
+                    f"Pack: {self.owner.plan.pack_id} ({self.display_name})"
+                )
+            self.app.push_screen(
+                ConfirmModal("Confirm Publish", preview_lines),
+                self._confirmed,
+            )
+            return
+        if self._confirmation_open:
+            return
+        if self.owner.result is not None or self.owner.error is not None:
+            lines = core.format_pack_publish_result(self.owner.result, self.owner.error)
+            if self.owner.cleanup_retained:
+                lines = (*lines, "Cleanup pending; r retries cleanup (no publication phase is repeated).")
+            self.query_one("#publish-status", Static).update("\n".join(lines))
+            if not self.owner.cleanup_retained:
+                self.app.release_publish(self.owner)
+            if self._navigation_pending and not self.owner.cleanup_retained:
+                self.app.release_publish(self.owner)
+                self.return_to_project()
+
+    def _confirmed(self, confirmed: bool | None) -> None:
+        self._confirmation_open = False
+        if not confirmed:
+            self.app.release_publish(self.owner)
+            self.return_to_project()
+            return
+        self.query_one("#publish-status", Static).update("Executing exact publish plan...")
+        self._start_execution()
+
+    def _retry_cleanup(self) -> None:
+        if (
+            not self.owner.cleanup_retained
+            or self.owner.plan is None
+            or not self.owner.done.is_set()
+            or not self.app.publish_worker_finished(self.owner)
+        ):
+            return
+        self.owner.done.clear()
+        self.owner.error = None
+        self.owner.cleanup_retained = True
+        def retry() -> None:
+            try:
+                core.retry_pack_publish_cleanup(
+                    self.owner.plan,
+                    deadline=time.monotonic() + PUBLISH_CLEANUP_TIMEOUT_SECONDS,
+                )
+                self.owner.cleanup_retained = False
+                self.owner.result = self.owner.plan.result
+            except BaseException as error:
+                self.owner.error = error
+            finally:
+                self.owner.done.set()
+        self.app.start_publish_worker(self.owner, retry)
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "r":
+            self._retry_cleanup()
+            event.stop()
+        elif event.key in {"q", "escape"}:
+            if self._confirmation_open:
+                self._confirmation_open = False
+                self.app.release_publish(self.owner)
+                self.return_to_project()
+            elif not self.owner.done.is_set() or self.owner.cleanup_retained:
+                self.owner.navigation_pending = True
+                self._navigation_pending = True
+                self.owner.cancel_event.set()
+                self.query_one("#publish-status", Static).update("Cancellation requested; waiting for worker...")
+            else:
+                self.app.release_publish(self.owner)
+                self.return_to_project()
+            event.stop()
+
+    def on_unmount(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+        if not self.owner.done.is_set():
+            self.owner.cancel_event.set()
+
+
 class ProjectScreen(BaseScreen):
     help_text = "i: install  l: list  j/k: move  Enter: run  q: main"
 
@@ -1611,66 +1886,24 @@ class ProjectScreen(BaseScreen):
         if action == "settings":
             self.app.open_settings(self.project_key)
             return
+        if action == "publish":
+            self.app.open_publish(self.project_key, self.project.display_name)
+            return
         if action == "create MODPACK":
             self.app.push_screen(
                 CreateFromTemplateModal(self.project),
                 self.create_from_selected_template,
             )
             return
-        if action in {"deploy", "publish"}:
-            try:
-                with self.app.suspend():
-                    preview = core.prepare_deploy_preview(self.project_key, action)
-            except Exception as error:
-                self.app.notify(str(error), severity="error")
-                return
-            self.app.push_screen(
-                ConfirmModal(
-                    "Confirm deploy preview?",
-                    preview.confirmation_lines,
-                ),
-                lambda confirmed: self.run_confirmed(action, preview, confirmed),
-            )
-            return
-        try:
-            confirmation = core.project_action_confirmation(
-                self.project_key,
-                action,
-            )
-        except Exception as error:
-            self.app.notify(str(error), severity="error")
-            return
-        if confirmation is not None:
-            self.app.push_screen(
-                ConfirmModal("Confirm remote action?", confirmation),
-                lambda confirmed: self.run_confirmed(
-                    action, confirmation, confirmed
-                ),
-            )
-            return
         self.run_action(action)
-
-    def run_confirmed(
-        self,
-        action: str,
-        confirmation: tuple[str, ...] | core.ProjectDeployPreview,
-        confirmed: bool | None,
-    ) -> None:
-        if confirmed:
-            self.run_action(action, confirmation)
-        elif isinstance(confirmation, core.ProjectDeployPreview):
-            core.discard_deploy_preview(confirmation)
 
     def run_action(
         self,
         action: str,
-        confirmation: tuple[str, ...] | core.ProjectDeployPreview | None = None,
     ) -> None:
         try:
             with self.app.suspend():
-                result = core.run_project_action(
-                    self.project_key, action, confirmation
-                )
+                result = core.run_project_action(self.project_key, action)
         except Exception as error:
             self.app.notify(str(error), severity="error")
             return

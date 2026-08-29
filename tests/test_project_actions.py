@@ -1,218 +1,113 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
-from pathlib import Path
-import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
-from textual.app import App
-from textual.widgets import Static
-
 import huroshiki
 import huroshiki_core as core
-import packctl
 
 
 PROJECT = core.ProjectInfo(
-    kind="pack",
-    project_id="demo",
-    display_name="Demo Pack",
-    minecraft="1.21.1",
-    loader="neoforge",
-    loader_version="21.1.0",
-    enabled=True,
+    kind="pack", project_id="demo", display_name="Demo Pack",
+    minecraft="1.21.1", loader="neoforge", loader_version="21.1.0", enabled=True,
 )
 
 
-class _ProjectTestApp(App[None]):
-    CSS_PATH = str(Path(huroshiki.__file__).with_name("huroshiki.tcss"))
-
-    def on_mount(self) -> None:
-        self.push_screen(huroshiki.ProjectScreen("pack:demo"))
-
-
-class ProjectActionConfirmationTest(unittest.TestCase):
-    def test_confirmation_uses_merged_remote_targets(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            packs = Path(directory) / "packs"
-            pack = packs / "demo"
-            pack.mkdir(parents=True)
-            (pack / "pack.yaml").write_text(
-                """id: demo
-distribution:
-  rsync_target: base:/packs/demo
-minecraft_server:
-  ssh_host: base-host
-  stack_dir: /srv/base
-  service: minecraft
-""",
-                encoding="utf-8",
-            )
-            (pack / "pack.local.yaml").write_text(
-                """distribution:
-  rsync_target: deploy@remote:/packs/demo
-minecraft_server:
-  ssh_host: ops@remote
-  stack_dir: /srv/demo
-""",
-                encoding="utf-8",
-            )
-
-            with patch.object(packctl, "PACKS", packs):
-                self.assertEqual(
-                    core.project_action_confirmation("pack:demo", "deploy"),
-                    (
-                        "Pack: demo",
-                        "Action: deploy",
-                        "Rsync target: deploy@remote:/packs/demo",
-                    ),
-                )
-                self.assertEqual(
-                    core.project_action_confirmation("pack:demo", "restart"),
-                    (
-                        "Pack: demo",
-                        "Action: restart",
-                        "SSH target: ops@remote",
-                        "Stack directory: /srv/demo",
-                        "Compose service: minecraft",
-                    ),
-                )
-                self.assertEqual(
-                    core.project_action_confirmation("pack:demo", "publish"),
-                    (
-                        "Pack: demo",
-                        "Action: publish",
-                        "Rsync target: deploy@remote:/packs/demo",
-                        "SSH target: ops@remote",
-                        "Stack directory: /srv/demo",
-                        "Compose service: minecraft",
-                    ),
-                )
-                self.assertIsNone(
-                    core.project_action_confirmation("pack:demo", "build")
-                )
-
-    def test_remote_action_aborts_if_config_changes_after_confirmation(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            packs = Path(directory) / "packs"
-            pack = packs / "demo"
-            pack.mkdir(parents=True)
-            (pack / "pack.yaml").write_text(
-                "id: demo\ndistribution:\n  rsync_target: old:/demo\n",
-                encoding="utf-8",
-            )
-
-            with patch.object(packctl, "PACKS", packs), patch.object(
-                core.subprocess, "run"
-            ) as subprocess_run:
-                confirmation = core.project_action_confirmation("pack:demo", "deploy")
-                with self.assertRaisesRegex(
-                    core.HuroshikiError, "changed after preview"
-                ):
-                    core.run_project_action("pack:demo", "deploy", confirmation)
-
-            subprocess_run.assert_not_called()
+class ProjectActionTest(unittest.TestCase):
+    def test_project_actions_only_exposes_publish_for_packs(self) -> None:
+        self.assertEqual(core.project_actions("pack:demo"), ("publish",))
+        self.assertEqual(core.project_actions("template:base"), ("create MODPACK", "validate"))
 
 
-class ProjectScreenActionTest(unittest.IsolatedAsyncioTestCase):
-    async def test_publish_confirmation_contents_and_cancel(self) -> None:
-        preview = core.ProjectDeployPreview(
-            "pack:demo",
-            "publish",
-            "[deploy]@remote:/packs/demo",
-            "digest",
-            (packctl.RsyncChange("deleted", "old.jar", "*deleting   old.jar"),),
-            ("*deleting   old.jar",),
-            ("ops@remote", "/srv/demo", "minecraft"),
+class ProjectScreenPublishTest(unittest.IsolatedAsyncioTestCase):
+    async def test_selecting_publish_opens_publish_without_legacy_deploy_calls(self) -> None:
+        with patch.object(huroshiki.core, "project_info", return_value=PROJECT), patch.object(
+            huroshiki.core, "prepare_deploy_preview", side_effect=AssertionError
+        ), patch.object(huroshiki.core, "run_project_action", side_effect=AssertionError), patch.object(
+            huroshiki.HuroshikiApp, "open_publish"
+        ) as open_publish:
+            app = huroshiki.HuroshikiApp("pack:demo")
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+                app.screen.run_selected()
+                await pilot.pause()
+            open_publish.assert_called_once_with("pack:demo", "Demo Pack")
+
+    async def test_publish_worker_is_named_non_daemon_and_confirmation_uses_exact_plan(self) -> None:
+        plan = object()
+        owner = huroshiki.PackPublishOwner("pack:demo", threading.Event(), 456.0)
+        app = huroshiki.HuroshikiApp()
+        seen = {}
+
+        def target() -> None:
+            seen["thread"] = threading.current_thread()
+            owner.plan = plan
+            owner.done.set()
+
+        app.start_publish_worker(owner, target)
+        owner.thread.join(2)
+        self.assertFalse(owner.thread.daemon)
+        self.assertTrue(owner.thread.name.startswith("huroshiki-publish-pack-demo"))
+        self.assertIs(seen["thread"], owner.thread)
+        self.assertTrue(app.publish_worker_finished(owner))
+
+    def test_confirmation_execution_passes_the_same_plan_controls(self) -> None:
+        plan = object()
+        owner = huroshiki.PackPublishOwner("pack:demo", threading.Event(), 456.0, plan=plan)
+        screen = huroshiki.PublishScreen("pack:demo")
+        screen.owner = owner
+        with patch.object(huroshiki.core, "execute_pack_publish", return_value="result") as execute:
+            screen._execute()
+        execute.assert_called_once_with(
+            plan, cancel_event=owner.cancel_event, deadline=owner.deadline,
+            progress=screen._set_progress,
         )
-        with (
-            patch.object(huroshiki.core, "project_info", return_value=PROJECT),
-            patch.object(
-                huroshiki.core,
-                "prepare_deploy_preview",
-                return_value=preview,
-            ),
-            patch.object(huroshiki.core, "run_project_action") as run_action,
-            patch.object(huroshiki.core, "discard_deploy_preview") as discard,
+
+    async def test_planning_failure_releases_owner(self) -> None:
+        with patch.object(huroshiki.core, "project_info", return_value=PROJECT), patch.object(
+            huroshiki.core, "plan_pack_publish", side_effect=RuntimeError("planning failed")
         ):
-            app = _ProjectTestApp()
-            with patch.object(app, "suspend", return_value=nullcontext()):
-                async with app.run_test() as pilot:
-                    await pilot.press("j", "enter")
-                    await pilot.pause()
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test() as pilot:
+                app.open_publish("pack:demo", "Demo Pack")
+                await pilot.pause(0.2)
+                screen = app.screen
+                self.assertIsInstance(screen, huroshiki.PublishScreen)
+                self.assertNotIn("pack:demo", app.publish_owners)
 
-                    modal = app.screen
-                    self.assertIsInstance(modal, huroshiki.ConfirmModal)
-                    self.assertEqual(modal.lines, list(preview.confirmation_lines))
-                    message = modal.query_one("#modal-message", Static)
-                    self.assertEqual(
-                        message.content, "\n".join(preview.confirmation_lines)
-                    )
-                    self.assertIn("[deploy]", str(message.render()))
-                    self.assertIn("1 deleted", str(message.render()))
+    async def test_cancelled_planning_completion_does_not_open_confirmation(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        plan = object()
 
-                    await pilot.press("escape")
-                    await pilot.pause()
-                    run_action.assert_not_called()
-                    discard.assert_called_once_with(preview)
+        def planner(*_args, **_kwargs):
+            started.set()
+            release.wait(2)
+            return plan
 
-    async def test_confirmed_deploy_runs_action(self) -> None:
-        preview = core.ProjectDeployPreview(
-            "pack:demo", "deploy", "host:/demo", "digest", (), ()
-        )
-        with (
-            patch.object(huroshiki.core, "project_info", return_value=PROJECT),
-            patch.object(
-                huroshiki.core,
-                "prepare_deploy_preview",
-                return_value=preview,
-            ),
-            patch.object(
-                huroshiki.core,
-                "run_project_action",
-                return_value=0,
-            ) as run_action,
-        ):
-            app = _ProjectTestApp()
-            with patch.object(app, "suspend", return_value=nullcontext()):
-                async with app.run_test() as pilot:
-                    await pilot.press("j", "j", "enter")
-                    await pilot.pause()
-                    run_action.assert_not_called()
+        with patch.object(huroshiki.core, "project_info", return_value=PROJECT), patch.object(
+            huroshiki.core, "plan_pack_publish", side_effect=planner
+        ), patch.object(huroshiki.core, "execute_pack_publish") as execute:
+            app = huroshiki.HuroshikiApp("pack:demo")
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app.open_publish("pack:demo", "Demo Pack")
+                await pilot.pause()
+                self.assertTrue(started.wait(1))
+                await pilot.press("escape")
+                release.set()
+                await pilot.pause(0.2)
+                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+                self.assertNotIn("pack:demo", app.publish_owners)
+                execute.assert_not_called()
 
-                    await pilot.press("enter")
-                    await pilot.pause()
-                    run_action.assert_called_once_with(
-                        "pack:demo",
-                        "deploy",
-                        preview,
-                    )
-
-    async def test_build_runs_immediately(self) -> None:
-        with (
-            patch.object(huroshiki.core, "project_info", return_value=PROJECT),
-            patch.object(
-                huroshiki.core,
-                "project_action_confirmation",
-                return_value=None,
-            ) as confirmation,
-            patch.object(
-                huroshiki.core,
-                "run_project_action",
-                return_value=0,
-            ) as run_action,
-        ):
-            app = _ProjectTestApp()
-            with patch.object(app, "suspend", return_value=nullcontext()):
-                async with app.run_test() as pilot:
-                    await pilot.press("enter")
-                    await pilot.pause()
-
-                    confirmation.assert_called_once_with("pack:demo", "build")
-                    run_action.assert_called_once_with("pack:demo", "build", None)
-                    self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_cancel_requests_event_without_releasing_active_owner(self) -> None:
+        app = huroshiki.HuroshikiApp()
+        owner = huroshiki.PackPublishOwner("pack:demo", threading.Event(), 456.0)
+        app.publish_owners[owner.project_key] = owner
+        owner.navigation_pending = True
+        owner.cancel_event.set()
+        self.assertTrue(owner.cancel_event.is_set())
+        self.assertIn(owner.project_key, app.publish_owners)

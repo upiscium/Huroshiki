@@ -5302,33 +5302,101 @@ def cmd_restart(args: argparse.Namespace) -> int:
 
 
 def cmd_publish(args: argparse.Namespace) -> int:
-    with ProjectLock(f"pack:{args.pack}", "publish"):
-        if _build_pack(args.pack) != 0:
-            return 1
-        config = load_pack_config(args.pack)
-        deploy_target = distribution_target_from_config(config, args.pack)
-        restart_target = minecraft_server_target_from_config(config, args.pack)
-        snapshot = _make_deploy_snapshot(args.pack, distribution_root(args.pack))
-        try:
-            digest = distribution_digest(snapshot)
-            result = _deploy_pack(
-                args.pack,
-                expected_target=deploy_target,
-                expected_dist_digest=digest,
-                snapshot=snapshot,
-                confirmed_target=deploy_target,
-            )
-            if result != 0:
-                return result
-            host, stack, service = restart_target
-            remote = (
-                f"cd {shlex.quote(stack)} && docker compose restart "
-                f"{shlex.quote(service)}"
-            )
-            run(["ssh", "--", host, remote])
+    # Import lazily because the Core facade uses packctl as its validation and
+    # filesystem authority.
+    import huroshiki_core as publish_core
+
+    cancel_event = threading.Event()
+    plan = None
+    try:
+        plan = publish_core.plan_pack_publish(
+            args.pack,
+            cancel_event=cancel_event,
+        )
+        _print_pack_publish_preview(plan, publish_core)
+        if args.preview:
             return 0
-        finally:
-            discard_deploy_snapshot(snapshot)
+        if not args.yes:
+            if not sys.stdin.isatty():
+                print(
+                    "error: publish requires interactive confirmation; use --yes",
+                    file=sys.stderr,
+                )
+                return 2
+            if input("Publish this plan? [y/N]: ").strip().lower() not in {
+                "y",
+                "yes",
+            }:
+                return 0
+        result = publish_core.execute_pack_publish(
+            plan,
+            cancel_event=plan.cancel_event,
+            deadline=plan.deadline,
+        )
+    except publish_core.PackPublishCleanupError as error:
+        interrupted = isinstance(error.primary_error, KeyboardInterrupt)
+        if error.plan is None:
+            _print_pack_publish_error(error, publish_core)
+            return 130 if interrupted else 1
+        try:
+            publish_core.retry_pack_publish_cleanup(error.plan)
+        except publish_core.PackPublishCleanupError as retry_error:
+            _print_pack_publish_error(retry_error, publish_core)
+            return 130 if interrupted else 1
+        except KeyboardInterrupt:
+            error.plan.cancel_event.set()
+            print(
+                "error: publish cleanup interrupted; cleanup remains pending",
+                file=sys.stderr,
+            )
+            return 130
+        result = error.plan.result
+        if result is None:
+            print("error: publish cleanup completed without a result", file=sys.stderr)
+            return 130 if interrupted else 1
+        if interrupted:
+            _print_pack_publish_result(result, publish_core)
+            return 130
+    except publish_core.PackPublishExecutionError as error:
+        _print_pack_publish_error(error, publish_core)
+        return 1
+    except KeyboardInterrupt:
+        cancel_event.set()
+        if plan is not None and plan.result is not None:
+            _print_pack_publish_result(plan.result, publish_core)
+        else:
+            print("error: publish cancelled", file=sys.stderr)
+        return 130
+
+    if result.final_status == "published":
+        print(f"Published {result.pack_id} generation {result.generation_id}")
+        return 0
+    _print_pack_publish_result(result, publish_core)
+    return 1
+
+
+def _print_pack_publish_preview(plan: object, publish_core: object) -> None:
+    for line in publish_core.format_pack_publish_plan(plan):
+        print(line)
+
+
+def _print_pack_publish_result(result: object, publish_core: object) -> None:
+    for line in publish_core.format_pack_publish_result(result):
+        print(line, file=sys.stderr)
+
+
+def _print_pack_publish_error(error: BaseException, publish_core: object) -> None:
+    result = getattr(error, "result", None)
+    if result is not None:
+        _print_pack_publish_result(result, publish_core)
+        return
+    if isinstance(error, publish_core.PackPublishDeadlineExceeded):
+        print("error: publish deadline exceeded", file=sys.stderr)
+        return
+    if isinstance(error, publish_core.PackPublishCancelled):
+        print("error: publish cancelled", file=sys.stderr)
+        return
+    print(f"error: {error}", file=sys.stderr)
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -5848,11 +5916,6 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("pack")
     item.add_argument("names", nargs="+")
     item.set_defaults(func=cmd_profile)
-    item = sub.add_parser("build")
-    item.add_argument("pack")
-    item.set_defaults(func=cmd_build)
-    item = sub.add_parser("build-all")
-    item.set_defaults(func=cmd_build_all)
     item = sub.add_parser("show-url-policy")
     item.add_argument("kind", choices=("pack", "template"))
     item.add_argument("project")
@@ -5874,26 +5937,17 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("template")
     item.add_argument("loader_version")
     item.set_defaults(func=cmd_set_template_loader_version)
-    item = sub.add_parser("deploy")
-    item.add_argument("pack")
-    item.add_argument("--expected-target")
-    item.add_argument("--expected-dist-digest")
-    item.set_defaults(func=cmd_deploy)
-    item = sub.add_parser("deploy-dry-run")
-    item.add_argument("pack")
-    item.set_defaults(func=cmd_deploy_dry_run)
-    item = sub.add_parser("restart")
-    item.add_argument("pack")
-    item.set_defaults(func=cmd_restart)
     item = sub.add_parser("publish")
     item.add_argument("pack")
+    item.add_argument("--yes", action="store_true", help="skip confirmation")
+    item.add_argument(
+        "--preview", action="store_true", help="plan and print without publishing"
+    )
     item.set_defaults(func=cmd_publish)
     item = sub.add_parser("serve")
     item.add_argument("pack")
     item.add_argument("--port", type=int, default=8080)
     item.set_defaults(func=cmd_serve)
-    item = sub.add_parser("deploy-all")
-    item.set_defaults(func=cmd_deploy_all)
     item = sub.add_parser("trash-list")
     item.set_defaults(func=cmd_trash_list)
     item = sub.add_parser("trash-restore")
@@ -5913,8 +5967,38 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+_RETIRED_COMMANDS = frozenset(
+    {"build", "build-all", "deploy", "deploy-dry-run", "deploy-all", "restart"}
+)
+
+
+def _retired_command(argv: Sequence[str]) -> str | None:
+    skip = False
+    for value in argv:
+        if skip:
+            skip = False
+            continue
+        if value == "--root":
+            skip = True
+            continue
+        if value.startswith("--root="):
+            continue
+        if value.startswith("-"):
+            continue
+        return value if value in _RETIRED_COMMANDS else None
+    return None
+
+
 def main() -> int:
-    args = parser().parse_args()
+    argv = sys.argv[1:]
+    retired = _retired_command(argv)
+    if retired is not None:
+        print(
+            f"packctl {retired} has been removed. Use packctl publish <pack>.",
+            file=sys.stderr,
+        )
+        return 2
+    args = parser().parse_args(argv)
     try:
         return args.func(args)
     except ConfigError as error:

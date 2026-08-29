@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
-import subprocess
 import tempfile
-import threading
-import time
 import unittest
 from unittest.mock import patch
 
@@ -166,204 +163,23 @@ sent 123 bytes  received 45 bytes
             snapshot_root = Path(directory) / ".huroshiki" / "deploy-snapshots"
             self.assertFalse(tuple(snapshot_root.iterdir()))
 
-    def test_core_preview_threads_cancel_and_deadline(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            packs = Path(directory) / "packs"
-            (packs / "demo").mkdir(parents=True)
-            (packs / "demo" / "pack.yaml").write_text("id: demo\n")
-            cancel = threading.Event()
-            deadline = time.monotonic() + 10
-            preview = packctl.DeployPreview(
-                "host:/demo", "digest", (), (), Path(directory) / "snapshot"
-            )
-            with patch.object(packctl, "PACKS", packs), patch.object(
-                packctl, "_build_pack", return_value=0
-            ) as build, patch.object(
-                packctl, "_deploy_preview", return_value=preview
-            ) as deploy:
-                result = core.prepare_deploy_preview(
-                    "pack:demo",
-                    "deploy",
-                    cancel_event=cancel,
-                    deadline=deadline,
-                )
-
-        self.assertEqual(result.target, "host:/demo")
-        self.assertIs(build.call_args.kwargs["cancel_event"], cancel)
-        self.assertEqual(build.call_args.kwargs["deadline"], deadline)
-        self.assertIs(deploy.call_args.kwargs["cancel_event"], cancel)
-        self.assertEqual(deploy.call_args.kwargs["deadline"], deadline)
-
-
-class ConfirmedDeployTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
-        self.packs = self.root / "packs"
-        self.snapshot = self.root / ".huroshiki" / "deploy-snapshots" / "snapshot"
-        self.snapshot.mkdir(parents=True)
-        (self.snapshot / "payload").write_text("previewed", encoding="utf-8")
-        self.digest = packctl.distribution_digest(self.snapshot)
-
-    def tearDown(self) -> None:
-        self.temp.cleanup()
-
-    def preview(self) -> core.ProjectDeployPreview:
-        return core.ProjectDeployPreview(
-            "pack:demo", "deploy", "host:/demo", self.digest, (), (), None,
-            self.snapshot,
-        )
-
-    def test_target_change_aborts_without_execution(self) -> None:
-        with patch.object(
-            packctl, "distribution_target", return_value="other:/demo"
-        ), patch.object(packctl, "PACKS", self.packs), patch.object(
-            packctl, "run_rsync_process"
-        ) as run:
-            with self.assertRaisesRegex(core.HuroshikiError, "changed after preview"):
-                core.run_project_action("pack:demo", "deploy", self.preview())
-        run.assert_not_called()
-
-    def test_dist_change_aborts_without_execution(self) -> None:
-        with patch.object(
-            packctl, "distribution_target", return_value="host:/demo"
-        ), patch.object(packctl, "PACKS", self.packs), patch.object(
-            packctl, "distribution_digest", return_value="changed"
-        ), patch.object(packctl, "run_rsync_process") as run:
-            with self.assertRaisesRegex(core.HuroshikiError, "changed after preview"):
-                core.run_project_action("pack:demo", "deploy", self.preview())
-        run.assert_not_called()
-
-    def test_confirmed_preview_executes_guarded_deploy(self) -> None:
-        completed = packctl.BoundedProcessResult(0, "", "", False, False)
-        with patch.object(
-            packctl, "distribution_target", return_value="host:/demo"
-        ), patch.object(packctl, "PACKS", self.packs), patch.object(
-            packctl, "run_rsync_process", return_value=completed
-        ) as run:
-            result = core.run_project_action("pack:demo", "deploy", self.preview())
-
-        self.assertEqual(result, 0)
-        self.assertNotIn("--dry-run", run.call_args.args[0])
-        self.assertEqual(run.call_args.kwargs.get("shell", False), False)
-        self.assertIn("-e", run.call_args.args[0])
-        self.assertIn("BatchMode=yes", run.call_args.args[0][run.call_args.args[0].index("-e") + 1])
-        self.assertRegex(run.call_args.args[0][run.call_args.args[0].index("-e") + 1], r"ConnectTimeout=\d+")
-        self.assertEqual(run.call_args.args[0][-1], "host:/demo/")
-        self.assertFalse(self.snapshot.exists())
-
-    def test_remote_target_validation_accepts_supported_forms(self) -> None:
-        for target in (
-            "alias:/srv/demo",
-            "user@example.com:/srv/demo",
-            "[2001:db8::1]:/srv/demo",
-            "user@[2001:db8::1]:/srv/demo",
-        ):
-            self.assertEqual(packctl.validate_rsync_target(target), target)
-
-    def test_remote_target_validation_rejects_local_and_unsafe_forms(self) -> None:
-        for target in (
-            "/tmp/demo",
-            "relative/path",
-            "-e sh:/tmp",
-            "host:relative",
-            "host:/tmp demo",
-            "host:/tmp\n--delete",
-            "[not-ipv6]:/tmp",
-        ):
-            with self.subTest(target=target), self.assertRaises(ValueError):
-                packctl.validate_rsync_target(target)
-
-    def test_deploy_reads_confirmed_snapshot_when_live_dist_mutates(self) -> None:
-        completed = subprocess.CompletedProcess([], 0)
-        live = self.root / "live"
-        live.mkdir()
-        (live / "payload").write_text("changed", encoding="utf-8")
-        seen: list[str] = []
-
-        def fake_run(command, **kwargs):
-            seen.append((Path(command[-2]) / "payload").read_text(encoding="utf-8"))
-            return completed
-
-        with patch.object(packctl, "PACKS", self.packs), patch.object(
-            packctl, "distribution_target", return_value="host:/demo"
-        ), patch.object(packctl, "run_rsync_process", side_effect=fake_run):
-            core.run_project_action("pack:demo", "deploy", self.preview())
-
-        self.assertEqual(seen, ["previewed"])
-
-    def test_core_deploy_threads_cancel_and_deadline(self) -> None:
-        cancel = threading.Event()
-        deadline = time.monotonic() + 10
-        with patch.object(
-            packctl, "distribution_target", return_value="host:/demo"
-        ), patch.object(packctl, "PACKS", self.packs), patch.object(
-            packctl, "_deploy_pack", return_value=0
-        ) as deploy:
-            result = core.run_project_action(
-                "pack:demo",
-                "deploy",
-                self.preview(),
-                cancel_event=cancel,
-                deadline=deadline,
-            )
-
-        self.assertEqual(result, 0)
-        self.assertIs(deploy.call_args.kwargs["cancel_event"], cancel)
-        self.assertEqual(deploy.call_args.kwargs["deadline"], deadline)
-
-    def test_publish_revalidates_restart_target_after_rsync(self) -> None:
-        preview = core.ProjectDeployPreview(
-            "pack:demo",
-            "publish",
-            "host:/demo",
-            self.digest,
-            (),
-            (),
-            ("server", "/srv/demo", "minecraft"),
-            self.snapshot,
-        )
-        commands: list[list[str]] = []
-
-        def fake_rsync(command, **kwargs):
-            commands.append(command)
-            return packctl.BoundedProcessResult(0, "", "", False, False)
-
-        def fake_run(command, **kwargs):
-            commands.append(command)
-            return None
-
-        with patch.object(packctl, "PACKS", self.packs), patch.object(
-            packctl, "distribution_target", return_value="host:/demo"
-        ), patch.object(
-            packctl,
-            "minecraft_server_target",
-            side_effect=[
-                ("server", "/srv/demo", "minecraft"),
-                ("changed", "/srv/demo", "minecraft"),
-            ],
-        ), patch.object(
-            packctl, "run_rsync_process", side_effect=fake_rsync
-        ), patch.object(packctl, "run", side_effect=fake_run):
-            with self.assertRaisesRegex(core.HuroshikiError, "changed during deployment"):
-                core.run_project_action("pack:demo", "publish", preview)
-
-        self.assertEqual(len(commands), 1)
-        self.assertEqual(commands[0][0], "rsync")
-
-    def test_restart_reads_configuration_once_and_executes_confirmed_tuple(self) -> None:
-        target = ("server", "/srv/demo", "minecraft")
-        confirmation = core._restart_confirmation("demo", "restart", target)
-        with patch.object(packctl, "PACKS", self.packs), patch.object(
-            packctl, "minecraft_server_target", return_value=target
-        ) as read_target, patch.object(packctl, "run") as run:
-            result = core.run_project_action("pack:demo", "restart", confirmation)
-
-        self.assertEqual(result, 0)
-        read_target.assert_called_once_with("demo")
-        run.assert_called_once_with(
-            ["ssh", "--", "server", "cd /srv/demo && docker compose restart minecraft"]
-        )
+class RetiredCoreDeploymentTest(unittest.TestCase):
+    def test_retired_pack_action_apis_fail_without_legacy_side_effects(self) -> None:
+        for action in ("build", "deploy", "publish", "restart"):
+            with self.subTest(action=action), patch.object(
+                packctl, "_build_pack"
+            ) as build, patch.object(packctl, "_deploy_pack") as deploy, patch.object(
+                packctl, "run"
+            ) as run:
+                with self.assertRaisesRegex(core.HuroshikiError, "retired"):
+                    core.run_project_action("pack:demo", action)
+                with self.assertRaisesRegex(core.HuroshikiError, "retired"):
+                    core.project_action_confirmation("pack:demo", action)
+                with self.assertRaisesRegex(core.HuroshikiError, "retired"):
+                    core.prepare_deploy_preview("pack:demo", action)
+                build.assert_not_called()
+                deploy.assert_not_called()
+                run.assert_not_called()
 
 
 if __name__ == "__main__":
