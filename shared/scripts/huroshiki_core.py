@@ -46,6 +46,7 @@ from pack_migration_roots import (
     PackRootRecord,
     PackMigrationRoot,
     PackMigrationRootError,
+    PackMigrationRootSelection,
     ROOT_MANIFEST_PATH,
     extract_pack_migration_roots,
     ensure_pack_root_manifest_ignored,
@@ -76,16 +77,6 @@ from mod_version_overrides import (
     write_mod_version_overrides,
 )
 
-if TYPE_CHECKING:
-    from pack_migration_conflicts import (
-        PackMigrationConflictResolutionResult,
-        PackMigrationResolutionRequest,
-    )
-    from pack_migration_resolution import (
-        PackMigrationProgress,
-        PackMigrationResolutionPlan,
-    )
-    from pack_migration_roots import PackMigrationRootSelection
 from content_operations import (
     CONTENT_EDITOR_MAX_BYTES,
     ContentBrowseResult,
@@ -210,9 +201,16 @@ from portable_paths import (
     portable_relative_path_key,
 )
 from pack_migration import (
+    PackMigrationCancelled,
+    PackMigrationCleanupError,
+    PackMigrationDeadlineExceeded,
+    PackMigrationError,
     PackMigrationPlan,
+    PackMigrationPlanningError,
     PackMigrationPublicationPlan,
+    PackMigrationPublicationError,
     PackMigrationSourceSnapshot,
+    PackMigrationStale,
     PackMigrationTarget,
     apply_pack_copy_migration_at as _apply_pack_copy_migration_at,
     apply_pack_migration_publication as _apply_pack_migration_publication,
@@ -222,6 +220,69 @@ from pack_migration import (
     prepare_pack_migration_publication as _prepare_pack_migration_publication,
     retry_pack_migration_cleanup as _retry_pack_migration_cleanup,
 )
+if TYPE_CHECKING:
+    from pack_migration_conflicts import (
+        PackMigrationConflictResolutionError,
+        PackMigrationConflictResolutionResult,
+        PackMigrationRemovedRoot,
+        PackMigrationReplacedRoot,
+        PackMigrationResolutionRequest,
+        PackMigrationRootResolution,
+    )
+    from pack_migration_resolution import (
+        PackMigrationDependencyDelta,
+        PackMigrationDependencyEntry,
+        PackMigrationProgress,
+        PackMigrationResolutionCancelled,
+        PackMigrationResolutionDeadlineExceeded,
+        PackMigrationResolutionError,
+        PackMigrationResolutionPlan,
+        PackMigrationResolvedRoot,
+        PackMigrationUnresolvedRoot,
+        UrlMigrationCompatibility,
+    )
+    from pack_migration_version_intent import (
+        PackMigrationVersionIntentError,
+        PackMigrationVersionIntentFacts,
+        PackMigrationVersionIntentIssue,
+    )
+
+
+_LAZY_MIGRATION_EXPORTS = {
+    "PackMigrationConflictResolutionError": "pack_migration_conflicts",
+    "PackMigrationConflictResolutionResult": "pack_migration_conflicts",
+    "PackMigrationRemovedRoot": "pack_migration_conflicts",
+    "PackMigrationReplacedRoot": "pack_migration_conflicts",
+    "PackMigrationResolutionRequest": "pack_migration_conflicts",
+    "PackMigrationRootResolution": "pack_migration_conflicts",
+    "PackMigrationDependencyDelta": "pack_migration_resolution",
+    "PackMigrationDependencyEntry": "pack_migration_resolution",
+    "PackMigrationProgress": "pack_migration_resolution",
+    "PackMigrationResolutionCancelled": "pack_migration_resolution",
+    "PackMigrationResolutionDeadlineExceeded": "pack_migration_resolution",
+    "PackMigrationResolutionError": "pack_migration_resolution",
+    "PackMigrationResolutionPlan": "pack_migration_resolution",
+    "PackMigrationResolvedRoot": "pack_migration_resolution",
+    "PackMigrationUnresolvedRoot": "pack_migration_resolution",
+    "UrlMigrationCompatibility": "pack_migration_resolution",
+    "PackMigrationVersionIntentError": "pack_migration_version_intent",
+    "PackMigrationVersionIntentFacts": "pack_migration_version_intent",
+    "PackMigrationVersionIntentIssue": "pack_migration_version_intent",
+}
+
+
+def __getattr__(name: str) -> object:
+    """Load migration result/choice models without a Core↔resolver import cycle."""
+    module_name = _LAZY_MIGRATION_EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    value = getattr(importlib.import_module(module_name), name)
+    globals()[name] = value
+    return value
+
+
 from pack_publish import (
     PackPublishCancelled,
     PackPublishDeadlineExceeded,
@@ -6020,6 +6081,18 @@ def commit_pack_migration_root_selection(
     )
 
 
+def create_pack_migration_resolution_request(
+    plan: PackMigrationPlan,
+    resolutions: tuple[PackMigrationRootResolution, ...],
+) -> PackMigrationResolutionRequest:
+    """Bind conflict choices to the current migration resolution authority."""
+    from pack_migration_conflicts import (
+        create_pack_migration_resolution_request as create_request,
+    )
+
+    return create_request(plan, resolutions)
+
+
 def resolve_pack_migration_conflicts(
     plan: PackMigrationPlan,
     request: "PackMigrationResolutionRequest",
@@ -8979,6 +9052,15 @@ def _update_exact_selection(
         project = canonical_modrinth_id(project_id, "Modrinth project ID")
         artifact = canonical_modrinth_id(artifact_id, "Modrinth version ID")
     return ExactModArtifactSelection(provider, project, artifact)
+
+
+def exact_mod_artifact_selection(
+    provider: str,
+    project_id: str,
+    artifact_id: str,
+) -> ExactModArtifactSelection:
+    """Create one canonical exact provider selection for shared Core workflows."""
+    return _update_exact_selection(provider, project_id, artifact_id)
 
 
 def _prospective_update_reachability(
@@ -12117,6 +12199,30 @@ def _run_noninteractive_packwiz(
     return result
 
 
+def run_noninteractive_packwiz(
+    command: list[str],
+    *,
+    cwd: Path,
+    cancel_event: threading.Event | None,
+    deadline: float,
+    label: str,
+    process_result_callback: Callable[[BoundedProcessResult], None] | None = None,
+    project_id: str | None = None,
+    operation: str = "packwiz",
+) -> ResolverProcessResult:
+    """Run one bounded noninteractive Packwiz command for shared Core workflows."""
+    return _run_noninteractive_packwiz(
+        command,
+        cwd=cwd,
+        cancel_event=cancel_event,
+        deadline=deadline,
+        label=label,
+        process_result_callback=process_result_callback,
+        project_id=project_id,
+        operation=operation,
+    )
+
+
 TEMPLATE_RESOLVER_TIMEOUT_SECONDS = PACKWIZ_PROCESS_TIMEOUT_SECONDS
 RESOLVER_POLL_SECONDS = PROCESS_POLL_SECONDS
 RESOLVER_TERMINATE_GRACE_SECONDS = PROCESS_TERMINATE_GRACE_SECONDS
@@ -12474,6 +12580,14 @@ def _verify_exact_root_metadata(
             f"{selection.identity_label} artifact {selection.artifact_id}"
         )
     return root
+
+
+def verify_exact_mod_metadata(
+    selection: ExactModArtifactSelection,
+    metadata: Sequence[ResolvedMetadata],
+) -> ResolvedMetadata:
+    """Verify that resolved metadata retains the requested exact artifact."""
+    return _verify_exact_root_metadata(selection, metadata)
 
 
 def resolve_exact_mod_closure(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 import os
 from pathlib import Path
 import stat
@@ -46,6 +47,20 @@ from provider_identity import (
     canonical_identity,
     parse_provider_metadata,
 )
+from pack_migration_version_intent import (
+    PackMigrationVersionIntentError,
+    PackMigrationVersionIntentFacts,
+    PackMigrationVersionIntentIssue,
+    DetachedVersionIntentMetadata,
+    intent_by_identity,
+    read_detached_version_intent,
+    validate_detached_version_intent,
+)
+from mod_version_overrides import (
+    ensure_mod_version_overrides_ignored,
+    serialize_mod_version_overrides,
+    write_mod_version_overrides,
+)
 
 
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -78,6 +93,7 @@ UnresolvedReason = Literal[
     "filename-collision",
     "identity-collision",
     "root-provenance-required",
+    "version-intent-blocked",
 ]
 
 
@@ -189,6 +205,9 @@ class PackMigrationResolutionPlan:
     state: Literal["resolved", "resolution-required"]
     provenance_required: bool = False
     resolution_attempt: int = 0
+    version_intent_facts: PackMigrationVersionIntentFacts = PackMigrationVersionIntentFacts()
+    version_intent_issues: tuple[PackMigrationVersionIntentIssue, ...] = ()
+    version_intent_digest: str = ""
 
     def diagnostic_summary(self) -> dict[str, object]:
         delta = self.dependency_delta
@@ -202,6 +221,8 @@ class PackMigrationResolutionPlan:
             "path_collisions": len(self.path_collisions),
             "filename_collisions": len(self.filename_collisions),
             "resolution_attempt": self.resolution_attempt,
+            "version_intent_digest": self.version_intent_digest,
+            "version_intent_issues": len(self.version_intent_issues),
             "dependency_delta": {
                 "added": len(delta.added),
                 "removed": len(delta.removed),
@@ -793,7 +814,8 @@ def commit_pack_migration_root_selection_at(
         if deadline is not None
         else time.monotonic() + PACK_MIGRATION_TIMEOUT_SECONDS
     )
-    checkpoint = lambda: _checkpoint(cancel_event, effective_deadline)
+    operation_event = cancel_event if cancel_event is not None else threading.Event()
+    checkpoint = lambda: _checkpoint(operation_event, effective_deadline)
     with plan._lock:
         resolution = plan.resolution
         if (
@@ -880,7 +902,7 @@ def commit_pack_migration_root_selection_at(
         _validate_live_source(
             plan,
             repository_root,
-            cancel_event,
+            operation_event,
             effective_deadline,
         )
         detached_source = plan.source_snapshot_root / "source"
@@ -918,7 +940,7 @@ def commit_pack_migration_root_selection_at(
                 packctl.run_packwiz(
                     ["packwiz", "refresh"],
                     cwd=provenance_source,
-                    cancel_event=cancel_event,
+                    cancel_event=operation_event,
                     deadline=effective_deadline,
                     project_id=plan.target.target_id,
                     operation="migration-provenance-refresh",
@@ -940,7 +962,7 @@ def commit_pack_migration_root_selection_at(
             _validate_live_source(
                 plan,
                 repository_root,
-                cancel_event,
+                operation_event,
                 effective_deadline,
             )
             _commit_root_provenance_source(
@@ -977,7 +999,8 @@ def _resolve_effective_root_set(
         if deadline is not None
         else time.monotonic() + PACK_MIGRATION_TIMEOUT_SECONDS
     )
-    checkpoint = lambda: _checkpoint(cancel_event, effective_deadline)
+    operation_event = cancel_event if cancel_event is not None else threading.Event()
+    checkpoint = lambda: _checkpoint(operation_event, effective_deadline)
     with plan._lock:
         conflict_retry = roots is not None and getattr(plan, "_active_resolution_request", None) is not None
         if plan.state != "staged" and not (conflict_retry and plan.state == "resolving"):
@@ -1002,7 +1025,7 @@ def _resolve_effective_root_set(
                 plan.source_key,
                 plan.source_root,
                 repository_root,
-                cancel_event=cancel_event,
+                cancel_event=operation_event,
                 deadline=effective_deadline,
             )
             if not _same_snapshot(live_source, plan.source_snapshot):
@@ -1035,6 +1058,36 @@ def _resolve_effective_root_set(
             ):
                 raise PackMigrationStale("Detached Packwiz source was replaced")
             try:
+                detached_overrides = read_detached_version_intent(
+                    detached_source, checkpoint=checkpoint
+                )
+                detached_metadata = (
+                    tuple(
+                        DetachedVersionIntentMetadata(
+                            entry.relative_path,
+                            _read_relative_file(
+                                detached_source,
+                                detached_source_scan,
+                                entry.relative_path,
+                                max_bytes=2 * 1024 * 1024,
+                            ),
+                        )
+                        for entry in detached_source_scan.entries
+                        if entry.kind == "file"
+                        and entry.relative_path.name.endswith(".pw.toml")
+                    )
+                    if detached_overrides
+                    else ()
+                )
+                intent_facts = validate_detached_version_intent(
+                    detached_source,
+                    metadata=detached_metadata,
+                    checkpoint=checkpoint,
+                    overrides=detached_overrides,
+                )
+            except PackMigrationVersionIntentError as error:
+                raise PackMigrationResolutionError(str(error)) from error
+            try:
                 original_roots = extract_pack_migration_roots(
                     detached_source,
                     expected_identity=detached_source_scan.root_identity,
@@ -1056,7 +1109,7 @@ def _resolve_effective_root_set(
                 _validate_live_source(
                     plan,
                     repository_root,
-                    cancel_event,
+                    operation_event,
                     effective_deadline,
                 )
                 result = PackMigrationResolutionPlan(
@@ -1086,12 +1139,40 @@ def _resolve_effective_root_set(
                     "resolution-required",
                     True,
                     int(getattr(plan, "_resolution_attempt", 0)),
+                    intent_facts,
+                    (),
+                    intent_facts.digest,
                 )
                 plan.resolution = result
                 plan._state = "resolution-required"
                 _record_plan_diagnostic(plan)
                 return result
             roots = tuple(roots)
+            # A conflict retry starts from the original detached authority, but
+            # an explicitly removed root is the one legitimate case where its
+            # intent is no longer part of the target request.  Never transfer
+            # that intent to a replacement identity.
+            root_ids = {root.canonical_identity for root in roots}
+            removed_ids = (
+                {root.canonical_identity for root in (original_roots or ())} - root_ids
+                if getattr(plan, "_active_resolution_request", None) is not None
+                else set()
+            )
+            if removed_ids:
+                intent_facts = replace(
+                    intent_facts,
+                    overrides=tuple(
+                        item for item in intent_facts.overrides
+                        if item.canonical_identity not in removed_ids
+                    ),
+                )
+                intent_facts = replace(
+                    intent_facts,
+                    digest=hashlib.sha256(
+                        serialize_mod_version_overrides(intent_facts.overrides)
+                    ).hexdigest(),
+                )
+            overrides = intent_by_identity(intent_facts)
             workspace = _create_workspace(plan)
             resolver_workspace_fd = os.open(workspace, _DIRECTORY_FLAGS)
             opened_workspace = os.fstat(resolver_workspace_fd)
@@ -1103,7 +1184,7 @@ def _resolve_effective_root_set(
             initialize_target_packwiz_source(
                 workspace,
                 plan.target,
-                cancel_event=cancel_event,
+                cancel_event=operation_event,
                 deadline=effective_deadline,
                 progress=progress,
                 operation_root=bound_workspace,
@@ -1112,6 +1193,8 @@ def _resolve_effective_root_set(
 
             resolved: list[PackMigrationResolvedRoot] = []
             unresolved: list[PackMigrationUnresolvedRoot] = []
+            intent_issues: list[PackMigrationVersionIntentIssue] = []
+            root_closures: list[tuple[PackMigrationRoot, object]] = []
             path_collisions: list[str] = []
             filename_collisions: list[str] = []
             identity_collisions: list[tuple[str, str]] = []
@@ -1119,6 +1202,7 @@ def _resolve_effective_root_set(
             for index, root in enumerate(
                 sorted(roots, key=lambda item: item.canonical_identity), 1
             ):
+                override = overrides.get(root.canonical_identity)
                 checkpoint()
                 _progress(
                     progress,
@@ -1135,7 +1219,7 @@ def _resolve_effective_root_set(
                         selector = core.resolve_project_selector(
                             "modrinth",
                             root.project_id,
-                            cancel_event=cancel_event,
+                            cancel_event=operation_event,
                             deadline=effective_deadline,
                         )
                         if selector.canonical_project_id != root.project_id:
@@ -1149,29 +1233,65 @@ def _resolve_effective_root_set(
                                 )
                             )
                             continue
-                    closure = core.resolve_mod_closure(
-                        provider=root.provider,
-                        selector=root.source_download_url or root.project_id,
-                        minecraft=plan.target.minecraft_version,
-                        loader=plan.target.loader,
-                        loader_version=plan.target.loader_version,
-                        canonical_project_id=(
-                            None if root.provider == "url" else root.project_id
-                        ),
-                        cancel_event=cancel_event,
-                        deadline=effective_deadline,
-                        resolver_root=bound_workspace / "roots" / f"root-{index}",
-                        url_max_jar_size_bytes=plan.source_snapshot.url_max_jar_size_bytes,
-                        url_allow_private_networks=plan.source_snapshot.url_allow_private_networks,
-                        process_result_callback=plan._record_resolver_process_result,
-                        diagnostic_project_id=plan.target.target_id,
-                    )
+                    if override is not None:
+                        selection = core.exact_mod_artifact_selection(
+                            override.provider,
+                            override.project_id,
+                            override.artifact_id,
+                        )
+                        exact_source = bound_workspace / "roots" / f"exact-{index}"
+                        core.create_resolver_source(
+                            exact_source,
+                            display_name=f"Resolve {root.canonical_identity}",
+                            minecraft=plan.target.minecraft_version,
+                            loader=plan.target.loader,
+                            loader_version=plan.target.loader_version,
+                        )
+                        closure = core.resolve_exact_mod_closure(
+                            selection,
+                            source=exact_source,
+                            cancel_event=operation_event,
+                            deadline=effective_deadline,
+                            checkpoint=checkpoint,
+                            process_result_callback=plan._record_resolver_process_result,
+                            diagnostic_project_id=plan.target.target_id,
+                        )
+                        core.verify_exact_mod_metadata(selection, closure.metadata)
+                    else:
+                        closure = core.resolve_mod_closure(
+                            provider=root.provider,
+                            selector=root.source_download_url or root.project_id,
+                            minecraft=plan.target.minecraft_version,
+                            loader=plan.target.loader,
+                            loader_version=plan.target.loader_version,
+                            canonical_project_id=(
+                                None if root.provider == "url" else root.project_id
+                            ),
+                            cancel_event=operation_event,
+                            deadline=effective_deadline,
+                            resolver_root=bound_workspace / "roots" / f"root-{index}",
+                            url_max_jar_size_bytes=plan.source_snapshot.url_max_jar_size_bytes,
+                            url_allow_private_networks=plan.source_snapshot.url_allow_private_networks,
+                            process_result_callback=plan._record_resolver_process_result,
+                            diagnostic_project_id=plan.target.target_id,
+                        )
                 except Exception as error:
                     if _operation_failure(error):
                         raise PackMigrationResolutionError(str(error)) from error
                     message = str(error)
                     lowered = message.lower()
-                    if root.provider == "url":
+                    if override is not None:
+                        reason = "version-intent-blocked"
+                        intent_issues.append(
+                            PackMigrationVersionIntentIssue(
+                                root.canonical_identity,
+                                root.canonical_identity,
+                                override.artifact_id,
+                                "version-intent-blocked",
+                                message[:240],
+                            )
+                        )
+                    elif root.provider == "url":
                         if "does not declare support for loader" in lowered:
                             reason: UnresolvedReason = "url-incompatible-loader"
                         elif "archive" in lowered or "metadata" in lowered:
@@ -1272,40 +1392,165 @@ def _resolve_effective_root_set(
                     target_metadata.filename,
                     classification,
                 )
-                try:
-                    core.merge_metadata_closure(
-                        bound_workspace / "source",
-                        closure,
-                        requested_side=root.source_side,
-                        cancel_event=cancel_event,
-                        deadline=deadline,
-                        equivalence_workspace=bound_workspace / "equivalence",
-                        process_result_callback=plan._record_resolver_process_result,
-                    )
-                except Exception as error:
-                    collision_reason = _classify_collision(str(error))
-                    if collision_reason is None:
-                        raise
-                    message = str(error)[:240]
-                    if collision_reason == "path-collision":
-                        path_collisions.append(message)
-                    elif collision_reason == "filename-collision":
-                        filename_collisions.append(message)
-                    elif collision_reason == "identity-collision":
-                        identity_collisions.append(
-                            (root.canonical_identity, "collision")
-                        )
-                    unresolved.append(
-                        PackMigrationUnresolvedRoot(
-                            root,
-                            collision_reason,
-                            message,
-                            False,
-                            True,
-                        )
-                    )
-                    continue
+                root_closures.append((root, closure))
                 resolved.append(resolved_root)
+            closure_by_root = {
+                root.canonical_identity: closure for root, closure in root_closures
+            }
+            root_ids = {root.canonical_identity for root in roots}
+            dependency_overrides = {
+                identity: override
+                for identity, override in overrides.items()
+                if identity not in root_ids
+            }
+            for owner, initial_closure in root_closures:
+                owner_identity = owner.canonical_identity
+                current = initial_closure
+                root_item = next(
+                    (
+                        item
+                        for item in current.metadata
+                        if f"{item.provider}:{item.project_id}" == owner_identity
+                    ),
+                    None,
+                )
+                root_artifact = (
+                    None
+                    if root_item is None
+                    else parse_provider_metadata(
+                        root_item.relative_path, root_item.contents
+                    ).file_id
+                )
+                constrained_identities: set[str] = set()
+                for constraint_attempt in range(len(dependency_overrides) + 1):
+                    current_identities = {
+                        f"{item.provider}:{item.project_id}"
+                        for item in current.metadata
+                    }
+                    required_identities = {
+                        identity
+                        for identity in dependency_overrides
+                        if identity in current_identities
+                    }
+                    if required_identities <= constrained_identities:
+                        break
+                    constrained_identities.update(required_identities)
+                    selections = tuple(
+                        core.exact_mod_artifact_selection(
+                            dependency_overrides[identity].provider,
+                            dependency_overrides[identity].project_id,
+                            dependency_overrides[identity].artifact_id,
+                        )
+                        for identity in sorted(constrained_identities)
+                    )
+                    if root_artifact is None or owner.provider == "url":
+                        message = (
+                            f"Exact dependency intent cannot constrain {owner_identity}"
+                        )
+                        intent_issues.extend(
+                            PackMigrationVersionIntentIssue(
+                                selection.identity_label,
+                                owner_identity,
+                                str(selection.artifact_id),
+                                "version-intent-blocked",
+                                message,
+                            )
+                            for selection in selections
+                        )
+                        break
+                    try:
+                        exact_source = bound_workspace / "roots" / (
+                            "constrained-"
+                            + owner_identity.replace(":", "-")
+                            + f"-{constraint_attempt:04d}"
+                        )
+                        core.create_resolver_source(
+                            exact_source,
+                            display_name=f"Resolve {owner_identity}",
+                            minecraft=plan.target.minecraft_version,
+                            loader=plan.target.loader,
+                            loader_version=plan.target.loader_version,
+                        )
+                        constrained = core.resolve_exact_mod_closure(
+                            core.exact_mod_artifact_selection(
+                                owner.provider,
+                                owner.project_id,
+                                root_artifact,
+                            ),
+                            source=exact_source,
+                            cancel_event=operation_event,
+                            deadline=effective_deadline,
+                            checkpoint=checkpoint,
+                            preseed_selections=selections,
+                            process_result_callback=plan._record_resolver_process_result,
+                            diagnostic_project_id=plan.target.target_id,
+                        )
+                        for selection in selections:
+                            core.verify_exact_mod_metadata(
+                                selection, constrained.metadata
+                            )
+                        current = constrained
+                        closure_by_root[owner_identity] = constrained
+                    except Exception as error:
+                        if _operation_failure(error):
+                            raise PackMigrationResolutionError(str(error)) from error
+                        intent_issues.extend(
+                            PackMigrationVersionIntentIssue(
+                                selection.identity_label,
+                                owner_identity,
+                                str(selection.artifact_id),
+                                "version-intent-blocked",
+                                str(error)[:240],
+                            )
+                            for selection in selections
+                        )
+                        break
+                else:
+                    raise PackMigrationResolutionError(
+                        "Exact dependency constraints did not converge for "
+                        f"{owner_identity}"
+                    )
+            issue_identities = {issue.identity for issue in intent_issues}
+            for identity, override in sorted(dependency_overrides.items()):
+                owners = tuple(
+                    root.canonical_identity
+                    for root, _ in root_closures
+                    if any(
+                        f"{item.provider}:{item.project_id}" == identity
+                        for item in closure_by_root[root.canonical_identity].metadata
+                    )
+                )
+                if not owners and identity not in issue_identities:
+                    intent_issues.append(
+                        PackMigrationVersionIntentIssue(
+                            identity,
+                            None,
+                            override.artifact_id,
+                            "version-intent-blocked",
+                            f"Version override {identity} is not required by any "
+                            "resolved root",
+                        )
+                    )
+            if intent_issues:
+                existing_intent_failures = {
+                    (item.source_root.canonical_identity, item.message)
+                    for item in unresolved
+                    if item.reason_code == "version-intent-blocked"
+                    and isinstance(item.source_root, PackMigrationRoot)
+                }
+                unresolved.extend(
+                    PackMigrationUnresolvedRoot(
+                        next(
+                            (root for root in roots if root.canonical_identity == issue.owner_identity),
+                            roots[0],
+                        ),
+                        "version-intent-blocked", issue.message, False,
+                        issue.identity == issue.owner_identity,
+                    ) for issue in intent_issues
+                    if roots
+                    and (issue.owner_identity or roots[0].canonical_identity, issue.message)
+                    not in existing_intent_failures
+                )
             _progress(
                 progress,
                 PackMigrationProgress(
@@ -1325,7 +1570,7 @@ def _resolve_effective_root_set(
                 _validate_live_source(
                     plan,
                     repository_root,
-                    cancel_event,
+                    operation_event,
                     effective_deadline,
                 )
                 result = PackMigrationResolutionPlan(
@@ -1344,19 +1589,71 @@ def _resolve_effective_root_set(
                     tuple(url_compatibility),
                     None,
                     "resolution-required",
+                    False,
+                    int(getattr(plan, "_resolution_attempt", 0)),
+                    intent_facts,
+                    tuple(intent_issues),
+                    intent_facts.digest,
                 )
                 plan.resolution = result
                 plan._state = "resolution-required"
                 _record_plan_diagnostic(plan)
                 return result
+            for root, _ in root_closures:
+                checkpoint()
+                try:
+                    core.merge_metadata_closure(
+                        bound_workspace / "source",
+                        closure_by_root[root.canonical_identity],
+                        requested_side=root.source_side,
+                        cancel_event=operation_event,
+                        deadline=effective_deadline,
+                        equivalence_workspace=bound_workspace / "equivalence",
+                        process_result_callback=plan._record_resolver_process_result,
+                    )
+                except Exception as error:
+                    collision_reason = _classify_collision(str(error))
+                    if collision_reason is None:
+                        raise
+                    unresolved.append(PackMigrationUnresolvedRoot(
+                        root, collision_reason, str(error)[:240], False, True
+                    ))
+                    break
+            if unresolved:
+                _validate_detached_snapshot(plan, checkpoint)
+                _validate_live_source(
+                    plan, repository_root, operation_event, effective_deadline
+                )
+                result = PackMigrationResolutionPlan(
+                    plan.source_snapshot.snapshot_digest, plan.target, roots, (),
+                    tuple(resolved), tuple(unresolved), PackMigrationDependencyDelta(),
+                    (), tuple(identity_collisions), tuple(path_collisions),
+                    tuple(filename_collisions), (), tuple(url_compatibility), None,
+                    "resolution-required", False,
+                    int(getattr(plan, "_resolution_attempt", 0)), intent_facts,
+                    tuple(intent_issues), intent_facts.digest,
+                )
+                plan.resolution = result
+                plan._state = "resolution-required"
+                _record_plan_diagnostic(plan)
+                return result
+            if intent_facts.overrides:
+                ensure_mod_version_overrides_ignored(
+                    bound_workspace / "source", checkpoint=checkpoint
+                )
+                write_mod_version_overrides(
+                    bound_workspace / "source",
+                    intent_facts.overrides,
+                    checkpoint=checkpoint,
+                )
             _progress(
                 progress,
                 PackMigrationProgress("refreshing", len(roots), len(roots), None, "Refreshing target"),
             )
-            core._run_noninteractive_packwiz(
+            core.run_noninteractive_packwiz(
                 ["packwiz", "refresh"],
                 cwd=bound_workspace / "source",
-                cancel_event=cancel_event,
+                cancel_event=operation_event,
                 deadline=effective_deadline,
                 label="Pack migration target refresh",
                 process_result_callback=plan._record_resolver_process_result,
@@ -1410,7 +1707,7 @@ def _resolve_effective_root_set(
             _validate_live_source(
                 plan,
                 repository_root,
-                cancel_event,
+                operation_event,
                 effective_deadline,
             )
             _progress(
@@ -1442,10 +1739,13 @@ def _resolve_effective_root_set(
                 (),
                 tuple(url_compatibility),
                 installed_scan,
-                    "resolved",
-                    False,
-                    int(getattr(plan, "_resolution_attempt", 0)),
-                )
+                "resolved",
+                False,
+                int(getattr(plan, "_resolution_attempt", 0)),
+                intent_facts,
+                (),
+                intent_facts.digest,
+            )
             plan.resolution = result
             plan._state = "resolved"
             _retire_resolution_pending_warnings(plan)
@@ -1509,7 +1809,10 @@ def resolve_pack_migration_conflicts_at(
             if deadline is not None
             else time.monotonic() + PACK_MIGRATION_TIMEOUT_SECONDS
         )
-        checkpoint = lambda: _checkpoint(cancel_event, effective_deadline)
+        operation_event = (
+            cancel_event if cancel_event is not None else threading.Event()
+        )
+        checkpoint = lambda: _checkpoint(operation_event, effective_deadline)
         _progress(
             progress,
             PackMigrationProgress(
@@ -1531,7 +1834,7 @@ def resolve_pack_migration_conflicts_at(
                     selector = core.resolve_project_selector(
                         "modrinth",
                         replacement.replacement_root.project_id,
-                        cancel_event=cancel_event,
+                        cancel_event=operation_event,
                         deadline=effective_deadline,
                     )
                 except Exception as error:
@@ -1565,7 +1868,9 @@ def resolve_pack_migration_conflicts_at(
             if _identity(plan.transaction_root) != plan._transaction_identity:
                 raise PackMigrationStale("Pack migration transaction root was replaced")
             _validate_detached_snapshot(plan, checkpoint)
-            _validate_live_source(plan, repository_root, cancel_event, effective_deadline)
+            _validate_live_source(
+                plan, repository_root, operation_event, effective_deadline
+            )
             staging = scan_pack_migration_source(plan.target_staging_root, checkpoint=checkpoint)
             if (
                 staging.snapshot_digest != plan._staging_snapshot_digest
@@ -1587,7 +1892,7 @@ def resolve_pack_migration_conflicts_at(
                 tuple(validated.effective_roots),
                 repository_root=repository_root,
                 state_root=state_root,
-                cancel_event=cancel_event,
+                cancel_event=operation_event,
                 deadline=effective_deadline,
                 progress=progress,
             )

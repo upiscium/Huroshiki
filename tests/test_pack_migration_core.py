@@ -541,6 +541,23 @@ url_max_jar_size_bytes: 123456
             pack_migration.discard_pack_migration_plan(plan)
         self.assertEqual(plan.state, "discarded")
 
+    def test_discard_final_cleanup_failure_is_not_swallowed(self) -> None:
+        plan = self.plan()
+        original = pack_migration._cleanup_transaction
+        with patch.object(
+            pack_migration,
+            "_cleanup_transaction",
+            side_effect=pack_migration.PackMigrationCleanupError("final cleanup blocked"),
+        ):
+            with self.assertRaises(pack_migration.PackMigrationCleanupError):
+                pack_migration.discard_pack_migration_plan(plan)
+        self.assertEqual(plan.state, "failed")
+        self.assertTrue(plan.transaction_root.is_dir())
+        self.assertTrue(packctl.project_lock_is_active("pack:demo"))
+        with patch.object(pack_migration, "_cleanup_transaction", side_effect=original):
+            pack_migration.discard_pack_migration_plan(plan)
+        self.assertEqual(plan.state, "discarded")
+
     def test_publication_lock_release_failure_retains_plan_diagnostic(self) -> None:
         plan = self.plan()
         self.make_ready(plan)

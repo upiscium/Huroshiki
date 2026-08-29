@@ -63,6 +63,25 @@ class PackMigrationConflictTest(unittest.TestCase):
             plan, (conflicts.PackMigrationRootResolution(identity, "remove"),)
         )
 
+    def test_core_factory_binds_and_validates_current_conflict_request(self) -> None:
+        plan = self._unresolved_plan()
+        identity = plan.resolution.unresolved_roots[0].source_root.canonical_identity
+        request = core.create_pack_migration_resolution_request(
+            plan,
+            (core.PackMigrationRootResolution(identity, "remove"),),
+        )
+
+        self.assertEqual(request.plan_identity, id(plan))
+        self.assertEqual(
+            request.source_snapshot_digest,
+            plan.source_snapshot.snapshot_digest,
+        )
+        self.assertEqual(
+            conflicts.validate_resolution_request(plan, request).effective_roots,
+            (),
+        )
+        pack_migration.discard_pack_migration_plan(plan)
+
     def test_request_rejects_state_plan_identity_source_and_unresolved_digests(self) -> None:
         plan = self._unresolved_plan()
         request = self._remove_request(plan)
