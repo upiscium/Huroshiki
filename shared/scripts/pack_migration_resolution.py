@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import hashlib
+import json
 import os
 from pathlib import Path
 import stat
@@ -21,6 +22,7 @@ from pack_migration import (
     _record_plan_diagnostic,
     _retire_resolution_pending_warnings,
     _same_snapshot,
+    _validate_plan_detached_state,
     snapshot_pack_migration_source_at,
 )
 from pack_migration_roots import (
@@ -230,6 +232,33 @@ class PackMigrationResolutionPlan:
                 "unchanged": len(delta.unchanged),
             },
         }
+
+
+@dataclass(frozen=True)
+class PackMigrationRootSelectionAuthority:
+    """Exact migration-local provenance selected from one fixed candidate set."""
+
+    source_snapshot_digest: str
+    target: PackMigrationTarget
+    resolution_attempt: int
+    candidate_digest: str
+    selections: tuple[PackMigrationRootSelection, ...]
+    selected_candidates: tuple[PackMigrationRootCandidate, ...]
+    roots: tuple[PackRootRecord, ...]
+    legacy_url_identities: tuple[tuple[Path, str], ...]
+    selection_digest: str
+
+    def validates(self, source_snapshot_digest: str, target: PackMigrationTarget) -> bool:
+        return (
+            self.source_snapshot_digest == source_snapshot_digest
+            and self.target == target
+            and self.selection_digest == _root_selection_digest(
+                self.source_snapshot_digest,
+                self.candidate_digest,
+                self.selections,
+                self.roots,
+            )
+        )
 
 
 def _checkpoint(cancel_event: threading.Event | None, deadline: float) -> None:
@@ -476,12 +505,7 @@ def _validate_detached_snapshot(
     plan: PackMigrationPlan,
     checkpoint: Callable[[], None],
 ) -> PackTreeScan:
-    detached = scan_pack_migration_source(
-        plan.source_snapshot_root, checkpoint=checkpoint
-    )
-    if detached.snapshot_digest != plan._source_copy_snapshot_digest:
-        raise PackMigrationStale("Detached source snapshot changed")
-    return detached
+    return _validate_plan_detached_state(plan, checkpoint)
 
 
 def _validate_live_source(
@@ -800,6 +824,368 @@ def _commit_root_provenance_source(
         os.close(pack_fd)
 
 
+def _root_candidate_digest(resolution: PackMigrationResolutionPlan) -> str:
+    payload = {
+        "source_snapshot_digest": resolution.source_snapshot_digest,
+        "target": {
+            "id": resolution.target.target_id,
+            "display_name": resolution.target.display_name,
+            "minecraft": resolution.target.minecraft_version,
+            "loader": resolution.target.loader,
+            "loader_version": resolution.target.loader_version,
+            "mode": resolution.target.mode,
+        },
+        "resolution_attempt": resolution.resolution_attempt,
+        "version_intent_digest": resolution.version_intent_digest,
+        "candidates": [
+            {
+                "canonical_identity": candidate.canonical_identity,
+                "provider": candidate.provider,
+                "project_id": candidate.project_id,
+                "source_file_id": candidate.source_file_id,
+                "source_version": candidate.source_version,
+                "source_side": candidate.source_side,
+                "source_metadata_path": candidate.source_metadata_path.as_posix(),
+                "source_filename": candidate.source_filename,
+                "source_download_url": candidate.source_download_url,
+            }
+            for candidate in sorted(
+                resolution.root_candidates,
+                key=lambda item: item.source_metadata_path.as_posix(),
+            )
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _root_selection_digest(
+    source_snapshot_digest: str,
+    candidate_digest: str,
+    selections: tuple[PackMigrationRootSelection, ...],
+    roots: tuple[PackRootRecord, ...],
+) -> str:
+    payload = {
+        "source_snapshot_digest": source_snapshot_digest,
+        "candidate_digest": candidate_digest,
+        "selections": [
+            {
+                "path": item.source_metadata_path.as_posix(),
+                "provider": item.provider,
+                "project_id": item.project_id,
+            }
+            for item in selections
+        ],
+        "roots": [
+            {
+                "provider": item.provider,
+                "project_id": item.project_id,
+                "side": item.side,
+            }
+            for item in roots
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _create_root_selection_authority(
+    plan: PackMigrationPlan,
+    selections: tuple[PackMigrationRootSelection, ...],
+    checkpoint: Callable[[], None],
+) -> PackMigrationRootSelectionAuthority:
+    resolution = plan.resolution
+    if (
+        plan.state != "resolution-required"
+        or not isinstance(resolution, PackMigrationResolutionPlan)
+        or not resolution.provenance_required
+        or resolution.source_snapshot_digest != plan.source_snapshot.snapshot_digest
+        or resolution.target != plan.target
+        or resolution.resolution_attempt != plan._resolution_attempt
+    ):
+        raise PackMigrationResolutionError(
+            "Root selection requires the current provenance resolution result"
+        )
+    if plan._migration_root_authority is not None:
+        raise PackMigrationResolutionError("Migration-local root provenance was already selected")
+    candidates = {
+        candidate.source_metadata_path: candidate
+        for candidate in resolution.root_candidates
+    }
+    if len(candidates) != len(resolution.root_candidates):
+        raise PackMigrationResolutionError("Root candidate paths are ambiguous")
+    selected_paths: set[Path] = set()
+    records: list[PackRootRecord] = []
+    normalized_selections: list[PackMigrationRootSelection] = []
+    legacy_url_selections: list[tuple[Path, str]] = []
+    identities: set[str] = set()
+    for selection in selections:
+        checkpoint()
+        if not isinstance(selection, PackMigrationRootSelection):
+            raise PackMigrationResolutionError(
+                "Root selections must use PackMigrationRootSelection"
+            )
+        if selection.source_metadata_path in selected_paths:
+            raise PackMigrationResolutionError(
+                f"Duplicate root selection: {selection.source_metadata_path}"
+            )
+        candidate = candidates.get(selection.source_metadata_path)
+        if candidate is None:
+            raise PackMigrationResolutionError(
+                f"Unknown root candidate: {selection.source_metadata_path}"
+            )
+        if selection.provider != candidate.provider:
+            raise PackMigrationResolutionError(
+                f"Root provider disagrees with metadata: {selection.source_metadata_path}"
+            )
+        try:
+            identity = canonical_identity(selection.provider, selection.project_id)
+        except ProviderIdentityError as error:
+            raise PackMigrationResolutionError(str(error)) from error
+        if candidate.canonical_identity is not None and identity != candidate.canonical_identity:
+            raise PackMigrationResolutionError(
+                f"Root identity disagrees with metadata: {selection.source_metadata_path}"
+            )
+        if identity in identities:
+            raise PackMigrationResolutionError(f"Duplicate selected root identity: {identity}")
+        selected_paths.add(selection.source_metadata_path)
+        identities.add(identity)
+        normalized_project_id = identity.partition(":")[2]
+        normalized_selections.append(
+            PackMigrationRootSelection(
+                selection.source_metadata_path,
+                selection.provider,
+                normalized_project_id,
+            )
+        )
+        records.append(
+            PackRootRecord(
+                selection.provider,
+                normalized_project_id,
+                candidate.source_side,
+            )
+        )
+        if candidate.provider == "url" and candidate.canonical_identity is None:
+            legacy_url_selections.append(
+                (candidate.source_metadata_path, normalized_project_id)
+            )
+    missing_legacy_urls = [
+        candidate.source_metadata_path
+        for candidate in resolution.root_candidates
+        if candidate.provider == "url"
+        and candidate.canonical_identity is None
+        and candidate.source_metadata_path not in selected_paths
+    ]
+    if missing_legacy_urls:
+        raise PackMigrationResolutionError(
+            "Legacy URL metadata requires an explicit root identity: "
+            f"{missing_legacy_urls[0]}"
+        )
+    candidate_digest = _root_candidate_digest(resolution)
+    ordered_selections = tuple(
+        sorted(normalized_selections, key=lambda item: item.source_metadata_path.as_posix())
+    )
+    ordered_candidates = tuple(
+        candidates[item.source_metadata_path] for item in ordered_selections
+    )
+    ordered_records = tuple(sorted(records, key=lambda item: item.canonical_identity))
+    ordered_urls = tuple(
+        sorted(legacy_url_selections, key=lambda item: item[0].as_posix())
+    )
+    selection_digest = _root_selection_digest(
+        plan.source_snapshot.snapshot_digest,
+        candidate_digest,
+        ordered_selections,
+        ordered_records,
+    )
+    return PackMigrationRootSelectionAuthority(
+        plan.source_snapshot.snapshot_digest,
+        plan.target,
+        plan._resolution_attempt,
+        candidate_digest,
+        ordered_selections,
+        ordered_candidates,
+        ordered_records,
+        ordered_urls,
+        selection_digest,
+    )
+
+
+def select_pack_migration_roots_at(
+    plan: PackMigrationPlan,
+    selections: tuple[PackMigrationRootSelection, ...],
+    *,
+    repository_root: Path,
+    state_root: Path,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[[PackMigrationProgress], None] | None = None,
+) -> PackMigrationResolutionPlan:
+    """Materialize explicit provenance in owned state and continue one plan."""
+    effective_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + PACK_MIGRATION_TIMEOUT_SECONDS
+    )
+    operation_event = cancel_event if cancel_event is not None else threading.Event()
+    checkpoint = lambda: _checkpoint(operation_event, effective_deadline)
+    with plan._lock:
+        if set(plan._lock_set.owned_keys) != {
+            plan.source_key,
+            f"pack:{plan.target.target_id}",
+        }:
+            raise PackMigrationResolutionError("Pack migration locks are not fully owned")
+        authority = _create_root_selection_authority(plan, tuple(selections), checkpoint)
+        try:
+            checkpoint()
+            _validate_detached_snapshot(plan, checkpoint)
+            _validate_live_source(
+                plan, repository_root, operation_event, effective_deadline
+            )
+            detached_source = plan.source_snapshot_root / "source"
+            detached_scan = scan_pack_migration_source(
+                detached_source, checkpoint=checkpoint
+            )
+            provenance_source = plan.transaction_root / "migration-provenance-source"
+            top_level = tuple(
+                sorted(
+                    {
+                        Path(entry.relative_path.parts[0])
+                        for entry in detached_scan.entries[1:]
+                    },
+                    key=lambda path: path.as_posix(),
+                )
+            )
+            copy_pack_tree_snapshot(
+                detached_scan,
+                provenance_source,
+                include=top_level,
+                checkpoint=checkpoint,
+                destination_parent_identity=plan._transaction_identity,
+            )
+            ensure_pack_root_manifest_ignored(
+                provenance_source, checkpoint=checkpoint
+            )
+            for relative_path, project_id in authority.legacy_url_identities:
+                checkpoint()
+                set_url_metadata_project_id(
+                    provenance_source, relative_path, project_id
+                )
+            write_pack_root_manifest(provenance_source, authority.roots)
+            metadata_before_refresh: dict[Path, bytes] = {}
+            if authority.legacy_url_identities:
+                before_refresh_scan = scan_pack_migration_source(
+                    provenance_source, checkpoint=checkpoint
+                )
+                metadata_before_refresh = {
+                    entry.relative_path: _read_relative_file(
+                        provenance_source,
+                        before_refresh_scan,
+                        entry.relative_path,
+                        max_bytes=2 * 1024 * 1024,
+                        checkpoint=checkpoint,
+                    )
+                    for entry in before_refresh_scan.entries
+                    if entry.kind == "file"
+                    and entry.relative_path.name.endswith(".pw.toml")
+                }
+                packctl.run_packwiz(
+                    ["packwiz", "refresh"],
+                    cwd=provenance_source,
+                    cancel_event=operation_event,
+                    deadline=effective_deadline,
+                    project_id=plan.target.target_id,
+                    operation="migration-local-provenance-refresh",
+                )
+            provenance_scan = scan_pack_migration_source(
+                provenance_source, checkpoint=checkpoint
+            )
+            if metadata_before_refresh:
+                metadata_after_refresh = {
+                    entry.relative_path: _read_relative_file(
+                        provenance_source,
+                        provenance_scan,
+                        entry.relative_path,
+                        max_bytes=2 * 1024 * 1024,
+                        checkpoint=checkpoint,
+                    )
+                    for entry in provenance_scan.entries
+                    if entry.kind == "file"
+                    and entry.relative_path.name.endswith(".pw.toml")
+                }
+                if metadata_after_refresh != metadata_before_refresh:
+                    raise PackMigrationResolutionError(
+                        "Migration-local provenance refresh changed Packwiz metadata"
+                    )
+            extracted = extract_pack_migration_roots(
+                provenance_source,
+                expected_identity=provenance_scan.root_identity,
+                expected_snapshot_digest=provenance_scan.snapshot_digest,
+                checkpoint=checkpoint,
+            )
+            extracted_records = tuple(
+                sorted(
+                    (
+                        PackRootRecord(root.provider, root.project_id, root.source_side)
+                        for root in extracted
+                    ),
+                    key=lambda item: item.canonical_identity,
+                )
+            )
+            if extracted_records != authority.roots:
+                raise PackMigrationResolutionError(
+                    "Migration-local root manifest does not match the selected roots"
+                )
+            extracted_by_path = {root.source_metadata_path: root for root in extracted}
+            for selection, candidate in zip(
+                authority.selections, authority.selected_candidates, strict=True
+            ):
+                root = extracted_by_path.get(selection.source_metadata_path)
+                if root is None or (
+                    root.canonical_identity
+                    != canonical_identity(selection.provider, selection.project_id)
+                    or root.source_file_id != candidate.source_file_id
+                    or root.source_version != candidate.source_version
+                    or root.source_side != candidate.source_side
+                    or root.source_metadata_path != candidate.source_metadata_path
+                    or root.source_filename != candidate.source_filename
+                    or root.source_download_url != candidate.source_download_url
+                ):
+                    raise PackMigrationResolutionError(
+                        "Migration-local selected root changed during materialization: "
+                        f"{selection.source_metadata_path}"
+                    )
+            _validate_detached_snapshot(plan, checkpoint)
+            _validate_live_source(
+                plan, repository_root, operation_event, effective_deadline
+            )
+            plan._provenance_source_root = provenance_source
+            plan._provenance_source_identity = provenance_scan.root_identity
+            plan._provenance_source_content_digest = provenance_scan.content_digest
+            plan._provenance_source_snapshot_digest = provenance_scan.snapshot_digest
+            plan._migration_root_authority = authority
+            plan._previous_resolution = plan.resolution
+            plan.resolution = None
+            plan._state = "staged"
+            _record_plan_diagnostic(plan)
+        except BaseException as error:
+            plan._state = "failed"
+            plan.cleanup_error = error
+            _record_plan_diagnostic(plan)
+            raise
+    return _resolve_effective_root_set(
+        plan,
+        None,
+        repository_root=repository_root,
+        state_root=state_root,
+        cancel_event=operation_event,
+        deadline=effective_deadline,
+        progress=progress,
+    )
+
+
 def commit_pack_migration_root_selection_at(
     plan: PackMigrationPlan,
     selections: tuple[PackMigrationRootSelection, ...],
@@ -1035,28 +1421,48 @@ def _resolve_effective_root_set(
                 progress,
                 PackMigrationProgress("extracting-roots", 0, 1, None, "Extracting roots"),
             )
-            detached_source = plan.source_snapshot_root / "source"
+            detached_source = (
+                plan._provenance_source_root
+                if plan._migration_root_authority is not None
+                else plan.source_snapshot_root / "source"
+            )
+            if detached_source is None:
+                raise PackMigrationStale(
+                    "Migration-local root provenance source is unavailable"
+                )
             detached_source_scan = scan_pack_migration_source(
                 detached_source, checkpoint=checkpoint
             )
-            detached_source_entry = next(
-                (
-                    entry
-                    for entry in detached.entries
-                    if entry.relative_path == Path("source")
-                ),
-                None,
-            )
-            if (
-                detached_source_entry is None
-                or detached_source_entry.kind != "directory"
-                or (
-                    detached_source_entry.device,
-                    detached_source_entry.inode,
+            if plan._migration_root_authority is None:
+                detached_source_entry = next(
+                    (
+                        entry
+                        for entry in detached.entries
+                        if entry.relative_path == Path("source")
+                    ),
+                    None,
                 )
-                != detached_source_scan.root_identity
+                if (
+                    detached_source_entry is None
+                    or detached_source_entry.kind != "directory"
+                    or (
+                        detached_source_entry.device,
+                        detached_source_entry.inode,
+                    )
+                    != detached_source_scan.root_identity
+                ):
+                    raise PackMigrationStale("Detached Packwiz source was replaced")
+            elif (
+                detached_source_scan.root_identity
+                != plan._provenance_source_identity
+                or detached_source_scan.content_digest
+                != plan._provenance_source_content_digest
+                or detached_source_scan.snapshot_digest
+                != plan._provenance_source_snapshot_digest
             ):
-                raise PackMigrationStale("Detached Packwiz source was replaced")
+                raise PackMigrationStale(
+                    "Migration-local provenance source changed before resolution"
+                )
             try:
                 detached_overrides = read_detached_version_intent(
                     detached_source, checkpoint=checkpoint
@@ -1633,6 +2039,54 @@ def _resolve_effective_root_set(
                 plan._state = "resolution-required"
                 _record_plan_diagnostic(plan)
                 return result
+            target_root_identities = {item.target_identity for item in resolved}
+            merged_target_entries = {
+                item.canonical_identity: item
+                for item in _metadata_entries(
+                    bound_workspace / "source", target_root_identities, checkpoint
+                )
+            }
+            finalized_resolved: list[PackMigrationResolvedRoot] = []
+            target_root_records: list[PackRootRecord] = []
+            for item in resolved:
+                provider, separator, project_id = item.target_identity.partition(":")
+                if not separator or canonical_identity(provider, project_id) != item.target_identity:
+                    raise PackMigrationResolutionError(
+                        f"Resolved target root identity is invalid: {item.target_identity}"
+                    )
+                target_entry = merged_target_entries.get(item.target_identity)
+                if target_entry is None or target_entry.side not in {
+                    "client", "server", "both"
+                }:
+                    raise PackMigrationResolutionError(
+                        f"Resolved target root metadata is unavailable: {item.target_identity}"
+                    )
+                final_classification = item.classification
+                if (
+                    final_classification == "unchanged"
+                    and target_entry.side != item.source_root.source_side
+                ):
+                    final_classification = "updated"
+                finalized_resolved.append(
+                    replace(
+                        item,
+                        target_side=target_entry.side,
+                        classification=final_classification,
+                    )
+                )
+                target_root_records.append(
+                    PackRootRecord(provider, project_id, target_entry.side)  # type: ignore[arg-type]
+                )
+            resolved = finalized_resolved
+            expected_target_roots = tuple(
+                sorted(target_root_records, key=lambda item: item.canonical_identity)
+            )
+            ensure_pack_root_manifest_ignored(
+                bound_workspace / "source", checkpoint=checkpoint
+            )
+            write_pack_root_manifest(
+                bound_workspace / "source", expected_target_roots
+            )
             if intent_facts.overrides:
                 ensure_mod_version_overrides_ignored(
                     bound_workspace / "source", checkpoint=checkpoint
@@ -1681,6 +2135,25 @@ def _resolve_effective_root_set(
                 resolver_workspace_fd,
                 checkpoint,
             )
+            installed_target_roots = extract_pack_migration_roots(
+                workspace / "source",
+                expected_identity=resolver_scan.root_identity,
+                expected_snapshot_digest=resolver_scan.snapshot_digest,
+                checkpoint=checkpoint,
+            )
+            installed_target_records = tuple(
+                sorted(
+                    (
+                        PackRootRecord(root.provider, root.project_id, root.source_side)
+                        for root in installed_target_roots
+                    ),
+                    key=lambda item: item.canonical_identity,
+                )
+            )
+            if installed_target_records != expected_target_roots:
+                raise PackMigrationResolutionError(
+                    "Resolved target root provenance does not match the effective root set"
+                )
             target_roots = {root.target_identity for root in resolved}
             after = _metadata_entries(
                 workspace / "source",
@@ -1983,6 +2456,7 @@ __all__ = [
     "PackMigrationDependencyEntry",
     "PackMigrationProgress",
     "PackMigrationResolutionPlan",
+    "PackMigrationRootSelectionAuthority",
     "PackMigrationResolvedRoot",
     "PackMigrationUnresolvedRoot",
     "UrlMigrationCompatibility",
@@ -1990,4 +2464,5 @@ __all__ = [
     "initialize_target_packwiz_source",
     "resolve_pack_migration_plan_at",
     "resolve_pack_migration_conflicts_at",
+    "select_pack_migration_roots_at",
 ]

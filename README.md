@@ -301,10 +301,9 @@ worker, displays progress and changed files, and completes cancellation cleanup 
 never migrates in place and never copies deployment or Minecraft-server settings. The source Pack is
 snapshotted before planning; source and target are locked in canonical order, and the target is
 installed with an atomic no-clobber operation. An existing target is therefore rejected rather than
-overwritten. Preview, target resolution, and target apply do not modify an already provenance-aware
-source Pack. The explicit legacy root-provenance step described below is the exception: it commits
-`.huroshiki-roots.json`, its ignore entry, and any required legacy URL identity to the source before
-restarting migration from a fresh snapshot.
+overwritten. Copy migration never modifies or commits to the source Pack. For a legacy Pack without
+root provenance, migration-local root selection is explicit and is used only to resolve the target;
+the successful target records canonical root provenance.
 
 ```bash
 packctl migrate old-pack --copy-to new-pack --display-name "New Pack" \
@@ -321,8 +320,9 @@ finished.
 
 Root provenance is read from `source/.huroshiki-roots.json`. A Pack without that manifest does not
 turn every installed dependency into a root: migration remains `resolution-required` until each
-root is explicitly selected. Use repeated `--root PROVIDER:ID` selections for roots. A legacy URL
-candidate without an identity uses `--root SOURCE_PATH=url:ID`. Use repeated `--remove ID`
+root is explicitly selected. This legacy selection is migration-local and does not change the source
+Pack; the selected canonical roots are recorded in the successful target. Use repeated
+`--root PROVIDER:ID` selections for roots. A legacy URL candidate without an identity uses `--root SOURCE_PATH=url:ID`. Use repeated `--remove ID`
 choices for roots that should be dropped, and repeated `--replace OLD=PROVIDER:ID` choices for
 canonical Modrinth or CurseForge replacements. `--remove` and `--replace` are only for the complete,
 digest-bound unresolved set shown by the preview; stale, incomplete, non-canonical, or ambiguous

@@ -242,6 +242,7 @@ if TYPE_CHECKING:
         PackMigrationResolutionDeadlineExceeded,
         PackMigrationResolutionError,
         PackMigrationResolutionPlan,
+        PackMigrationRootSelectionAuthority,
         PackMigrationResolvedRoot,
         PackMigrationUnresolvedRoot,
         UrlMigrationCompatibility,
@@ -267,6 +268,7 @@ _LAZY_MIGRATION_EXPORTS = {
     "PackMigrationResolutionDeadlineExceeded": "pack_migration_resolution",
     "PackMigrationResolutionError": "pack_migration_resolution",
     "PackMigrationResolutionPlan": "pack_migration_resolution",
+    "PackMigrationRootSelectionAuthority": "pack_migration_resolution",
     "PackMigrationResolvedRoot": "pack_migration_resolution",
     "PackMigrationUnresolvedRoot": "pack_migration_resolution",
     "UrlMigrationCompatibility": "pack_migration_resolution",
@@ -6502,20 +6504,20 @@ class PackCopyMigrationSession:
                 if self._plan is None:
                     raise PackMigrationError("Pack migration root authority is incomplete")
                 plan = self._plan
-            commit_pack_migration_root_selection(
+            resolution = select_pack_migration_roots(
                 plan,
                 tuple(selections),
                 cancel_event=self._cancel_event,
                 deadline=self._deadline,
+                progress=self._reporter(progress),
             )
             with self._lock:
-                self._snapshot = None
-                self._plan = None
-                self._resolution = None
                 self._publication = None
                 self._removed_roots = ()
                 self._replaced_roots = ()
-            return self._start_current_plan(progress)
+                self._resolution = resolution
+                self._state = self._classify_resolution(resolution)
+            return self.view
         except BaseException as error:
             self._record_failure(error)
             raise
@@ -7070,6 +7072,28 @@ def commit_pack_migration_root_selection(
         repository_root=ROOT,
         cancel_event=cancel_event,
         deadline=deadline,
+    )
+
+
+def select_pack_migration_roots(
+    plan: PackMigrationPlan,
+    selections: tuple["PackMigrationRootSelection", ...],
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[["PackMigrationProgress"], None] | None = None,
+) -> "PackMigrationResolutionPlan":
+    """Apply digest-bound provenance only to this migration's owned state."""
+    from pack_migration_resolution import select_pack_migration_roots_at
+
+    return select_pack_migration_roots_at(
+        plan,
+        selections,
+        repository_root=ROOT,
+        state_root=STATE_ROOT,
+        cancel_event=cancel_event,
+        deadline=deadline,
+        progress=progress,
     )
 
 

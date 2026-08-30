@@ -41,6 +41,49 @@ class PackMigrationPublicationTest(unittest.TestCase):
             if warning.acknowledgement_required
         )
 
+    def selected_plan(self):
+        """Resolve provenance in transaction state, never by editing live source."""
+        source = self.fixture.source
+        (source / ".huroshiki-roots.json").unlink(missing_ok=True)
+        (source / "mods/example.pw.toml").write_bytes(
+            resolution_fixture.metadata("v1").contents
+        )
+        plan = self.fixture.plan()
+        required = pack_migration_resolution.resolve_pack_migration_plan_at(
+            plan,
+            repository_root=self.fixture.root,
+            state_root=self.fixture.state,
+        )
+        self.assertTrue(required.provenance_required)
+        closure = resolution_fixture.PackMigrationResolutionTest.fake_closure()
+        return plan, closure
+
+    @staticmethod
+    def fake_target_init(root, *, display_name, minecraft, loader, loader_version, **_):
+        source = root / "source"
+        (source / "mods").mkdir(parents=True)
+        (source / "pack.toml").write_text(
+            f'''name = "{display_name}"
+author = "Test"
+pack-format = "packwiz:1.1.0"
+[index]
+file = "index.toml"
+hash-format = "sha256"
+hash = "target"
+[versions]
+minecraft = "{minecraft}"
+{loader} = "{loader_version}"
+''',
+            encoding="utf-8",
+        )
+        (source / "index.toml").write_text(
+            'hash-format = "sha256"\n', encoding="utf-8"
+        )
+        (source / ".packwizignore").write_text(
+            "/.huroshiki-roots.json\n", encoding="utf-8"
+        )
+        resolution_fixture.write_pack_root_manifest(source, ())
+
     def test_public_ready_apply_and_replay_rejection(self) -> None:
         plan = self.fixture.plan()
         self.fixture.make_ready(plan)
@@ -178,6 +221,24 @@ class PackMigrationPublicationTest(unittest.TestCase):
                 acknowledged_warning_codes=self.acknowledgements(plan),
             )
 
+    def test_replaced_staging_root_is_rejected_during_publication_preparation(self) -> None:
+        plan, resolution = self.resolved_input()
+        displaced = plan.target_staging_root.with_name("displaced-target-staging")
+        plan.target_staging_root.rename(displaced)
+        shutil.copytree(displaced, plan.target_staging_root)
+        copied_source = plan.target_staging_root / "source"
+        shutil.rmtree(copied_source)
+        (displaced / "source").rename(copied_source)
+        with self.assertRaisesRegex(
+            pack_migration.PackMigrationStale, "staging root was replaced"
+        ):
+            pack_migration.prepare_pack_migration_publication(
+                plan,
+                resolution,
+                acknowledged_warning_codes=self.acknowledgements(plan),
+            )
+        pack_migration.discard_pack_migration_plan(plan)
+
     def test_target_existing_and_wrong_plan_are_rejected(self) -> None:
         first = self.fixture.plan()
         self.fixture.make_ready(first)
@@ -309,6 +370,44 @@ class PackMigrationPublicationTest(unittest.TestCase):
         self.assertIn("cleaning-up", phases)
         self.assertEqual(self.fixture.snapshot().snapshot_digest, source_before)
 
+    def test_selected_success_publishes_without_mutating_source_tree(self) -> None:
+        plan, closure = self.selected_plan()
+        source_before = resolution_fixture.filesystem_snapshot(self.fixture.source)
+        with patch.object(
+            packctl, "init_packwiz_project", side_effect=self.fake_target_init
+        ), patch.object(
+            resolution_fixture.core, "resolve_mod_closure", return_value=closure
+        ), patch.object(
+            resolution_fixture.core,
+            "resolve_project_selector",
+            side_effect=resolution_fixture.PackMigrationResolutionTest.fake_selector,
+        ), patch.object(packctl, "run_packwiz"):
+            resolved = pack_migration_resolution.select_pack_migration_roots_at(
+                plan,
+                (resolution_fixture.PackMigrationRootSelection(
+                    resolution_fixture.Path("mods/example.pw.toml"), "modrinth", "root-project"
+                ),),
+                repository_root=self.fixture.root,
+                state_root=self.fixture.state,
+            )
+        publication = pack_migration.prepare_pack_migration_publication(
+            plan, resolved, acknowledged_warning_codes=self.acknowledgements(plan)
+        )
+        pack_migration.apply_pack_migration_publication(publication)
+        self.assertEqual(resolution_fixture.filesystem_snapshot(self.fixture.source), source_before)
+        published_source = self.fixture.packs / "next" / "source"
+        self.assertEqual(
+            [
+                item.canonical_identity
+                for item in resolution_fixture.read_pack_root_manifest(published_source)
+            ],
+            ["modrinth:root-project"],
+        )
+        self.assertIn(
+            "/.huroshiki-roots.json",
+            (published_source / ".packwizignore").read_text(encoding="utf-8").splitlines(),
+        )
+
     def test_ambiguous_rename_retains_target_ownership_for_retry(self) -> None:
         plan = self.fixture.plan()
         self.fixture.make_ready(plan)
@@ -324,6 +423,159 @@ class PackMigrationPublicationTest(unittest.TestCase):
         self.assertTrue(plan.transaction_root.is_dir())
         self.assertTrue(packctl.project_lock_is_active("pack:demo"))
         pack_migration.discard_pack_migration_plan(plan)
+
+    def test_selection_failure_cancel_and_deadline_leave_source_and_target_untouched(self) -> None:
+        for mode in ("failure", "cancel", "deadline"):
+            with self.subTest(mode=mode):
+                plan, closure = self.selected_plan()
+                source_before = resolution_fixture.filesystem_snapshot(self.fixture.source)
+                event = threading.Event()
+                if mode == "failure":
+                    failure: BaseException = RuntimeError("resolver failure")
+                elif mode == "cancel":
+                    failure = pack_migration_resolution.PackMigrationResolutionCancelled("cancelled")
+                else:
+                    failure = pack_migration_resolution.PackMigrationResolutionDeadlineExceeded("deadline")
+                with patch.object(
+                    packctl, "init_packwiz_project", side_effect=self.fake_target_init
+                ), patch.object(
+                    resolution_fixture.core, "resolve_mod_closure", side_effect=failure
+                ), patch.object(
+                    resolution_fixture.core,
+                    "resolve_project_selector",
+                    side_effect=resolution_fixture.PackMigrationResolutionTest.fake_selector,
+                ), patch.object(packctl, "run_packwiz"):
+                    if mode == "failure":
+                        result = pack_migration_resolution.select_pack_migration_roots_at(
+                            plan,
+                            (resolution_fixture.PackMigrationRootSelection(
+                                resolution_fixture.Path("mods/example.pw.toml"), "modrinth", "root-project"
+                            ),),
+                            repository_root=self.fixture.root, state_root=self.fixture.state,
+                        )
+                        self.assertEqual(result.state, "resolution-required")
+                    else:
+                        with self.assertRaises(pack_migration_resolution.PackMigrationResolutionError):
+                            pack_migration_resolution.select_pack_migration_roots_at(
+                                plan,
+                                (resolution_fixture.PackMigrationRootSelection(
+                                    resolution_fixture.Path("mods/example.pw.toml"), "modrinth", "root-project"
+                                ),),
+                                repository_root=self.fixture.root, state_root=self.fixture.state,
+                                cancel_event=event,
+                                deadline=(time.monotonic() + 60 if mode == "deadline" else None),
+                            )
+                self.assertEqual(resolution_fixture.filesystem_snapshot(self.fixture.source), source_before)
+                self.assertFalse(self.fixture.packs.joinpath("next").exists())
+                pack_migration.discard_pack_migration_plan(plan)
+
+    def test_discard_cleanup_failure_after_selection_preserves_source(self) -> None:
+        plan, closure = self.selected_plan()
+        source_before = resolution_fixture.filesystem_snapshot(self.fixture.source)
+        with patch.object(
+            packctl, "init_packwiz_project", side_effect=self.fake_target_init
+        ), patch.object(resolution_fixture.core, "resolve_mod_closure", return_value=closure), patch.object(
+            resolution_fixture.core,
+            "resolve_project_selector",
+            side_effect=resolution_fixture.PackMigrationResolutionTest.fake_selector,
+        ), patch.object(
+            packctl, "run_packwiz"
+        ):
+            pack_migration_resolution.select_pack_migration_roots_at(
+                plan,
+                (resolution_fixture.PackMigrationRootSelection(
+                    resolution_fixture.Path("mods/example.pw.toml"), "modrinth", "root-project"
+                ),),
+                repository_root=self.fixture.root, state_root=self.fixture.state,
+            )
+        with patch.object(
+            pack_migration, "_remove_directory_contents",
+            side_effect=pack_migration.PackMigrationCleanupError("blocked"),
+        ):
+            with self.assertRaises(pack_migration.PackMigrationCleanupError):
+                pack_migration.discard_pack_migration_plan(plan)
+        self.assertEqual(resolution_fixture.filesystem_snapshot(self.fixture.source), source_before)
+        pack_migration.discard_pack_migration_plan(plan)
+
+    def test_external_source_mutation_after_selection_is_stale(self) -> None:
+        plan, closure = self.selected_plan()
+        with patch.object(
+            packctl, "init_packwiz_project", side_effect=self.fake_target_init
+        ), patch.object(resolution_fixture.core, "resolve_mod_closure", return_value=closure), patch.object(
+            resolution_fixture.core,
+            "resolve_project_selector",
+            side_effect=resolution_fixture.PackMigrationResolutionTest.fake_selector,
+        ), patch.object(
+            packctl, "run_packwiz"
+        ):
+            resolved = pack_migration_resolution.select_pack_migration_roots_at(
+                plan,
+                (resolution_fixture.PackMigrationRootSelection(
+                    resolution_fixture.Path("mods/example.pw.toml"), "modrinth", "root-project"
+                ),),
+                repository_root=self.fixture.root, state_root=self.fixture.state,
+            )
+        source_file = self.fixture.source / "mods/example.pw.toml"
+        source_file.write_bytes(source_file.read_bytes() + b"\n")
+        with self.assertRaises(pack_migration.PackMigrationStale):
+            pack_migration.prepare_pack_migration_publication(
+                plan, resolved, acknowledged_warning_codes=self.acknowledgements(plan)
+            )
+        pack_migration.discard_pack_migration_plan(plan)
+
+    def test_preparation_and_precommit_failures_after_selection_preserve_source(self) -> None:
+        for phase in ("preparation", "precommit"):
+            with self.subTest(phase=phase):
+                plan, closure = self.selected_plan()
+                source_before = resolution_fixture.filesystem_snapshot(self.fixture.source)
+                with patch.object(
+                    packctl, "init_packwiz_project", side_effect=self.fake_target_init
+                ), patch.object(
+                    resolution_fixture.core, "resolve_mod_closure", return_value=closure
+                ), patch.object(
+                    resolution_fixture.core,
+                    "resolve_project_selector",
+                    side_effect=resolution_fixture.PackMigrationResolutionTest.fake_selector,
+                ), patch.object(packctl, "run_packwiz"):
+                    resolved = pack_migration_resolution.select_pack_migration_roots_at(
+                        plan,
+                        (resolution_fixture.PackMigrationRootSelection(
+                            resolution_fixture.Path("mods/example.pw.toml"),
+                            "modrinth",
+                            "root-project",
+                        ),),
+                        repository_root=self.fixture.root,
+                        state_root=self.fixture.state,
+                    )
+                try:
+                    if phase == "preparation":
+                        with patch.object(
+                            pack_migration, "_matches_validated_target", return_value=False
+                        ):
+                            with self.assertRaises(pack_migration.PackMigrationStale):
+                                pack_migration.prepare_pack_migration_publication(
+                                    plan,
+                                    resolved,
+                                    acknowledged_warning_codes=self.acknowledgements(plan),
+                                )
+                    else:
+                        publication = pack_migration.prepare_pack_migration_publication(
+                            plan,
+                            resolved,
+                            acknowledged_warning_codes=self.acknowledgements(plan),
+                        )
+                        with patch.object(
+                            packctl, "renameat2", side_effect=OSError("precommit failure")
+                        ):
+                            with self.assertRaises(pack_migration.PackMigrationPublicationError):
+                                pack_migration.apply_pack_migration_publication(publication)
+                    self.assertEqual(
+                        resolution_fixture.filesystem_snapshot(self.fixture.source),
+                        source_before,
+                    )
+                    self.assertFalse((self.fixture.packs / "next").exists())
+                finally:
+                    pack_migration.discard_pack_migration_plan(plan)
 
 
 class PackMigrationResolverPublicationIntegrationTest(unittest.TestCase):
