@@ -1035,6 +1035,23 @@ def _minimal_planning_owner(
     )
 
 
+def _release_planning_locks(
+    plan: PackMigrationPlan,
+    planning_error: BaseException,
+) -> None:
+    """Release planning locks or retain the failed owner for cleanup retry."""
+    try:
+        plan._lock_set.release()
+    except BaseException as release_error:
+        plan.cleanup_error = release_error
+        plan._state = "failed"
+        _record_plan_diagnostic(plan)
+        raise PackMigrationPlanningError(
+            f"{planning_error}; Pack migration lock release failed: {release_error}",
+            plan,
+        ) from planning_error
+
+
 def _remove_directory_contents(
     directory_fd: int,
     checkpoint: Callable[[], None],
@@ -1463,10 +1480,13 @@ def plan_pack_copy_migration_at(
                 raise PackMigrationPlanningError(
                     f"{error}; Pack migration cleanup failed: {caught}", plan
                 ) from error
-            lock_set.release()
+            _release_planning_locks(plan, error)
             raise
         if cleanup_error is None:
-            lock_set.release()
+            if plan is None:
+                lock_set.release()
+                raise
+            _release_planning_locks(plan, error)
             raise
         raise PackMigrationPlanningError(
             f"{error}; Pack migration cleanup failed: {cleanup_error}",

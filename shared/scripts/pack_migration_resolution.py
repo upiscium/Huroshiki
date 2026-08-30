@@ -1148,30 +1148,12 @@ def _resolve_effective_root_set(
                 _record_plan_diagnostic(plan)
                 return result
             roots = tuple(roots)
-            # A conflict retry starts from the original detached authority, but
-            # an explicitly removed root is the one legitimate case where its
-            # intent is no longer part of the target request.  Never transfer
-            # that intent to a replacement identity.
             root_ids = {root.canonical_identity for root in roots}
-            removed_ids = (
+            retired_root_ids = (
                 {root.canonical_identity for root in (original_roots or ())} - root_ids
                 if getattr(plan, "_active_resolution_request", None) is not None
                 else set()
             )
-            if removed_ids:
-                intent_facts = replace(
-                    intent_facts,
-                    overrides=tuple(
-                        item for item in intent_facts.overrides
-                        if item.canonical_identity not in removed_ids
-                    ),
-                )
-                intent_facts = replace(
-                    intent_facts,
-                    digest=hashlib.sha256(
-                        serialize_mod_version_overrides(intent_facts.overrides)
-                    ).hexdigest(),
-                )
             overrides = intent_by_identity(intent_facts)
             workspace = _create_workspace(plan)
             resolver_workspace_fd = os.open(workspace, _DIRECTORY_FLAGS)
@@ -1192,6 +1174,7 @@ def _resolve_effective_root_set(
             import huroshiki_core as core
 
             resolved: list[PackMigrationResolvedRoot] = []
+            provisional_resolved: dict[str, PackMigrationResolvedRoot] = {}
             unresolved: list[PackMigrationUnresolvedRoot] = []
             intent_issues: list[PackMigrationVersionIntentIssue] = []
             root_closures: list[tuple[PackMigrationRoot, object]] = []
@@ -1393,15 +1376,13 @@ def _resolve_effective_root_set(
                     classification,
                 )
                 root_closures.append((root, closure))
-                resolved.append(resolved_root)
+                provisional_resolved[root.canonical_identity] = resolved_root
             closure_by_root = {
                 root.canonical_identity: closure for root, closure in root_closures
             }
-            root_ids = {root.canonical_identity for root in roots}
             dependency_overrides = {
                 identity: override
                 for identity, override in overrides.items()
-                if identity not in root_ids
             }
             for owner, initial_closure in root_closures:
                 owner_identity = owner.canonical_identity
@@ -1430,7 +1411,8 @@ def _resolve_effective_root_set(
                     required_identities = {
                         identity
                         for identity in dependency_overrides
-                        if identity in current_identities
+                        if identity != owner_identity
+                        and identity in current_identities
                     }
                     if required_identities <= constrained_identities:
                         break
@@ -1511,6 +1493,11 @@ def _resolve_effective_root_set(
                         f"{owner_identity}"
                     )
             issue_identities = {issue.identity for issue in intent_issues}
+            final_graph_identities = {
+                f"{item.provider}:{item.project_id}"
+                for root, _ in root_closures
+                for item in closure_by_root[root.canonical_identity].metadata
+            }
             for identity, override in sorted(dependency_overrides.items()):
                 owners = tuple(
                     root.canonical_identity
@@ -1520,7 +1507,11 @@ def _resolve_effective_root_set(
                         for item in closure_by_root[root.canonical_identity].metadata
                     )
                 )
-                if not owners and identity not in issue_identities:
+                if (
+                    not owners
+                    and identity not in issue_identities
+                    and identity not in retired_root_ids
+                ):
                     intent_issues.append(
                         PackMigrationVersionIntentIssue(
                             identity,
@@ -1531,6 +1522,25 @@ def _resolve_effective_root_set(
                             "resolved root",
                         )
                     )
+            retained_intent_identities = final_graph_identities | root_ids
+            retained_overrides = tuple(
+                item
+                for item in intent_facts.overrides
+                if item.canonical_identity in retained_intent_identities
+            )
+            intent_facts = replace(
+                intent_facts,
+                overrides=retained_overrides,
+                automatic_identities=tuple(
+                    identity
+                    for identity in sorted(final_graph_identities)
+                    if identity
+                    not in {item.canonical_identity for item in retained_overrides}
+                ),
+                digest=hashlib.sha256(
+                    serialize_mod_version_overrides(retained_overrides)
+                ).hexdigest(),
+            )
             if intent_issues:
                 existing_intent_failures = {
                     (item.source_root.canonical_identity, item.message)
@@ -1565,42 +1575,15 @@ def _resolve_effective_root_set(
                 root.canonical_identity for root in (original_roots or roots)
             }
             before = _metadata_entries(detached_source, source_roots, checkpoint)
-            if unresolved:
-                _validate_detached_snapshot(plan, checkpoint)
-                _validate_live_source(
-                    plan,
-                    repository_root,
-                    operation_event,
-                    effective_deadline,
-                )
-                result = PackMigrationResolutionPlan(
-                    plan.source_snapshot.snapshot_digest,
-                    plan.target,
-                    roots,
-                    (),
-                    tuple(resolved),
-                    tuple(unresolved),
-                    PackMigrationDependencyDelta(),
-                    (),
-                    tuple(identity_collisions),
-                    tuple(path_collisions),
-                    tuple(filename_collisions),
-                    (),
-                    tuple(url_compatibility),
-                    None,
-                    "resolution-required",
-                    False,
-                    int(getattr(plan, "_resolution_attempt", 0)),
-                    intent_facts,
-                    tuple(intent_issues),
-                    intent_facts.digest,
-                )
-                plan.resolution = result
-                plan._state = "resolution-required"
-                _record_plan_diagnostic(plan)
-                return result
+            unresolved_identities = {
+                item.source_root.canonical_identity
+                for item in unresolved
+                if isinstance(item.source_root, PackMigrationRoot)
+            }
             for root, _ in root_closures:
                 checkpoint()
+                if root.canonical_identity in unresolved_identities:
+                    continue
                 try:
                     core.merge_metadata_closure(
                         bound_workspace / "source",
@@ -1615,10 +1598,23 @@ def _resolve_effective_root_set(
                     collision_reason = _classify_collision(str(error))
                     if collision_reason is None:
                         raise
-                    unresolved.append(PackMigrationUnresolvedRoot(
-                        root, collision_reason, str(error)[:240], False, True
-                    ))
-                    break
+                    message = str(error)[:240]
+                    if collision_reason == "path-collision":
+                        path_collisions.append(message)
+                    elif collision_reason == "filename-collision":
+                        filename_collisions.append(message)
+                    elif collision_reason == "identity-collision":
+                        identity_collisions.append(
+                            (root.canonical_identity, "collision")
+                        )
+                    unresolved.append(
+                        PackMigrationUnresolvedRoot(
+                            root, collision_reason, message, False, True
+                        )
+                    )
+                    unresolved_identities.add(root.canonical_identity)
+                    continue
+                resolved.append(provisional_resolved[root.canonical_identity])
             if unresolved:
                 _validate_detached_snapshot(plan, checkpoint)
                 _validate_live_source(
