@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import shutil
 import unittest
 import threading
 import time
@@ -49,6 +50,27 @@ class PackMigrationPublicationTest(unittest.TestCase):
         self.assertEqual(published.project_key, "pack:next")
         with self.assertRaises(pack_migration.PackMigrationPublicationError):
             pack_migration.apply_pack_copy_migration_at(plan._public_test_handoff)
+
+    def test_byte_identical_target_replacement_does_not_match_handoff(self) -> None:
+        plan = self.fixture.plan()
+        self.fixture.make_ready(plan)
+        token = plan._validation_token
+        assert token is not None
+        replacement = self.fixture.packs / "replacement"
+        shutil.copytree(plan.target_staging_root, replacement)
+        try:
+            snapshot = pack_migration.snapshot_pack_migration_source_at(
+                "pack:next", replacement, self.fixture.root
+            )
+            self.assertEqual(
+                snapshot._tree_scan.content_digest,
+                token.staging_content_digest,
+            )
+            self.assertNotEqual(snapshot.project_identity, token.staging_identity)
+            self.assertFalse(pack_migration._matches_validated_target(snapshot, token))
+        finally:
+            shutil.rmtree(replacement)
+            pack_migration.discard_pack_migration_plan(plan)
 
     def test_raw_plan_wrong_handoff_and_acknowledgement_rejection(self) -> None:
         plan = self.fixture.plan()
@@ -188,6 +210,41 @@ class PackMigrationPublicationTest(unittest.TestCase):
         with self.assertRaises(pack_migration.PackMigrationPublicationError):
             pack_migration.apply_pack_copy_migration_at(plan._public_test_handoff)
         pack_migration.discard_pack_migration_plan(plan)
+
+    def test_every_resolution_semantic_field_is_bound_to_handoff(self) -> None:
+        plan, resolution = self.resolved_input()
+        variants = {
+            "roots": resolution.roots + (object(),),
+            "root_candidates": resolution.root_candidates + (object(),),
+            "resolved_roots": resolution.resolved_roots + (object(),),
+            "unresolved_roots": resolution.unresolved_roots + (object(),),
+            "dependency_delta": replace(
+                resolution.dependency_delta, added=(object(),)
+            ),
+            "side_changes": (("a", "b", "client"),),
+            "identity_changes": (("a", "b"),),
+            "path_collisions": ("mods/new.pw.toml",),
+            "filename_collisions": ("new.jar",),
+            "provider_warnings": ("provider changed",),
+            "url_compatibility": (("a", object()),),
+            "target_source_snapshot": replace(
+                resolution.target_source_snapshot, snapshot_digest="changed"
+            ),
+            "provenance_required": True,
+            "resolution_attempt": resolution.resolution_attempt + 1,
+        }
+        try:
+            for field, value in variants.items():
+                with self.subTest(field=field):
+                    changed = replace(resolution, **{field: value})
+                    plan.resolution = changed
+                    with self.assertRaises(pack_migration.PackMigrationError):
+                        pack_migration.apply_pack_migration_publication(
+                            plan._public_test_handoff
+                        )
+                    plan.resolution = resolution
+        finally:
+            pack_migration.discard_pack_migration_plan(plan)
 
     def test_cleanup_failure_preserves_target_and_retry_verifies_it(self) -> None:
         plan = self.fixture.plan()

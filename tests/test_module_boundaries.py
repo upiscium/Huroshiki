@@ -2,6 +2,11 @@ import unittest
 
 import deploy_support
 import huroshiki_core
+import pack_migration
+import pack_migration_conflicts
+import pack_migration_resolution
+import pack_migration_roots
+import pack_migration_version_intent
 import packctl
 import publish_activation
 import publish_orchestration
@@ -29,6 +34,65 @@ class ModuleBoundaryTest(unittest.TestCase):
             huroshiki_core.download_url_artifact,
             url_artifacts.download_url_artifact,
         )
+
+    def test_core_reexports_pack_migration_api(self) -> None:
+        self.assertIs(huroshiki_core.PackMigrationPlan, pack_migration.PackMigrationPlan)
+        self.assertIs(
+            huroshiki_core.PackMigrationPublicationPlan,
+            pack_migration.PackMigrationPublicationPlan,
+        )
+        self.assertIs(
+            huroshiki_core.PackMigrationResolutionPlan,
+            pack_migration_resolution.PackMigrationResolutionPlan,
+        )
+        self.assertIs(
+            huroshiki_core.PackMigrationUnresolvedRoot,
+            pack_migration_resolution.PackMigrationUnresolvedRoot,
+        )
+        self.assertIs(
+            huroshiki_core.PackMigrationResolutionRequest,
+            pack_migration_conflicts.PackMigrationResolutionRequest,
+        )
+        self.assertIs(
+            huroshiki_core.PackMigrationRootResolution,
+            pack_migration_conflicts.PackMigrationRootResolution,
+        )
+        self.assertIs(
+            huroshiki_core.PackMigrationRootSelection,
+            pack_migration_roots.PackMigrationRootSelection,
+        )
+        self.assertIs(
+            huroshiki_core.PackMigrationVersionIntentFacts,
+            pack_migration_version_intent.PackMigrationVersionIntentFacts,
+        )
+        self.assertIs(
+            huroshiki_core.PackMigrationVersionIntentIssue,
+            pack_migration_version_intent.PackMigrationVersionIntentIssue,
+        )
+        self.assertIs(
+            huroshiki_core.PackMigrationConflictResolutionError,
+            pack_migration_conflicts.PackMigrationConflictResolutionError,
+        )
+        self.assertIs(
+            huroshiki_core.PackMigrationVersionIntentError,
+            pack_migration_version_intent.PackMigrationVersionIntentError,
+        )
+        for name in (
+            "snapshot_pack_migration_source",
+            "plan_pack_copy_migration",
+            "resolve_pack_migration_plan",
+            "commit_pack_migration_root_selection",
+            "create_pack_migration_resolution_request",
+            "resolve_pack_migration_conflicts",
+            "prepare_pack_migration_publication",
+            "apply_pack_migration_publication",
+            "retry_pack_migration_cleanup",
+            "discard_pack_migration_plan",
+            "exact_mod_artifact_selection",
+            "verify_exact_mod_metadata",
+            "run_noninteractive_packwiz",
+        ):
+            self.assertTrue(callable(getattr(huroshiki_core, name)))
 
     def test_core_reexports_publish_target_api(self) -> None:
         self.assertIs(

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import stat
 import threading
 import time
@@ -26,6 +25,11 @@ from pack_tree_policy import (
     PackTreeScan,
     copy_pack_tree_snapshot,
     scan_pack_migration_source,
+)
+from pack_migration_version_intent import (
+    DetachedVersionIntentMetadata,
+    PackMigrationVersionIntentError,
+    validate_detached_version_intent,
 )
 
 
@@ -448,6 +452,23 @@ def snapshot_pack_migration_source_at(
             "source/pack.toml",
         )
     except PackMigrationError as error:
+        validation_errors.append(str(error))
+    try:
+        validate_detached_version_intent(
+            root / "source",
+            metadata=tuple(
+                DetachedVersionIntentMetadata(
+                    entry.relative_path.relative_to("source"),
+                    _read_scanned_file(scan, entry.relative_path) or b"",
+                )
+                for entry in scan.entries
+                if entry.kind == "file"
+                and entry.relative_path.parts[:1] == ("source",)
+                and entry.relative_path.name.endswith(".pw.toml")
+            ),
+            checkpoint=checkpoint,
+        )
+    except (PackMigrationError, PackMigrationVersionIntentError) as error:
         validation_errors.append(str(error))
     content_scan = scan_content_overlays(root / "content", checkpoint=checkpoint)
     validation_errors.extend(
@@ -979,6 +1000,58 @@ def _cleanup_transaction(
     raise PackMigrationCleanupError("Pack migration transaction cleanup was incomplete")
 
 
+def _minimal_planning_owner(
+    *,
+    source_key: str,
+    source_root: Path,
+    target_root: Path,
+    target: PackMigrationTarget,
+    transaction_root: Path,
+    transaction_identity: tuple[int, int],
+    lock_set: packctl.ProjectLockSet,
+    source_snapshot: PackMigrationSourceSnapshot,
+    target_parent_identity: tuple[int, int],
+) -> PackMigrationPlan:
+    """Create the smallest retained owner for failures during plan setup."""
+    return PackMigrationPlan(
+        source_key=source_key,
+        source_root=source_root,
+        target_root=target_root,
+        target=target,
+        source_snapshot=source_snapshot,
+        transaction_root=transaction_root,
+        source_snapshot_root=transaction_root / "source-snapshot",
+        target_staging_root=transaction_root / "target-staging",
+        changes=(),
+        warnings=(),
+        copied_files=0,
+        copied_directories=0,
+        copied_bytes=0,
+        skipped_paths=(),
+        lock_set=lock_set,
+        transaction_identity=transaction_identity,
+        target_parent_identity=target_parent_identity,
+        state="failed",
+    )
+
+
+def _release_planning_locks(
+    plan: PackMigrationPlan,
+    planning_error: BaseException,
+) -> None:
+    """Release planning locks or retain the failed owner for cleanup retry."""
+    try:
+        plan._lock_set.release()
+    except BaseException as release_error:
+        plan.cleanup_error = release_error
+        plan._state = "failed"
+        _record_plan_diagnostic(plan)
+        raise PackMigrationPlanningError(
+            f"{planning_error}; Pack migration lock release failed: {release_error}",
+            plan,
+        ) from planning_error
+
+
 def _remove_directory_contents(
     directory_fd: int,
     checkpoint: Callable[[], None],
@@ -1383,9 +1456,37 @@ def plan_pack_copy_migration_at(
                 plan.cleanup_error = caught
                 _record_plan_diagnostic(plan)
         elif transaction_root is not None:
-            shutil.rmtree(transaction_root, ignore_errors=True)
+            # The transaction already has an identity, so retain a minimal
+            # owner rather than falling back to unbounded, silent deletion.
+            plan = _minimal_planning_owner(
+                source_key=source_key,
+                source_root=source_root,
+                target_root=target_root,
+                target=target,
+                transaction_root=transaction_root,
+                transaction_identity=transaction_identity,
+                lock_set=lock_set,
+                source_snapshot=expected_snapshot,
+                target_parent_identity=target_parent_identity,
+            )
+            try:
+                _cleanup_transaction(
+                    plan,
+                    time.monotonic() + PACK_MIGRATION_CLEANUP_TIMEOUT_SECONDS,
+                )
+            except BaseException as caught:
+                plan.cleanup_error = caught
+                _record_plan_diagnostic(plan)
+                raise PackMigrationPlanningError(
+                    f"{error}; Pack migration cleanup failed: {caught}", plan
+                ) from error
+            _release_planning_locks(plan, error)
+            raise
         if cleanup_error is None:
-            lock_set.release()
+            if plan is None:
+                lock_set.release()
+                raise
+            _release_planning_locks(plan, error)
             raise
         raise PackMigrationPlanningError(
             f"{error}; Pack migration cleanup failed: {cleanup_error}",
@@ -1394,8 +1495,36 @@ def plan_pack_copy_migration_at(
 
 
 def _publication_digest(value: object) -> str:
+    def canonical(item: object) -> object:
+        if isinstance(item, Path):
+            return {"__path__": item.as_posix()}
+        if is_dataclass(item) and not isinstance(item, type):
+            return {
+                field.name: canonical(getattr(item, field.name))
+                for field in fields(item)
+            }
+        if isinstance(item, dict):
+            return {
+                str(key): canonical(value)
+                for key, value in sorted(item.items(), key=lambda pair: str(pair[0]))
+            }
+        if isinstance(item, (tuple, list)):
+            return [canonical(value) for value in item]
+        if isinstance(item, (set, frozenset)):
+            return sorted((canonical(value) for value in item), key=repr)
+        if isinstance(item, (str, int, float, bool)) or item is None:
+            return item
+        # Resolution plans are dataclasses today.  Binding an additive object
+        # field by its public attributes keeps this digest fail-closed as the
+        # resolution API grows, without relying on unstable object reprs.
+        attributes = getattr(item, "__dict__", None)
+        if isinstance(attributes, dict):
+            return {key: canonical(value) for key, value in sorted(attributes.items())}
+        return {"__type__": f"{type(item).__module__}.{type(item).__qualname__}",
+                "__value__": str(item)}
+
     return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+        json.dumps(canonical(value), sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
 
@@ -1412,40 +1541,16 @@ def _required_warning_digest(warnings: tuple[PackMigrationWarning, ...]) -> str:
                 "identifier": _warning_identifier(warning),
             }
             for warning in warnings
-            if warning.acknowledgement_required
         ]
     )
 
 
 def _resolution_digest(resolution: object) -> str:
-    target = getattr(resolution, "target", None)
-    snapshot = getattr(resolution, "target_source_snapshot", None)
-    return _publication_digest(
-        {
-            "source": getattr(resolution, "source_snapshot_digest", None),
-            "state": getattr(resolution, "state", None),
-            "attempt": getattr(resolution, "resolution_attempt", None),
-            "target": {
-                "id": getattr(target, "target_id", None),
-                "minecraft": getattr(target, "minecraft_version", None),
-                "loader": getattr(target, "loader", None),
-                "loader_version": getattr(target, "loader_version", None),
-            },
-            "staging": getattr(snapshot, "snapshot_digest", None),
-            "resolved": [
-                getattr(item, "target_identity", None)
-                for item in getattr(resolution, "resolved_roots", ())
-            ],
-            "unresolved": [
-                getattr(item, "reason_code", None)
-                for item in getattr(resolution, "unresolved_roots", ())
-            ],
-            "collisions": [
-                getattr(resolution, name, ())
-                for name in ("path_collisions", "filename_collisions")
-            ],
-        }
-    )
+    # Digest every declared field recursively, including source roots,
+    # dependency deltas, URL compatibility, warnings, and the full target
+    # source scan.  This intentionally does not select a hand-maintained
+    # subset: additive resolution intent must be covered by the handoff too.
+    return _publication_digest(resolution)
 
 
 def _warning_identifier(warning: PackMigrationWarning) -> str:
@@ -1733,6 +1838,7 @@ def _matches_validated_target(
 ) -> bool:
     return (
         not snapshot.validation_errors
+        and snapshot.project_identity == token.staging_identity
         and snapshot._tree_scan.content_digest == token.staging_content_digest
         and snapshot.pack_yaml_digest == token.target_snapshot.pack_yaml_digest
         and snapshot.pack_toml_digest == token.target_snapshot.pack_toml_digest
@@ -2025,11 +2131,10 @@ def discard_pack_migration_plan(
         plan._state = "discarding"
         try:
             plan._retry_resolver_process_cleanup(effective_deadline)
-            _cleanup_transaction(
-                plan,
-                effective_deadline,
-                preserve_diagnostic=True,
-            )
+            # Do not release either lock until the transaction has been
+            # removed.  A failed cleanup therefore retains the owner, locks,
+            # and diagnostics for a subsequent discard retry.
+            _cleanup_transaction(plan, effective_deadline)
             _release_plan_locks(plan)
         except BaseException as error:
             plan.cleanup_error = error
@@ -2037,14 +2142,6 @@ def discard_pack_migration_plan(
             _record_plan_diagnostic(plan)
             raise
         plan._state = "discarded"
-        try:
-            _cleanup_transaction(
-                plan,
-                time.monotonic() + PACK_MIGRATION_CLEANUP_TIMEOUT_SECONDS,
-            )
-        except BaseException as error:
-            plan.cleanup_error = error
-            return
         plan.cleanup_error = None
 
 

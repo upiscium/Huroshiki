@@ -114,6 +114,33 @@ def resolution_snapshot_digest(resolution: object, attempt_number: int) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def create_pack_migration_resolution_request(
+    plan: "PackMigrationPlan",
+    resolutions: tuple[PackMigrationRootResolution, ...],
+) -> PackMigrationResolutionRequest:
+    """Bind caller choices to the current unresolved plan without exposing digests."""
+    from pack_migration_resolution import PackMigrationResolutionPlan
+
+    with plan._lock:
+        current = plan.resolution
+        if plan.state != "resolution-required" or not isinstance(
+            current, PackMigrationResolutionPlan
+        ):
+            raise PackMigrationConflictResolutionError(
+                "Pack migration is not awaiting conflict resolution"
+            )
+        request = PackMigrationResolutionRequest(
+            id(plan),
+            plan.source_snapshot.snapshot_digest,
+            resolution_snapshot_digest(
+                current, int(getattr(plan, "_resolution_attempt", 0))
+            ),
+            tuple(resolutions),
+        )
+        validate_resolution_request(plan, request)
+        return request
+
+
 def _strict_text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise PackMigrationConflictResolutionError(
@@ -176,6 +203,14 @@ def validate_resolution_request(
     ):
         raise PackMigrationConflictResolutionError(
             "Root provenance must be selected through the provenance API"
+        )
+    if any(
+        issue.owner_identity is None or issue.identity != issue.owner_identity
+        for issue in resolution.version_intent_issues
+    ):
+        raise PackMigrationConflictResolutionError(
+            "Dependency version intent must be changed at its source Authority "
+            "before migration conflict resolution"
         )
 
     unresolved: dict[str, object] = {}
@@ -319,6 +354,7 @@ __all__ = [
     "PackMigrationRootResolution",
     "ResolutionAction",
     "ValidatedPackMigrationResolution",
+    "create_pack_migration_resolution_request",
     "resolution_snapshot_digest",
     "validate_resolution_request",
 ]

@@ -541,6 +541,107 @@ url_max_jar_size_bytes: 123456
             pack_migration.discard_pack_migration_plan(plan)
         self.assertEqual(plan.state, "discarded")
 
+    def test_discard_final_cleanup_failure_is_not_swallowed(self) -> None:
+        plan = self.plan()
+        original = pack_migration._cleanup_transaction
+        with patch.object(
+            pack_migration,
+            "_cleanup_transaction",
+            side_effect=pack_migration.PackMigrationCleanupError("final cleanup blocked"),
+        ):
+            with self.assertRaises(pack_migration.PackMigrationCleanupError):
+                pack_migration.discard_pack_migration_plan(plan)
+        self.assertEqual(plan.state, "failed")
+        self.assertTrue(plan.transaction_root.is_dir())
+        self.assertTrue(packctl.project_lock_is_active("pack:demo"))
+        with patch.object(pack_migration, "_cleanup_transaction", side_effect=original):
+            pack_migration.discard_pack_migration_plan(plan)
+        self.assertEqual(plan.state, "discarded")
+
+    def test_full_planning_failure_retains_partial_lock_release_owner(self) -> None:
+        before = self.snapshot().snapshot_digest
+        original_release = packctl.ProjectLockSet.release
+        failed = False
+
+        def release(lock_set: packctl.ProjectLockSet) -> None:
+            nonlocal failed
+            if not failed:
+                failed = True
+                source_lock = next(
+                    lock
+                    for lock in lock_set.locks
+                    if lock.project_key == "pack:demo"
+                )
+                source_lock.release()
+                error = OSError("injected target unlock failure")
+                lock_set.release_errors = {"pack:next": error}
+                raise packctl.ProjectLockSetError(str(error), lock_set)
+            original_release(lock_set)
+
+        with patch.object(
+            pack_migration,
+            "_stage_pack_migration_target_config",
+            side_effect=RuntimeError("injected full-plan failure"),
+        ), patch.object(packctl.ProjectLockSet, "release", new=release):
+            with self.assertRaises(pack_migration.PackMigrationPlanningError) as caught:
+                self.plan()
+
+        owner = caught.exception.plan
+        self.assertEqual(owner.state, "failed")
+        self.assertIsInstance(owner.cleanup_error, packctl.ProjectLockSetError)
+        self.assertFalse(owner.transaction_root.exists())
+        self.assertEqual(owner._lock_set.owned_keys, ("pack:next",))
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+        self.assertTrue(packctl.project_lock_is_active("pack:next"))
+        self.assertEqual(self.snapshot().snapshot_digest, before)
+        self.assertFalse((self.packs / "next").exists())
+
+        pack_migration.discard_pack_migration_plan(owner)
+        self.assertEqual(owner.state, "discarded")
+        self.assertFalse(packctl.project_lock_is_active("pack:next"))
+
+    def test_minimal_planning_owner_retains_lock_release_failure(self) -> None:
+        before = self.snapshot().snapshot_digest
+        original_release = packctl.ProjectLockSet.release
+        failed = False
+
+        def release(lock_set: packctl.ProjectLockSet) -> None:
+            nonlocal failed
+            if not failed:
+                failed = True
+                source_lock = next(
+                    lock
+                    for lock in lock_set.locks
+                    if lock.project_key == "pack:demo"
+                )
+                source_lock.release()
+                error = OSError("injected minimal-owner unlock failure")
+                lock_set.release_errors = {"pack:next": error}
+                raise packctl.ProjectLockSetError(str(error), lock_set)
+            original_release(lock_set)
+
+        with patch.object(
+            pack_migration,
+            "_warnings_and_skips",
+            side_effect=RuntimeError("injected setup failure"),
+        ), patch.object(packctl.ProjectLockSet, "release", new=release):
+            with self.assertRaises(pack_migration.PackMigrationPlanningError) as caught:
+                self.plan()
+
+        owner = caught.exception.plan
+        self.assertEqual(owner.state, "failed")
+        self.assertIsInstance(owner.cleanup_error, packctl.ProjectLockSetError)
+        self.assertFalse(owner.transaction_root.exists())
+        self.assertEqual(owner._lock_set.owned_keys, ("pack:next",))
+        self.assertFalse(packctl.project_lock_is_active("pack:demo"))
+        self.assertTrue(packctl.project_lock_is_active("pack:next"))
+        self.assertEqual(self.snapshot().snapshot_digest, before)
+        self.assertFalse((self.packs / "next").exists())
+
+        pack_migration.discard_pack_migration_plan(owner)
+        self.assertEqual(owner.state, "discarded")
+        self.assertFalse(packctl.project_lock_is_active("pack:next"))
+
     def test_publication_lock_release_failure_retains_plan_diagnostic(self) -> None:
         plan = self.plan()
         self.make_ready(plan)
