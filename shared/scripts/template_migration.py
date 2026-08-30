@@ -395,7 +395,49 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
             unresolved.append(_unresolved(root, "version-intent-blocked" if exact else "no-compatible-file", str(error), retry=not bool(exact), version=exact.artifact_id if exact else None))
         if progress: progress(f"resolved root {root.source_index}")
     # Dependency-scoped exact intent constrains observed closures without ever
-    # becoming root intent.  Missing or mismatched artifacts fail closed.
+    # becoming root intent.  When the provider's automatic closure selected a
+    # different artifact, rebuild that root closure with the dependency pins
+    # preseeded instead of silently accepting Automatic or promoting the
+    # dependency to a root.
+    rebuilt_closures: list[tuple[TemplateRootIntent, object]] = []
+    for root, closure in closures:
+        records = [_metadata_identity(item) for item in getattr(closure, "metadata", ())]
+        applicable = [
+            constraint
+            for constraint in dependency_constraints
+            if any((item.provider, item.project_id) == (constraint.provider, constraint.project_id) for item in records)
+        ]
+        mismatched = [
+            constraint
+            for constraint in applicable
+            if not any((item.provider, item.project_id, item.file_id) == (constraint.provider, constraint.project_id, constraint.artifact_id) for item in records)
+        ]
+        if mismatched:
+            try:
+                root_identity = tuple(getattr(closure, "root_identity", ()))
+                root_record = next(item for item in records if (item.provider, item.project_id) == root_identity)
+                if root_identity[0] not in {"modrinth", "curseforge"} or not root_record.file_id:
+                    raise TemplateMigrationError("Exact dependency constraints require a provider root artifact")
+                root_selection = core.exact_mod_artifact_selection(root_identity[0], root_identity[1], root_record.file_id)
+                preseed = tuple(core.exact_mod_artifact_selection(item.provider, item.project_id, item.artifact_id) for item in applicable)
+                constrained_source = attempt_root / "roots" / f"constrained-{root.source_index}"
+                core.create_resolver_source(constrained_source, display_name=f"Constrain {root.name}", minecraft=plan.target.minecraft_version, loader=plan.target.loader, loader_version=plan.target.reference_loader_version)
+                closure = core.resolve_exact_mod_closure(root_selection, source=constrained_source, cancel_event=state.event, deadline=state.deadline, checkpoint=lambda: _check(state.event, state.deadline), preseed_selections=preseed, process_result_callback=lambda value: _record_process(state, value), diagnostic_project_id=plan.target.target_id)
+                records = [_metadata_identity(item) for item in getattr(closure, "metadata", ())]
+                for constraint in applicable:
+                    if not any((item.provider, item.project_id, item.file_id) == (constraint.provider, constraint.project_id, constraint.artifact_id) for item in records):
+                        raise TemplateMigrationError(f"Exact dependency artifact {constraint.artifact_id} was not retained")
+                resolved_index = next(index for index, item in enumerate(resolved) if item.source_index == root.source_index)
+                previous = resolved[resolved_index]
+                resolved[resolved_index] = TemplateResolvedRoot(previous.source_index, previous.provider, previous.project_id, previous.side, core.resolved_closure_fingerprint(closure), previous.artifact_id, tuple(sorted(f"{item.provider}:{item.project_id}" for item in records)), previous.classification, previous.url_evidence)
+            except BaseException as error:
+                if _resolver_integrity(error): raise TemplateMigrationOperationError(str(error)) from error
+                constraint = mismatched[0]
+                unresolved.append(_unresolved(root, "version-intent-blocked", str(error), retry=False, version=constraint.artifact_id))
+        rebuilt_closures.append((root, closure))
+    closures = rebuilt_closures
+
+    # Missing or still-mismatched exact dependency artifacts fail closed.
     for constraint in dependency_constraints:
         matches = []
         for root, closure in closures:

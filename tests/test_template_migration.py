@@ -253,11 +253,21 @@ class TemplateMigrationCoreTest(unittest.TestCase):
         self.assertNotIn("name: Depends1", manifest)
         migration.discard_template_migration_plan(plan)
 
-        blocked = SimpleNamespace(root_identity=("modrinth", "Project1"), metadata=(
+        automatic = SimpleNamespace(root_identity=("modrinth", "Project1"), metadata=(
             self.metadata("modrinth", "Project1", "Version1", "root"),
             self.metadata("modrinth", "Depends1", "OtherVer", "dependency")))
-        context, _ = self.resolver_patches(closure=blocked)
-        with context:
+        context, _ = self.resolver_patches(closure=automatic)
+        with context, patch("huroshiki_core.exact_mod_artifact_selection", side_effect=lambda *args: args), \
+             patch("huroshiki_core.resolve_exact_mod_closure", return_value=compatible) as constrained:
+            plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
+        self.assertEqual(result.status, "resolved")
+        self.assertEqual(constrained.call_args.kwargs["preseed_selections"],
+                         (("modrinth", "Depends1", "DepVer01"),))
+        migration.discard_template_migration_plan(plan)
+
+        context, _ = self.resolver_patches(closure=automatic)
+        with context, patch("huroshiki_core.exact_mod_artifact_selection", side_effect=lambda *args: args), \
+             patch("huroshiki_core.resolve_exact_mod_closure", side_effect=RuntimeError("exact dependency unavailable")):
             plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
         self.assertEqual(result.status, "resolution-required")
         self.assertEqual(result.unresolved[0].code, "version-intent-blocked")
