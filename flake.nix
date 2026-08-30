@@ -100,6 +100,7 @@
              test -f ${huroshiki}/lib/huroshiki/url_artifacts.py
             test -f ${huroshiki}/lib/huroshiki/project_locks.py
             test -f ${huroshiki}/lib/huroshiki/pack_migration.py
+            test -f ${huroshiki}/lib/huroshiki/template_migration.py
             test -f ${huroshiki}/lib/huroshiki/pack_migration_resolution.py
             test -f ${huroshiki}/lib/huroshiki/pack_migration_roots.py
             test -f ${huroshiki}/lib/huroshiki/pack_tree_policy.py

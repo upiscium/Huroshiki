@@ -8,6 +8,7 @@ import pack_migration_resolution
 import pack_migration_roots
 import pack_migration_version_intent
 import packctl
+import template_migration
 import publish_activation
 import publish_orchestration
 import publish_restart
@@ -99,6 +100,20 @@ class ModuleBoundaryTest(unittest.TestCase):
             "exact_mod_artifact_selection",
             "verify_exact_mod_metadata",
             "run_noninteractive_packwiz",
+        ):
+            self.assertTrue(callable(getattr(huroshiki_core, name)))
+
+    def test_core_reexports_template_migration_api(self) -> None:
+        self.assertIs(huroshiki_core.TemplateMigrationTarget, template_migration.TemplateMigrationTarget)
+        self.assertIs(huroshiki_core.TemplateResolutionResult, template_migration.TemplateResolutionResult)
+        for name in (
+            "snapshot_template_migration_source",
+            "plan_template_copy_migration",
+            "resolve_template_migration_plan",
+            "prepare_template_migration_publication",
+            "apply_template_migration_publication",
+            "retry_template_migration_cleanup",
+            "discard_template_migration_plan",
         ):
             self.assertTrue(callable(getattr(huroshiki_core, name)))
 

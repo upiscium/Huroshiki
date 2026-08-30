@@ -222,6 +222,28 @@ from pack_migration import (
     prepare_pack_migration_publication as _prepare_pack_migration_publication,
     retry_pack_migration_cleanup as _retry_pack_migration_cleanup,
 )
+from template_migration import (
+    TemplateExactConstraint,
+    TemplateMigrationError,
+    TemplateMigrationOperationError,
+    TemplateMigrationPlanningError,
+    TemplateMigrationPlan,
+    TemplateMigrationPublication,
+    TemplateMigrationSourceSnapshot,
+    TemplateMigrationTarget,
+    TemplateResolutionResult,
+    TemplateResolvedRoot,
+    TemplateRootIntent,
+    TemplateUnresolvedRoot,
+    TemplateUrlEvidence,
+    apply_template_migration_publication as _apply_template_migration_publication,
+    discard_template_migration_plan as _discard_template_migration_plan,
+    plan_template_copy_migration_at,
+    prepare_template_migration_publication as _prepare_template_migration_publication,
+    resolve_template_migration_plan_at,
+    retry_template_migration_cleanup as _retry_template_migration_cleanup,
+    snapshot_template_migration_source_at,
+)
 
 
 if TYPE_CHECKING:
@@ -6049,6 +6071,86 @@ def discard_pack_migration_plan(
     deadline: float | None = None,
 ) -> None:
     _discard_pack_migration_plan(plan, deadline=deadline)
+
+
+def snapshot_template_migration_source(
+    template_id: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> TemplateMigrationSourceSnapshot:
+    return snapshot_template_migration_source_at(
+        template_id,
+        packctl.get_template_root(template_id),
+        cancel_event=cancel_event,
+        deadline=deadline,
+    )
+
+
+def plan_template_copy_migration(
+    source_id: str,
+    target: TemplateMigrationTarget,
+    *,
+    expected_snapshot: TemplateMigrationSourceSnapshot,
+    cancel_event: threading.Event,
+    deadline: float,
+) -> TemplateMigrationPlan:
+    return plan_template_copy_migration_at(
+        source_id,
+        target,
+        root=packctl.get_template_root(source_id),
+        expected_snapshot=expected_snapshot,
+        cancel_event=cancel_event,
+        deadline=deadline,
+    )
+
+
+def resolve_template_migration_plan(
+    plan: TemplateMigrationPlan,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> TemplateResolutionResult:
+    return resolve_template_migration_plan_at(
+        plan, cancel_event=cancel_event, deadline=deadline, progress=progress
+    )
+
+
+def prepare_template_migration_publication(
+    plan: TemplateMigrationPlan,
+    resolution: TemplateResolutionResult,
+    *,
+    warning_acknowledgements: tuple[str, ...] = (),
+) -> TemplateMigrationPublication:
+    return _prepare_template_migration_publication(
+        plan, resolution, warning_acknowledgements=warning_acknowledgements
+    )
+
+
+def apply_template_migration_publication(
+    publication: TemplateMigrationPublication,
+) -> TemplateMigrationSourceSnapshot:
+    return _apply_template_migration_publication(publication)
+
+
+def retry_template_migration_cleanup(
+    publication: TemplateMigrationPublication,
+    *,
+    deadline: float,
+    cancel_event: threading.Event | None = None,
+) -> TemplateMigrationSourceSnapshot:
+    return _retry_template_migration_cleanup(
+        publication, deadline=deadline, cancel_event=cancel_event
+    )
+
+
+def discard_template_migration_plan(
+    plan: TemplateMigrationPlan,
+    *,
+    deadline: float | None = None,
+) -> None:
+    _discard_template_migration_plan(plan, deadline=deadline)
 
 
 PackCopyMigrationSessionState = Literal[
