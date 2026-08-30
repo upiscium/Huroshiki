@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import stat
 import tempfile
 import threading
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import packctl
+import project_locks
 import template_migration as migration
 
 
@@ -123,10 +125,46 @@ class TemplateMigrationCoreTest(unittest.TestCase):
                 self.assertEqual(result.status, "resolved")
                 migration.discard_template_migration_plan(plan)
         root_calls = [call for call in calls if "provider" in call]
-        self.assertEqual((root_calls[0]["minecraft"], root_calls[0]["loader"], root_calls[0]["loader_version"]),
-                         ("1.21.4", "neoforge", "21.4.1"))
         self.assertEqual((root_calls[1]["minecraft"], root_calls[1]["loader"], root_calls[1]["loader_version"]),
+                         ("1.21.4", "neoforge", "21.4.1"))
+        self.assertEqual((root_calls[3]["minecraft"], root_calls[3]["loader"], root_calls[3]["loader_version"]),
                          ("1.20.1", "fabric", "0.16.5"))
+
+    def test_legal_modrinth_selector_resolves_to_canonical_target_identity(self) -> None:
+        self._write_template(self.source, mods=[
+            {"name": "Create", "provider": "modrinth", "project_id": "create-id", "side": "both"}])
+        closure = SimpleNamespace(root_identity=("modrinth", "Project1"), metadata=(
+            self.metadata("modrinth", "Project1", "Version1", "create"),))
+        context, _ = self.resolver_patches(closure=closure)
+        with context, patch("huroshiki_core.resolve_project_selector", return_value=SimpleNamespace(
+            provider="modrinth", canonical_project_id="Project1")):
+            plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
+        self.assertEqual(result.status, "resolved")
+        self.assertEqual(result.resolved[0].project_id, "Project1")
+        self.assertEqual(result.resolved[0].classification, "unchanged")
+        self.assertEqual(result.ordered_root_facts[0].source_selector, "create-id")
+        self.assertEqual(result.ordered_root_facts[0].target_canonical_identity, "modrinth:Project1")
+        manifest = (plan._state.staging / "template.yaml").read_text()
+        self.assertIn("project_id: Project1", manifest)
+        self.assertNotIn("project_id: create-id", manifest)
+        migration.discard_template_migration_plan(plan)
+
+    def test_artifact_classification_uses_source_baseline(self) -> None:
+        source = SimpleNamespace(root_identity=("modrinth", "Abc123"), metadata=(
+            self.metadata("modrinth", "Abc123", "source-v", "root"),))
+        for target_artifact, expected in (("source-v", "unchanged"), ("target-v", "updated")):
+            with self.subTest(target_artifact=target_artifact):
+                target = SimpleNamespace(root_identity=("modrinth", "Abc123"), metadata=(
+                    self.metadata("modrinth", "Abc123", target_artifact, "root"),))
+                context, _ = self.resolver_patches(closure=source)
+                with context, patch("huroshiki_core.resolve_mod_closure", side_effect=lambda **kwargs: source if kwargs["minecraft"] == "1.21.1" else target):
+                    plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
+                self.assertEqual(result.resolved[0].classification, expected)
+                self.assertEqual(result.ordered_root_facts[0].source_artifact.artifact_id, "source-v")
+                self.assertEqual(result.ordered_root_facts[0].target_artifact.artifact_id, target_artifact)
+                self.assertEqual(result.source_minecraft_version, "1.21.1")
+                self.assertEqual(result.target.minecraft_version, "1.21.4")
+                migration.discard_template_migration_plan(plan)
 
     def test_snapshot_is_path_independent_and_source_is_immutable(self) -> None:
         before = (self.source / "template.yaml").read_bytes()
@@ -173,6 +211,51 @@ class TemplateMigrationCoreTest(unittest.TestCase):
         self.assertFalse(packctl.project_lock_is_active("template:base"))
         self.assertFalse(packctl.project_lock_is_active("template:next"))
 
+    def test_planning_failure_retains_partial_lock_release_owner(self) -> None:
+        class Lock:
+            def __init__(self, key: str, fail_once: bool = False):
+                self.project_key = key; self.owned = True; self.fail_once = fail_once; self.calls = 0
+            def release(self):
+                self.calls += 1
+                if self.fail_once:
+                    self.fail_once = False
+                    raise OSError("release failed")
+                self.owned = False
+
+        def lock_set():
+            source = Lock("template:base", fail_once=True)
+            target = Lock("template:next")
+            return project_locks.ProjectLockSet((source, target)), source, target
+
+        # Failure before transaction allocation.
+        (self.templates / "next").mkdir()
+        locks, source_lock, target_lock = lock_set()
+        with patch.object(packctl, "acquire_project_locks", return_value=locks):
+            with self.assertRaises(migration.TemplateMigrationPlanningError) as caught:
+                self.plan()
+        owner = caught.exception.plan
+        self.assertEqual(owner._state.locks.owned_keys, ("template:base",))
+        self.assertFalse(target_lock.owned)
+        self.assertIsNone(owner._state.tx)
+        migration.discard_template_migration_plan(owner, deadline=time.monotonic() + 30)
+        self.assertEqual(owner._state.locks.owned_keys, ())
+        self.assertEqual(source_lock.calls, 2)
+        (self.templates / "next").rmdir()
+
+        # Failure after transaction allocation removes only migration state,
+        # while retaining the one lock whose release failed.
+        locks, source_lock, target_lock = lock_set()
+        with patch.object(packctl, "acquire_project_locks", return_value=locks), \
+             patch.object(migration, "_write_new_regular", side_effect=OSError("staging failed")):
+            with self.assertRaises(migration.TemplateMigrationPlanningError) as caught:
+                self.plan()
+        owner = caught.exception.plan
+        self.assertEqual(owner._state.locks.owned_keys, ("template:base",))
+        self.assertIsNotNone(owner._state.tx)
+        self.assertFalse(owner._state.tx.exists())
+        migration.discard_template_migration_plan(owner, deadline=time.monotonic() + 30)
+        self.assertEqual(owner._state.locks.owned_keys, ())
+
     def test_order_and_sides_are_preserved_and_dependencies_are_not_persisted(self) -> None:
         self._write_template(self.source, mods=[
             {"name": "First", "provider": "modrinth", "project_id": "Abc123", "side": "client"},
@@ -186,7 +269,7 @@ class TemplateMigrationCoreTest(unittest.TestCase):
         second = SimpleNamespace(root_identity=("curseforge", "1234"), metadata=(
             self.metadata("curseforge", "1234", "1", "second"),))
         with context:
-            with patch("huroshiki_core.resolve_mod_closure", side_effect=[closure, second]):
+            with patch("huroshiki_core.resolve_mod_closure", side_effect=lambda **kwargs: second if kwargs.get("provider") == "curseforge" else closure):
                 plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
         self.assertEqual(result.status, "resolved")
         self.assertEqual([(r.source_index, r.side) for r in result.resolved], [(0, "client"), (1, "server")])
@@ -216,7 +299,7 @@ class TemplateMigrationCoreTest(unittest.TestCase):
              patch("huroshiki_core.verify_exact_mod_metadata"):
             plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
         self.assertEqual(result.status, "resolved")
-        exact.assert_called_once()
+        self.assertEqual(exact.call_count, 2)
         manifest = (plan._state.staging / "template.yaml").read_text()
         self.assertIn("artifact_id: Version1", manifest)
         self.assertIn("scope: root", manifest)
@@ -309,6 +392,48 @@ class TemplateMigrationCoreTest(unittest.TestCase):
         (self.templates / "next").rmdir()
         migration.discard_template_migration_plan(plan)
 
+    def test_publication_revalidates_parent_transaction_and_staging_descriptors(self) -> None:
+        def ready():
+            plan = self.plan(); context, _ = self.resolver_patches()
+            with context:
+                result = migration.resolve_template_migration_plan_at(plan)
+            return plan, migration.prepare_template_migration_publication(plan, result)
+
+        original_verify = migration._verify
+
+        plan, publication = ready()
+        old_parent = self.root / "templates-original"
+        def replace_parent(*args):
+            original_verify(*args)
+            self.templates.rename(old_parent); self.templates.mkdir()
+        with patch.object(migration, "_verify", side_effect=replace_parent):
+            with self.assertRaisesRegex(migration.TemplateMigrationOperationError, "parent identity"):
+                migration.apply_template_migration_publication(publication)
+        self.templates.rmdir(); old_parent.rename(self.templates)
+        migration.discard_template_migration_plan(plan)
+
+        plan, publication = ready()
+        old_tx = plan._state.tx.with_name(plan._state.tx.name + "-original")
+        def replace_transaction(*args):
+            original_verify(*args)
+            plan._state.tx.rename(old_tx); shutil.copytree(old_tx, plan._state.tx)
+        with patch.object(migration, "_verify", side_effect=replace_transaction):
+            with self.assertRaisesRegex(migration.TemplateMigrationOperationError, "transaction identity"):
+                migration.apply_template_migration_publication(publication)
+        shutil.rmtree(plan._state.tx); old_tx.rename(plan._state.tx)
+        migration.discard_template_migration_plan(plan)
+
+        plan, publication = ready()
+        old_staging = plan._state.tx / "staging-original"
+        def replace_staging(*args):
+            original_verify(*args)
+            plan._state.staging.rename(old_staging); shutil.copytree(old_staging, plan._state.staging)
+        with patch.object(migration, "_verify", side_effect=replace_staging):
+            with self.assertRaisesRegex(migration.TemplateMigrationOperationError, "staging identity"):
+                migration.apply_template_migration_publication(publication)
+        shutil.rmtree(plan._state.staging); old_staging.rename(plan._state.staging)
+        migration.discard_template_migration_plan(plan)
+
     def test_resolver_cancellation_and_deadline_leave_target_absent(self) -> None:
         event = threading.Event(); plan = self.plan(cancel_event=event)
         def cancelled(**kwargs):
@@ -341,7 +466,8 @@ class TemplateMigrationCoreTest(unittest.TestCase):
             local="url_max_jar_size_bytes: 12345\nurl_allow_private_networks: true\n")
         def url_closure(loaders: str, versions: str):
             contents = ("name = 'jar'\nfilename = 'jar.jar'\nside = 'both'\n"
-                        f"[huroshiki]\nloaders = [{loaders}]\nminecraft-versions = [{versions}]\n").encode()
+                        "[download]\nurl = 'https://example.invalid/jar.jar'\n"
+                        f"[huroshiki]\nproject-id = 'jar'\nloaders = [{loaders}]\nminecraft-versions = [{versions}]\n").encode()
             return SimpleNamespace(root_identity=("url", "jar"), metadata=(
                 SimpleNamespace(relative_path=Path("jar.pw.toml"), contents=contents,
                                  identity=("url", "jar")),))
@@ -349,11 +475,15 @@ class TemplateMigrationCoreTest(unittest.TestCase):
         context, calls = self.resolver_patches(closure=compatible, calls=[])
         with context:
             plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
+        self.assertEqual(result.status, "resolved", result.unresolved)
         self.assertEqual(result.url_evidence[0].status, "compatible")
         self.assertEqual(result.url_evidence[0].effective_max_size_bytes, 12345)
         self.assertTrue(result.url_evidence[0].effective_allow_private_networks)
         self.assertEqual(calls[0]["url_max_jar_size_bytes"], 12345)
         self.assertTrue(calls[0]["url_allow_private_networks"])
+        manifest = (plan._state.staging / "template.yaml").read_text()
+        self.assertNotIn("url_max_jar_size_bytes", manifest)
+        self.assertNotIn("url_allow_private_networks", manifest)
         migration.discard_template_migration_plan(plan)
 
         for loaders, versions, expected in [('"fabric"', '"1.21.4"', "incompatible"),
@@ -366,15 +496,68 @@ class TemplateMigrationCoreTest(unittest.TestCase):
             self.assertEqual(result.status, "resolution-required")
             migration.discard_template_migration_plan(plan)
 
+    def test_committed_url_size_policy_is_preserved_without_local_policy_copy(self) -> None:
+        self._write_template(self.source, mods=[{"name": "Jar", "provider": "url",
+            "project_id": "jar", "side": "both", "url": "https://example.invalid/jar.jar"}])
+        with (self.source / "template.yaml").open("a", encoding="utf-8") as handle:
+            handle.write("url_max_jar_size_bytes: 4096\n")
+        contents = ("name = 'jar'\nfilename = 'jar.jar'\nside = 'both'\n"
+                    "[download]\nurl = 'https://example.invalid/jar.jar'\n"
+                    "[huroshiki]\nproject-id = 'jar'\nloaders = ['neoforge']\nminecraft-versions = ['1.21.4']\n").encode()
+        closure = SimpleNamespace(root_identity=("url", "jar"), metadata=(
+            SimpleNamespace(relative_path=Path("jar.pw.toml"), contents=contents, identity=("url", "jar")),))
+        context, _ = self.resolver_patches(closure=closure)
+        with context:
+            plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
+        self.assertEqual(result.status, "resolved", result.unresolved)
+        manifest = (plan._state.staging / "template.yaml").read_text()
+        self.assertIn("url_max_jar_size_bytes: 4096", manifest)
+        self.assertNotIn("url_allow_private_networks", manifest)
+        migration.discard_template_migration_plan(plan)
+
     def test_metadata_collision_and_resolver_termination_failure_do_not_publish(self) -> None:
         plan = self.plan()
         context, _ = self.resolver_patches()
         with context:
             with patch("huroshiki_core.merge_metadata_closure", side_effect=RuntimeError("metadata collision")):
-                with self.assertRaises(RuntimeError):
-                    migration.resolve_template_migration_plan_at(plan)
+                result = migration.resolve_template_migration_plan_at(plan)
+        self.assertEqual(result.status, "resolution-required")
+        self.assertEqual(result.collisions[0].reason_code, "identity-collision")
+        self.assertEqual(result.resolved, ())
         self.assertFalse((self.templates / "next").exists())
         migration.discard_template_migration_plan(plan)
+
+    def test_cross_root_collisions_are_deterministic_typed_facts(self) -> None:
+        self._write_template(self.source, mods=[
+            {"name": "First", "provider": "modrinth", "project_id": "Project1", "side": "both"},
+            {"name": "Second", "provider": "modrinth", "project_id": "Project2", "side": "both"},
+        ])
+        closures = {
+            "Project1": SimpleNamespace(root_identity=("modrinth", "Project1"), metadata=(self.metadata("modrinth", "Project1", "Version1", "first"),)),
+            "Project2": SimpleNamespace(root_identity=("modrinth", "Project2"), metadata=(self.metadata("modrinth", "Project2", "Version2", "second"),)),
+        }
+        for message, code, field in (
+            ("metadata path collision", "path-collision", "path_collisions"),
+            ("filename collision", "filename-collision", "filename_collisions"),
+            ("dependency equivalence conflict", "identity-collision", "identity_collisions"),
+        ):
+            with self.subTest(code=code):
+                context, _ = self.resolver_patches(closure=closures["Project1"])
+                merge_calls = 0
+                def merge(*args, **kwargs):
+                    nonlocal merge_calls
+                    merge_calls += 1
+                    if merge_calls == 2: raise RuntimeError(message)
+                with context, patch("huroshiki_core.resolve_mod_closure", side_effect=lambda **kwargs: closures[kwargs["canonical_project_id"]]), \
+                     patch("huroshiki_core.merge_metadata_closure", side_effect=merge):
+                    plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
+                self.assertEqual(result.status, "resolution-required")
+                self.assertEqual(result.resolved, ())
+                self.assertEqual([item.source_index for item in result.unresolved], [0, 1])
+                self.assertEqual(result.collisions[0].reason_code, code)
+                self.assertEqual(getattr(result, field), result.collisions)
+                self.assertEqual(result.collisions[0].source_indices, (0, 1))
+                migration.discard_template_migration_plan(plan)
 
         plan = self.plan()
         bad = self._TerminationFailure("resolver did not terminate")
@@ -430,6 +613,42 @@ class TemplateMigrationCoreTest(unittest.TestCase):
         self.assertTrue((self.templates / "next" / "template.yaml").is_file())
         self.assertIsNotNone(plan._state.cleanup_error)
         migration.retry_template_migration_cleanup(publication, deadline=time.monotonic() + 30)
+
+    def test_cleanup_retry_rejects_byte_identical_published_replacement(self) -> None:
+        plan = self.plan(); context, _ = self.resolver_patches()
+        with context:
+            result = migration.resolve_template_migration_plan_at(plan)
+        publication = migration.prepare_template_migration_publication(plan, result)
+        original_cleanup = migration._cleanup
+        with patch.object(migration, "_cleanup", side_effect=migration.TemplateMigrationOperationError("cleanup")):
+            with self.assertRaises(migration.TemplateMigrationOperationError):
+                migration.apply_template_migration_publication(publication)
+        target = self.templates / "next"; original_target = self.templates / "next-original"
+        target.rename(original_target); shutil.copytree(original_target, target)
+        with self.assertRaisesRegex(migration.TemplateMigrationOperationError, "changed"):
+            migration.retry_template_migration_cleanup(publication, deadline=time.monotonic() + 30)
+        shutil.rmtree(target); original_target.rename(target)
+        with patch.object(migration, "_cleanup", original_cleanup):
+            migration.retry_template_migration_cleanup(publication, deadline=time.monotonic() + 30)
+
+    def test_cleanup_retry_rejects_same_inode_reparented_target(self) -> None:
+        plan = self.plan(); context, _ = self.resolver_patches()
+        with context:
+            result = migration.resolve_template_migration_plan_at(plan)
+        publication = migration.prepare_template_migration_publication(plan, result)
+        original_cleanup = migration._cleanup
+        with patch.object(migration, "_cleanup", side_effect=migration.TemplateMigrationOperationError("cleanup")):
+            with self.assertRaises(migration.TemplateMigrationOperationError):
+                migration.apply_template_migration_publication(publication)
+        old_parent = self.root / "templates-original"
+        self.templates.rename(old_parent); self.templates.mkdir()
+        (old_parent / "next").rename(self.templates / "next")
+        with self.assertRaisesRegex(migration.TemplateMigrationOperationError, "parent changed"):
+            migration.retry_template_migration_cleanup(publication, deadline=time.monotonic() + 30)
+        (self.templates / "next").rename(old_parent / "next")
+        self.templates.rmdir(); old_parent.rename(self.templates)
+        with patch.object(migration, "_cleanup", original_cleanup):
+            migration.retry_template_migration_cleanup(publication, deadline=time.monotonic() + 30)
 
 
 if __name__ == "__main__":

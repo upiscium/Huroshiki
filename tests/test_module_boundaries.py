@@ -106,6 +106,8 @@ class ModuleBoundaryTest(unittest.TestCase):
     def test_core_reexports_template_migration_api(self) -> None:
         self.assertIs(huroshiki_core.TemplateMigrationTarget, template_migration.TemplateMigrationTarget)
         self.assertIs(huroshiki_core.TemplateResolutionResult, template_migration.TemplateResolutionResult)
+        self.assertIs(huroshiki_core.TemplateCollisionFact, template_migration.TemplateCollisionFact)
+        self.assertIs(huroshiki_core.TemplateRootResolutionFact, template_migration.TemplateRootResolutionFact)
         for name in (
             "snapshot_template_migration_source",
             "plan_template_copy_migration",

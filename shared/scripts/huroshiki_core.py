@@ -223,6 +223,8 @@ from pack_migration import (
     retry_pack_migration_cleanup as _retry_pack_migration_cleanup,
 )
 from template_migration import (
+    TemplateArtifactFact,
+    TemplateCollisionFact,
     TemplateExactConstraint,
     TemplateMigrationError,
     TemplateMigrationOperationError,
@@ -233,9 +235,12 @@ from template_migration import (
     TemplateMigrationTarget,
     TemplateResolutionResult,
     TemplateResolvedRoot,
+    TemplateRootResolutionFact,
     TemplateRootIntent,
     TemplateUnresolvedRoot,
     TemplateUrlEvidence,
+    TemplateVersionIntentFact,
+    TemplateVersionIntentIssue,
     apply_template_migration_publication as _apply_template_migration_publication,
     discard_template_migration_plan as _discard_template_migration_plan,
     plan_template_copy_migration_at,
