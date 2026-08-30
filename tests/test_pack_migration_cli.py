@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
 import unittest
@@ -10,18 +10,20 @@ import huroshiki_core as core
 import packctl
 
 
+def migration_argv(*extra: str) -> list[str]:
+    return [
+        "migrate", "demo",
+        "--copy-to", "next",
+        "--display-name", "Next",
+        "--minecraft", "1.21.4",
+        "--loader", "fabric",
+        "--loader-version", "0.16.0",
+        *extra,
+    ]
+
+
 def migration_args(*extra: str):
-    return packctl.parser().parse_args(
-        [
-            "migrate", "demo",
-            "--copy-to", "next",
-            "--display-name", "Next",
-            "--minecraft", "1.21.4",
-            "--loader", "fabric",
-            "--loader-version", "0.16.0",
-            *extra,
-        ]
-    )
+    return packctl.parser().parse_args(migration_argv(*extra))
 
 
 class FakeMigrationSession:
@@ -117,6 +119,22 @@ class PackMigrationCliTest(unittest.TestCase):
         self.assertIn("PREVIEW", output)
         self.assertIn("target not published", output)
 
+    def test_preview_rejects_warning_acknowledgement_before_session_creation(self) -> None:
+        error_output = StringIO()
+        with patch.object(
+            packctl.sys,
+            "argv",
+            ["packctl", *migration_argv("--ack-warning", "unknown-value")],
+        ), patch.object(
+            core, "PackCopyMigrationSession"
+        ) as session_type, redirect_stderr(error_output):
+            result = packctl.main()
+
+        self.assertEqual(result, 2)
+        self.assertIn("--ack-warning requires --apply", error_output.getvalue())
+        session_type.assert_not_called()
+        self.assertEqual(FakeMigrationSession.instances, [])
+
     def test_apply_forwards_exact_acknowledgements_and_publishes(self) -> None:
         result, output, session = self.run_command(
             "--apply", "--ack-warning", "review", "--ack-warning", "config"
@@ -126,6 +144,27 @@ class PackMigrationCliTest(unittest.TestCase):
         self.assertIn("publish", session.calls)
         self.assertNotIn("discard", session.calls)
         self.assertIn("Migration completed. Target Pack: next", output)
+
+    def test_apply_unknown_acknowledgement_remains_session_rejected(self) -> None:
+        original_prepare = FakeMigrationSession.prepare_publication
+
+        def prepare(session: FakeMigrationSession, acknowledgements) -> None:
+            original_prepare(session, acknowledgements)
+            raise core.PackMigrationError(
+                "Unknown Pack migration warning acknowledgement: unknown-value"
+            )
+
+        with patch.object(FakeMigrationSession, "prepare_publication", prepare):
+            with self.assertRaisesRegex(
+                packctl.ConfigError, "Unknown Pack migration warning acknowledgement"
+            ):
+                self.run_command("--apply", "--ack-warning", "unknown-value")
+
+        session = FakeMigrationSession.instances[-1]
+        self.assertEqual(
+            session.calls,
+            ["start", "preview", ("prepare", ("unknown-value",)), "discard"],
+        )
 
     def test_provenance_required_prints_requirements_and_discards(self) -> None:
         FakeMigrationSession.start_state = "provenance-required"

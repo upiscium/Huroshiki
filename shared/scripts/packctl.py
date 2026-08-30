@@ -5821,10 +5821,6 @@ def _migration_choices(args: argparse.Namespace, core: Any) -> tuple[object, ...
         raise ConfigError("Duplicate migration replacement")
     if set(removals) & set(old_ids):
         raise ConfigError("A migration identity cannot be both removed and replaced")
-    acknowledgements = _migration_arg(args, "ack_warnings")
-    if len(acknowledgements) != len(set(acknowledgements)):
-        raise ConfigError("Duplicate migration warning acknowledgement")
-
     result = []
     for identity in removals:
         result.append(core.PackMigrationRootResolution(identity, "remove"))
@@ -5919,6 +5915,9 @@ def _migration_failure(session: object, error: BaseException) -> ConfigError:
 
 def cmd_migrate(args: argparse.Namespace) -> int:
     """Run the non-interactive Pack copy migration protocol."""
+    if _migration_arg(args, "ack_warnings") and not args.apply:
+        raise ConfigError("--ack-warning requires --apply")
+
     import huroshiki_core as core
 
     cancel_event = threading.Event()
