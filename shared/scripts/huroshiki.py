@@ -113,6 +113,7 @@ class FilterInput(Input):
 PROJECT_ACTION_LABELS = {
     "Content": "content",
     "Apply Template": "apply template",
+    "migrate": "migrate / copy version",
 }
 
 
@@ -156,6 +157,702 @@ class PackPublishOwner:
     cleanup_retained: bool = False
     navigation_pending: bool = False
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+
+@dataclass
+class PackCopyMigrationOwner:
+    """Application ownership for a copy migration and both project locks."""
+    source_key: str
+    target_key: str
+    session: core.PackCopyMigrationSession
+    cancel_event: threading.Event
+    deadline: float
+    done: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+    error: BaseException | None = None
+    cleanup_retained: bool = False
+    published: bool = False
+    cleanup_pending: bool = False
+    navigation_pending: bool = False
+    progress_message: str | None = None
+    pending_view: core.PackCopyMigrationView | None = None
+    pending_preview: object | None = None
+    cleanup_completed: bool = False
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    @property
+    def keys(self) -> tuple[str, str]:
+        return (self.source_key, self.target_key)
+
+
+def _session_cancel(session: core.PackCopyMigrationSession) -> None:
+    session.cancel()
+
+
+def _migration_cleanup(owner: PackCopyMigrationOwner, deadline: float) -> None:
+    try:
+        lifecycle = owner.session.view.publication_lifecycle
+        if lifecycle == "committed":
+            owner.session.retry_cleanup(deadline=deadline)
+            owner.published = True
+        elif lifecycle == "uncertain":
+            owner.cleanup_retained = True
+            owner.cleanup_pending = True
+            return
+        else:
+            owner.session.discard(deadline=deadline)
+        owner.cleanup_retained = False
+        owner.cleanup_pending = False
+    except BaseException:
+        owner.cleanup_retained = True
+        owner.cleanup_pending = True
+
+
+def _migration_retry_cleanup(owner: PackCopyMigrationOwner, deadline: float) -> None:
+    _migration_cleanup(owner, deadline)
+
+
+class PackCopyMigrationTargetModal(ModalScreen[dict[str, str] | None]):
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+enter", "submit", "Continue"),
+    ]
+    FIELD_IDS = (
+        "migration-target-id",
+        "migration-target-name",
+        "migration-target-minecraft",
+        "migration-target-loader",
+        "migration-target-loader-version",
+    )
+
+    def compose(self) -> ComposeResult:
+        with Container(id="modal-dialog", classes="form-dialog"):
+            yield Static("Copy pack / migration target", classes="modal-title")
+            for label, field_id, placeholder in (
+                ("Target project ID", self.FIELD_IDS[0], "new-pack"),
+                ("Display name", self.FIELD_IDS[1], "New Pack"),
+                ("Minecraft version", self.FIELD_IDS[2], "1.21.1"),
+                ("Loader", self.FIELD_IDS[3], "neoforge"),
+                ("Loader version", self.FIELD_IDS[4], "21.1.1"),
+            ):
+                yield Static(label)
+                yield Input(placeholder=placeholder, id=field_id)
+            yield Static(
+                "Copy only. Explicit legacy provenance selection may update the source. "
+                "Enter: next / submit; Esc: cancel",
+                classes="modal-help",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one(f"#{self.FIELD_IDS[0]}", Input).focus()
+
+    @on(Input.Submitted)
+    def submitted(self, event: Input.Submitted) -> None:
+        inputs = [self.query_one(f"#{item}", Input) for item in self.FIELD_IDS]
+        index = inputs.index(event.input)
+        if index + 1 < len(inputs):
+            inputs[index + 1].focus()
+        else:
+            self.action_submit()
+
+    def action_submit(self) -> None:
+        values = {
+            item: self.query_one(f"#{item}", Input).value.strip()
+            for item in self.FIELD_IDS
+        }
+        if not all(values.values()):
+            self.app.notify("All target fields are required", severity="error")
+            return
+        self.dismiss(
+            {
+                "project_id": values[self.FIELD_IDS[0]],
+                "display_name": values[self.FIELD_IDS[1]],
+                "minecraft": values[self.FIELD_IDS[2]],
+                "loader": values[self.FIELD_IDS[3]].lower(),
+                "loader_version": values[self.FIELD_IDS[4]],
+            }
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+MigrationTargetModal = PackCopyMigrationTargetModal
+
+
+class PackMigrationIdentityModal(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, title: str, provider: str) -> None:
+        super().__init__()
+        self.title_text = title
+        self.provider = provider
+
+    def compose(self) -> ComposeResult:
+        with Container(id="modal-dialog", classes="form-dialog"):
+            yield Static(self.title_text, classes="modal-title")
+            yield Static(f"Canonical provider: {self.provider}")
+            yield Input(placeholder="Canonical project ID", id="migration-project-id")
+            yield Static("Enter: select   Esc: cancel", classes="modal-help")
+
+    def on_mount(self) -> None:
+        self.query_one("#migration-project-id", Input).focus()
+
+    @on(Input.Submitted, "#migration-project-id")
+    def submitted(self, event: Input.Submitted) -> None:
+        project_id = event.value.strip()
+        if not project_id:
+            self.app.notify("A canonical project ID is required", severity="error")
+            return
+        self.dismiss(f"{self.provider}:{project_id}")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PackMigrationReplacementModal(ModalScreen[tuple[str, str] | None]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, source_identity: str) -> None:
+        super().__init__()
+        self.source_identity = source_identity
+
+    def compose(self) -> ComposeResult:
+        with Container(id="modal-dialog", classes="form-dialog"):
+            yield Static(f"Replace {self.source_identity}", classes="modal-title")
+            yield Static("Provider (modrinth or curseforge)")
+            yield Input(placeholder="modrinth", id="migration-replacement-provider")
+            yield Static("Canonical project ID")
+            yield Input(placeholder="project ID", id="migration-replacement-project")
+            yield Static("Enter: continue   Esc: cancel", classes="modal-help")
+
+    @on(Input.Submitted)
+    def submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "migration-replacement-provider":
+            self.query_one("#migration-replacement-project", Input).focus()
+            return
+        provider = (
+            self.query_one("#migration-replacement-provider", Input)
+            .value.strip()
+            .lower()
+        )
+        project_id = self.query_one("#migration-replacement-project", Input).value.strip()
+        if provider not in {"modrinth", "curseforge"} or not project_id:
+            self.app.notify(
+                "Replacement requires modrinth or curseforge and a canonical project ID",
+                severity="error",
+            )
+            return
+        self.dismiss((provider, project_id))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PackCopyMigrationScreen(Screen[None]):
+    """Thin UI coordinator: all migration authorities remain in Core."""
+    BINDINGS = [Binding("escape", "leave", "Cancel"), Binding("q", "leave", "Cancel")]
+
+    def __init__(self, owner: PackCopyMigrationOwner) -> None:
+        super().__init__()
+        self.owner = owner
+        self.session = owner.session
+        self.screen_title = f"Pack migration / {owner.source_key} → {owner.target_key}"
+        self.status = "Starting migration planning..."
+        self.roots: list[core.PackCopyMigrationRootCandidateView] = []
+        self.conflicts: list[core.PackCopyMigrationUnresolvedView] = []
+        self.selected_roots: dict[str, str] = {}
+        self.conflict_choices: dict[str, core.PackMigrationRootResolution] = {}
+        self.preview: core.PackCopyMigrationPreview | None = None
+        self.acknowledged_warnings: tuple[str, ...] = ()
+        self.phase = "start"
+        self._timer: Timer | None = None
+        self._rendered_phase: str | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.screen_title, id="screen-title")
+        yield Static(self.status, id="migration-status", markup=False)
+        yield DataTable(id="migration-options")
+        yield Static(
+            "Space: select/remove   p: replace   Enter: continue   "
+            "q/Esc: cancel   r: retry cleanup",
+            id="key-help",
+        )
+
+    def on_mount(self) -> None:
+        table = self.query_one("#migration-options", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("Selection")
+        table.add_column("Details")
+        table.focus()
+        self._timer = self.set_interval(0.05, self._poll)
+        self._start_worker("start", self._start)
+
+    def _start(self) -> None:
+        try:
+            view = self.session.start(progress=self._progress)
+            self._store_result(view)
+        except BaseException as error:
+            self.owner.error = error
+        finally:
+            self.owner.done.set()
+
+    def _progress(self, value: object) -> None:
+        message = getattr(value, "message", None)
+        if isinstance(message, str) and message:
+            with self.owner.lock:
+                self.owner.progress_message = message
+
+    def _store_result(self, view: core.PackCopyMigrationView) -> None:
+        preview = self.session.preview() if view.state == "resolved" else None
+        with self.owner.lock:
+            self.owner.pending_view = view
+            self.owner.pending_preview = preview
+
+    def _route_view(self, view: core.PackCopyMigrationView) -> None:
+        self._rendered_phase = None
+        if view.state == "provenance-required":
+            self.roots = list(view.candidates)
+            self.phase = "roots"
+        elif view.state == "resolution-required":
+            self.conflicts = list(view.unresolved)
+            self.phase = "conflicts"
+        elif view.state == "resolved":
+            with self.owner.lock:
+                self.preview = self.owner.pending_preview
+                self.owner.pending_preview = None
+            self.phase = "preview"
+        else:
+            raise core.HuroshikiError(
+                view.error_message or f"Unexpected migration state: {view.state}"
+            )
+
+    def _start_worker(self, phase: str, target: Callable[[], None]) -> None:
+        if self.owner.thread is not None and self.owner.thread.is_alive():
+            return
+        self.owner.done.clear()
+        self.owner.error = None
+        self.owner.thread = threading.Thread(
+            target=target,
+            name=(
+                f"huroshiki-pack-migration-{phase}-"
+                f"{self.owner.source_key.replace(':', '-')}"
+            ),
+            daemon=False,
+        )
+        try:
+            self.owner.thread.start()
+        except BaseException as error:
+            self.owner.error = error
+            self.owner.done.set()
+
+    def _poll(self) -> None:
+        with self.owner.lock:
+            progress_message = self.owner.progress_message
+        if progress_message:
+            self.status = progress_message
+        if not self.owner.done.is_set():
+            self.query_one("#migration-status", Static).update(self.status)
+            return
+        if self.owner.thread is not None:
+            self.owner.thread.join(0)
+            if self.owner.thread.is_alive():
+                return
+        if self.owner.navigation_pending and self.phase != "discard":
+            self.phase = "discard"
+            self.status = "Cleaning migration ownership..."
+            with self.owner.lock:
+                cleanup_completed = self.owner.cleanup_completed
+            if not cleanup_completed:
+                self._start_worker("discard", self._discard)
+                return
+        if self.phase == "discard":
+            if self.owner.cleanup_retained:
+                if self.session.view.publication_uncertain:
+                    self.status = (
+                        "Publication outcome is uncertain; ownership is retained. "
+                        "Do not treat the target as rolled back."
+                    )
+                else:
+                    self.status = (
+                        "Cleanup failed; transaction retained. Press r to retry cleanup."
+                    )
+            else:
+                self.app.release_pack_copy_migration(self.owner)
+                self.app.open_project(
+                    self.owner.target_key if self.owner.published else self.owner.source_key
+                )
+            self.query_one("#migration-status", Static).update(self.status)
+            return
+        if self.owner.error is not None:
+            view = self.session.view
+            if view.publication_lifecycle == "committed":
+                self.owner.published = True
+                self.owner.cleanup_retained = True
+                self.status = (
+                    "Target Pack was published successfully. Migration cleanup is still "
+                    f"pending: {self.owner.error}. Press r to retry cleanup."
+                )
+            elif view.publication_uncertain:
+                self.owner.cleanup_retained = True
+                self.status = (
+                    "Migration publication outcome is uncertain; ownership is retained: "
+                    f"{self.owner.error}"
+                )
+            else:
+                self.status = f"Migration failed; target not published: {self.owner.error}"
+            self.query_one("#migration-status", Static).update(self.status)
+            return
+        with self.owner.lock:
+            pending_view = self.owner.pending_view
+            self.owner.pending_view = None
+        if pending_view is not None:
+            self._route_view(pending_view)
+        if self.phase == "roots":
+            if self._rendered_phase != self.phase:
+                self._render_roots()
+                self._rendered_phase = self.phase
+            self.status = (
+                "Select migration roots explicitly; Space toggles, Enter continues."
+            )
+        elif self.phase == "conflicts":
+            if self._rendered_phase != self.phase:
+                self._render_conflicts()
+                self._rendered_phase = self.phase
+            self.status = (
+                "Choose Remove or Replace for every conflict; p enters a replacement."
+            )
+        elif self.phase == "preview":
+            if self._rendered_phase != self.phase:
+                self._show_preview()
+                self._rendered_phase = self.phase
+        elif self.phase == "publish":
+            if self.owner.published:
+                if self.owner.cleanup_retained:
+                    self.status = "Published; cleanup pending. Press r to retry cleanup."
+                else:
+                    self.status = "Published; cleanup complete. Opening target..."
+                    self.app.release_pack_copy_migration(self.owner)
+                    self.app.open_project(self.owner.target_key)
+        self.query_one("#migration-status", Static).update(self.status)
+
+    def _render_roots(self) -> None:
+        table = self.query_one("#migration-options", DataTable)
+        table.clear()
+        for root in self.roots:
+            marker = "[x]" if root.selection_key in self.selected_roots else "[ ]"
+            identity = root.canonical_identity or "identity required"
+            table.add_row(
+                marker,
+                f"{root.metadata_path} | {identity} | side={root.side} | {root.filename}",
+            )
+
+    def _render_conflicts(self) -> None:
+        table = self.query_one("#migration-options", DataTable)
+        table.clear()
+        for conflict in self.conflicts:
+            choice = self.conflict_choices.get(conflict.source_identity)
+            if choice is None:
+                label = (
+                    "Blocked"
+                    if conflict.reason_code == "version-intent-blocked"
+                    else "Required"
+                )
+            elif choice.action == "remove":
+                label = "Remove"
+            else:
+                label = f"Replace → {choice.replacement_provider}:{choice.replacement_project_id}"
+            table.add_row(
+                label,
+                f"{conflict.source_identity} | {conflict.reason_code} | {conflict.message}",
+            )
+
+    def _show_preview(self) -> None:
+        if self.preview is None:
+            return
+        lines = core.format_pack_copy_migration_preview(self.preview)
+        self.status = "\n".join(lines) + "\nPress Enter to continue to acknowledgement."
+
+    def _advance(self) -> None:
+        if self.phase == "roots":
+            if not self.selected_roots:
+                self.app.notify("Select at least one migration root", severity="warning")
+                return
+            selections = tuple(sorted(self.selected_roots.items()))
+            self.phase = "resolving"
+            self.status = "Committing root provenance and restarting resolution..."
+            self._start_worker("resolve", lambda: self._resolve(selections))
+        elif self.phase == "conflicts":
+            blocked = [
+                item for item in self.conflicts
+                if item.reason_code == "version-intent-blocked"
+                or item.version_intent_issue is not None
+            ]
+            if blocked:
+                self.app.notify(
+                    "Dependency exact-version intent must be changed at its source "
+                    "before migration",
+                    severity="error",
+                )
+                return
+            missing = [
+                item.source_identity for item in self.conflicts
+                if item.source_identity not in self.conflict_choices
+            ]
+            if missing:
+                self.app.notify(
+                    "Every unresolved root requires a choice", severity="warning"
+                )
+                return
+            choices = tuple(
+                self.conflict_choices[item.source_identity]
+                for item in self.conflicts
+            )
+            self.phase = "resolving"
+            self.status = "Resolving explicit migration choices..."
+            self._start_worker(
+                "resolve-conflicts", lambda: self._resolve_conflicts(choices)
+            )
+        elif self.phase == "preview":
+            assert self.preview is not None
+            required = self.preview.required_warning_codes
+            if required:
+                warnings = tuple(
+                    f"[{item.code}] {item.message}"
+                    for item in self.preview.warnings
+                    if item.acknowledgement_required
+                )
+                self.app.push_screen(
+                    ConfirmModal(
+                        "Acknowledge every migration warning",
+                        (*warnings, "Confirm explicitly acknowledges every code above."),
+                    ),
+                    self._confirm_warnings,
+                )
+            else:
+                self._request_publication_confirmation()
+
+    def _confirm_warnings(self, confirmed: bool | None) -> None:
+        if not confirmed or self.preview is None:
+            return
+        self.acknowledged_warnings = self.preview.required_warning_codes
+        self._request_publication_confirmation()
+
+    def _request_publication_confirmation(self) -> None:
+        self.app.push_screen(
+            ConfirmModal(
+                "Confirm copy migration",
+                (
+                    f"Create target Pack {self.owner.target_key.partition(':')[2]} atomically.",
+                    "The source Pack remains unchanged except explicit provenance already committed.",
+                    "No build, Publish, deploy, or restart is run.",
+                ),
+            ),
+            self._confirm_publication,
+        )
+
+    def _confirm_publication(self, confirmed: bool | None) -> None:
+        if not confirmed:
+            return
+        self.phase = "publish"
+        self.status = "Publishing target..."
+        self._start_worker("publish", self._publish)
+
+    def _resolve(self, selections: tuple[tuple[str, str], ...]) -> None:
+        try:
+            view = self.session.select_root_candidates(
+                selections,
+                progress=self._progress,
+            )
+            self._store_result(view)
+        except BaseException as error:
+            self.owner.error = error
+        finally:
+            self.owner.done.set()
+
+    def _resolve_conflicts(
+        self, choices: tuple[core.PackMigrationRootResolution, ...]
+    ) -> None:
+        try:
+            view = self.session.resolve_conflicts(choices, progress=self._progress)
+            self._store_result(view)
+        except BaseException as error:
+            self.owner.error = error
+        finally:
+            self.owner.done.set()
+
+    def _publish(self) -> None:
+        try:
+            self.session.prepare_publication(
+                self.acknowledged_warnings,
+                progress=self._progress,
+            )
+            self.session.publish(progress=self._progress)
+            self.owner.published = True
+        except BaseException as error:
+            self.owner.error = error
+            lifecycle = self.session.view.publication_lifecycle
+            self.owner.published = lifecycle == "committed"
+            self.owner.cleanup_retained = lifecycle in {"committed", "uncertain"}
+        finally: self.owner.done.set()
+
+    def _discard(self) -> None:
+        try:
+            cleanup_deadline = time.monotonic() + PUBLISH_CLEANUP_TIMEOUT_SECONDS
+            _migration_cleanup(self.owner, cleanup_deadline)
+            if not self.owner.cleanup_retained:
+                with self.owner.lock:
+                    self.owner.cleanup_completed = True
+        except BaseException as error:
+            self.owner.cleanup_retained = True
+            self.owner.error = error
+        finally:
+            self.owner.done.set()
+
+    def _retry_cleanup(self) -> None:
+        if not self.owner.cleanup_retained:
+            return
+        self._start_worker("cleanup", self._retry_only)
+
+    def _retry_only(self) -> None:
+        try:
+            cleanup_deadline = time.monotonic() + PUBLISH_CLEANUP_TIMEOUT_SECONDS
+            _migration_retry_cleanup(self.owner, cleanup_deadline)
+            if not self.owner.cleanup_retained:
+                self.owner.error = None
+                self.owner.navigation_pending = True
+                with self.owner.lock:
+                    self.owner.cleanup_completed = True
+        except BaseException as error:
+            self.owner.error = error
+        finally:
+            self.owner.done.set()
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "space" and self.phase == "roots":
+            table = self.query_one("#migration-options", DataTable)
+            index = (
+                max(0, min(table.cursor_row, len(self.roots) - 1))
+                if self.roots
+                else None
+            )
+            if index is not None:
+                root = self.roots[index]
+                if root.selection_key in self.selected_roots:
+                    self.selected_roots.pop(root.selection_key, None)
+                    self._render_roots()
+                elif root.canonical_identity is not None:
+                    self.selected_roots[root.selection_key] = root.canonical_identity
+                    self._render_roots()
+                else:
+                    self.app.push_screen(
+                        PackMigrationIdentityModal(
+                            f"Select identity for {root.metadata_path}", root.provider
+                        ),
+                        lambda identity, item=root: self._set_root_identity(item, identity),
+                    )
+        elif event.key == "space" and self.phase == "conflicts":
+            table = self.query_one("#migration-options", DataTable)
+            index = (
+                max(0, min(table.cursor_row, len(self.conflicts) - 1))
+                if self.conflicts
+                else None
+            )
+            if index is not None:
+                conflict = self.conflicts[index]
+                if (
+                    conflict.reason_code == "version-intent-blocked"
+                    or conflict.version_intent_issue is not None
+                ):
+                    self.app.notify(
+                        "This dependency version-intent block cannot be removed or replaced",
+                        severity="error",
+                    )
+                    event.stop()
+                    return
+                current = self.conflict_choices.get(conflict.source_identity)
+                if current is not None and current.action == "remove":
+                    self.conflict_choices.pop(conflict.source_identity, None)
+                else:
+                    self.conflict_choices[conflict.source_identity] = (
+                        core.PackMigrationRootResolution(
+                            conflict.source_identity, "remove"
+                        )
+                    )
+                self._render_conflicts()
+        elif event.key == "p" and self.phase == "conflicts":
+            table = self.query_one("#migration-options", DataTable)
+            index = (
+                max(0, min(table.cursor_row, len(self.conflicts) - 1))
+                if self.conflicts
+                else None
+            )
+            if index is not None:
+                conflict = self.conflicts[index]
+                if (
+                    not conflict.replacement_supported
+                    or conflict.version_intent_issue is not None
+                ):
+                    self.app.notify(
+                        "Replacement is not supported for this root", severity="error"
+                    )
+                else:
+                    self.app.push_screen(
+                        PackMigrationReplacementModal(conflict.source_identity),
+                        lambda replacement, item=conflict: self._set_replacement(item, replacement),
+                    )
+        elif (
+            event.key == "enter"
+            and self.phase in {"roots", "conflicts", "preview"}
+            and self.owner.done.is_set()
+        ):
+            self._advance()
+        elif event.key == "r":
+            self._retry_cleanup()
+        elif event.key in {"q", "escape"}:
+            self.owner.navigation_pending = True
+            self.owner.cancel_event.set()
+            _session_cancel(self.session)
+            if self.owner.done.is_set():
+                self._start_worker("discard", self._discard)
+            else:
+                self.status = "Cancellation requested; waiting for cleanup..."
+        else:
+            return
+        event.stop()
+
+    def _set_root_identity(
+        self,
+        root: core.PackCopyMigrationRootCandidateView,
+        identity: str | None,
+    ) -> None:
+        if identity is not None:
+            self.selected_roots[root.selection_key] = identity
+            self._render_roots()
+
+    def _set_replacement(
+        self,
+        conflict: core.PackCopyMigrationUnresolvedView,
+        replacement: tuple[str, str] | None,
+    ) -> None:
+        if replacement is None:
+            return
+        provider, project_id = replacement
+        self.conflict_choices[conflict.source_identity] = core.PackMigrationRootResolution(
+            conflict.source_identity,
+            "replace",
+            replacement_provider=provider,
+            replacement_project_id=project_id,
+        )
+        self._render_conflicts()
+
+    def on_unmount(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+        if self.owner.thread is not None and self.owner.thread.is_alive():
+            self.owner.cancel_event.set()
+            _session_cancel(self.session)
 
 
 class HuroshikiApp(App[None]):
@@ -207,6 +904,7 @@ class HuroshikiApp(App[None]):
             str, TemplateImportApplyOwner
         ] = {}
         self.publish_owners: dict[str, PackPublishOwner] = {}
+        self.pack_copy_migration_owners: dict[str, PackCopyMigrationOwner] = {}
 
     def on_mount(self) -> None:
         if self.initial_project:
@@ -232,6 +930,35 @@ class HuroshikiApp(App[None]):
         )
         for owner in tuple(self.publish_owners.values()):
             owner.cancel_event.set()
+        migration_owners = tuple(
+            {id(owner): owner for owner in self.pack_copy_migration_owners.values()}.values()
+        )
+        for owner in migration_owners:
+            owner.cancel_event.set()
+            _session_cancel(owner.session)
+        for owner in migration_owners:
+            key = owner.source_key
+            if not owner.done.wait(max(0.0, deadline - time.monotonic())):
+                print(f"Pack migration worker did not stop before shutdown for {key}", file=sys.stderr)
+                continue
+            if owner.thread is not None:
+                owner.thread.join(max(0.0, deadline - time.monotonic()))
+            if owner.thread is not None and owner.thread.is_alive():
+                print(f"Pack migration worker did not join before shutdown for {key}", file=sys.stderr)
+                continue
+            cleanup_deadline = time.monotonic() + PUBLISH_CLEANUP_TIMEOUT_SECONDS
+            if not owner.published:
+                _migration_cleanup(owner, cleanup_deadline)
+            elif owner.cleanup_retained:
+                _migration_retry_cleanup(owner, cleanup_deadline)
+            if not owner.cleanup_retained:
+                self.release_pack_copy_migration(owner)
+            else:
+                print(
+                    f"Pack migration cleanup ownership retained for {key}: "
+                    f"{owner.session.view.publication_lifecycle}",
+                    file=sys.stderr,
+                )
         for project_key, owner in tuple(self.publish_owners.items()):
             if not owner.done.wait(max(0.0, deadline - time.monotonic())):
                 print(f"Publish worker did not stop before shutdown for {project_key}", file=sys.stderr)
@@ -559,6 +1286,66 @@ class HuroshikiApp(App[None]):
             return
         self.selected_project = project_key
         self.switch_screen(PublishScreen(project_key, display_name=display_name))
+
+    def open_pack_copy_migration(self, project_key: str) -> None:
+        if not self.project_is_usable(project_key):
+            return
+        if any(project_key in owner.keys for owner in self.pack_copy_migration_owners.values()):
+            self.notify("A migration already uses this pack", severity="warning")
+            return
+        self.selected_project = project_key
+        self.push_screen(
+            PackCopyMigrationTargetModal(),
+            lambda values: self._start_pack_copy_migration(project_key, values),
+        )
+
+    def _start_pack_copy_migration(
+        self, source_key: str, values: dict[str, str] | None
+    ) -> None:
+        if values is None:
+            return
+        target_key = f"pack:{values['project_id']}"
+        if any(
+            key in (source_key, target_key)
+            for owner in self.pack_copy_migration_owners.values()
+            for key in owner.keys
+        ):
+            self.notify("A migration already uses one of these packs", severity="warning")
+            return
+        try:
+            target = core.PackMigrationTarget(
+                target_id=values["project_id"],
+                display_name=values["display_name"],
+                minecraft_version=values["minecraft"],
+                loader=values["loader"],
+                loader_version=values["loader_version"],
+            )
+            cancel_event = threading.Event()
+            deadline = time.monotonic() + PUBLISH_OPERATION_TIMEOUT_SECONDS
+            session = core.PackCopyMigrationSession(
+                source_key,
+                target,
+                cancel_event,
+                deadline,
+            )
+        except BaseException as error:
+            self.notify(str(error), severity="error")
+            return
+        owner = PackCopyMigrationOwner(
+            source_key,
+            target_key,
+            session,
+            cancel_event,
+            deadline,
+        )
+        self.pack_copy_migration_owners[source_key] = owner
+        self.pack_copy_migration_owners[target_key] = owner
+        self.switch_screen(PackCopyMigrationScreen(owner))
+
+    def release_pack_copy_migration(self, owner: PackCopyMigrationOwner) -> None:
+        for key in owner.keys:
+            if self.pack_copy_migration_owners.get(key) is owner:
+                self.pack_copy_migration_owners.pop(key, None)
 
     def start_publish_worker(self, owner: PackPublishOwner, target: Callable[[], object]) -> None:
         if owner.project_key in self.publish_owners and self.publish_owners[owner.project_key] is not owner:
@@ -1888,6 +2675,9 @@ class ProjectScreen(BaseScreen):
             return
         if action == "publish":
             self.app.open_publish(self.project_key, self.project.display_name)
+            return
+        if action in {"migrate / copy", "migrate", "copy"}:
+            self.app.open_pack_copy_migration(self.project_key)
             return
         if action == "create MODPACK":
             self.app.push_screen(

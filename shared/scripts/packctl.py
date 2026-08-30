@@ -5787,6 +5787,229 @@ def cmd_clean_state(args: argparse.Namespace) -> int:
     return 0
 
 
+def _migration_replacement(value: str) -> tuple[str, str]:
+    """Parse the deliberately small, canonical replacement CLI syntax."""
+    if value.count("=") != 1:
+        raise ConfigError("Migration replacements must use OLD=PROVIDER:PROJECT")
+    old, new = value.split("=", 1)
+    if not old or not new or new.count(":") != 1:
+        raise ConfigError("Migration replacements must use OLD=PROVIDER:PROJECT")
+    provider, project = new.split(":", 1)
+    if not provider or not project:
+        raise ConfigError("Migration replacements must use OLD=PROVIDER:PROJECT")
+    return old, new
+
+
+def _migration_arg(args: argparse.Namespace, name: str) -> tuple[str, ...]:
+    return tuple(getattr(args, name, None) or ())
+
+
+def _migration_choices(args: argparse.Namespace, core: Any) -> tuple[object, ...]:
+    roots = _migration_arg(args, "migration_roots")
+    if len(roots) != len(set(roots)):
+        raise ConfigError("Duplicate migration root selection")
+
+    removals = _migration_arg(args, "migration_removals")
+    if len(removals) != len(set(removals)):
+        raise ConfigError("Duplicate migration removal")
+    replacements = tuple(
+        _migration_replacement(value)
+        for value in _migration_arg(args, "migration_replacements")
+    )
+    old_ids = tuple(old for old, _ in replacements)
+    if len(old_ids) != len(set(old_ids)):
+        raise ConfigError("Duplicate migration replacement")
+    if set(removals) & set(old_ids):
+        raise ConfigError("A migration identity cannot be both removed and replaced")
+    acknowledgements = _migration_arg(args, "ack_warnings")
+    if len(acknowledgements) != len(set(acknowledgements)):
+        raise ConfigError("Duplicate migration warning acknowledgement")
+
+    result = []
+    for identity in removals:
+        result.append(core.PackMigrationRootResolution(identity, "remove"))
+    for old, new in replacements:
+        provider, project = new.split(":", 1)
+        result.append(
+            core.PackMigrationRootResolution(
+                old,
+                "replace",
+                replacement_provider=provider,
+                replacement_project_id=project,
+            )
+        )
+    return tuple(result)
+
+
+def _migration_root_selections(
+    values: Sequence[str], session: object
+) -> tuple[tuple[str, str], ...]:
+    candidates = tuple(getattr(session, "candidates", ()) or ())
+    result: list[tuple[str, str]] = []
+    for value in values:
+        if "=" in value:
+            if value.count("=") != 1:
+                raise ConfigError(
+                    "Migration roots must use PROVIDER:PROJECT or PATH=PROVIDER:PROJECT"
+                )
+            key, identity = value.split("=", 1)
+            matches = [item for item in candidates if item.selection_key == key]
+        else:
+            identity = value
+            matches = [item for item in candidates if item.canonical_identity == identity]
+        if identity.count(":") != 1 or not all(identity.split(":", 1)):
+            raise ConfigError(
+                "Migration roots must use PROVIDER:PROJECT or PATH=PROVIDER:PROJECT"
+            )
+        if len(matches) != 1:
+            raise ConfigError(
+                f"Migration root does not select exactly one current candidate: {value}"
+            )
+        result.append((matches[0].selection_key, identity))
+    if len({key for key, _identity in result}) != len(result):
+        raise ConfigError("Duplicate migration root candidate selection")
+    if len({identity for _key, identity in result}) != len(result):
+        raise ConfigError("Duplicate migration root identity")
+    return tuple(result)
+
+
+def _migration_requirements(session: object, core: Any) -> None:
+    lines = core.format_pack_copy_migration_requirements(session)
+    if lines:
+        print("\n".join(lines))
+
+
+def _discard_migration(session: object) -> bool:
+    try:
+        result = session.discard()
+    except Exception as error:
+        raise ConfigError(f"Pack migration cleanup failed: {error}") from error
+    state = getattr(session, "state", None)
+    return result is not False and state not in {"cleanup-pending", "cleanup-required"}
+
+
+def _migration_failure(session: object, error: BaseException) -> ConfigError:
+    """Clean only the lifecycle that Core proves is safe to clean."""
+    state = getattr(session, "state", None)
+    view = getattr(session, "view", None)
+    lifecycle = getattr(view, "publication_lifecycle", "none")
+    if lifecycle == "committed":
+        try:
+            session.retry_cleanup()
+        except BaseException as cleanup_error:
+            return ConfigError(
+                "Target Pack was published successfully, but migration cleanup is "
+                f"still pending: {cleanup_error}"
+            )
+        return ConfigError(
+            "Target Pack was published successfully; migration cleanup completed "
+            f"after an initial failure: {error}"
+        )
+    if lifecycle == "uncertain" or state == "publication-uncertain":
+        return ConfigError(
+            "Pack migration publication outcome is uncertain; retained diagnostic "
+            f"ownership must be inspected: {error}"
+        )
+    try:
+        _discard_migration(session)
+    except ConfigError as cleanup_error:
+        return ConfigError(f"{error}; {cleanup_error}")
+    return ConfigError(str(error))
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """Run the non-interactive Pack copy migration protocol."""
+    import huroshiki_core as core
+
+    cancel_event = threading.Event()
+    deadline = time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+    try:
+        target = core.PackMigrationTarget(
+            target_id=args.copy_to,
+            display_name=args.display_name,
+            minecraft_version=args.minecraft,
+            loader=args.loader,
+            loader_version=args.loader_version,
+        )
+        session = core.PackCopyMigrationSession(
+            f"pack:{args.source_pack}", target, cancel_event, deadline
+        )
+    except Exception as error:
+        raise ConfigError(str(error)) from error
+    try:
+        choices = _migration_choices(args, core)
+        session.start()
+        candidates = tuple(getattr(session, "candidates", ()) or ())
+        if candidates:
+            if not args.migration_roots:
+                _migration_requirements(session, core)
+                _discard_migration(session)
+                return 2
+            session.select_root_candidates(
+                _migration_root_selections(args.migration_roots, session)
+            )
+        elif args.migration_roots:
+            raise ConfigError("Explicit migration roots are not currently required")
+
+        unresolved = tuple(getattr(session, "unresolved", ()) or ())
+        if choices:
+            if not unresolved:
+                raise ConfigError("Migration conflict choices are not currently required")
+            session.resolve_conflicts(choices)
+            unresolved = tuple(getattr(session, "unresolved", ()) or ())
+        if getattr(session, "state", None) in {"failed", "error"}:
+            raise ConfigError(
+                str(getattr(session, "error", None) or "Pack migration failed")
+            )
+        if unresolved or getattr(session, "state", None) != "resolved":
+            _migration_requirements(session, core)
+            _discard_migration(session)
+            return 2
+
+        preview = session.preview()
+        print("\n".join(core.format_pack_copy_migration_preview(preview)))
+        if not args.apply:
+            if not _discard_migration(session):
+                return 2
+            print("Preview ready; target not published.")
+            return 0
+        session.prepare_publication(tuple(args.ack_warnings or ()))
+        try:
+            session.publish()
+        except BaseException as publication_error:
+            if session.view.publication_lifecycle != "committed":
+                raise
+            try:
+                session.retry_cleanup()
+            except BaseException as cleanup_error:
+                raise ConfigError(
+                    "Target Pack was published successfully, but migration cleanup is "
+                    f"still pending: {cleanup_error}"
+                ) from publication_error
+            print(
+                "Target Pack was published successfully; migration cleanup completed "
+                "after an initial failure."
+            )
+        print(f"Migration completed. Target Pack: {args.copy_to}")
+        return 0
+    except KeyboardInterrupt as error:
+        cancel_event.set()
+        failure = _migration_failure(
+            session, ConfigError("Migration cancelled; target not published")
+        )
+        raise failure from error
+    except ConfigError as error:
+        if (
+            getattr(getattr(session, "view", None), "publication_lifecycle", None)
+            == "committed"
+            and "cleanup is still pending" in str(error)
+        ):
+            raise
+        raise _migration_failure(session, error) from error
+    except Exception as error:
+        raise _migration_failure(session, error) from error
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Manage multiple Packwiz projects")
     root.add_argument(
@@ -5964,6 +6187,34 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--keep", type=int, default=0)
     item.add_argument("--project")
     item.set_defaults(func=cmd_clean_state)
+    item = sub.add_parser("migrate")
+    item.add_argument("source_pack")
+    item.add_argument("--copy-to", required=True, dest="copy_to")
+    item.add_argument("--display-name", required=True, dest="display_name")
+    item.add_argument("--minecraft", required=True)
+    item.add_argument("--loader", required=True, choices=sorted(LOADER_FLAGS))
+    item.add_argument("--loader-version", required=True, dest="loader_version")
+    # This cannot be named ``root``: the top-level --root selects the repository.
+    item.add_argument(
+        "--root",
+        action="append",
+        dest="migration_roots",
+        metavar="ROOT|PATH=ROOT",
+    )
+    item.add_argument(
+        "--remove", action="append", dest="migration_removals", metavar="IDENTITY"
+    )
+    item.add_argument(
+        "--replace",
+        action="append",
+        dest="migration_replacements",
+        metavar="OLD=PROVIDER:PROJECT",
+    )
+    item.add_argument(
+        "--ack-warning", action="append", dest="ack_warnings", metavar="ID"
+    )
+    item.add_argument("--apply", action="store_true")
+    item.set_defaults(func=cmd_migrate)
     return root
 
 

@@ -171,7 +171,7 @@ class PackMigrationConflictTest(unittest.TestCase):
     def test_curseforge_replacements_require_numeric_canonical_ids(self) -> None:
         plan = self._unresolved_plan()
         identity = plan.resolution.unresolved_roots[0].source_root.canonical_identity
-        for project_id in ("slug", "-1", "12.5"):
+        for project_id in ("slug", "-1", "0", "0123", "12.5"):
             with self.subTest(project_id=project_id):
                 choice = conflicts.PackMigrationRootResolution(identity, "replace", "curseforge", project_id)
                 with self.assertRaises(conflicts.PackMigrationConflictResolutionError):

@@ -15,8 +15,8 @@ PROJECT = core.ProjectInfo(
 
 
 class ProjectActionTest(unittest.TestCase):
-    def test_project_actions_only_exposes_publish_for_packs(self) -> None:
-        self.assertEqual(core.project_actions("pack:demo"), ("publish",))
+    def test_project_actions_exposes_migrate_and_publish_for_packs(self) -> None:
+        self.assertEqual(core.project_actions("pack:demo"), ("migrate", "publish"))
         self.assertEqual(core.project_actions("template:base"), ("create MODPACK", "validate"))
 
 
@@ -31,6 +31,7 @@ class ProjectScreenPublishTest(unittest.IsolatedAsyncioTestCase):
             async with app.run_test() as pilot:
                 await pilot.pause()
                 self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+                await pilot.press("j")
                 app.screen.run_selected()
                 await pilot.pause()
             open_publish.assert_called_once_with("pack:demo", "Demo Pack")
