@@ -59,7 +59,7 @@ from pack_migration_roots import (
     write_pack_root_manifest,
 )
 from pack_tree_policy import PackTreePolicyError, PackTreeScan, scan_pack_migration_source
-from provider_identity import parse_provider_metadata
+from provider_identity import canonical_identity, parse_provider_metadata
 from provider_artifacts import materialize_provider_artifact
 from mod_version_overrides import (
     ModVersionOverride,
@@ -201,6 +201,8 @@ from portable_paths import (
     portable_relative_path_key,
 )
 from pack_migration import (
+    PACK_MIGRATION_CLEANUP_TIMEOUT_SECONDS,
+    PACK_MIGRATION_TIMEOUT_SECONDS,
     PackMigrationCancelled,
     PackMigrationCleanupError,
     PackMigrationDeadlineExceeded,
@@ -220,7 +222,10 @@ from pack_migration import (
     prepare_pack_migration_publication as _prepare_pack_migration_publication,
     retry_pack_migration_cleanup as _retry_pack_migration_cleanup,
 )
+
+
 if TYPE_CHECKING:
+    from pack_migration_roots import PackMigrationRootCandidate
     from pack_migration_conflicts import (
         PackMigrationConflictResolutionError,
         PackMigrationConflictResolutionResult,
@@ -6044,6 +6049,993 @@ def discard_pack_migration_plan(
     _discard_pack_migration_plan(plan, deadline=deadline)
 
 
+PackCopyMigrationSessionState = Literal[
+    "new",
+    "planning",
+    "resolving",
+    "provenance-required",
+    "resolution-required",
+    "resolved",
+    "ready",
+    "preparing-publication",
+    "publishing",
+    "published",
+    "cleanup-pending",
+    "discarding",
+    "retrying-cleanup",
+    "publication-uncertain",
+    "failed",
+    "cancelled",
+    "discarded",
+]
+
+
+@dataclass(frozen=True)
+class PackCopyMigrationRootCandidateView:
+    selection_key: str
+    canonical_identity: str | None
+    provider: str
+    project_id: str | None
+    source_file_id: str | None
+    source_version: str | None
+    side: str
+    metadata_path: str
+    filename: str
+
+
+@dataclass(frozen=True)
+class PackCopyMigrationUnresolvedView:
+    source_identity: str
+    side: str
+    reason_code: str
+    message: str
+    retryable: bool
+    replacement_supported: bool
+    metadata_path: str
+    version_intent_issue: str | None = None
+
+
+@dataclass(frozen=True)
+class PackCopyMigrationWarningView:
+    code: str
+    message: str
+    relative_path: str | None
+    acknowledgement_required: bool
+
+
+@dataclass(frozen=True)
+class PackCopyMigrationResolvedRootView:
+    source_identity: str
+    target_identity: str
+    target_file_id: str | None
+    target_version: str | None
+    side: str
+    metadata_path: str
+    filename: str
+    classification: str
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PackCopyMigrationDependencyView:
+    canonical_identity: str
+    provider: str
+    project_id: str
+    file_id: str | None
+    version: str | None
+    side: str
+    metadata_path: str
+    filename: str
+    root: bool
+
+
+@dataclass(frozen=True)
+class PackCopyMigrationDependencyDeltaView:
+    added: tuple[PackCopyMigrationDependencyView, ...] = ()
+    removed: tuple[PackCopyMigrationDependencyView, ...] = ()
+    updated: tuple[
+        tuple[PackCopyMigrationDependencyView, PackCopyMigrationDependencyView], ...
+    ] = ()
+    unchanged: tuple[PackCopyMigrationDependencyView, ...] = ()
+    side_changed: tuple[
+        tuple[PackCopyMigrationDependencyView, PackCopyMigrationDependencyView], ...
+    ] = ()
+    identity_changed: tuple[
+        tuple[PackCopyMigrationDependencyView, PackCopyMigrationDependencyView], ...
+    ] = ()
+    path_changed: tuple[tuple[str, str], ...] = ()
+    filename_changed: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class PackCopyMigrationView:
+    state: PackCopyMigrationSessionState
+    source_key: str
+    target: PackMigrationTarget
+    progress_phase: str | None
+    progress_message: str | None
+    candidates: tuple[PackCopyMigrationRootCandidateView, ...]
+    unresolved: tuple[PackCopyMigrationUnresolvedView, ...]
+    required_warning_codes: tuple[str, ...]
+    publication_lifecycle: str
+    cleanup_pending: bool
+    publication_uncertain: bool
+    error_message: str | None
+
+
+@dataclass(frozen=True)
+class PackCopyMigrationPreview:
+    source_key: str
+    target: PackMigrationTarget
+    source_minecraft_version: str
+    source_loader: str
+    source_loader_version: str
+    source_snapshot_digest: str
+    copied_files: int
+    copied_directories: int
+    copied_bytes: int
+    skipped_paths: tuple[str, ...]
+    changes: tuple[tuple[str, str | None, str], ...]
+    warnings: tuple[PackCopyMigrationWarningView, ...]
+    roots: tuple[str, ...]
+    resolved_roots: tuple[PackCopyMigrationResolvedRootView, ...]
+    dependency_delta: PackCopyMigrationDependencyDeltaView
+    side_changes: tuple[tuple[str, str, str], ...]
+    identity_changes: tuple[tuple[str, str], ...]
+    path_collisions: tuple[str, ...]
+    filename_collisions: tuple[str, ...]
+    provider_warnings: tuple[str, ...]
+    url_compatibility: tuple[tuple[str, str, str, str, tuple[str, ...]], ...]
+    version_overrides: tuple[tuple[str, str, bool], ...]
+    automatic_version_identities: tuple[str, ...]
+    version_intent_issues: tuple[tuple[str, str | None, str, str], ...]
+    removed_roots: tuple[tuple[str, tuple[str, ...]], ...]
+    replaced_roots: tuple[tuple[str, str], ...]
+    resolution_attempt: int
+
+    @property
+    def required_warning_codes(self) -> tuple[str, ...]:
+        return tuple(
+            warning.code for warning in self.warnings if warning.acknowledgement_required
+        )
+
+
+def _migration_candidate_view(
+    candidate: "PackMigrationRootCandidate",
+) -> PackCopyMigrationRootCandidateView:
+    relative = getattr(candidate, "source_metadata_path")
+    path = relative.as_posix()
+    identity = getattr(candidate, "canonical_identity", None)
+    return PackCopyMigrationRootCandidateView(
+        path,
+        identity,
+        getattr(candidate, "provider"),
+        getattr(candidate, "project_id"),
+        getattr(candidate, "source_file_id"),
+        getattr(candidate, "source_version"),
+        getattr(candidate, "source_side"),
+        path,
+        getattr(candidate, "source_filename"),
+    )
+
+
+def _migration_dependency_view(
+    entry: "PackMigrationDependencyEntry",
+) -> PackCopyMigrationDependencyView:
+    return PackCopyMigrationDependencyView(
+        getattr(entry, "canonical_identity"),
+        getattr(entry, "provider"),
+        getattr(entry, "project_id"),
+        getattr(entry, "file_id"),
+        getattr(entry, "version"),
+        getattr(entry, "side"),
+        getattr(entry, "metadata_path").as_posix(),
+        getattr(entry, "filename"),
+        getattr(entry, "root"),
+    )
+
+
+def _migration_delta_view(
+    delta: "PackMigrationDependencyDelta",
+) -> PackCopyMigrationDependencyDeltaView:
+    pairs = lambda values: tuple(
+        (_migration_dependency_view(before), _migration_dependency_view(after))
+        for before, after in values
+    )
+    return PackCopyMigrationDependencyDeltaView(
+        added=tuple(_migration_dependency_view(item) for item in delta.added),
+        removed=tuple(_migration_dependency_view(item) for item in delta.removed),
+        updated=pairs(delta.updated),
+        unchanged=tuple(_migration_dependency_view(item) for item in delta.unchanged),
+        side_changed=pairs(delta.side_changed),
+        identity_changed=pairs(delta.identity_changed),
+        path_changed=tuple((left.as_posix(), right.as_posix()) for left, right in delta.path_changed),
+        filename_changed=tuple(delta.filename_changed),
+    )
+
+
+class PackCopyMigrationSession:
+    """UI-neutral owner for one exact Copy migration authority chain."""
+
+    def __init__(
+        self,
+        source_key: str,
+        target: PackMigrationTarget,
+        cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> None:
+        kind, _project_id = split_project_key(source_key)
+        if kind != "pack":
+            raise HuroshikiError("Pack migration is available only for packs")
+        if not isinstance(target, PackMigrationTarget):
+            raise TypeError("Pack migration target must be a PackMigrationTarget")
+        self.source_key = source_key
+        self.target = target
+        self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
+        self._deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + PACK_MIGRATION_TIMEOUT_SECONDS
+        )
+        self._state: PackCopyMigrationSessionState = "new"
+        self._snapshot: PackMigrationSourceSnapshot | None = None
+        self._plan: PackMigrationPlan | None = None
+        self._resolution: PackMigrationResolutionPlan | None = None
+        self._publication: PackMigrationPublicationPlan | None = None
+        self._published_snapshot: PackMigrationSourceSnapshot | None = None
+        self._removed_roots: tuple[PackMigrationRemovedRoot, ...] = ()
+        self._replaced_roots: tuple[PackMigrationReplacedRoot, ...] = ()
+        self._progress: PackMigrationProgress | None = None
+        self._error: BaseException | None = None
+        self._operation_active = False
+        self._lock = threading.RLock()
+
+    @property
+    def cancel_event(self) -> threading.Event:
+        return self._cancel_event
+
+    @property
+    def deadline(self) -> float:
+        return self._deadline
+
+    @property
+    def state(self) -> PackCopyMigrationSessionState:
+        with self._lock:
+            return self._state
+
+    @property
+    def error(self) -> BaseException | None:
+        with self._lock:
+            return self._error
+
+    @property
+    def candidates(self) -> tuple[PackCopyMigrationRootCandidateView, ...]:
+        with self._lock:
+            resolution = self._resolution
+            values = getattr(resolution, "root_candidates", ()) if resolution is not None else ()
+            return tuple(_migration_candidate_view(item) for item in values)
+
+    @property
+    def unresolved(self) -> tuple[PackCopyMigrationUnresolvedView, ...]:
+        with self._lock:
+            return self._unresolved_view()
+
+    @property
+    def view(self) -> PackCopyMigrationView:
+        with self._lock:
+            progress = self._progress
+            plan = self._plan
+            lifecycle = plan.publication_lifecycle if plan is not None else "none"
+            warnings = plan.warnings if plan is not None else ()
+            return PackCopyMigrationView(
+                self._state,
+                self.source_key,
+                self.target,
+                getattr(progress, "phase", None),
+                getattr(progress, "message", None),
+                self.candidates,
+                self._unresolved_view(),
+                tuple(
+                    item.code for item in warnings if item.acknowledgement_required
+                ),
+                lifecycle,
+                self._state == "cleanup-pending",
+                lifecycle == "uncertain",
+                str(self._error) if self._error is not None else None,
+            )
+
+    def _unresolved_view(self) -> tuple[PackCopyMigrationUnresolvedView, ...]:
+        resolution = self._resolution
+        if resolution is None:
+            return ()
+        issues = {
+            item.identity: item.message
+            for item in getattr(resolution, "version_intent_issues", ())
+        }
+        result: list[PackCopyMigrationUnresolvedView] = []
+        for item in getattr(resolution, "unresolved_roots", ()):
+            source = item.source_root
+            path = source.source_metadata_path.as_posix()
+            identity = getattr(source, "canonical_identity", None) or f"candidate:{path}"
+            result.append(
+                PackCopyMigrationUnresolvedView(
+                    identity,
+                    source.source_side,
+                    item.reason_code,
+                    item.message,
+                    item.retryable,
+                    item.replacement_supported,
+                    path,
+                    issues.get(identity),
+                )
+            )
+        return tuple(result)
+
+    def _reporter(
+        self, callback: Callable[[PackMigrationProgress], None] | None
+    ) -> Callable[[PackMigrationProgress], None]:
+        def report(value: PackMigrationProgress) -> None:
+            with self._lock:
+                self._progress = value
+            if callback is not None:
+                try:
+                    callback(value)
+                except Exception:
+                    pass
+
+        return report
+
+    def _classify_resolution(
+        self, resolution: PackMigrationResolutionPlan
+    ) -> PackCopyMigrationSessionState:
+        if getattr(resolution, "provenance_required", False):
+            return "provenance-required"
+        if (
+            getattr(resolution, "state", None) == "resolution-required"
+            or getattr(resolution, "unresolved_roots", ())
+        ):
+            return "resolution-required"
+        if getattr(resolution, "state", None) != "resolved":
+            raise PackMigrationError("Pack migration returned an invalid resolution state")
+        return "resolved"
+
+    def _claim_operation(
+        self,
+        allowed_states: set[PackCopyMigrationSessionState],
+        next_state: PackCopyMigrationSessionState,
+    ) -> None:
+        with self._lock:
+            if self._operation_active:
+                raise PackMigrationError("Another Pack migration operation is active")
+            if self._state not in allowed_states:
+                raise PackMigrationError(
+                    f"Pack migration operation is invalid in state {self._state}"
+                )
+            self._operation_active = True
+            self._state = next_state
+
+    def _release_operation(self) -> None:
+        with self._lock:
+            self._operation_active = False
+
+    def _record_failure(self, error: BaseException) -> None:
+        with self._lock:
+            self._error = error
+            plan = self._plan
+            lifecycle = plan.publication_lifecycle if plan is not None else "precommit"
+            if lifecycle == "committed":
+                self._state = "cleanup-pending"
+            elif lifecycle == "uncertain":
+                self._state = "publication-uncertain"
+            elif self._cancel_event.is_set() or isinstance(
+                error, (PackMigrationCancelled, PackMigrationDeadlineExceeded)
+            ):
+                self._state = "cancelled"
+            else:
+                self._state = "failed"
+
+    def _start_current_plan(
+        self, progress: Callable[[PackMigrationProgress], None] | None
+    ) -> PackCopyMigrationView:
+        with self._lock:
+            self._state = "planning"
+            self._error = None
+        reporter = self._reporter(progress)
+        try:
+            snapshot = snapshot_pack_migration_source(
+                self.source_key,
+                cancel_event=self._cancel_event,
+                deadline=self._deadline,
+            )
+            with self._lock:
+                self._snapshot = snapshot
+            plan = plan_pack_copy_migration(
+                self.source_key,
+                self.target,
+                expected_snapshot=snapshot,
+                cancel_event=self._cancel_event,
+                deadline=self._deadline,
+            )
+            with self._lock:
+                self._plan = plan
+            resolution = resolve_pack_migration_plan(
+                plan,
+                cancel_event=self._cancel_event,
+                deadline=self._deadline,
+                progress=reporter,
+            )
+            with self._lock:
+                self._resolution = resolution
+                self._state = self._classify_resolution(resolution)
+            return self.view
+        except BaseException as error:
+            retained = getattr(error, "plan", None)
+            if isinstance(retained, PackMigrationPlan):
+                with self._lock:
+                    self._plan = retained
+            self._record_failure(error)
+            raise
+
+    def start(
+        self, *, progress: Callable[[PackMigrationProgress], None] | None = None
+    ) -> PackCopyMigrationView:
+        self._claim_operation({"new"}, "planning")
+        try:
+            return self._start_current_plan(progress)
+        finally:
+            self._release_operation()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    def select_roots(
+        self,
+        selections: tuple[PackMigrationRootSelection, ...],
+        *,
+        progress: Callable[[PackMigrationProgress], None] | None = None,
+    ) -> PackCopyMigrationView:
+        if any(not isinstance(item, PackMigrationRootSelection) for item in selections):
+            raise TypeError("Root selections must use PackMigrationRootSelection")
+        self._claim_operation({"provenance-required"}, "resolving")
+        try:
+            with self._lock:
+                if self._plan is None:
+                    raise PackMigrationError("Pack migration root authority is incomplete")
+                plan = self._plan
+            commit_pack_migration_root_selection(
+                plan,
+                tuple(selections),
+                cancel_event=self._cancel_event,
+                deadline=self._deadline,
+            )
+            with self._lock:
+                self._snapshot = None
+                self._plan = None
+                self._resolution = None
+                self._publication = None
+                self._removed_roots = ()
+                self._replaced_roots = ()
+            return self._start_current_plan(progress)
+        except BaseException as error:
+            self._record_failure(error)
+            raise
+        finally:
+            self._release_operation()
+
+    def select_root_identities(
+        self,
+        identities: tuple[str, ...],
+        *,
+        progress: Callable[[PackMigrationProgress], None] | None = None,
+    ) -> PackCopyMigrationView:
+        with self._lock:
+            if self._operation_active:
+                raise PackMigrationError("Another Pack migration operation is active")
+            resolution = self._resolution
+            if self._state != "provenance-required" or resolution is None:
+                raise PackMigrationError("Pack migration is not awaiting root provenance")
+            requested = tuple(identities)
+            if len(set(requested)) != len(requested):
+                raise PackMigrationError("Duplicate root selection")
+            candidates = tuple(getattr(resolution, "root_candidates", ()))
+            selections: list[PackMigrationRootSelection] = []
+            for identity in requested:
+                matches = [item for item in candidates if item.canonical_identity == identity]
+                if len(matches) != 1:
+                    raise PackMigrationError(
+                        f"Root identity does not select exactly one candidate: {identity}"
+                    )
+                candidate = matches[0]
+                selections.append(
+                    PackMigrationRootSelection(
+                        candidate.source_metadata_path,
+                        candidate.provider,
+                        candidate.project_id,
+                    )
+                )
+        return self.select_roots(tuple(selections), progress=progress)
+
+    def select_root_candidates(
+        self,
+        selections: tuple[tuple[str, str], ...],
+        *,
+        progress: Callable[[PackMigrationProgress], None] | None = None,
+    ) -> PackCopyMigrationView:
+        """Bind relative candidate keys to explicit canonical identities."""
+        with self._lock:
+            if self._operation_active:
+                raise PackMigrationError("Another Pack migration operation is active")
+            resolution = self._resolution
+            if self._state != "provenance-required" or resolution is None:
+                raise PackMigrationError("Pack migration is not awaiting root provenance")
+            candidates = {
+                item.source_metadata_path.as_posix(): item
+                for item in getattr(resolution, "root_candidates", ())
+            }
+            if len(candidates) != len(getattr(resolution, "root_candidates", ())):
+                raise PackMigrationError("Root candidate paths are ambiguous")
+            seen: set[str] = set()
+            typed: list[PackMigrationRootSelection] = []
+            for key, identity in selections:
+                if key in seen:
+                    raise PackMigrationError(f"Duplicate root candidate selection: {key}")
+                seen.add(key)
+                candidate = candidates.get(key)
+                if candidate is None:
+                    raise PackMigrationError(f"Unknown root candidate: {key}")
+                provider, separator, project_id = identity.partition(":")
+                if not separator or canonical_identity(provider, project_id) != identity:
+                    raise PackMigrationError(f"Invalid canonical root identity: {identity}")
+                if provider != candidate.provider:
+                    raise PackMigrationError(
+                        f"Root provider disagrees with candidate metadata: {key}"
+                    )
+                if (
+                    candidate.canonical_identity is not None
+                    and candidate.canonical_identity != identity
+                ):
+                    raise PackMigrationError(
+                        f"Root identity disagrees with candidate metadata: {key}"
+                    )
+                typed.append(
+                    PackMigrationRootSelection(
+                        candidate.source_metadata_path,
+                        candidate.provider,
+                        project_id,
+                    )
+                )
+        return self.select_roots(tuple(typed), progress=progress)
+
+    def resolve_conflicts(
+        self,
+        resolutions: tuple["PackMigrationRootResolution", ...],
+        *,
+        progress: Callable[[PackMigrationProgress], None] | None = None,
+    ) -> PackCopyMigrationView:
+        self._claim_operation({"resolution-required"}, "resolving")
+        try:
+            with self._lock:
+                if self._plan is None:
+                    raise PackMigrationError("Pack migration conflict authority is incomplete")
+                plan = self._plan
+            request = create_pack_migration_resolution_request(
+                plan, tuple(resolutions)
+            )
+            result = resolve_pack_migration_conflicts(
+                plan,
+                request,
+                cancel_event=self._cancel_event,
+                deadline=self._deadline,
+                progress=self._reporter(progress),
+            )
+            with self._lock:
+                self._resolution = result.resolution_plan
+                self._removed_roots = result.removed_roots
+                self._replaced_roots = result.replaced_roots
+                self._state = self._classify_resolution(result.resolution_plan)
+            return self.view
+        except BaseException as error:
+            self._record_failure(error)
+            raise
+        finally:
+            self._release_operation()
+
+    def preview(self) -> PackCopyMigrationPreview:
+        with self._lock:
+            if self._state not in {"resolved", "ready"}:
+                raise PackMigrationError("Pack migration preview requires a resolved plan")
+            if self._plan is None or self._resolution is None or self._snapshot is None:
+                raise PackMigrationError("Pack migration preview authority is incomplete")
+            plan = self._plan
+            resolution = self._resolution
+            warnings = tuple(
+                PackCopyMigrationWarningView(
+                    item.code,
+                    item.message,
+                    item.relative_path.as_posix() if item.relative_path else None,
+                    item.acknowledgement_required,
+                )
+                for item in plan.warnings
+            )
+            resolved_roots = tuple(
+                PackCopyMigrationResolvedRootView(
+                    item.source_root.canonical_identity,
+                    item.target_identity,
+                    item.target_file_id,
+                    item.target_version,
+                    item.target_side,
+                    item.target_metadata_path.as_posix(),
+                    item.target_filename,
+                    item.classification,
+                    tuple(item.warnings),
+                )
+                for item in resolution.resolved_roots
+            )
+            compatibility = tuple(
+                (
+                    identity,
+                    value.status,
+                    value.loader_status,
+                    value.minecraft_status,
+                    tuple(value.warnings),
+                )
+                for identity, value in resolution.url_compatibility
+            )
+            facts = resolution.version_intent_facts
+            return PackCopyMigrationPreview(
+                self.source_key,
+                self.target,
+                self._snapshot.minecraft_version or "unknown",
+                self._snapshot.loader or "unknown",
+                self._snapshot.loader_version or "unknown",
+                self._snapshot.snapshot_digest,
+                plan.copied_files,
+                plan.copied_directories,
+                plan.copied_bytes,
+                tuple(path.as_posix() for path in plan.skipped_paths),
+                tuple(
+                    (
+                        item.category,
+                        item.relative_path.as_posix() if item.relative_path else None,
+                        item.detail,
+                    )
+                    for item in plan.changes
+                ),
+                warnings,
+                tuple(item.canonical_identity for item in resolution.roots),
+                resolved_roots,
+                _migration_delta_view(resolution.dependency_delta),
+                tuple(resolution.side_changes),
+                tuple(resolution.identity_changes),
+                tuple(resolution.path_collisions),
+                tuple(resolution.filename_collisions),
+                tuple(resolution.provider_warnings),
+                compatibility,
+                tuple(
+                    (item.canonical_identity, item.artifact_id, item.locked)
+                    for item in facts.overrides
+                ),
+                tuple(facts.automatic_identities),
+                tuple(
+                    (
+                        item.identity,
+                        item.owner_identity,
+                        item.requested_artifact_id,
+                        item.message,
+                    )
+                    for item in resolution.version_intent_issues
+                ),
+                tuple(
+                    (
+                        item.source_root.canonical_identity,
+                        tuple(item.removed_dependencies),
+                    )
+                    for item in self._removed_roots
+                ),
+                tuple(
+                    (item.old_identity, item.new_identity)
+                    for item in self._replaced_roots
+                ),
+                resolution.resolution_attempt,
+            )
+
+    def prepare_publication(
+        self,
+        acknowledged_warning_codes: tuple[str, ...] = (),
+        *,
+        progress: Callable[[PackMigrationProgress], None] | None = None,
+    ) -> PackCopyMigrationView:
+        self._claim_operation({"resolved"}, "preparing-publication")
+        try:
+            with self._lock:
+                if self._plan is None or self._resolution is None:
+                    raise PackMigrationError(
+                        "Pack migration publication authority is incomplete"
+                    )
+                plan = self._plan
+                resolution = self._resolution
+            publication = prepare_pack_migration_publication(
+                plan,
+                resolution,
+                acknowledged_warning_codes=tuple(acknowledged_warning_codes),
+                cancel_event=self._cancel_event,
+                deadline=self._deadline,
+                progress=self._reporter(progress),
+            )
+            with self._lock:
+                self._publication = publication
+                self._state = "ready"
+            return self.view
+        except BaseException as error:
+            self._record_failure(error)
+            raise
+        finally:
+            self._release_operation()
+
+    def publish(
+        self, *, progress: Callable[[PackMigrationProgress], None] | None = None
+    ) -> PackMigrationSourceSnapshot:
+        self._claim_operation({"ready"}, "publishing")
+        try:
+            with self._lock:
+                if self._publication is None:
+                    raise PackMigrationError("Pack migration publication handoff is missing")
+                publication = self._publication
+            published = apply_pack_migration_publication(
+                publication,
+                cancel_event=self._cancel_event,
+                deadline=self._deadline,
+                progress=self._reporter(progress),
+            )
+            with self._lock:
+                self._published_snapshot = published
+                self._state = "published"
+                self._error = None
+            return published
+        except BaseException as error:
+            self._record_failure(error)
+            raise
+        finally:
+            self._release_operation()
+
+    def discard(self, *, deadline: float | None = None) -> None:
+        with self._lock:
+            if self._operation_active:
+                raise PackMigrationError("Another Pack migration operation is active")
+            plan = self._plan
+            if plan is None:
+                if self._state not in {"published", "publication-uncertain"}:
+                    self._state = "discarded"
+                return
+            lifecycle = plan.publication_lifecycle
+            if lifecycle == "committed":
+                raise PackMigrationError(
+                    "Published migration cleanup must use retry_cleanup"
+                )
+            if lifecycle == "uncertain":
+                self._state = "publication-uncertain"
+                raise PackMigrationError(
+                    "Pack migration publication outcome is uncertain; ownership is retained"
+                )
+            self._operation_active = True
+            self._state = "discarding"
+        cleanup_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + PACK_MIGRATION_CLEANUP_TIMEOUT_SECONDS
+        )
+        try:
+            discard_pack_migration_plan(plan, deadline=cleanup_deadline)
+            with self._lock:
+                self._state = "discarded"
+                self._error = None
+        except BaseException as error:
+            with self._lock:
+                self._state = "cleanup-pending"
+                self._error = error
+            raise
+        finally:
+            self._release_operation()
+
+    def retry_cleanup(
+        self,
+        *,
+        deadline: float | None = None,
+        progress: Callable[[PackMigrationProgress], None] | None = None,
+    ) -> PackMigrationSourceSnapshot:
+        with self._lock:
+            if self._operation_active:
+                raise PackMigrationError("Another Pack migration operation is active")
+            if (
+                self._plan is None
+                or self._publication is None
+                or self._plan.publication_lifecycle != "committed"
+            ):
+                raise PackMigrationError(
+                    "Pack migration has no committed cleanup requiring retry"
+                )
+            publication = self._publication
+            self._operation_active = True
+            self._state = "retrying-cleanup"
+        cleanup_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + PACK_MIGRATION_CLEANUP_TIMEOUT_SECONDS
+        )
+        cleanup_event = threading.Event()
+        try:
+            published = retry_pack_migration_cleanup(
+                publication,
+                cancel_event=cleanup_event,
+                deadline=cleanup_deadline,
+                progress=self._reporter(progress),
+            )
+            with self._lock:
+                self._published_snapshot = published
+                self._state = "published"
+                self._error = None
+            return published
+        except BaseException as error:
+            with self._lock:
+                self._state = "cleanup-pending"
+                self._error = error
+            raise
+        finally:
+            self._release_operation()
+
+
+def format_pack_copy_migration_requirements(
+    session: PackCopyMigrationSession | PackCopyMigrationView,
+) -> tuple[str, ...]:
+    candidate = getattr(session, "view", session)
+    view = candidate if hasattr(candidate, "state") else session
+    lines: list[str] = []
+    if view.state == "provenance-required":
+        lines.append("Root provenance selection required; target not published.")
+        for item in view.candidates:
+            identity = item.canonical_identity or "identity-required"
+            lines.append(
+                f"  {item.metadata_path}: {identity} side={item.side} file={item.filename}"
+            )
+        lines.append("Rerun with one --root selection for every explicit root.")
+    elif view.state == "resolution-required":
+        lines.append("Migration resolution required; target not published.")
+        for item in view.unresolved:
+            version_intent_blocked = (
+                item.reason_code == "version-intent-blocked"
+                or item.version_intent_issue is not None
+            )
+            replacement = (
+                "version-intent-authority"
+                if version_intent_blocked
+                else (
+                    "replace-supported"
+                    if item.replacement_supported
+                    else "no-replacement"
+                )
+            )
+            lines.append(
+                f"  {item.source_identity} side={item.side} reason={item.reason_code} "
+                f"retryable={str(item.retryable).lower()} {replacement}: {item.message}"
+            )
+            if item.version_intent_issue:
+                lines.append(f"    version intent: {item.version_intent_issue}")
+            if version_intent_blocked:
+                lines.append(
+                    "    remedy: exact source version intent is authoritative; change "
+                    "the source version intent or return it to Automatic, then rerun "
+                    "migration."
+                )
+            else:
+                lines.append(
+                    f"    remedy: rerun with --remove {item.source_identity} or "
+                    f"--replace {item.source_identity}=PROVIDER:PROJECT."
+                )
+    elif view.state == "cleanup-pending":
+        lines.append("Migration cleanup is pending; ownership and locks are retained.")
+    elif view.state == "publication-uncertain":
+        lines.append("Migration publication outcome is uncertain; ownership is retained.")
+    elif view.error_message:
+        lines.append(view.error_message)
+    return tuple(lines)
+
+
+def format_pack_copy_migration_preview(
+    preview: PackCopyMigrationPreview,
+) -> tuple[str, ...]:
+    delta = preview.dependency_delta
+    target = preview.target
+    lines = [
+        f"Source Pack: {preview.source_key.partition(':')[2]}",
+        f"Target Pack: {target.target_id} ({target.display_name})",
+        f"Source versions: Minecraft {preview.source_minecraft_version}, "
+        f"{preview.source_loader} {preview.source_loader_version}",
+        f"Target versions: Minecraft {target.minecraft_version}, "
+        f"{target.loader} {target.loader_version}",
+        f"Source snapshot: {preview.source_snapshot_digest[:16]}",
+        f"Roots: {len(preview.roots)}",
+        f"Dependencies: +{len(delta.added)} -{len(delta.removed)} "
+        f"updated={len(delta.updated)} unchanged={len(delta.unchanged)}",
+        f"Copied: {preview.copied_files} files, {preview.copied_directories} directories, "
+        f"{preview.copied_bytes} bytes",
+    ]
+    for root in sorted(preview.resolved_roots, key=lambda item: item.source_identity):
+        lines.append(
+            f"Root [{root.classification}]: {root.source_identity} -> "
+            f"{root.target_identity} side={root.side} version={root.target_version or '-'}"
+        )
+    for entry in sorted(delta.added, key=lambda item: item.canonical_identity):
+        lines.append(
+            f"Dependency added: {entry.canonical_identity} side={entry.side} "
+            f"version={entry.version or '-'}"
+        )
+    for entry in sorted(delta.removed, key=lambda item: item.canonical_identity):
+        lines.append(f"Dependency removed: {entry.canonical_identity}")
+    for before, after in sorted(
+        delta.updated, key=lambda pair: pair[0].canonical_identity
+    ):
+        lines.append(
+            f"Dependency updated: {before.canonical_identity} "
+            f"{before.version or '-'} -> {after.version or '-'}"
+        )
+    for identity, before, after in preview.side_changes:
+        lines.append(f"Side change: {identity} {before} -> {after}")
+    for before, after in delta.path_changed:
+        lines.append(f"Dependency path change: {before} -> {after}")
+    for before, after in delta.filename_changed:
+        lines.append(f"Dependency filename change: {before} -> {after}")
+    for before, after in delta.identity_changed:
+        lines.append(
+            f"Dependency identity change: {before.canonical_identity} -> "
+            f"{after.canonical_identity}"
+        )
+    for before, after in preview.identity_changes:
+        lines.append(f"Identity change: {before} -> {after}")
+    for identity, dependencies in preview.removed_roots:
+        lines.append(f"Removed root: {identity}")
+        if dependencies:
+            lines.append(f"  Removed dependencies: {', '.join(dependencies)}")
+    for before, after in preview.replaced_roots:
+        lines.append(f"Replaced root: {before} -> {after}")
+    for identity, artifact, locked in preview.version_overrides:
+        lines.append(
+            f"Exact version intent: {identity} artifact={artifact} locked={str(locked).lower()}"
+        )
+    if preview.automatic_version_identities:
+        lines.append(
+            f"Automatic version intent: {len(preview.automatic_version_identities)} identities"
+        )
+    for identity, owner, artifact, message in preview.version_intent_issues:
+        lines.append(
+            f"Version intent blocked: {identity} owner={owner or '-'} "
+            f"artifact={artifact}: {message}"
+        )
+    for identity, status, loader_status, minecraft_status, warnings in preview.url_compatibility:
+        lines.append(
+            f"URL compatibility: {identity} status={status} loader={loader_status} "
+            f"minecraft={minecraft_status}"
+        )
+        lines.extend(f"  URL warning: {warning}" for warning in warnings)
+    lines.extend(f"Path collision: {item}" for item in preview.path_collisions)
+    lines.extend(f"Filename collision: {item}" for item in preview.filename_collisions)
+    lines.extend(f"Provider warning: {item}" for item in preview.provider_warnings)
+    for category, path, detail in preview.changes:
+        if category not in {"target-config", "skip"}:
+            continue
+        location = f" ({path})" if path else ""
+        lines.append(f"{category.replace('-', ' ').title()}{location}: {detail}")
+    for warning in preview.warnings:
+        required = " acknowledgement-required" if warning.acknowledgement_required else ""
+        location = f" ({warning.relative_path})" if warning.relative_path else ""
+        lines.append(f"Warning [{warning.code}]{required}{location}: {warning.message}")
+    if preview.required_warning_codes:
+        lines.append(
+            "Required warning acknowledgements: "
+            + ", ".join(preview.required_warning_codes)
+        )
+    return tuple(lines)
+
+
 def resolve_pack_migration_plan(
     plan: PackMigrationPlan,
     *,
@@ -11836,7 +12828,7 @@ def clean_state(
 def project_actions(project_key_value: str) -> tuple[str, ...]:
     kind, _ = split_project_key(project_key_value)
     if kind == "pack":
-        return ("publish",)
+        return ("migrate", "publish")
     return ("create MODPACK", "validate")
 
 

@@ -36,6 +36,9 @@ class ModuleBoundaryTest(unittest.TestCase):
         )
 
     def test_core_reexports_pack_migration_api(self) -> None:
+        self.assertTrue(callable(huroshiki_core.PackCopyMigrationSession))
+        self.assertTrue(callable(huroshiki_core.format_pack_copy_migration_preview))
+        self.assertTrue(callable(huroshiki_core.format_pack_copy_migration_requirements))
         self.assertIs(huroshiki_core.PackMigrationPlan, pack_migration.PackMigrationPlan)
         self.assertIs(
             huroshiki_core.PackMigrationPublicationPlan,

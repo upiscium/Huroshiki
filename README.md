@@ -295,6 +295,50 @@ migration or refresh failures and concurrent pack changes leave the real source 
 The same flow is available under `Settings` then `Versions`; preparation runs in a background
 worker, displays progress and changed files, and completes cancellation cleanup before navigation.
 
+### Copy migration
+
+`packctl migrate` is the Copy-only workflow for moving a Pack to a new Minecraft/loader target. It
+never migrates in place and never copies deployment or Minecraft-server settings. The source Pack is
+snapshotted before planning; source and target are locked in canonical order, and the target is
+installed with an atomic no-clobber operation. An existing target is therefore rejected rather than
+overwritten. Preview, target resolution, and target apply do not modify an already provenance-aware
+source Pack. The explicit legacy root-provenance step described below is the exception: it commits
+`.huroshiki-roots.json`, its ignore entry, and any required legacy URL identity to the source before
+restarting migration from a fresh snapshot.
+
+```bash
+packctl migrate old-pack --copy-to new-pack --display-name "New Pack" \
+  --minecraft 1.21.1 --loader neoforge --loader-version 21.1.234
+packctl migrate old-pack --copy-to new-pack --display-name "New Pack" \
+  --minecraft 1.21.1 --loader neoforge --loader-version 21.1.234 --apply
+```
+
+The loader must be one of `fabric`, `forge`, `neoforge`, or `quilt`. The default is a preview;
+`--apply` publishes the reviewed target copy. Migration does not automatically build, deploy,
+publish, or restart anything. A post-publication cleanup failure leaves the transaction and locks
+retained as **cleanup pending**; retry or clean that retained state before treating the operation as
+finished.
+
+Root provenance is read from `source/.huroshiki-roots.json`. A Pack without that manifest does not
+turn every installed dependency into a root: migration remains `resolution-required` until each
+root is explicitly selected. Use repeated `--root PROVIDER:ID` selections for roots. A legacy URL
+candidate without an identity uses `--root SOURCE_PATH=url:ID`. Use repeated `--remove ID`
+choices for roots that should be dropped, and repeated `--replace OLD=PROVIDER:ID` choices for
+canonical Modrinth or CurseForge replacements. `--remove` and `--replace` are only for the complete,
+digest-bound unresolved set shown by the preview; stale, incomplete, non-canonical, or ambiguous
+choices fail closed. `--ack-warning WARNING_CODE` must be repeated for every warning that requires
+an acknowledgement. The global managed-repository
+`--root PATH` remains a global option and must appear
+before `migrate`, for example `packctl --root /srv/modpacks migrate ...`.
+
+Migration preserves the source's exact MOD version intent from
+`.huroshiki-version-overrides.json`, which remains authoritative. A locked source identity is a hard
+constraint and cannot be silently replaced; an incompatible target resolution is rejected. Any
+newly carried exact identity is unlocked by default. Exact dependency intent is retained only when
+that dependency is required by a selected root; it is not promoted to a root and an unavailable or
+conflicting dependency blocks migration. Review the complete root/dependency changes and required
+warning acknowledgements before using `--apply`.
+
 `packctl apply-template <pack> <template> [<template> ...]` prepares a one-shot import into an
 existing pack. The default is a dry run; `--apply` publishes the staged closure. Name, URL selector,
 logical-identity replacement, and resolved-identity conflicts require a version 4 `--resolution`

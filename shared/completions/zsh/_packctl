@@ -22,9 +22,9 @@ _packctl() {
     if (( skip_root )); then
       _packctl_root="$word"
       skip_root=0
-    elif [[ "$word" == --root ]]; then
+    elif [[ -z "$command" && "$word" == --root ]]; then
       skip_root=1
-    elif [[ "$word" == --root=* ]]; then
+    elif [[ -z "$command" && "$word" == --root=* ]]; then
       _packctl_root="${word#--root=}"
     elif [[ -z "$command" && "$word" != -* ]]; then
       command="$word"
@@ -55,6 +55,7 @@ _packctl() {
       'remove:remove installed mods'
       'update:update all mods'
       'loader-version:preview or apply a loader version migration'
+      'migrate:copy a pack to a new Minecraft/loader target'
       'version:preview or apply exact/Automatic MOD version intent'
       'pin:preview or pin exact MOD version intent'
       'unpin:preview or unpin exact MOD version intent'
@@ -143,6 +144,24 @@ _packctl() {
     (loader-version:2)
       candidates=(latest recommended)
       _describe 'loader version' candidates
+      ;;
+    (migrate:1)
+      candidates=("${(@f)$(_packctl_candidates packs)}")
+      _describe source candidates
+      ;;
+    (migrate:*)
+      _arguments \
+        '--copy-to=[new target Pack ID]:target Pack ID' \
+        '--display-name=[target display name]:display name' \
+        '--minecraft=[target Minecraft version]:Minecraft version' \
+        '--loader=[target loader]:loader:(fabric forge neoforge quilt)' \
+        '--loader-version=[target loader version]:loader version' \
+        '*--root=[explicit root identity or path=identity]:root selection' \
+        '*--remove=[remove an unresolved root]:root identity' \
+        '*--replace=[replace an unresolved root]:old root=new provider root' \
+        '*--ack-warning=[acknowledge a migration warning]:warning code' \
+        '--apply[apply the reviewed migration; default is preview]' \
+        '*:argument:_files'
       ;;
     (profile:2|profile:*)
       selected_pack="${words[command_index + 1]}"

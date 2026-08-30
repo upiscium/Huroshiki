@@ -271,6 +271,14 @@ def validate_resolution_request(
                 raise PackMigrationConflictResolutionError(
                     "Replacement provider must be modrinth or curseforge"
                 )
+            if provider == "curseforge" and (
+                not project_id.isdecimal()
+                or int(project_id) <= 0
+                or str(int(project_id)) != project_id
+            ):
+                raise PackMigrationConflictResolutionError(
+                    "CurseForge replacement project ID must be a positive canonical integer"
+                )
             if replacement_identity == identity:
                 raise PackMigrationConflictResolutionError(
                     "Replacement must use a different canonical identity"

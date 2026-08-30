@@ -143,6 +143,9 @@ class PackMigrationSourceSnapshot:
     total_bytes: int
     snapshot_digest: str
     validation_errors: tuple[str, ...]
+    minecraft_version: str | None
+    loader: str | None
+    loader_version: str | None
     _tree_scan: PackTreeScan = field(repr=False, compare=False)
 
 
@@ -446,8 +449,9 @@ def snapshot_pack_migration_source_at(
         distribution_config_digest = None
         url_max_jar_size_bytes = DEFAULT_URL_MAX_JAR_SIZE_BYTES
         url_allow_private_networks = False
+    source_versions: tuple[str, str, str] | None = None
     try:
-        _pack_versions_from_bytes(
+        source_versions = _pack_versions_from_bytes(
             _read_scanned_file(scan, Path("source/pack.toml")),
             "source/pack.toml",
         )
@@ -529,6 +533,9 @@ def snapshot_pack_migration_source_at(
         sum(entry.size for entry in scan.entries if entry.kind == "file"),
         snapshot_digest,
         immutable_errors,
+        source_versions[0] if source_versions is not None else None,
+        source_versions[1] if source_versions is not None else None,
+        source_versions[2] if source_versions is not None else None,
         scan,
     )
 
@@ -643,6 +650,17 @@ class PackMigrationPlan:
     @property
     def state(self) -> str:
         return self._state
+
+    @property
+    def publication_lifecycle(self) -> Literal["precommit", "uncertain", "committed", "discarded"]:
+        """A read-only lifecycle classification for UI/coordinator callers."""
+        if self._publication_committed:
+            return "committed"
+        if self._publication_state == "uncertain":
+            return "uncertain"
+        if self._state == "discarded":
+            return "discarded"
+        return "precommit"
 
 
 def _identity(path: Path) -> tuple[int, int]:
