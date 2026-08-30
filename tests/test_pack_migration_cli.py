@@ -152,6 +152,107 @@ class PackMigrationCliTest(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertEqual(session.calls, ["start", "discard"])
 
+    def test_version_intent_blocked_formatter_never_advertises_resolution_flags(self) -> None:
+        target = core.PackMigrationTarget(
+            "next", "Next", "1.21.4", "fabric", "0.16.0"
+        )
+        blocked = core.PackCopyMigrationUnresolvedView(
+            "modrinth:dependency",
+            "both",
+            "version-intent-blocked",
+            "Exact dependency artifact is unavailable",
+            False,
+            True,
+            "mods/dependency.pw.toml",
+            "owner modrinth:root requires artifact v1",
+        )
+        view = core.PackCopyMigrationView(
+            "resolution-required",
+            "pack:demo",
+            target,
+            None,
+            None,
+            (),
+            (blocked,),
+            (),
+            "precommit",
+            False,
+            False,
+            None,
+        )
+        output = "\n".join(core.format_pack_copy_migration_requirements(view))
+        self.assertNotIn("--remove", output)
+        self.assertNotIn("--replace", output)
+        self.assertIn("exact source version intent is authoritative", output)
+        self.assertIn("return it to Automatic", output)
+        self.assertIn("rerun migration", output)
+
+    def test_cli_blocked_output_does_not_offer_remove_or_replace(self) -> None:
+        FakeMigrationSession.start_state = "resolution-required"
+        blocked = core.PackCopyMigrationUnresolvedView(
+            "modrinth:dependency",
+            "both",
+            "version-intent-blocked",
+            "Exact dependency artifact is unavailable",
+            False,
+            True,
+            "mods/dependency.pw.toml",
+            "owner modrinth:root requires artifact v1",
+        )
+        original_start = FakeMigrationSession.start
+
+        def start(session: FakeMigrationSession) -> None:
+            original_start(session)
+            session.unresolved = (blocked,)
+
+        output = StringIO()
+        with patch.object(FakeMigrationSession, "start", start), patch.object(
+            core, "PackCopyMigrationSession", FakeMigrationSession
+        ), redirect_stdout(output):
+            result = packctl.cmd_migrate(migration_args())
+        text = output.getvalue()
+        self.assertEqual(result, 2)
+        self.assertNotIn("--remove", text)
+        self.assertNotIn("--replace", text)
+        self.assertIn("return it to Automatic", text)
+
+    def test_mixed_requirements_scope_resolution_flags_to_ordinary_conflict(self) -> None:
+        target = core.PackMigrationTarget(
+            "next", "Next", "1.21.4", "fabric", "0.16.0"
+        )
+        ordinary = core.PackCopyMigrationUnresolvedView(
+            "modrinth:ordinary",
+            "client",
+            "no-compatible-file",
+            "No compatible file",
+            False,
+            True,
+            "mods/ordinary.pw.toml",
+        )
+        blocked = core.PackCopyMigrationUnresolvedView(
+            "modrinth:dependency",
+            "both",
+            "version-intent-blocked",
+            "Exact dependency artifact is unavailable",
+            False,
+            False,
+            "mods/dependency.pw.toml",
+            "Exact source intent blocks the dependency",
+        )
+        view = core.PackCopyMigrationView(
+            "resolution-required", "pack:demo", target, None, None, (),
+            (ordinary, blocked), (), "precommit", False, False, None,
+        )
+        lines = core.format_pack_copy_migration_requirements(view)
+        ordinary_remedy = next(line for line in lines if "--remove" in line)
+        blocked_remedy = next(
+            line for line in lines if "exact source version intent" in line
+        )
+        self.assertIn("modrinth:ordinary", ordinary_remedy)
+        self.assertNotIn("modrinth:dependency", ordinary_remedy)
+        self.assertNotIn("--remove", blocked_remedy)
+        self.assertNotIn("--replace", blocked_remedy)
+
     def test_committed_cleanup_failure_retries_without_discard(self) -> None:
         FakeMigrationSession.publish_error = core.PackMigrationCleanupError("blocked")
         result, output, session = self.run_command("--apply", "--ack-warning", "review")

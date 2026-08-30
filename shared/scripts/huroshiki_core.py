@@ -6901,14 +6901,36 @@ def format_pack_copy_migration_requirements(
     elif view.state == "resolution-required":
         lines.append("Migration resolution required; target not published.")
         for item in view.unresolved:
-            replacement = "replace-supported" if item.replacement_supported else "no-replacement"
+            version_intent_blocked = (
+                item.reason_code == "version-intent-blocked"
+                or item.version_intent_issue is not None
+            )
+            replacement = (
+                "version-intent-authority"
+                if version_intent_blocked
+                else (
+                    "replace-supported"
+                    if item.replacement_supported
+                    else "no-replacement"
+                )
+            )
             lines.append(
                 f"  {item.source_identity} side={item.side} reason={item.reason_code} "
                 f"retryable={str(item.retryable).lower()} {replacement}: {item.message}"
             )
             if item.version_intent_issue:
                 lines.append(f"    version intent: {item.version_intent_issue}")
-        lines.append("Rerun with exactly one --remove or --replace choice per unresolved root.")
+            if version_intent_blocked:
+                lines.append(
+                    "    remedy: exact source version intent is authoritative; change "
+                    "the source version intent or return it to Automatic, then rerun "
+                    "migration."
+                )
+            else:
+                lines.append(
+                    f"    remedy: rerun with --remove {item.source_identity} or "
+                    f"--replace {item.source_identity}=PROVIDER:PROJECT."
+                )
     elif view.state == "cleanup-pending":
         lines.append("Migration cleanup is pending; ownership and locks are retained.")
     elif view.state == "publication-uncertain":

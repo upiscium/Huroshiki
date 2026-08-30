@@ -178,6 +178,11 @@ class PackCopyMigrationOwner:
     pending_view: core.PackCopyMigrationView | None = None
     pending_preview: object | None = None
     cleanup_completed: bool = False
+    failure_error: BaseException | None = None
+    cleanup_error: BaseException | None = None
+    cleanup_thread: threading.Thread | None = None
+    cleanup_done: threading.Event = field(default_factory=threading.Event)
+    cleanup_for_failure: bool = False
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     @property
@@ -198,18 +203,71 @@ def _migration_cleanup(owner: PackCopyMigrationOwner, deadline: float) -> None:
         elif lifecycle == "uncertain":
             owner.cleanup_retained = True
             owner.cleanup_pending = True
+            owner.cleanup_error = None
             return
         else:
             owner.session.discard(deadline=deadline)
         owner.cleanup_retained = False
         owner.cleanup_pending = False
-    except BaseException:
+        owner.cleanup_error = None
+    except BaseException as error:
         owner.cleanup_retained = True
         owner.cleanup_pending = True
+        owner.cleanup_error = error
 
 
 def _migration_retry_cleanup(owner: PackCopyMigrationOwner, deadline: float) -> None:
     _migration_cleanup(owner, deadline)
+
+
+def _run_migration_shutdown_cleanup(
+    owner: PackCopyMigrationOwner,
+    *,
+    deadline: float,
+) -> bool:
+    """Run migration cleanup off-loop and wait only until the bounded deadline."""
+    lifecycle = owner.session.view.publication_lifecycle
+    if lifecycle == "uncertain":
+        owner.cleanup_retained = True
+        owner.cleanup_pending = True
+        return False
+    done = threading.Event()
+
+    def cleanup() -> None:
+        try:
+            _migration_cleanup(owner, deadline)
+        finally:
+            done.set()
+
+    thread = threading.Thread(
+        target=cleanup,
+        name=(
+            "huroshiki-pack-migration-shutdown-cleanup-"
+            f"{owner.source_key.replace(':', '-')}"
+        ),
+        daemon=False,
+    )
+    owner.cleanup_done = done
+    owner.cleanup_thread = thread
+    try:
+        thread.start()
+    except BaseException as error:
+        owner.cleanup_error = error
+        owner.cleanup_retained = True
+        owner.cleanup_pending = True
+        done.set()
+        return False
+    remaining = max(0.0, deadline - time.monotonic())
+    if not done.wait(remaining):
+        owner.cleanup_retained = True
+        owner.cleanup_pending = True
+        return False
+    thread.join(max(0.0, deadline - time.monotonic()))
+    if thread.is_alive():
+        owner.cleanup_retained = True
+        owner.cleanup_pending = True
+        return False
+    return not owner.cleanup_retained
 
 
 class PackCopyMigrationTargetModal(ModalScreen[dict[str, str] | None]):
@@ -445,6 +503,10 @@ class PackCopyMigrationScreen(Screen[None]):
             self.owner.thread.start()
         except BaseException as error:
             self.owner.error = error
+            if phase in {"discard", "cleanup", "failure-cleanup"}:
+                self.owner.cleanup_error = error
+                self.owner.cleanup_retained = True
+                self.owner.cleanup_pending = True
             self.owner.done.set()
 
     def _poll(self) -> None:
@@ -485,6 +547,27 @@ class PackCopyMigrationScreen(Screen[None]):
                 )
             self.query_one("#migration-status", Static).update(self.status)
             return
+        if self.phase == "failure-cleanup":
+            failure = self.owner.failure_error
+            detail = f"\nDetail: {failure}" if failure is not None else ""
+            if self.owner.cleanup_retained:
+                self.status = (
+                    "Migration failed; target not published.\n"
+                    "Migration cleanup is still pending. Press r to retry cleanup."
+                    f"{detail}"
+                )
+            else:
+                self.status = (
+                    "Migration failed; target not published.\n"
+                    f"Cleanup completed.{detail}"
+                )
+                self.phase = "failure-cleaned"
+                self.app.release_pack_copy_migration(self.owner)
+            self.query_one("#migration-status", Static).update(self.status)
+            return
+        if self.phase == "failure-cleaned":
+            self.query_one("#migration-status", Static).update(self.status)
+            return
         if self.owner.error is not None:
             view = self.session.view
             if view.publication_lifecycle == "committed":
@@ -501,7 +584,17 @@ class PackCopyMigrationScreen(Screen[None]):
                     f"{self.owner.error}"
                 )
             else:
-                self.status = f"Migration failed; target not published: {self.owner.error}"
+                self.owner.failure_error = self.owner.error
+                self.owner.error = None
+                self.owner.cleanup_for_failure = True
+                self.phase = "failure-cleanup"
+                self.status = (
+                    "Migration failed; target not published.\n"
+                    "Cleaning retained migration ownership..."
+                )
+                self._start_worker("failure-cleanup", self._discard)
+                self.query_one("#migration-status", Static).update(self.status)
+                return
             self.query_one("#migration-status", Static).update(self.status)
             return
         with self.owner.lock:
@@ -520,9 +613,34 @@ class PackCopyMigrationScreen(Screen[None]):
             if self._rendered_phase != self.phase:
                 self._render_conflicts()
                 self._rendered_phase = self.phase
-            self.status = (
-                "Choose Remove or Replace for every conflict; p enters a replacement."
+            blocked = tuple(
+                item
+                for item in self.conflicts
+                if item.reason_code == "version-intent-blocked"
+                or item.version_intent_issue is not None
             )
+            ordinary_count = len(self.conflicts) - len(blocked)
+            if blocked and ordinary_count:
+                self.status = (
+                    "Choose Remove or Replace only for ordinary conflicts. Exact source "
+                    "version-intent blocks must be changed or returned to Automatic."
+                )
+                help_text = (
+                    "Space: remove ordinary conflict   p: replace ordinary conflict   "
+                    "q/Esc: cancel"
+                )
+            elif blocked:
+                self.status = (
+                    "Exact source version intent is authoritative. Change it or return "
+                    "it to Automatic, then rerun migration."
+                )
+                help_text = "q/Esc: cancel"
+            else:
+                self.status = (
+                    "Choose Remove or Replace for every conflict; p enters a replacement."
+                )
+                help_text = "Space: remove   p: replace   Enter: continue   q/Esc: cancel"
+            self.query_one("#key-help", Static).update(help_text)
         elif self.phase == "preview":
             if self._rendered_phase != self.phase:
                 self._show_preview()
@@ -557,15 +675,32 @@ class PackCopyMigrationScreen(Screen[None]):
                 label = (
                     "Blocked"
                     if conflict.reason_code == "version-intent-blocked"
+                    or conflict.version_intent_issue is not None
                     else "Required"
                 )
             elif choice.action == "remove":
                 label = "Remove"
             else:
                 label = f"Replace → {choice.replacement_provider}:{choice.replacement_project_id}"
+            detail = " ".join(conflict.message.split())
+            if len(detail) > 240:
+                detail = detail[:237] + "..."
+            facts = (
+                f"identity={conflict.source_identity} | side={conflict.side} | "
+                f"reason={conflict.reason_code} | metadata_path={conflict.metadata_path} | "
+                f"detail={detail} | "
+                f"retryable={str(conflict.retryable).lower()} | "
+                "replacement_supported="
+                f"{str(conflict.replacement_supported).lower()}"
+            )
+            if conflict.version_intent_issue is not None:
+                issue = " ".join(conflict.version_intent_issue.split())
+                if len(issue) > 240:
+                    issue = issue[:237] + "..."
+                facts += f" | version_intent_issue={issue}"
             table.add_row(
                 label,
-                f"{conflict.source_identity} | {conflict.reason_code} | {conflict.message}",
+                facts,
             )
 
     def _show_preview(self) -> None:
@@ -721,7 +856,8 @@ class PackCopyMigrationScreen(Screen[None]):
             _migration_retry_cleanup(self.owner, cleanup_deadline)
             if not self.owner.cleanup_retained:
                 self.owner.error = None
-                self.owner.navigation_pending = True
+                if not self.owner.cleanup_for_failure:
+                    self.owner.navigation_pending = True
                 with self.owner.lock:
                     self.owner.cleanup_completed = True
         except BaseException as error:
@@ -811,6 +947,11 @@ class PackCopyMigrationScreen(Screen[None]):
         elif event.key == "r":
             self._retry_cleanup()
         elif event.key in {"q", "escape"}:
+            if self.phase == "failure-cleaned":
+                self.app.open_project(self.owner.source_key)
+                event.stop()
+                return
+            self.owner.cleanup_for_failure = False
             self.owner.navigation_pending = True
             self.owner.cancel_event.set()
             _session_cancel(self.session)
@@ -939,18 +1080,34 @@ class HuroshikiApp(App[None]):
         for owner in migration_owners:
             key = owner.source_key
             if not owner.done.wait(max(0.0, deadline - time.monotonic())):
-                print(f"Pack migration worker did not stop before shutdown for {key}", file=sys.stderr)
+                print(
+                    f"Pack migration worker did not stop before shutdown for {key}; "
+                    "cleanup ownership is retained",
+                    file=sys.stderr,
+                )
                 continue
             if owner.thread is not None:
                 owner.thread.join(max(0.0, deadline - time.monotonic()))
             if owner.thread is not None and owner.thread.is_alive():
-                print(f"Pack migration worker did not join before shutdown for {key}", file=sys.stderr)
+                print(
+                    f"Pack migration worker did not join before shutdown for {key}; "
+                    "cleanup ownership is retained",
+                    file=sys.stderr,
+                )
                 continue
             cleanup_deadline = time.monotonic() + PUBLISH_CLEANUP_TIMEOUT_SECONDS
-            if not owner.published:
-                _migration_cleanup(owner, cleanup_deadline)
-            elif owner.cleanup_retained:
-                _migration_retry_cleanup(owner, cleanup_deadline)
+            lifecycle = owner.session.view.publication_lifecycle
+            cleanup_required = lifecycle == "precommit" or (
+                lifecycle == "committed" and owner.cleanup_retained
+            )
+            if cleanup_required:
+                _run_migration_shutdown_cleanup(
+                    owner,
+                    deadline=cleanup_deadline,
+                )
+            elif lifecycle == "uncertain":
+                owner.cleanup_retained = True
+                owner.cleanup_pending = True
             if not owner.cleanup_retained:
                 self.release_pack_copy_migration(owner)
             else:
