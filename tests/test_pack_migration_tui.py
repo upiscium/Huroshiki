@@ -22,6 +22,7 @@ PROJECT = core.ProjectInfo(
 class FakeMigrationSession:
     instances: list["FakeMigrationSession"] = []
     delay_start = False
+    delay_roots = False
     preview_result: object = object()
     initial_state = "resolved"
     initial_candidates: tuple[core.PackCopyMigrationRootCandidateView, ...] = ()
@@ -47,6 +48,8 @@ class FakeMigrationSession:
         self.prepare_calls: list[tuple[str, ...]] = []
         self.publish_calls = 0
         self.root_calls: list[tuple[tuple[str, str], ...]] = []
+        self.root_started = threading.Event()
+        self.root_release = threading.Event()
         self.conflict_calls: list[tuple[core.PackMigrationRootResolution, ...]] = []
         self._state = "new"
         self.lifecycle = type(self).lifecycle
@@ -97,6 +100,12 @@ class FakeMigrationSession:
 
     def select_root_candidates(self, selections, *, progress=None):
         self.root_calls.append(tuple(selections))
+        self.root_started.set()
+        if self.delay_roots:
+            self.root_release.wait(3)
+        if self.cancel_event.is_set():
+            self._state = "cancelled"
+            raise core.PackMigrationCancelled("cancelled after root selection")
         self._state = "resolved"
         return self.view
 
@@ -144,6 +153,7 @@ class PackMigrationTuiTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         FakeMigrationSession.instances.clear()
         FakeMigrationSession.delay_start = False
+        FakeMigrationSession.delay_roots = False
         FakeMigrationSession.preview_result = object()
         FakeMigrationSession.initial_state = "resolved"
         FakeMigrationSession.initial_candidates = ()
@@ -405,6 +415,11 @@ class PackMigrationTuiTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.15)
                 screen = app.screen
                 self.assertEqual(screen.phase, "roots")
+                self.assertIn("explicitly", screen.status)
+                self.assertIn("migration-local", screen.status)
+                self.assertIn("source Pack unchanged", screen.status)
+                self.assertNotIn("commit", screen.status.lower())
+                self.assertNotIn("update", screen.status.lower())
                 await pilot.press("space", "enter")
                 deadline = time.monotonic() + 2
                 while screen.phase != "preview" and time.monotonic() < deadline:
@@ -451,6 +466,48 @@ class PackMigrationTuiTest(unittest.IsolatedAsyncioTestCase):
                 choice = session.conflict_calls[0][0]
                 self.assertEqual(choice.source_identity, "modrinth:old")
                 self.assertEqual(choice.action, "remove")
+
+    async def test_cancel_after_root_selection_waits_then_discards(self) -> None:
+        FakeMigrationSession.initial_state = "provenance-required"
+        FakeMigrationSession.delay_roots = True
+        FakeMigrationSession.initial_candidates = (
+            core.PackCopyMigrationRootCandidateView(
+                "mods/a.pw.toml", "modrinth:a", "modrinth", "a", None,
+                None, "both", "mods/a.pw.toml", "a.jar",
+            ),
+        )
+        values = {
+            "project_id": "next", "display_name": "Next", "minecraft": "1.21.4",
+            "loader": "fabric", "loader_version": "0.16.0",
+        }
+        with patch.object(huroshiki.core, "project_info", return_value=PROJECT), patch.object(
+            huroshiki.core, "PackCopyMigrationSession", FakeMigrationSession
+        ), patch.object(
+            huroshiki.core, "format_pack_copy_migration_preview", return_value=("preview",)
+        ):
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test() as pilot:
+                app._start_pack_copy_migration("pack:demo", values)
+                await pilot.pause(0.15)
+                screen = app.screen
+                await pilot.press("space", "enter")
+                session = FakeMigrationSession.instances[-1]
+                deadline = time.monotonic() + 2
+                while not session.root_started.is_set() and time.monotonic() < deadline:
+                    await pilot.pause(0.05)
+                self.assertTrue(session.root_started.is_set())
+                await pilot.press("escape")
+                await pilot.pause(0.1)
+                self.assertIs(app.screen, screen)
+                self.assertEqual(session.cancel_calls, 1)
+                self.assertEqual(session.discard_calls, 0)
+                session.root_release.set()
+                deadline = time.monotonic() + 2
+                while app.screen is screen and time.monotonic() < deadline:
+                    await pilot.pause(0.05)
+                self.assertEqual(session.root_calls, [(('mods/a.pw.toml', 'modrinth:a'),)])
+                self.assertEqual(session.discard_calls, 1)
+                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
 
     async def test_conflict_rendering_includes_complete_bounded_typed_facts(self) -> None:
         FakeMigrationSession.initial_state = "resolution-required"
@@ -541,6 +598,10 @@ class PackMigrationTuiTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertIsInstance(app.screen, huroshiki.ConfirmModal)
                 self.assertEqual(app.screen.dialog_title, "Confirm copy migration")
+                confirmation = " ".join(app.screen.lines)
+                self.assertIn("source Pack is never changed", confirmation)
+                self.assertIn("successful target", confirmation)
+                self.assertNotIn("committed", confirmation.lower())
                 session = FakeMigrationSession.instances[-1]
                 self.assertEqual(session.prepare_calls, [])
 

@@ -296,7 +296,8 @@ class PackCopyMigrationTargetModal(ModalScreen[dict[str, str] | None]):
                 yield Static(label)
                 yield Input(placeholder=placeholder, id=field_id)
             yield Static(
-                "Copy only. Explicit legacy provenance selection may update the source. "
+                "Copy only. Legacy root selection is explicit, migration-local, and never changes "
+                "the source Pack. "
                 "Enter: next / submit; Esc: cancel",
                 classes="modal-help",
             )
@@ -607,7 +608,8 @@ class PackCopyMigrationScreen(Screen[None]):
                 self._render_roots()
                 self._rendered_phase = self.phase
             self.status = (
-                "Select migration roots explicitly; Space toggles, Enter continues."
+                "Select migration roots explicitly (migration-local; source Pack unchanged); "
+                "Space toggles, Enter continues."
             )
         elif self.phase == "conflicts":
             if self._rendered_phase != self.phase:
@@ -716,7 +718,7 @@ class PackCopyMigrationScreen(Screen[None]):
                 return
             selections = tuple(sorted(self.selected_roots.items()))
             self.phase = "resolving"
-            self.status = "Committing root provenance and restarting resolution..."
+            self.status = "Applying migration-local root selection and restarting resolution..."
             self._start_worker("resolve", lambda: self._resolve(selections))
         elif self.phase == "conflicts":
             blocked = [
@@ -780,7 +782,7 @@ class PackCopyMigrationScreen(Screen[None]):
                 "Confirm copy migration",
                 (
                     f"Create target Pack {self.owner.target_key.partition(':')[2]} atomically.",
-                    "The source Pack remains unchanged except explicit provenance already committed.",
+                    "The source Pack is never changed; canonical root provenance is recorded in the successful target.",
                     "No build, Publish, deploy, or restart is run.",
                 ),
             ),

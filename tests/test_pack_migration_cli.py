@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import huroshiki_core as core
 import packctl
+from tests import test_pack_migration_resolution as resolution_fixture
 
 
 def migration_argv(*extra: str) -> list[str]:
@@ -312,6 +313,55 @@ class PackMigrationCliTest(unittest.TestCase):
                 packctl.cmd_migrate(migration_args("--apply", "--ack-warning", "review"))
         session = FakeMigrationSession.instances[-1]
         self.assertNotIn("discard", session.calls)
+
+
+class PackMigrationCliFilesystemTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = resolution_fixture.PackMigrationResolutionTest(
+            methodName="runTest"
+        )
+        self.fixture.setUp()
+        (self.fixture.source / ".huroshiki-roots.json").unlink()
+
+    def tearDown(self) -> None:
+        self.fixture.tearDown()
+
+    def run_real_preview(self, resolver_side_effect: object) -> int:
+        output = StringIO()
+        with patch.object(
+            packctl,
+            "init_packwiz_project",
+            side_effect=self.fixture.fake_init,
+        ), patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=resolver_side_effect,
+        ), patch.object(
+            core,
+            "resolve_project_selector",
+            side_effect=self.fixture.fake_selector,
+        ), patch.object(packctl, "run_packwiz"), redirect_stdout(output):
+            return packctl.cmd_migrate(
+                migration_args("--root", "modrinth:root-project")
+            )
+
+    def test_preview_with_explicit_root_leaves_source_tree_unchanged(self) -> None:
+        before = resolution_fixture.filesystem_snapshot(self.fixture.pack)
+        result = self.run_real_preview(self.fixture.fake_closure)
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            resolution_fixture.filesystem_snapshot(self.fixture.pack), before
+        )
+        self.assertFalse((self.fixture.packs / "next").exists())
+
+    def test_failure_after_explicit_root_leaves_source_tree_unchanged(self) -> None:
+        before = resolution_fixture.filesystem_snapshot(self.fixture.pack)
+        with self.assertRaisesRegex(packctl.ConfigError, "protocol failed"):
+            self.run_real_preview(core.HuroshikiError("resolver protocol failed"))
+        self.assertEqual(
+            resolution_fixture.filesystem_snapshot(self.fixture.pack), before
+        )
+        self.assertFalse((self.fixture.packs / "next").exists())
 
 
 if __name__ == "__main__":

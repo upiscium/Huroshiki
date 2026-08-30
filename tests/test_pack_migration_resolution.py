@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
+import stat
 import unittest
 from unittest.mock import patch
 
@@ -50,6 +52,32 @@ version = "{version}"
         "modrinth",
         project,
     )
+
+
+def filesystem_snapshot(root: Path) -> tuple[tuple[str, str, int, bytes | None], ...]:
+    """Capture the contract-visible tree without following filesystem links."""
+    captured: list[tuple[str, str, int, bytes | None]] = []
+
+    def visit(directory: Path, prefix: Path = Path(".")) -> None:
+        with os.scandir(directory) as entries:
+            for entry in sorted(entries, key=lambda item: item.name):
+                path = directory / entry.name
+                relative = (prefix / entry.name).as_posix()
+                info = entry.stat(follow_symlinks=False)
+                mode = stat.S_IMODE(info.st_mode)
+                if stat.S_ISDIR(info.st_mode):
+                    kind, contents = "directory", None
+                    captured.append((relative, kind, mode, contents))
+                    visit(path, prefix / entry.name)
+                elif stat.S_ISREG(info.st_mode):
+                    captured.append((relative, "file", mode, path.read_bytes()))
+                elif stat.S_ISLNK(info.st_mode):
+                    captured.append((relative, "symlink", mode, None))
+                else:
+                    captured.append((relative, "special", mode, None))
+
+    visit(root)
+    return tuple(captured)
 
 
 class PackMigrationResolutionTest(unittest.TestCase):
@@ -207,6 +235,66 @@ class PackMigrationResolutionTest(unittest.TestCase):
         )
         pack_migration.discard_pack_migration_plan(plan)
 
+    def test_final_merged_root_side_drives_preview_and_target_provenance(self) -> None:
+        (self.source / "mods/example.pw.toml").unlink(missing_ok=True)
+        modrinth_root = self.provider_metadata(
+            "modrinth", "root-project", filename="root.jar", side="client",
+            digest="1" * 64,
+        )
+        curseforge_root = self.provider_metadata(
+            "curseforge", "123", filename="other.jar", side="server",
+            digest="2" * 64,
+        )
+        (self.source / modrinth_root.relative_path).write_bytes(modrinth_root.contents)
+        (self.source / curseforge_root.relative_path).write_bytes(curseforge_root.contents)
+        write_pack_root_manifest(
+            self.source,
+            (
+                PackRootRecord("modrinth", "root-project", "client"),
+                PackRootRecord("curseforge", "123", "server"),
+            ),
+        )
+        plan = self.plan()
+
+        def closure(**kwargs: object) -> core.ResolvedModClosure:
+            project = str(kwargs["canonical_project_id"])
+            if project == "root-project":
+                return core.ResolvedModClosure(
+                    ("modrinth", project), (modrinth_root,)
+                )
+            dependency_view = self.provider_metadata(
+                "modrinth", "root-project", filename="root.jar", side="server",
+                digest="1" * 64,
+            )
+            return core.ResolvedModClosure(
+                ("curseforge", project), (curseforge_root, dependency_view)
+            )
+
+        with patch.object(packctl, "init_packwiz_project", side_effect=self.fake_init), patch.object(
+            core, "resolve_mod_closure", side_effect=closure
+        ), patch.object(core, "resolve_project_selector", side_effect=self.fake_selector), patch.object(
+            packctl, "run_packwiz"
+        ):
+            result = resolution.resolve_pack_migration_plan_at(
+                plan, repository_root=self.root, state_root=self.state
+            )
+        finalized = {
+            item.target_identity: item for item in result.resolved_roots
+        }
+        self.assertEqual(finalized["modrinth:root-project"].target_side, "both")
+        self.assertEqual(
+            finalized["modrinth:root-project"].classification, "updated"
+        )
+        target_roots = {
+            item.canonical_identity: item.side
+            for item in read_pack_root_manifest(plan.target_staging_root / "source")
+        }
+        self.assertEqual(
+            target_roots,
+            {"curseforge:123": "server", "modrinth:root-project": "both"},
+        )
+        pack_migration.discard_pack_migration_plan(plan)
+
     def test_non_equivalent_cross_provider_dependency_collision_fails_closed(self) -> None:
         self._two_provider_roots()
         plan = self.plan()
@@ -360,8 +448,14 @@ class PackMigrationResolutionTest(unittest.TestCase):
             original_staging,
         )
 
-        selected = resolution.commit_pack_migration_root_selection_at(
-            first_plan,
+        source_before_selection = filesystem_snapshot(self.source)
+        with patch.object(packctl, "init_packwiz_project", side_effect=self.fake_init), patch.object(
+            core, "resolve_mod_closure", side_effect=self.fake_closure
+        ), patch.object(core, "resolve_project_selector", side_effect=self.fake_selector), patch.object(
+            packctl, "run_packwiz"
+        ):
+            selected_result = resolution.select_pack_migration_roots_at(
+                first_plan,
             (
                 PackMigrationRootSelection(
                     Path("mods/example.pw.toml"),
@@ -370,35 +464,24 @@ class PackMigrationResolutionTest(unittest.TestCase):
                 ),
             ),
             repository_root=self.root,
+            state_root=self.state,
         )
-        self.assertEqual(first_plan.state, "discarded")
+        self.assertEqual(selected_result.state, "resolved")
+        self.assertEqual(filesystem_snapshot(self.source), source_before_selection)
         self.assertEqual(
-            [record.canonical_identity for record in selected],
+            [record.canonical_identity for record in read_pack_root_manifest(
+                first_plan.target_staging_root / "source"
+            )],
             ["modrinth:root-project"],
         )
         self.assertEqual(
-            [record.canonical_identity for record in read_pack_root_manifest(self.source)],
-            ["modrinth:root-project"],
+            (first_plan.target_staging_root / "source" / ".packwizignore").read_text(
+                encoding="utf-8"
+            ),
+            "/.huroshiki-roots.json\n",
         )
-        self.assertIn(
-            "/.huroshiki-roots.json",
-            (self.source / ".packwizignore").read_text(encoding="utf-8").splitlines(),
-        )
-
-        second_plan = self.plan()
-        with patch.object(packctl, "init_packwiz_project", side_effect=self.fake_init), patch.object(
-            core, "resolve_mod_closure", side_effect=self.fake_closure
-        ), patch.object(core, "resolve_project_selector", side_effect=self.fake_selector), patch.object(
-            packctl, "run_packwiz"
-        ):
-            second_result = resolution.resolve_pack_migration_plan_at(
-                second_plan,
-                repository_root=self.root,
-                state_root=self.state,
-            )
-        self.assertEqual(second_result.state, "resolved")
-        self.assertFalse(second_result.provenance_required)
-        pack_migration.discard_pack_migration_plan(second_plan)
+        self.assertFalse((self.source / ".huroshiki-roots.json").exists())
+        pack_migration.discard_pack_migration_plan(first_plan)
 
     def test_provenance_exchange_exception_rolls_live_source_back(self) -> None:
         (self.source / ".huroshiki-roots.json").unlink()
@@ -448,7 +531,75 @@ class PackMigrationResolutionTest(unittest.TestCase):
         self.assertTrue(packctl.project_lock_is_active("pack:demo"))
         pack_migration.discard_pack_migration_plan(plan)
 
-    def test_legacy_url_root_selection_persists_identity_and_refreshes(self) -> None:
+    def test_legacy_url_root_selection_is_local_and_target_gets_identity(self) -> None:
+        (self.source / ".huroshiki-roots.json").unlink()
+        (self.source / "mods" / "example.pw.toml").write_text(
+            '''name = "Legacy URL"
+filename = "legacy.jar"
+side = "both"
+[download]
+url = "https://example.invalid/legacy.jar"
+[huroshiki]
+loaders = ["fabric"]
+minecraft-versions = ["1.21.4"]
+''',
+            encoding="utf-8",
+        )
+        plan = self.plan()
+        result = resolution.resolve_pack_migration_plan_at(
+            plan,
+            repository_root=self.root,
+            state_root=self.state,
+        )
+        self.assertIsNone(result.root_candidates[0].canonical_identity)
+        source_before = filesystem_snapshot(self.source)
+        target_url_metadata = b'''name = "Legacy URL"
+filename = "legacy.jar"
+side = "both"
+[download]
+url = "https://example.invalid/legacy.jar"
+[huroshiki]
+project-id = "legacy-url-id"
+loaders = ["fabric"]
+minecraft-versions = ["1.21.4"]
+'''
+        legacy_closure = core.ResolvedModClosure(
+            ("url", "legacy-url-id"),
+            (core.ResolvedMetadata(
+                ("url", "legacy-url-id"), Path("mods/example.pw.toml"), "legacy.jar",
+                target_url_metadata,
+                "url", "legacy-url-id"
+            ),),
+        )
+        with patch.object(packctl, "init_packwiz_project", side_effect=self.fake_init), patch.object(
+            core, "resolve_mod_closure", return_value=legacy_closure
+        ), patch.object(packctl, "run_packwiz") as refresh:
+            selected = resolution.select_pack_migration_roots_at(
+                plan,
+                (
+                    PackMigrationRootSelection(
+                        Path("mods/example.pw.toml"),
+                        "url",
+                        "legacy-url-id",
+                    ),
+                ),
+            repository_root=self.root,
+            state_root=self.state,
+        )
+        refresh.assert_called_once()
+        self.assertEqual(selected.state, "resolved")
+        self.assertEqual(filesystem_snapshot(self.source), source_before)
+        self.assertIn(
+            'project-id = "legacy-url-id"',
+            (plan.target_staging_root / "source" / "mods" / "example.pw.toml").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            read_pack_root_manifest(plan.target_staging_root / "source")[0].canonical_identity,
+            "url:legacy-url-id",
+        )
+        pack_migration.discard_pack_migration_plan(plan)
+
+    def test_legacy_url_refresh_cannot_change_selected_metadata(self) -> None:
         (self.source / ".huroshiki-roots.json").unlink()
         (self.source / "mods" / "example.pw.toml").write_text(
             '''name = "Legacy URL"
@@ -460,33 +611,36 @@ url = "https://example.invalid/legacy.jar"
             encoding="utf-8",
         )
         plan = self.plan()
-        result = resolution.resolve_pack_migration_plan_at(
-            plan,
-            repository_root=self.root,
-            state_root=self.state,
+        required = resolution.resolve_pack_migration_plan_at(
+            plan, repository_root=self.root, state_root=self.state
         )
-        self.assertIsNone(result.root_candidates[0].canonical_identity)
-        with patch.object(packctl, "run_packwiz") as refresh:
-            resolution.commit_pack_migration_root_selection_at(
-                plan,
-                (
-                    PackMigrationRootSelection(
-                        Path("mods/example.pw.toml"),
-                        "url",
-                        "legacy-url-id",
+        self.assertTrue(required.provenance_required)
+        source_before = filesystem_snapshot(self.source)
+
+        def mutate_metadata(*_args: object, **kwargs: object) -> None:
+            path = Path(kwargs["cwd"]) / "mods/example.pw.toml"
+            path.write_bytes(path.read_bytes() + b"\n# changed by refresh\n")
+
+        with patch.object(packctl, "run_packwiz", side_effect=mutate_metadata):
+            with self.assertRaisesRegex(
+                resolution.PackMigrationResolutionError,
+                "refresh changed Packwiz metadata",
+            ):
+                resolution.select_pack_migration_roots_at(
+                    plan,
+                    (
+                        PackMigrationRootSelection(
+                            Path("mods/example.pw.toml"),
+                            "url",
+                            "legacy-url-id",
+                        ),
                     ),
-                ),
-                repository_root=self.root,
-            )
-        refresh.assert_called_once()
-        self.assertIn(
-            'project-id = "legacy-url-id"',
-            (self.source / "mods" / "example.pw.toml").read_text(encoding="utf-8"),
-        )
-        self.assertEqual(
-            read_pack_root_manifest(self.source)[0].canonical_identity,
-            "url:legacy-url-id",
-        )
+                    repository_root=self.root,
+                    state_root=self.state,
+                )
+        self.assertEqual(filesystem_snapshot(self.source), source_before)
+        self.assertFalse((self.packs / "next").exists())
+        pack_migration.discard_pack_migration_plan(plan)
 
 
 if __name__ == "__main__":

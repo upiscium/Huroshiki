@@ -146,7 +146,7 @@ class PackCopyMigrationSessionTest(unittest.TestCase):
         self.assertEqual(observed, ["planning"])
         self.assertEqual(session.view.progress_message, "Resolving")
 
-    def test_provenance_selection_restarts_with_same_owner_controls(self) -> None:
+    def test_provenance_selection_continues_same_plan_and_owner_controls(self) -> None:
         candidate = PackMigrationRootCandidate(
             "modrinth:abc", "modrinth", "abc", "file", "1.0", "both",
             Path("mods/example.pw.toml"), "example.jar",
@@ -165,30 +165,40 @@ class PackCopyMigrationSessionTest(unittest.TestCase):
                 ),
             ),
         )
-        second_plan = SimpleNamespace(**self.plan.__dict__)
         session = core.PackCopyMigrationSession(
             "pack:demo", self.target, self.event, self.deadline
         )
         with patch.object(
-            core, "snapshot_pack_migration_source", side_effect=(self.snapshot, self.snapshot)
+            core, "snapshot_pack_migration_source", return_value=self.snapshot
         ) as snapshot, patch.object(
-            core, "plan_pack_copy_migration", side_effect=(self.plan, second_plan)
-        ), patch.object(
+            core, "plan_pack_copy_migration", return_value=self.plan
+        ) as plan, patch.object(
             core, "resolve_pack_migration_plan",
-            side_effect=(first_resolution, self.resolution),
-        ), patch.object(core, "commit_pack_migration_root_selection") as commit:
+            return_value=first_resolution,
+        ) as resolve, patch.object(
+            core, "select_pack_migration_roots", return_value=self.resolution
+        ) as select, patch.object(
+            core, "commit_pack_migration_root_selection"
+        ) as commit, patch.object(
+            core, "discard_pack_migration_plan"
+        ) as discard:
             view = session.start()
             self.assertEqual(view.state, "provenance-required")
             view = session.select_root_candidates(
                 (("mods/example.pw.toml", "modrinth:abc"),)
             )
+            session.discard(deadline=321.0)
         self.assertEqual(view.state, "resolved")
-        selection = commit.call_args.args[1][0]
+        selection = select.call_args.args[1][0]
         self.assertEqual(selection.source_metadata_path, Path("mods/example.pw.toml"))
-        self.assertIs(commit.call_args.args[0], self.plan)
-        self.assertIs(commit.call_args.kwargs["cancel_event"], self.event)
-        self.assertEqual(snapshot.call_count, 2)
-        self.assertTrue(all(item.kwargs["deadline"] == self.deadline for item in snapshot.call_args_list))
+        self.assertIs(select.call_args.args[0], self.plan)
+        self.assertIs(select.call_args.kwargs["cancel_event"], self.event)
+        self.assertEqual(select.call_args.kwargs["deadline"], self.deadline)
+        self.assertEqual(snapshot.call_count, 1)
+        self.assertEqual(plan.call_count, 1)
+        self.assertEqual(resolve.call_count, 1)
+        commit.assert_not_called()
+        discard.assert_called_once_with(self.plan, deadline=321.0)
 
     def test_conflicts_use_current_request_and_exact_result(self) -> None:
         unresolved = SimpleNamespace(

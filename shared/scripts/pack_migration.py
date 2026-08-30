@@ -597,6 +597,11 @@ class PackMigrationPlan:
         self._source_copy_identity: tuple[int, int] | None = None
         self._source_copy_content_digest: str | None = None
         self._source_copy_snapshot_digest: str | None = None
+        self._provenance_source_root: Path | None = None
+        self._provenance_source_identity: tuple[int, int] | None = None
+        self._provenance_source_content_digest: str | None = None
+        self._provenance_source_snapshot_digest: str | None = None
+        self._migration_root_authority: object | None = None
         self._staging_identity: tuple[int, int] | None = None
         self._staging_snapshot_digest: str | None = None
         self._resolved_source_snapshot_digest: str | None = None
@@ -818,6 +823,10 @@ def _write_plan_file(plan: PackMigrationPlan, repository_root: Path) -> None:
         "publication_committed": plan._publication_committed,
         "publication_state": plan._publication_state,
         "source_snapshot_digest": plan.source_snapshot.snapshot_digest,
+        "migration_local_provenance": plan._migration_root_authority is not None,
+        "migration_root_selection_digest": getattr(
+            plan._migration_root_authority, "selection_digest", None
+        ),
         "formal_staging_digest": plan._resolved_staging_digest or plan._staging_snapshot_digest,
         "target_id": plan.target.target_id,
         "acknowledged_warning_codes": list(plan._acknowledged_warning_codes),
@@ -1571,6 +1580,41 @@ def _resolution_digest(resolution: object) -> str:
     return _publication_digest(resolution)
 
 
+def _validate_plan_detached_state(
+    plan: PackMigrationPlan,
+    checkpoint: Callable[[], None],
+) -> PackTreeScan:
+    """Validate the immutable snapshot and any migration-local provenance copy."""
+    detached = scan_pack_migration_source(
+        plan.source_snapshot_root, checkpoint=checkpoint
+    )
+    if (
+        detached.root_identity != plan._source_copy_identity
+        or detached.content_digest != plan._source_copy_content_digest
+        or detached.snapshot_digest != plan._source_copy_snapshot_digest
+    ):
+        raise PackMigrationStale("Detached source snapshot changed")
+    authority = plan._migration_root_authority
+    provenance_root = plan._provenance_source_root
+    if authority is None and provenance_root is None:
+        return detached
+    if authority is None or provenance_root is None:
+        raise PackMigrationStale("Migration-local root provenance authority is incomplete")
+    authority_validator = getattr(authority, "validates", None)
+    if not callable(authority_validator) or not authority_validator(
+        plan.source_snapshot.snapshot_digest, plan.target
+    ):
+        raise PackMigrationStale("Migration-local root provenance authority is stale")
+    provenance = scan_pack_migration_source(provenance_root, checkpoint=checkpoint)
+    if (
+        provenance.root_identity != plan._provenance_source_identity
+        or provenance.content_digest != plan._provenance_source_content_digest
+        or provenance.snapshot_digest != plan._provenance_source_snapshot_digest
+    ):
+        raise PackMigrationStale("Migration-local provenance source changed")
+    return detached
+
+
 def _warning_identifier(warning: PackMigrationWarning) -> str:
     return _publication_digest(
         {
@@ -1649,6 +1693,10 @@ def prepare_pack_migration_publication(
         if len(normalized_acknowledgements) != len(supplied) or normalized_acknowledgements != required:
             raise PackMigrationPublicationError("Warning acknowledgement set is incomplete or unknown")
         checkpoint()
+        if _identity(plan.target_staging_root) != plan._staging_identity:
+            raise PackMigrationStale(
+                "Pack migration target staging root was replaced before publication"
+            )
         resolved_source = scan_pack_migration_source(
             plan.target_staging_root / "source", checkpoint=checkpoint
         )
@@ -1665,6 +1713,10 @@ def prepare_pack_migration_publication(
         staging = scan_pack_migration_source(
             plan.target_staging_root, checkpoint=checkpoint
         )
+        if staging.root_identity != plan._staging_identity:
+            raise PackMigrationStale(
+                "Pack migration target staging root was replaced before publication"
+            )
         _validate = snapshot_pack_migration_source_at(
             f"pack:{plan.target.target_id}", plan.target_staging_root,
             plan.target_root.parent.parent, cancel_event=cancel_event, deadline=effective_deadline,
@@ -1687,9 +1739,7 @@ def prepare_pack_migration_publication(
         current_source = snapshot_pack_migration_source_at(plan.source_key, plan.source_root, plan.source_root.parent.parent, cancel_event=cancel_event, deadline=effective_deadline)
         if not _same_snapshot(current_source, plan.source_snapshot):
             raise PackMigrationStale("Source Pack changed before publication")
-        detached = scan_pack_migration_source(plan.source_snapshot_root, checkpoint=checkpoint)
-        if detached.snapshot_digest != plan._source_copy_snapshot_digest or detached.root_identity != plan._source_copy_identity:
-            raise PackMigrationStale("Detached source snapshot changed before publication")
+        _validate_plan_detached_state(plan, checkpoint)
         if not _target_missing(plan.target_root, plan._target_parent_identity):
             raise PackMigrationPublicationError("Target Pack appeared before publication")
         if set(plan._lock_set.owned_keys) != {plan.source_key, f"pack:{plan.target.target_id}"}:
@@ -1977,16 +2027,7 @@ def _apply_pack_copy_migration_raw(
             raise PackMigrationStale("Pack migration transaction root was replaced")
         if _identity(plan.target_staging_root) != plan._staging_identity:
             raise PackMigrationStale("Pack migration staging root was replaced")
-        if _identity(plan.source_snapshot_root) != plan._source_copy_identity:
-            raise PackMigrationStale("Detached source snapshot root was replaced")
-        detached_scan = scan_pack_migration_source(
-            plan.source_snapshot_root,
-            checkpoint=checkpoint,
-        )
-        if detached_scan.content_digest != plan._source_copy_content_digest:
-            raise PackMigrationStale("Detached source snapshot changed after planning")
-        if detached_scan.snapshot_digest != plan._source_copy_snapshot_digest:
-            raise PackMigrationStale("Detached source snapshot identity changed after planning")
+        _validate_plan_detached_state(plan, checkpoint)
         current_source = snapshot_pack_migration_source_at(
             plan.source_key,
             plan.source_root,

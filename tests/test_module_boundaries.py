@@ -49,6 +49,10 @@ class ModuleBoundaryTest(unittest.TestCase):
             pack_migration_resolution.PackMigrationResolutionPlan,
         )
         self.assertIs(
+            huroshiki_core.PackMigrationRootSelectionAuthority,
+            pack_migration_resolution.PackMigrationRootSelectionAuthority,
+        )
+        self.assertIs(
             huroshiki_core.PackMigrationUnresolvedRoot,
             pack_migration_resolution.PackMigrationUnresolvedRoot,
         )
@@ -85,6 +89,7 @@ class ModuleBoundaryTest(unittest.TestCase):
             "plan_pack_copy_migration",
             "resolve_pack_migration_plan",
             "commit_pack_migration_root_selection",
+            "select_pack_migration_roots",
             "create_pack_migration_resolution_request",
             "resolve_pack_migration_conflicts",
             "prepare_pack_migration_publication",
