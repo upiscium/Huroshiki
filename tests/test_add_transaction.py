@@ -438,10 +438,14 @@ class AddTransactionTest(unittest.TestCase):
             ),
         )
         with patch.object(core, "resolve_mod_closure", return_value=divergent):
-            with self.assertRaisesRegex(core.HuroshikiError, "disagreement"):
+            with self.assertRaises(core.MetadataClosureCollisionError) as caught:
                 core.add_mod_transactionally(
                     self.key, "modrinth", "existing", "server"
                 )
+        self.assertIn("disagreement", str(caught.exception))
+        self.assertEqual(caught.exception.evidence.reason_code, "identity-collision")
+        self.assertEqual(caught.exception.evidence.left_identity, record.identity)
+        self.assertEqual(caught.exception.evidence.right_identity, record.identity)
         self.assertEqual(self.snapshot(), original)
         self.assert_unlocked()
 
@@ -480,12 +484,112 @@ class AddTransactionTest(unittest.TestCase):
                 "resolve_mod_closure",
                 return_value=core.ResolvedModClosure(base.identity, (record,)),
             ):
-                with self.assertRaisesRegex(core.HuroshikiError, message):
+                with self.assertRaises(core.MetadataClosureCollisionError) as caught:
                     core.add_mod_transactionally(
                         self.key, "modrinth", "incoming", "both"
                     )
+                self.assertIn(message.lower(), str(caught.exception).lower())
+                evidence = caught.exception.evidence
+                self.assertEqual(evidence.left_identity, ("modrinth", "existing"))
+                self.assertEqual(evidence.right_identity, ("modrinth", "incoming"))
+                self.assertEqual(
+                    evidence.reason_code,
+                    "path-collision" if "path" in message.lower() else "filename-collision",
+                )
                 self.assertEqual(self.snapshot(), original)
                 self.assert_unlocked()
+
+    def test_simultaneous_path_and_filename_collisions_report_both_edges(self) -> None:
+        path_owner = self.source / "mods/shared.pw.toml"
+        path_owner.write_text(
+            metadata("Path owner", "Path0001").replace(
+                'filename = "Path0001.jar"', 'filename = "path.jar"'
+            ),
+            encoding="utf-8",
+        )
+        filename_owner = self.source / "mods/filename-owner.pw.toml"
+        filename_owner.write_text(
+            metadata("Filename owner", "File0001").replace(
+                'filename = "File0001.jar"', 'filename = "shared.jar"'
+            ),
+            encoding="utf-8",
+        )
+        incoming_contents = metadata("Incoming", "Incm0001").replace(
+            'filename = "Incm0001.jar"', 'filename = "shared.jar"'
+        ).encode()
+        incoming = core.ResolvedMetadata(
+            ("modrinth", "Incm0001"),
+            Path("mods/shared.pw.toml"),
+            "shared.jar",
+            incoming_contents,
+            "modrinth",
+            "Incm0001",
+        )
+        original = self.snapshot()
+        with patch.object(
+            core,
+            "resolve_mod_closure",
+            return_value=core.ResolvedModClosure(incoming.identity, (incoming,)),
+        ):
+            with self.assertRaises(core.MetadataClosureCollisionError) as caught:
+                core.add_mod_transactionally(
+                    self.key, "modrinth", "Incm0001", "both"
+                )
+        self.assertEqual(caught.exception.evidence, caught.exception.evidences[0])
+        self.assertEqual(
+            [evidence.reason_code for evidence in caught.exception.evidences],
+            ["path-collision", "filename-collision"],
+        )
+        self.assertEqual(
+            [
+                (evidence.left_identity, evidence.right_identity)
+                for evidence in caught.exception.evidences
+            ],
+            [
+                (("modrinth", "Path0001"), incoming.identity),
+                (("modrinth", "File0001"), incoming.identity),
+            ],
+        )
+        self.assertEqual(self.snapshot(), original)
+        self.assert_unlocked()
+
+    def test_internal_simultaneous_collisions_report_both_edges(self) -> None:
+        def record(project: str, path: str, filename: str) -> core.ResolvedMetadata:
+            contents = metadata(project, project).replace(
+                f'filename = "{project}.jar"', f'filename = "{filename}"'
+            ).encode()
+            return core.ResolvedMetadata(
+                ("modrinth", project),
+                Path("mods") / path,
+                filename,
+                contents,
+                "modrinth",
+                project,
+            )
+
+        path_owner = record("APath001", "shared.pw.toml", "path.jar")
+        filename_owner = record("BFile001", "filename-owner.pw.toml", "shared.jar")
+        incoming = record("CRoot001", "shared.pw.toml", "shared.jar")
+        with self.assertRaises(core.MetadataClosureCollisionError) as caught:
+            core.merge_metadata_closure(
+                self.source,
+                core.ResolvedModClosure(
+                    incoming.identity, (path_owner, filename_owner, incoming)
+                ),
+                requested_side="both",
+            )
+        self.assertEqual(
+            [evidence.reason_code for evidence in caught.exception.evidences],
+            ["path-collision", "filename-collision"],
+        )
+        self.assertEqual(
+            [evidence.left_identity for evidence in caught.exception.evidences],
+            [path_owner.identity, filename_owner.identity],
+        )
+        self.assertEqual(
+            [evidence.right_identity for evidence in caught.exception.evidences],
+            [incoming.identity, incoming.identity],
+        )
 
     def test_url_resolver_returns_single_root_closure(self) -> None:
         artifact = self.url_artifact()
@@ -1067,6 +1171,19 @@ class AddTransactionTest(unittest.TestCase):
 
         self.assertEqual(core.tree_digest_snapshot(self.source), before)
         self.assertFalse((self.source / ".huroshiki-roots.json").exists())
+
+        with patch.object(
+            core,
+            "materialize_provider_artifact",
+            side_effect=core.HuroshikiError("resolver deadline exceeded"),
+        ):
+            with self.assertRaises(core.HuroshikiError) as caught:
+                core.merge_metadata_closure(
+                    self.source,
+                    core.ResolvedModClosure(root.identity, (root, incoming)),
+                    requested_side="client",
+                )
+        self.assertNotIsInstance(caught.exception, core.MetadataClosureCollisionError)
 
     def test_equivalent_dependencies_inside_one_closure_collapse(self) -> None:
         digest = "c" * 64

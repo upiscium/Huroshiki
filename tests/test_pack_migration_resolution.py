@@ -312,9 +312,108 @@ class PackMigrationResolutionTest(unittest.TestCase):
         ), patch.object(core, "resolve_project_selector", side_effect=self.fake_selector), patch.object(
             core, "materialize_provider_artifact", side_effect=materialize
         ):
-            with self.assertRaisesRegex(core.HuroshikiError, "could not be verified as equivalent"):
-                resolution.resolve_pack_migration_plan_at(plan, repository_root=self.root, state_root=self.state)
-        self.assertEqual(plan.state, "failed")
+            result = resolution.resolve_pack_migration_plan_at(
+                plan, repository_root=self.root, state_root=self.state
+            )
+        self.assertEqual(result.state, "resolution-required")
+        self.assertEqual(
+            {item.source_root.canonical_identity for item in result.unresolved_roots},
+            {"modrinth:root-project", "curseforge:123"},
+        )
+        self.assertEqual(result.resolved_roots, ())
+        self.assertEqual(
+            result.identity_changes,
+            (("curseforge:456", "modrinth:shared"),),
+        )
+        pack_migration.discard_pack_migration_plan(plan)
+
+    def test_multi_owner_collision_marks_all_contributing_roots_unresolved(self) -> None:
+        (self.source / "mods/example.pw.toml").unlink(missing_ok=True)
+        root_ids = ("RootA001", "RootB001", "RootC001")
+        root_metadata = {
+            project: self.provider_metadata(
+                "modrinth",
+                project,
+                filename=f"{project}.jar",
+                side="both",
+                digest=(str(index) * 64),
+            )
+            for index, project in enumerate(root_ids, start=1)
+        }
+        for record in root_metadata.values():
+            (self.source / record.relative_path).write_bytes(record.contents)
+        write_pack_root_manifest(
+            self.source,
+            tuple(PackRootRecord("modrinth", project, "both") for project in root_ids),
+        )
+
+        def dependency(project: str, path: str, filename: str) -> core.ResolvedMetadata:
+            base = self.provider_metadata(
+                "modrinth", project, filename=filename, side="both", digest="a" * 64
+            )
+            return core.ResolvedMetadata(
+                base.identity,
+                Path("mods") / path,
+                filename,
+                base.contents,
+                base.provider,
+                base.project_id,
+            )
+
+        path_owner = dependency("Path0001", "shared.pw.toml", "path.jar")
+        filename_owner = dependency("File0001", "filename-owner.pw.toml", "shared.jar")
+        incoming = dependency("Incm0001", "shared.pw.toml", "shared.jar")
+        closures = {
+            "RootA001": core.ResolvedModClosure(("modrinth", "RootA001"), (root_metadata["RootA001"], path_owner)),
+            "RootB001": core.ResolvedModClosure(("modrinth", "RootB001"), (root_metadata["RootB001"], filename_owner)),
+            "RootC001": core.ResolvedModClosure(("modrinth", "RootC001"), (root_metadata["RootC001"], incoming)),
+        }
+        evidences = (
+            core.MetadataCollisionEvidence("path-collision", path_owner.identity, incoming.identity, path_owner.relative_path, incoming.relative_path, path_owner.filename, incoming.filename),
+            core.MetadataCollisionEvidence("filename-collision", filename_owner.identity, incoming.identity, filename_owner.relative_path, incoming.relative_path, filename_owner.filename, incoming.filename),
+        )
+        merge_calls = 0
+        def merge(*args: object, **kwargs: object) -> tuple[Path, ...]:
+            nonlocal merge_calls
+            merge_calls += 1
+            if merge_calls == 3:
+                raise core.MetadataClosureCollisionError(
+                    "path and filename have different owners", evidences=evidences
+                )
+            return ()
+
+        plan = self.plan()
+        with patch.object(packctl, "init_packwiz_project", side_effect=self.fake_init), patch.object(
+            core,
+            "resolve_project_selector",
+            side_effect=lambda provider, selector, **kwargs: core.ResolvedSelector(provider, selector, selector, selector),
+        ), patch.object(
+            core,
+            "resolve_mod_closure",
+            side_effect=lambda **kwargs: closures[str(kwargs["canonical_project_id"])],
+        ), patch.object(core, "merge_metadata_closure", side_effect=merge):
+            result = resolution.resolve_pack_migration_plan_at(
+                plan, repository_root=self.root, state_root=self.state
+            )
+        self.assertEqual(result.state, "resolution-required")
+        self.assertEqual(result.resolved_roots, ())
+        self.assertEqual(
+            {item.source_root.canonical_identity for item in result.unresolved_roots},
+            {"modrinth:RootA001", "modrinth:RootB001", "modrinth:RootC001"},
+        )
+        self.assertEqual(
+            {
+                item.source_root.canonical_identity: item.reason_code
+                for item in result.unresolved_roots
+            },
+            {
+                "modrinth:RootA001": "path-collision",
+                "modrinth:RootB001": "filename-collision",
+                "modrinth:RootC001": "path-collision",
+            },
+        )
+        self.assertTrue(result.path_collisions)
+        self.assertTrue(result.filename_collisions)
         pack_migration.discard_pack_migration_plan(plan)
 
     def test_failed_handoff_rolls_staging_source_back(self) -> None:
