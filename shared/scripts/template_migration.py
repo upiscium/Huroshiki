@@ -129,6 +129,7 @@ class TemplateVersionIntentFact:
 class TemplateVersionIntentIssue:
     provider: str; project_id: str; artifact_id: str; scope: str
     reason_code: Literal["version-intent-blocked"]; detail: str
+    owner_source_indices: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -148,7 +149,7 @@ class TemplateResolvedRoot:
 
 @dataclass(frozen=True)
 class TemplateUnresolvedRoot:
-    source_index: int; canonical_identity: str; code: str; detail: str
+    source_index: int; source_selector: str; canonical_identity: str | None; code: str; detail: str
     retry: bool = False; replacement_supported: bool = True; version_issue: str | None = None
 
 
@@ -395,8 +396,28 @@ def _url_evidence(root: TemplateRootIntent, closure: object, state: _State) -> T
     return TemplateUrlEvidence(root.url or "", status, loader_status, minecraft_status, loaders, versions, int(policy.get("url_max_jar_size_bytes", 256 * 1024 * 1024)), bool(policy.get("url_allow_private_networks", False)), "URL artifact compatibility is verified" if status == "compatible" else "URL artifact compatibility requires resolution")
 
 
-def _unresolved(root: TemplateRootIntent, code: str, detail: str, *, retry: bool = True, version: str | None = None) -> TemplateUnresolvedRoot:
-    return TemplateUnresolvedRoot(root.source_index, f"{root.provider}:{root.project_id}", code, detail[:240], retry, root.provider != "url", version)
+def _unresolved(
+    root: TemplateRootIntent,
+    code: str,
+    detail: str,
+    *,
+    canonical_identity: str | None = None,
+    retry: bool = True,
+    version: str | None = None,
+    replacement_supported: bool | None = None,
+) -> TemplateUnresolvedRoot:
+    if replacement_supported is None:
+        replacement_supported = root.provider != "url" and code != "version-intent-blocked"
+    return TemplateUnresolvedRoot(
+        root.source_index,
+        root.project_id,
+        canonical_identity,
+        code,
+        detail[:240],
+        retry,
+        replacement_supported,
+        version,
+    )
 
 
 def _root_artifact_fact(closure: object) -> tuple[TemplateArtifactFact, tuple[str, ...]]:
@@ -452,6 +473,8 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
 
     for root in plan.roots:
         _check(state.event, state.deadline)
+        canonical_identity: str | None = None
+        exact: TemplateExactConstraint | None = None
         try:
             if root.provider == "modrinth":
                 canonical = core.resolve_project_selector(root.provider, root.project_id, cancel_event=state.event, deadline=state.deadline, process_result_callback=lambda value: _record_process(state, value))
@@ -462,6 +485,7 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
                 provider, project = root.provider, root.project_id
             else:
                 provider, project = "url", root.project_id
+            canonical_identity = f"{provider}:{project}"
             exact = root_constraints.get((provider, project))
             source_closure = resolve_runtime(root, provider, project, exact, phase="source", runtime=state.snapshot.target)
             target_closure = resolve_runtime(root, provider, project, exact, phase="target", runtime=plan.target)
@@ -472,7 +496,9 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
                 evidence = _url_evidence(root, target_closure, state); url_facts.append(evidence)
                 if evidence.status != "compatible":
                     code = "url-incompatible-loader" if evidence.loader_status == "incompatible" else "url-incompatible-minecraft" if evidence.minecraft_status == "incompatible" else "url-compatible-unknown"
-                    unresolved.append(_unresolved(root, code, evidence.detail, retry=evidence.status == "unknown")); continue
+                    actual = tuple(getattr(target_closure, "root_identity", ()))
+                    actual_identity = f"{actual[0]}:{actual[1]}" if len(actual) == 2 else canonical_identity
+                    unresolved.append(_unresolved(root, code, evidence.detail, canonical_identity=actual_identity, retry=evidence.status == "unknown")); continue
             source_fact, _ = _root_artifact_fact(source_closure); target_fact, identities = _root_artifact_fact(target_closure)
             same_artifact = source_fact.canonical_identity == target_fact.canonical_identity and (
                 source_fact.artifact_id == target_fact.artifact_id if source_fact.artifact_id is not None and target_fact.artifact_id is not None else source_fact.metadata_digest == target_fact.metadata_digest
@@ -480,9 +506,20 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
             provisional[root.source_index] = {"root": root, "provider": provider, "project": project, "source": source_closure, "target": target_closure, "source_fact": source_fact, "target_fact": target_fact, "identities": identities, "evidence": evidence, "classification": "unchanged" if same_artifact else "updated"}
         except BaseException as error:
             if _resolver_integrity(error): raise TemplateMigrationOperationError(str(error)) from error
-            exact = root_constraints.get((root.provider, root.project_id))
-            unresolved.append(_unresolved(root, "version-intent-blocked" if exact else "no-compatible-file", str(error), retry=not bool(exact), version=exact.artifact_id if exact else None))
+            unresolved.append(_unresolved(root, "version-intent-blocked" if exact else "no-compatible-file", str(error), canonical_identity=canonical_identity, retry=not bool(exact), version=exact.artifact_id if exact else None))
         if progress: progress(f"resolved root {root.source_index}")
+
+    dependency_owner_indices: dict[tuple[str, str, str], tuple[int, ...]] = {}
+    for constraint in dependency_constraints:
+        owners = []
+        for source_index, value in provisional.items():
+            if any(
+                (_metadata_identity(record).provider, _metadata_identity(record).project_id)
+                == (constraint.provider, constraint.project_id)
+                for record in getattr(value["target"], "metadata", ())
+            ):
+                owners.append(source_index)
+        dependency_owner_indices[(constraint.provider, constraint.project_id, constraint.artifact_id)] = tuple(sorted(owners))
 
     # Apply dependency-scoped exact target intent without promoting dependencies.
     for source_index in tuple(sorted(provisional)):
@@ -520,7 +557,7 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
             except BaseException as error:
                 if _resolver_integrity(error): raise TemplateMigrationOperationError(str(error)) from error
                 constraint = mismatched[0]
-                unresolved.append(_unresolved(root, "version-intent-blocked", str(error), retry=False, version=constraint.artifact_id))
+                unresolved.append(_unresolved(root, "version-intent-blocked", str(error), canonical_identity=item["target_fact"].canonical_identity, retry=False, version=constraint.artifact_id))
                 provisional.pop(source_index, None)
 
     # Missing or still-mismatched exact dependency artifacts fail closed.
@@ -534,26 +571,37 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
                 identity = _metadata_identity(item)
                 if (identity.provider, identity.project_id) == (constraint.provider, constraint.project_id): matches.append((root, identity))
         satisfied = bool(matches) and all(identity.file_id == constraint.artifact_id for _, identity in matches)
-        owners = tuple(sorted({root.source_index for root, _ in matches}))
+        owners = tuple(sorted({root.source_index for root, _ in matches})) or dependency_owner_indices.get((constraint.provider, constraint.project_id, constraint.artifact_id), ())
         version_facts.append(TemplateVersionIntentFact(constraint.provider, constraint.project_id, constraint.artifact_id, constraint.scope, satisfied, owners))
         if not satisfied:
-            owner = matches[0][0] if matches else (plan.roots[0] if plan.roots else TemplateRootIntent(0, constraint.project_id, constraint.provider, constraint.project_id, "both"))
             detail = f"Exact dependency artifact {constraint.artifact_id} is unavailable in the target closure"
-            version_issues.append(TemplateVersionIntentIssue(constraint.provider, constraint.project_id, constraint.artifact_id, constraint.scope, "version-intent-blocked", detail))
-            for source_index in owners or (owner.source_index,):
-                root = next((value for value in plan.roots if value.source_index == source_index), owner)
-                if not any(value.source_index == source_index for value in unresolved): unresolved.append(_unresolved(root, "version-intent-blocked", detail, retry=False, version=constraint.artifact_id))
+            version_issues.append(TemplateVersionIntentIssue(constraint.provider, constraint.project_id, constraint.artifact_id, constraint.scope, "version-intent-blocked", detail, owners))
+            for source_index in owners:
+                root = next(value for value in plan.roots if value.source_index == source_index)
+                canonical = provisional[source_index]["target_fact"].canonical_identity if source_index in provisional else None
+                if not any(value.source_index == source_index for value in unresolved): unresolved.append(_unresolved(root, "version-intent-blocked", detail, canonical_identity=canonical, retry=False, version=constraint.artifact_id))
                 provisional.pop(source_index, None)
     for constraint in state.snapshot.overrides:
         if constraint.scope == "root":
             owners = tuple(sorted(index for index, item in provisional.items() if (item["provider"], item["project"]) == (constraint.provider, constraint.project_id)))
             satisfied = bool(owners)
             version_facts.append(TemplateVersionIntentFact(constraint.provider, constraint.project_id, constraint.artifact_id, constraint.scope, satisfied, owners))
-            if not satisfied: version_issues.append(TemplateVersionIntentIssue(constraint.provider, constraint.project_id, constraint.artifact_id, constraint.scope, "version-intent-blocked", "Exact root artifact is unavailable"))
+            if not satisfied: version_issues.append(TemplateVersionIntentIssue(constraint.provider, constraint.project_id, constraint.artifact_id, constraint.scope, "version-intent-blocked", "Exact root artifact is unavailable", tuple(index for index, root in enumerate(plan.roots) if (root.provider, root.project_id) == (constraint.provider, constraint.project_id))))
 
     staging_digest = None
     warnings = tuple(f"{fact.url}: compatibility unknown" for fact in url_facts if fact.status == "unknown")
-    if not unresolved and len(provisional) == len(plan.roots):
+    if not unresolved and not version_issues and len(provisional) == len(plan.roots):
+        collision_member_owners: dict[
+            tuple[tuple[str, str], Path, str], dict[int, int]
+        ] = {}
+        for owner_index, value in provisional.items():
+            for record in getattr(value["target"], "metadata", ()):
+                identity = getattr(record, "identity", None)
+                if isinstance(identity, tuple) and len(identity) == 2:
+                    member = _metadata_identity(record)
+                    key = (identity, record.relative_path, member.filename)
+                    counts = collision_member_owners.setdefault(key, {})
+                    counts[owner_index] = counts.get(owner_index, 0) + 1
         combined = attempt_root / "combined"
         core.create_resolver_source(combined, display_name=plan.target.display_name, minecraft=plan.target.minecraft_version, loader=plan.target.loader, loader_version=plan.target.reference_loader_version)
         explicit = {(item["provider"], item["project"]): item["root"].side for item in provisional.values() if item["provider"] != "url"}
@@ -566,16 +614,41 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
             core.run_noninteractive_packwiz(["packwiz", "refresh"], cwd=combined, cancel_event=state.event, deadline=state.deadline, label="Template migration refresh", process_result_callback=lambda value: _record_process(state, value), project_id=plan.target.target_id, operation="template-migration-refresh")
         except BaseException as error:
             if _resolver_integrity(error): raise TemplateMigrationOperationError(str(error)) from error
-            reason = _collision_reason(error)
+            structured = error if isinstance(error, core.MetadataClosureCollisionError) else None
+            reason = structured.evidence.reason_code if structured is not None else _collision_reason(error)
             if reason is None: raise
-            affected = tuple(sorted(set(merged_indices + [source_index])))
-            identities = tuple(sorted({provisional[index]["target_fact"].canonical_identity for index in affected}))
-            paths = tuple(sorted({provisional[index]["target_fact"].metadata_path for index in affected}, key=lambda value: value.as_posix()))
-            filenames = tuple(sorted({provisional[index]["target_fact"].filename for index in affected}))
+            if structured is not None:
+                evidence = structured.evidence
+                identities = tuple(sorted((f"{evidence.left_identity[0]}:{evidence.left_identity[1]}", f"{evidence.right_identity[0]}:{evidence.right_identity[1]}")))
+                left_key = (evidence.left_identity, evidence.left_path, evidence.left_filename)
+                right_key = (evidence.right_identity, evidence.right_path, evidence.right_filename)
+                left_owners = collision_member_owners.get(left_key, {})
+                right_owners = collision_member_owners.get(right_key, {})
+                if evidence.left_identity != evidence.right_identity:
+                    affected_set = set(left_owners) | set(right_owners)
+                elif left_key != right_key:
+                    affected_set = set(left_owners) & set(right_owners)
+                    if not affected_set:
+                        affected_set = set(left_owners) | set(right_owners)
+                else:
+                    affected_set = {
+                        index for index, count in left_owners.items() if count >= 2
+                    }
+                    if not affected_set:
+                        affected_set = set(left_owners)
+                affected = tuple(sorted(affected_set or {source_index}))
+                paths = tuple(sorted({evidence.left_path, evidence.right_path}, key=lambda value: value.as_posix()))
+                filenames = tuple(sorted({evidence.left_filename, evidence.right_filename}))
+            else:
+                affected = (source_index,)
+                target_fact = provisional[source_index]["target_fact"]
+                identities = (target_fact.canonical_identity,)
+                paths = (target_fact.metadata_path,)
+                filenames = (target_fact.filename,)
             collision = TemplateCollisionFact(reason, affected, identities, paths, filenames, str(error)[:240]); collisions.append(collision)
             for index in affected:
                 root = provisional[index]["root"]
-                unresolved.append(_unresolved(root, reason, collision.detail, retry=False)); provisional.pop(index, None)
+                unresolved.append(_unresolved(root, reason, collision.detail, canonical_identity=provisional[index]["target_fact"].canonical_identity, retry=False)); provisional.pop(index, None)
 
     resolved: list[TemplateResolvedRoot] = []
     root_facts: list[TemplateRootResolutionFact] = []
@@ -588,7 +661,7 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
     unresolved_by_index = {item.source_index: item for item in unresolved}
     unresolved = [unresolved_by_index[index] for index in sorted(unresolved_by_index)]
     if set(provisional).intersection(unresolved_by_index): raise TemplateMigrationOperationError("Template resolution membership is incoherent")
-    status: Literal["resolved", "resolution-required"] = "resolved" if len(resolved) == len(plan.roots) and not unresolved else "resolution-required"
+    status: Literal["resolved", "resolution-required"] = "resolved" if len(resolved) == len(plan.roots) and not unresolved and not version_issues else "resolution-required"
     if status == "resolved":
         target_roots = {fact.source_index: fact for fact in root_facts}
         mods = [{"name": root.name, "provider": root.provider, "project_id": (target_roots[root.source_index].target_artifact.project_id if root.provider == "modrinth" else root.project_id), "side": root.side, **({"url": root.url} if root.url else {})} for root in plan.roots]

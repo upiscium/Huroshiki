@@ -312,9 +312,19 @@ class PackMigrationResolutionTest(unittest.TestCase):
         ), patch.object(core, "resolve_project_selector", side_effect=self.fake_selector), patch.object(
             core, "materialize_provider_artifact", side_effect=materialize
         ):
-            with self.assertRaisesRegex(core.HuroshikiError, "could not be verified as equivalent"):
-                resolution.resolve_pack_migration_plan_at(plan, repository_root=self.root, state_root=self.state)
-        self.assertEqual(plan.state, "failed")
+            result = resolution.resolve_pack_migration_plan_at(
+                plan, repository_root=self.root, state_root=self.state
+            )
+        self.assertEqual(result.state, "resolution-required")
+        self.assertEqual(
+            {item.source_root.canonical_identity for item in result.unresolved_roots},
+            {"modrinth:root-project", "curseforge:123"},
+        )
+        self.assertEqual(result.resolved_roots, ())
+        self.assertEqual(
+            result.identity_changes,
+            (("curseforge:456", "modrinth:shared"),),
+        )
         pack_migration.discard_pack_migration_plan(plan)
 
     def test_failed_handoff_rolls_staging_source_back(self) -> None:

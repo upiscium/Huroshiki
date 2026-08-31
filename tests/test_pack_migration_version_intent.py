@@ -810,14 +810,28 @@ class PackMigrationVersionIntentTest(unittest.TestCase):
                 (metadata(VERSION_2), metadata(VERSION_1, dependency=True)),
             )
 
+        left = metadata(VERSION_2)
+        right = metadata(VERSION_2, dependency=True)
         cases = (
-            ("path", "metadata path collision", "path_collisions"),
-            ("filename", "JAR filename collision", "filename_collisions"),
-            ("identity", "provider identity mismatch", "identity_changes"),
+            ("path", "metadata path collision", "path-collision", "path_collisions"),
+            ("filename", "JAR filename collision", "filename-collision", "filename_collisions"),
+            ("identity", "provider identity mismatch", "identity-collision", "identity_changes"),
         )
-        for label, message, diagnostic_field in cases:
+        for label, message, reason_code, diagnostic_field in cases:
             with self.subTest(collision=label):
                 plan = self.plan()
+                collision = core.MetadataClosureCollisionError(
+                    message,
+                    core.MetadataCollisionEvidence(
+                        reason_code,
+                        left.identity,
+                        right.identity,
+                        left.relative_path,
+                        right.relative_path,
+                        left.filename,
+                        right.filename,
+                    ),
+                )
                 with patch.object(
                     packctl, "init_packwiz_project", side_effect=self.fake_init
                 ), patch.object(
@@ -829,7 +843,7 @@ class PackMigrationVersionIntentTest(unittest.TestCase):
                 ), patch.object(
                     core,
                     "merge_metadata_closure",
-                    side_effect=core.HuroshikiError(message),
+                    side_effect=collision,
                 ):
                     result = resolution.resolve_pack_migration_plan_at(
                         plan, repository_root=self.root, state_root=self.state

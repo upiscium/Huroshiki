@@ -1348,6 +1348,25 @@ class ResolvedModClosure:
 
 
 @dataclass(frozen=True)
+class MetadataCollisionEvidence:
+    reason_code: Literal["identity-collision", "path-collision", "filename-collision"]
+    left_identity: tuple[str, str]
+    right_identity: tuple[str, str]
+    left_path: Path
+    right_path: Path
+    left_filename: str
+    right_filename: str
+
+
+class MetadataClosureCollisionError(HuroshikiError):
+    """Shared merge rejection carrying the exact colliding metadata pair."""
+
+    def __init__(self, message: str, evidence: MetadataCollisionEvidence) -> None:
+        super().__init__(message)
+        self.evidence = evidence
+
+
+@dataclass(frozen=True)
 class ResolvedSelector:
     provider: str
     original: str
@@ -3285,6 +3304,8 @@ class PackTransaction:
                     equivalence_workspace=self.root / "equivalence",
                     process_result_callback=self._record_equivalence_process_result,
                 )
+            except MetadataClosureCollisionError:
+                raise
             except Exception as error:
                 raise HuroshikiError(f"Could not merge resolved MOD closure: {error}") from error
             self._assert_version_overrides_preserved(overrides)
@@ -13886,6 +13907,24 @@ def _verify_dependency_collision(
     return evidence
 
 
+def _metadata_collision_evidence(
+    reason_code: Literal["identity-collision", "path-collision", "filename-collision"],
+    left_identity: tuple[str, str],
+    right_identity: tuple[str, str],
+    left: ResolvedMetadata | ModInfo,
+    right: ResolvedMetadata | ModInfo,
+) -> MetadataCollisionEvidence:
+    return MetadataCollisionEvidence(
+        reason_code,
+        left_identity,
+        right_identity,
+        left.relative_path,
+        right.relative_path,
+        left.filename,
+        right.filename,
+    )
+
+
 def merge_metadata_closure(
     staged_source: Path,
     closure: ResolvedModClosure,
@@ -13951,9 +13990,17 @@ def merge_metadata_closure(
                 f"{item.identity!r} vs {canonical_identity!r}"
             )
         if item.identity in incoming_records:
-            raise HuroshikiError(
+            existing_item = incoming_records[item.identity]
+            raise MetadataClosureCollisionError(
                 f"Resolved closure contains duplicate identity "
-                f"{item.provider}:{item.project_id}"
+                f"{item.provider}:{item.project_id}",
+                _metadata_collision_evidence(
+                    "identity-collision",
+                    item.identity,
+                    item.identity,
+                    existing_item,
+                    item,
+                ),
             )
         incoming_records[item.identity] = item
     while True:
@@ -13962,21 +14009,30 @@ def merge_metadata_closure(
         collision_pair: tuple[tuple[str, str], tuple[str, str]] | None = None
         for identity, item in sorted(incoming_records.items()):
             checkpoint()
+            path_owner = incoming_path_owners.get(
+                portable_relative_path_key(item.relative_path)
+            )
+            filename_owner = incoming_filename_owners.get(
+                portable_basename_key(item.filename)
+            )
             owners = {
                 owner
-                for owner in (
-                    incoming_path_owners.get(
-                        portable_relative_path_key(item.relative_path)
-                    ),
-                    incoming_filename_owners.get(
-                        portable_basename_key(item.filename)
-                    ),
-                )
+                for owner in (path_owner, filename_owner)
                 if owner is not None and owner != identity
             }
             if len(owners) > 1:
-                raise HuroshikiError(
-                    "Resolved closure metadata path and filename have different owners"
+                owner = path_owner if path_owner is not None else filename_owner
+                left = incoming_records[owner]
+                evidence = _metadata_collision_evidence(
+                    "path-collision" if path_owner is not None else "filename-collision",
+                    owner,
+                    identity,
+                    left,
+                    item,
+                )
+                raise MetadataClosureCollisionError(
+                    "Resolved closure metadata path and filename have different owners",
+                    evidence,
                 )
             if owners:
                 collision_pair = (next(iter(owners)), identity)
@@ -13988,12 +14044,25 @@ def merge_metadata_closure(
         if collision_pair is None:
             break
         left_identity, right_identity = collision_pair
-        if {left_identity[0], right_identity[0]} != {"modrinth", "curseforge"}:
-            raise HuroshikiError(
-                "Resolved closure contains a metadata path or filename collision"
-            )
         left_item = incoming_records[left_identity]
         right_item = incoming_records[right_identity]
+        collision_reason: Literal["path-collision", "filename-collision"] = (
+            "path-collision"
+            if portable_relative_path_key(left_item.relative_path)
+            == portable_relative_path_key(right_item.relative_path)
+            else "filename-collision"
+        )
+        if {left_identity[0], right_identity[0]} != {"modrinth", "curseforge"}:
+            raise MetadataClosureCollisionError(
+                "Resolved closure contains a metadata path or filename collision",
+                _metadata_collision_evidence(
+                    collision_reason,
+                    left_identity,
+                    right_identity,
+                    left_item,
+                    right_item,
+                ),
+            )
         left_candidate = _dependency_candidate(
             identity=left_identity,
             relative_path=left_item.relative_path,
@@ -14026,15 +14095,27 @@ def merge_metadata_closure(
             ),
             existing=False,
         )
-        evidence = _verify_dependency_collision(
-            left_candidate,
-            right_candidate,
-            context=context,
-            workspace=workspace,
-            cancel_event=cancel_event,
-            deadline=deadline,
-            process_result_callback=process_result_callback,
-        )
+        try:
+            evidence = _verify_dependency_collision(
+                left_candidate,
+                right_candidate,
+                context=context,
+                workspace=workspace,
+                cancel_event=cancel_event,
+                deadline=deadline,
+                process_result_callback=process_result_callback,
+            )
+        except HuroshikiError as error:
+            raise MetadataClosureCollisionError(
+                str(error),
+                _metadata_collision_evidence(
+                    "identity-collision",
+                    left_identity,
+                    right_identity,
+                    left_item,
+                    right_item,
+                ),
+            ) from error
         selected_identity = tuple(evidence.selected_identity.split(":", 1))
         losing_identity = (
             right_identity if selected_identity == left_identity else left_identity
@@ -14048,8 +14129,16 @@ def merge_metadata_closure(
         checkpoint()
         identity = (canonical_provider(mod.provider), mod.project_id)
         if identity in existing_by_identity:
-            raise HuroshikiError(
-                f"Existing metadata identity {identity[0]}:{identity[1]} is duplicated"
+            existing_mod = existing_by_identity[identity]
+            raise MetadataClosureCollisionError(
+                f"Existing metadata identity {identity[0]}:{identity[1]} is duplicated",
+                _metadata_collision_evidence(
+                    "identity-collision",
+                    identity,
+                    identity,
+                    existing_mod,
+                    mod,
+                ),
             )
         existing_by_identity[identity] = mod
         path_owners[portable_relative_path_key(mod.relative_path)] = identity
@@ -14091,8 +14180,21 @@ def merge_metadata_closure(
         }
         if collision_owners:
             if len(collision_owners) != 1:
-                raise HuroshikiError(
-                    "Metadata path and filename are owned by different identities"
+                collision_identity = (
+                    path_owner if path_owner is not None else filename_owner
+                )
+                collision = existing_by_identity[collision_identity]
+                raise MetadataClosureCollisionError(
+                    "Metadata path and filename are owned by different identities",
+                    _metadata_collision_evidence(
+                        "path-collision"
+                        if path_owner is not None
+                        else "filename-collision",
+                        collision_identity,
+                        item.identity,
+                        collision,
+                        item,
+                    ),
                 )
             collision_identity = next(iter(collision_owners))
             collision = existing_by_identity.get(collision_identity)
@@ -14103,15 +14205,35 @@ def merge_metadata_closure(
                 canonical_provider(item.provider),
             } != {"modrinth", "curseforge"}:
                 if path_owner is not None and path_owner != item.identity:
-                    raise HuroshikiError(
+                    message = (
                         f"Metadata path collision at {item.relative_path}: "
                         f"{collision_identity[0]}:{collision_identity[1]} vs "
                         f"{item.provider}:{item.project_id}"
                     )
-                raise HuroshikiError(
+                    raise MetadataClosureCollisionError(
+                        message,
+                        _metadata_collision_evidence(
+                            "path-collision",
+                            collision_identity,
+                            item.identity,
+                            collision,
+                            item,
+                        ),
+                    )
+                message = (
                     f"Filename collision for {item.filename!r}: "
                     f"{collision_identity[0]}:{collision_identity[1]} vs "
                     f"{item.provider}:{item.project_id}"
+                )
+                raise MetadataClosureCollisionError(
+                    message,
+                    _metadata_collision_evidence(
+                        "filename-collision",
+                        collision_identity,
+                        item.identity,
+                        collision,
+                        item,
+                    ),
                 )
             collision_contents = safe_child(
                 staged_source, collision.relative_path
@@ -14141,15 +14263,27 @@ def merge_metadata_closure(
                 ),
                 existing=False,
             )
-            evidence = _verify_dependency_collision(
-                existing_candidate,
-                incoming_candidate,
-                context=context,
-                workspace=workspace,
-                cancel_event=cancel_event,
-                deadline=deadline,
-                process_result_callback=process_result_callback,
-            )
+            try:
+                evidence = _verify_dependency_collision(
+                    existing_candidate,
+                    incoming_candidate,
+                    context=context,
+                    workspace=workspace,
+                    cancel_event=cancel_event,
+                    deadline=deadline,
+                    process_result_callback=process_result_callback,
+                )
+            except HuroshikiError as error:
+                raise MetadataClosureCollisionError(
+                    str(error),
+                    _metadata_collision_evidence(
+                        "identity-collision",
+                        collision_identity,
+                        item.identity,
+                        collision,
+                        item,
+                    ),
+                ) from error
             assigned_side = union_side(collision.side, item_side)
             if evidence.selected_identity == existing_candidate.provider_identity:
                 updated = _metadata_contents_with_side(
@@ -14175,9 +14309,16 @@ def merge_metadata_closure(
                 or _closure_metadata_semantics(existing_contents)
                 != _closure_metadata_semantics(item.contents)
             ):
-                raise HuroshikiError(
+                raise MetadataClosureCollisionError(
                     "Resolved metadata disagreement for existing identity "
-                    f"{item.provider}:{item.project_id}"
+                    f"{item.provider}:{item.project_id}",
+                    _metadata_collision_evidence(
+                        "identity-collision",
+                        item.identity,
+                        item.identity,
+                        existing,
+                        item,
+                    ),
                 )
             if existing.side_error is not None:
                 raise HuroshikiError(

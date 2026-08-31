@@ -438,10 +438,14 @@ class AddTransactionTest(unittest.TestCase):
             ),
         )
         with patch.object(core, "resolve_mod_closure", return_value=divergent):
-            with self.assertRaisesRegex(core.HuroshikiError, "disagreement"):
+            with self.assertRaises(core.MetadataClosureCollisionError) as caught:
                 core.add_mod_transactionally(
                     self.key, "modrinth", "existing", "server"
                 )
+        self.assertIn("disagreement", str(caught.exception))
+        self.assertEqual(caught.exception.evidence.reason_code, "identity-collision")
+        self.assertEqual(caught.exception.evidence.left_identity, record.identity)
+        self.assertEqual(caught.exception.evidence.right_identity, record.identity)
         self.assertEqual(self.snapshot(), original)
         self.assert_unlocked()
 
@@ -480,10 +484,18 @@ class AddTransactionTest(unittest.TestCase):
                 "resolve_mod_closure",
                 return_value=core.ResolvedModClosure(base.identity, (record,)),
             ):
-                with self.assertRaisesRegex(core.HuroshikiError, message):
+                with self.assertRaises(core.MetadataClosureCollisionError) as caught:
                     core.add_mod_transactionally(
                         self.key, "modrinth", "incoming", "both"
                     )
+                self.assertIn(message.lower(), str(caught.exception).lower())
+                evidence = caught.exception.evidence
+                self.assertEqual(evidence.left_identity, ("modrinth", "existing"))
+                self.assertEqual(evidence.right_identity, ("modrinth", "incoming"))
+                self.assertEqual(
+                    evidence.reason_code,
+                    "path-collision" if "path" in message.lower() else "filename-collision",
+                )
                 self.assertEqual(self.snapshot(), original)
                 self.assert_unlocked()
 

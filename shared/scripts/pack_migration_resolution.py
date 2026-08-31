@@ -1986,6 +1986,17 @@ def _resolve_effective_root_set(
                 for item in unresolved
                 if isinstance(item.source_root, PackMigrationRoot)
             }
+            roots_by_identity = {root.canonical_identity: root for root, _ in root_closures}
+            collision_member_owners: dict[
+                tuple[tuple[str, str], Path, str], dict[str, int]
+            ] = {}
+            for owner_root, owner_closure in root_closures:
+                for record in owner_closure.metadata:
+                    key = (record.identity, record.relative_path, record.filename)
+                    counts = collision_member_owners.setdefault(key, {})
+                    counts[owner_root.canonical_identity] = (
+                        counts.get(owner_root.canonical_identity, 0) + 1
+                    )
             for root, _ in root_closures:
                 checkpoint()
                 if root.canonical_identity in unresolved_identities:
@@ -2001,7 +2012,16 @@ def _resolve_effective_root_set(
                         process_result_callback=plan._record_resolver_process_result,
                     )
                 except Exception as error:
-                    collision_reason = _classify_collision(str(error))
+                    structured = (
+                        error
+                        if isinstance(error, core.MetadataClosureCollisionError)
+                        else None
+                    )
+                    collision_reason = (
+                        structured.evidence.reason_code
+                        if structured is not None
+                        else _classify_collision(str(error))
+                    )
                     if collision_reason is None:
                         raise
                     message = str(error)[:240]
@@ -2010,15 +2030,63 @@ def _resolve_effective_root_set(
                     elif collision_reason == "filename-collision":
                         filename_collisions.append(message)
                     elif collision_reason == "identity-collision":
-                        identity_collisions.append(
-                            (root.canonical_identity, "collision")
+                        if structured is not None:
+                            left = ":".join(structured.evidence.left_identity)
+                            right = ":".join(structured.evidence.right_identity)
+                            identity_collisions.append((left, right))
+                        else:
+                            identity_collisions.append(
+                                (root.canonical_identity, "collision")
+                            )
+                    affected_identities = {root.canonical_identity}
+                    if structured is not None:
+                        evidence = structured.evidence
+                        left_key = (
+                            evidence.left_identity,
+                            evidence.left_path,
+                            evidence.left_filename,
                         )
-                    unresolved.append(
-                        PackMigrationUnresolvedRoot(
-                            root, collision_reason, message, False, True
+                        right_key = (
+                            evidence.right_identity,
+                            evidence.right_path,
+                            evidence.right_filename,
                         )
-                    )
-                    unresolved_identities.add(root.canonical_identity)
+                        left_owners = collision_member_owners.get(left_key, {})
+                        right_owners = collision_member_owners.get(right_key, {})
+                        if evidence.left_identity != evidence.right_identity:
+                            affected_identities = set(left_owners) | set(right_owners)
+                        elif left_key != right_key:
+                            affected_identities = set(left_owners) & set(right_owners)
+                            if not affected_identities:
+                                affected_identities = set(left_owners) | set(right_owners)
+                        else:
+                            affected_identities = {
+                                identity
+                                for identity, count in left_owners.items()
+                                if count >= 2
+                            }
+                            if not affected_identities:
+                                affected_identities = set(left_owners)
+                        if not affected_identities:
+                            affected_identities.add(root.canonical_identity)
+                    resolved = [
+                        item
+                        for item in resolved
+                        if item.source_root.canonical_identity not in affected_identities
+                    ]
+                    for affected_identity in sorted(affected_identities):
+                        if affected_identity in unresolved_identities:
+                            continue
+                        unresolved.append(
+                            PackMigrationUnresolvedRoot(
+                                roots_by_identity[affected_identity],
+                                collision_reason,
+                                message,
+                                False,
+                                True,
+                            )
+                        )
+                        unresolved_identities.add(affected_identity)
                     continue
                 resolved.append(provisional_resolved[root.canonical_identity])
             if unresolved:

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import packctl
+import huroshiki_core as core
 import project_locks
 import template_migration as migration
 
@@ -147,6 +148,24 @@ class TemplateMigrationCoreTest(unittest.TestCase):
         manifest = (plan._state.staging / "template.yaml").read_text()
         self.assertIn("project_id: Project1", manifest)
         self.assertNotIn("project_id: create-id", manifest)
+        migration.discard_template_migration_plan(plan)
+
+    def test_canonicalized_selector_retains_identity_after_target_failure(self) -> None:
+        self._write_template(self.source, mods=[
+            {"name": "Create", "provider": "modrinth", "project_id": "create-id", "side": "both"}])
+        source = SimpleNamespace(root_identity=("modrinth", "Project1"), metadata=(
+            self.metadata("modrinth", "Project1", "Version1", "create"),))
+        context, _ = self.resolver_patches(closure=source)
+        def resolve(**kwargs):
+            if kwargs["minecraft"] == "1.21.1": return source
+            raise RuntimeError("no compatible file")
+        with context, patch("huroshiki_core.resolve_project_selector", return_value=SimpleNamespace(
+            provider="modrinth", canonical_project_id="Project1")), \
+             patch("huroshiki_core.resolve_mod_closure", side_effect=resolve):
+            plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
+        self.assertEqual(result.status, "resolution-required")
+        self.assertEqual(result.unresolved[0].source_selector, "create-id")
+        self.assertEqual(result.unresolved[0].canonical_identity, "modrinth:Project1")
         migration.discard_template_migration_plan(plan)
 
     def test_artifact_classification_uses_source_baseline(self) -> None:
@@ -354,6 +373,31 @@ class TemplateMigrationCoreTest(unittest.TestCase):
             plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
         self.assertEqual(result.status, "resolution-required")
         self.assertEqual(result.unresolved[0].code, "version-intent-blocked")
+        self.assertEqual(result.version_intent_issues[0].owner_source_indices, (0,))
+        self.assertFalse(result.unresolved[0].replacement_supported)
+        migration.discard_template_migration_plan(plan)
+
+    def test_missing_dependency_exact_intent_is_global_without_synthetic_owner(self) -> None:
+        self._write_template(self.source, mods=[
+            {"name": "First", "provider": "modrinth", "project_id": "Project1", "side": "both"},
+            {"name": "Second", "provider": "modrinth", "project_id": "Project2", "side": "both"},
+        ], overrides=[{"provider": "modrinth", "project_id": "Depends1",
+                       "artifact_id": "DepVer01", "scope": "dependency"}])
+        closures = {
+            project: SimpleNamespace(root_identity=("modrinth", project), metadata=(
+                self.metadata("modrinth", project, "Version1", project.lower()),))
+            for project in ("Project1", "Project2")
+        }
+        context, _ = self.resolver_patches(closure=closures["Project1"])
+        with context, patch("huroshiki_core.resolve_mod_closure", side_effect=lambda **kwargs: closures[kwargs["canonical_project_id"]]):
+            plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
+        self.assertEqual(result.status, "resolution-required")
+        self.assertEqual(result.unresolved, ())
+        self.assertEqual([item.source_index for item in result.resolved], [0, 1])
+        self.assertEqual(result.version_intent_issues[0].owner_source_indices, ())
+        self.assertFalse((plan._state.staging / "template.yaml").exists())
+        with self.assertRaises(migration.TemplateMigrationOperationError):
+            migration.prepare_template_migration_publication(plan, result)
         migration.discard_template_migration_plan(plan)
 
     def test_source_stale_and_staging_digest_mutation_fail_closed(self) -> None:
@@ -529,17 +573,22 @@ class TemplateMigrationCoreTest(unittest.TestCase):
 
     def test_cross_root_collisions_are_deterministic_typed_facts(self) -> None:
         self._write_template(self.source, mods=[
-            {"name": "First", "provider": "modrinth", "project_id": "Project1", "side": "both"},
-            {"name": "Second", "provider": "modrinth", "project_id": "Project2", "side": "both"},
+            {"name": "A", "provider": "modrinth", "project_id": "Project1", "side": "both"},
+            {"name": "B", "provider": "modrinth", "project_id": "Project2", "side": "both"},
+            {"name": "C", "provider": "modrinth", "project_id": "Project3", "side": "both"},
         ])
+        left = self.metadata("modrinth", "DepA0001", "DepAV001", "actual-left")
+        right = self.metadata("curseforge", "999", "9", "actual-right")
+        left_fact = migration._metadata_identity(left); right_fact = migration._metadata_identity(right)
         closures = {
-            "Project1": SimpleNamespace(root_identity=("modrinth", "Project1"), metadata=(self.metadata("modrinth", "Project1", "Version1", "first"),)),
-            "Project2": SimpleNamespace(root_identity=("modrinth", "Project2"), metadata=(self.metadata("modrinth", "Project2", "Version2", "second"),)),
+            "Project1": SimpleNamespace(root_identity=("modrinth", "Project1"), metadata=(self.metadata("modrinth", "Project1", "Version1", "a"), left)),
+            "Project2": SimpleNamespace(root_identity=("modrinth", "Project2"), metadata=(self.metadata("modrinth", "Project2", "Version2", "b"), self.metadata("modrinth", "Unrel001", "UnrelV01", "unrelated"))),
+            "Project3": SimpleNamespace(root_identity=("modrinth", "Project3"), metadata=(self.metadata("modrinth", "Project3", "Version3", "c"), right)),
         }
-        for message, code, field in (
-            ("metadata path collision", "path-collision", "path_collisions"),
-            ("filename collision", "filename-collision", "filename_collisions"),
-            ("dependency equivalence conflict", "identity-collision", "identity_collisions"),
+        for code, field in (
+            ("path-collision", "path_collisions"),
+            ("filename-collision", "filename_collisions"),
+            ("identity-collision", "identity_collisions"),
         ):
             with self.subTest(code=code):
                 context, _ = self.resolver_patches(closure=closures["Project1"])
@@ -547,18 +596,97 @@ class TemplateMigrationCoreTest(unittest.TestCase):
                 def merge(*args, **kwargs):
                     nonlocal merge_calls
                     merge_calls += 1
-                    if merge_calls == 2: raise RuntimeError(message)
+                    if merge_calls == 3:
+                        evidence = core.MetadataCollisionEvidence(
+                            code, ("modrinth", "DepA0001"), ("curseforge", "999"),
+                            left.relative_path, right.relative_path, left_fact.filename, right_fact.filename,
+                        )
+                        raise core.MetadataClosureCollisionError("exact collision", evidence)
                 with context, patch("huroshiki_core.resolve_mod_closure", side_effect=lambda **kwargs: closures[kwargs["canonical_project_id"]]), \
                      patch("huroshiki_core.merge_metadata_closure", side_effect=merge):
                     plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
                 self.assertEqual(result.status, "resolution-required")
-                self.assertEqual(result.resolved, ())
-                self.assertEqual([item.source_index for item in result.unresolved], [0, 1])
+                self.assertTrue(result.collisions, result)
+                self.assertEqual(result.collisions[0].source_indices, (0, 2))
+                self.assertEqual([item.source_index for item in result.resolved], [1])
+                self.assertEqual([item.source_index for item in result.unresolved], [0, 2])
                 self.assertEqual(result.collisions[0].reason_code, code)
                 self.assertEqual(getattr(result, field), result.collisions)
-                self.assertEqual(result.collisions[0].source_indices, (0, 1))
+                self.assertEqual(result.collisions[0].canonical_identities, ("curseforge:999", "modrinth:DepA0001"))
+                self.assertEqual(result.collisions[0].metadata_paths, (Path("actual-left.pw.toml"), Path("actual-right.pw.toml")))
+                self.assertEqual(result.collisions[0].filenames, ("actual-left.jar", "actual-right.jar"))
                 migration.discard_template_migration_plan(plan)
 
+    def test_internal_incoming_collision_only_blocks_its_root(self) -> None:
+        self._write_template(self.source, mods=[
+            {"name": "A", "provider": "modrinth", "project_id": "Project1", "side": "both"},
+            {"name": "B", "provider": "modrinth", "project_id": "Project2", "side": "both"},
+            {"name": "C", "provider": "modrinth", "project_id": "Project3", "side": "both"},
+        ])
+        left = self.metadata("modrinth", "DepC0001", "DepCV001", "c-left")
+        right = self.metadata("curseforge", "777", "7", "c-right")
+        left_fact = migration._metadata_identity(left); right_fact = migration._metadata_identity(right)
+        closures = {
+            "Project1": SimpleNamespace(root_identity=("modrinth", "Project1"), metadata=(self.metadata("modrinth", "Project1", "Version1", "a"),)),
+            "Project2": SimpleNamespace(root_identity=("modrinth", "Project2"), metadata=(self.metadata("modrinth", "Project2", "Version2", "b"),)),
+            "Project3": SimpleNamespace(root_identity=("modrinth", "Project3"), metadata=(self.metadata("modrinth", "Project3", "Version3", "c"), left, right)),
+        }
+        context, _ = self.resolver_patches(closure=closures["Project1"])
+        merge_calls = 0
+        def merge(*args, **kwargs):
+            nonlocal merge_calls
+            merge_calls += 1
+            if merge_calls == 3:
+                evidence = core.MetadataCollisionEvidence(
+                    "path-collision", ("modrinth", "DepC0001"), ("curseforge", "777"),
+                    left.relative_path, right.relative_path, left_fact.filename, right_fact.filename,
+                )
+                raise core.MetadataClosureCollisionError("internal collision", evidence)
+        with context, patch("huroshiki_core.resolve_mod_closure", side_effect=lambda **kwargs: closures[kwargs["canonical_project_id"]]), \
+             patch("huroshiki_core.merge_metadata_closure", side_effect=merge):
+            plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
+        self.assertEqual([item.source_index for item in result.resolved], [0, 1])
+        self.assertEqual([item.source_index for item in result.unresolved], [2])
+        self.assertEqual(result.collisions[0].source_indices, (2,))
+        migration.discard_template_migration_plan(plan)
+
+    def test_same_identity_internal_collision_does_not_block_single_member_owner(self) -> None:
+        self._write_template(self.source, mods=[
+            {"name": "A", "provider": "modrinth", "project_id": "Project1", "side": "both"},
+            {"name": "B", "provider": "modrinth", "project_id": "Project2", "side": "both"},
+            {"name": "C", "provider": "modrinth", "project_id": "Project3", "side": "both"},
+        ])
+        left = self.metadata("modrinth", "Shared01", "SharedV1", "shared-left")
+        right = self.metadata("modrinth", "Shared01", "SharedV2", "shared-right")
+        left_fact = migration._metadata_identity(left); right_fact = migration._metadata_identity(right)
+        closures = {
+            "Project1": SimpleNamespace(root_identity=("modrinth", "Project1"), metadata=(self.metadata("modrinth", "Project1", "Version1", "a"),)),
+            "Project2": SimpleNamespace(root_identity=("modrinth", "Project2"), metadata=(self.metadata("modrinth", "Project2", "Version2", "b"), left)),
+            "Project3": SimpleNamespace(root_identity=("modrinth", "Project3"), metadata=(self.metadata("modrinth", "Project3", "Version3", "c"), left, right)),
+        }
+        context, _ = self.resolver_patches(closure=closures["Project1"])
+        merge_calls = 0
+        def merge(*args, **kwargs):
+            nonlocal merge_calls
+            merge_calls += 1
+            if merge_calls == 3:
+                raise core.MetadataClosureCollisionError(
+                    "same identity collision",
+                    core.MetadataCollisionEvidence(
+                        "identity-collision", left.identity, right.identity,
+                        left.relative_path, right.relative_path,
+                        left_fact.filename, right_fact.filename,
+                    ),
+                )
+        with context, patch("huroshiki_core.resolve_mod_closure", side_effect=lambda **kwargs: closures[kwargs["canonical_project_id"]]), \
+             patch("huroshiki_core.merge_metadata_closure", side_effect=merge):
+            plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
+        self.assertEqual([item.source_index for item in result.resolved], [0, 1])
+        self.assertEqual([item.source_index for item in result.unresolved], [2])
+        self.assertEqual(result.collisions[0].source_indices, (2,))
+        migration.discard_template_migration_plan(plan)
+
+    def test_resolver_termination_failure_is_fatal(self) -> None:
         plan = self.plan()
         bad = self._TerminationFailure("resolver did not terminate")
         context, _ = self.resolver_patches()
