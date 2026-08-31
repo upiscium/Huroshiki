@@ -617,6 +617,108 @@ class TemplateMigrationCoreTest(unittest.TestCase):
                 self.assertEqual(result.collisions[0].filenames, ("actual-left.jar", "actual-right.jar"))
                 migration.discard_template_migration_plan(plan)
 
+    def test_multi_owner_collision_preserves_every_edge_and_unrelated_root(self) -> None:
+        self._write_template(self.source, mods=[
+            {"name": name, "provider": "modrinth", "project_id": project, "side": "both"}
+            for name, project in (("A", "Project1"), ("B", "Project2"), ("C", "Project3"), ("D", "Project4"))
+        ])
+        path_owner = self.metadata("modrinth", "Path0001", "PathV001", "shared")
+        path_owner.contents = path_owner.contents.replace(b'filename = "shared.jar"', b'filename = "path.jar"')
+        filename_owner = self.metadata("modrinth", "File0001", "FileV001", "filename-owner")
+        filename_owner.contents = filename_owner.contents.replace(b'filename = "filename-owner.jar"', b'filename = "shared.jar"')
+        incoming = self.metadata("modrinth", "Incm0001", "IncmV001", "shared")
+        closures = {
+            "Project1": SimpleNamespace(root_identity=("modrinth", "Project1"), metadata=(self.metadata("modrinth", "Project1", "Version1", "a"), path_owner)),
+            "Project2": SimpleNamespace(root_identity=("modrinth", "Project2"), metadata=(self.metadata("modrinth", "Project2", "Version2", "b"), filename_owner)),
+            "Project3": SimpleNamespace(root_identity=("modrinth", "Project3"), metadata=(self.metadata("modrinth", "Project3", "Version3", "c"), incoming)),
+            "Project4": SimpleNamespace(root_identity=("modrinth", "Project4"), metadata=(self.metadata("modrinth", "Project4", "Version4", "d"),)),
+        }
+        evidences = (
+            core.MetadataCollisionEvidence(
+                "path-collision", path_owner.identity, incoming.identity,
+                path_owner.relative_path, incoming.relative_path, "path.jar", "shared.jar",
+            ),
+            core.MetadataCollisionEvidence(
+                "filename-collision", filename_owner.identity, incoming.identity,
+                filename_owner.relative_path, incoming.relative_path, "shared.jar", "shared.jar",
+            ),
+        )
+        context, _ = self.resolver_patches(closure=closures["Project1"])
+        merge_calls = 0
+        def merge(*args, **kwargs):
+            nonlocal merge_calls
+            merge_calls += 1
+            if merge_calls == 3:
+                raise core.MetadataClosureCollisionError(
+                    "path and filename have different owners", evidences=evidences
+                )
+        with context, patch("huroshiki_core.resolve_mod_closure", side_effect=lambda **kwargs: closures[kwargs["canonical_project_id"]]), \
+             patch("huroshiki_core.merge_metadata_closure", side_effect=merge):
+            plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
+        self.assertEqual(result.status, "resolution-required")
+        self.assertEqual([item.source_index for item in result.resolved], [3])
+        self.assertEqual([item.source_index for item in result.unresolved], [0, 1, 2])
+        self.assertEqual(
+            [(item.reason_code, item.source_indices) for item in result.collisions],
+            [("path-collision", (0, 2)), ("filename-collision", (1, 2))],
+        )
+        self.assertEqual(
+            [item.canonical_identities for item in result.collisions],
+            [
+                ("modrinth:Incm0001", "modrinth:Path0001"),
+                ("modrinth:File0001", "modrinth:Incm0001"),
+            ],
+        )
+        self.assertEqual(
+            result.collisions[0].metadata_paths,
+            (Path("shared.pw.toml"),),
+        )
+        self.assertEqual(
+            result.collisions[1].metadata_paths,
+            (Path("filename-owner.pw.toml"), Path("shared.pw.toml")),
+        )
+        self.assertEqual(result.collisions[0].filenames, ("path.jar", "shared.jar"))
+        self.assertEqual(result.collisions[1].filenames, ("shared.jar",))
+        migration.discard_template_migration_plan(plan)
+
+    def test_multi_owner_collision_inside_one_closure_keeps_all_edges(self) -> None:
+        self._write_template(self.source, mods=[
+            {"name": "A", "provider": "modrinth", "project_id": "Project1", "side": "both"},
+            {"name": "B", "provider": "modrinth", "project_id": "Project2", "side": "both"},
+            {"name": "C", "provider": "modrinth", "project_id": "Project3", "side": "both"},
+        ])
+        path_owner = self.metadata("modrinth", "Path0001", "PathV001", "shared")
+        path_owner.contents = path_owner.contents.replace(b'filename = "shared.jar"', b'filename = "path.jar"')
+        filename_owner = self.metadata("modrinth", "File0001", "FileV001", "filename-owner")
+        filename_owner.contents = filename_owner.contents.replace(b'filename = "filename-owner.jar"', b'filename = "shared.jar"')
+        incoming = self.metadata("modrinth", "Incm0001", "IncmV001", "shared")
+        closures = {
+            "Project1": SimpleNamespace(root_identity=("modrinth", "Project1"), metadata=(self.metadata("modrinth", "Project1", "Version1", "a"),)),
+            "Project2": SimpleNamespace(root_identity=("modrinth", "Project2"), metadata=(self.metadata("modrinth", "Project2", "Version2", "b"),)),
+            "Project3": SimpleNamespace(root_identity=("modrinth", "Project3"), metadata=(self.metadata("modrinth", "Project3", "Version3", "c"), path_owner, filename_owner, incoming)),
+        }
+        evidences = (
+            core.MetadataCollisionEvidence("path-collision", path_owner.identity, incoming.identity, path_owner.relative_path, incoming.relative_path, "path.jar", "shared.jar"),
+            core.MetadataCollisionEvidence("filename-collision", filename_owner.identity, incoming.identity, filename_owner.relative_path, incoming.relative_path, "shared.jar", "shared.jar"),
+        )
+        context, _ = self.resolver_patches(closure=closures["Project1"])
+        merge_calls = 0
+        def merge(*args, **kwargs):
+            nonlocal merge_calls
+            merge_calls += 1
+            if merge_calls == 3:
+                raise core.MetadataClosureCollisionError("internal multi-owner collision", evidences=evidences)
+        with context, patch("huroshiki_core.resolve_mod_closure", side_effect=lambda **kwargs: closures[kwargs["canonical_project_id"]]), \
+             patch("huroshiki_core.merge_metadata_closure", side_effect=merge):
+            plan = self.plan(); result = migration.resolve_template_migration_plan_at(plan)
+        self.assertEqual([item.source_index for item in result.resolved], [0, 1])
+        self.assertEqual([item.source_index for item in result.unresolved], [2])
+        self.assertEqual(
+            [(item.reason_code, item.source_indices) for item in result.collisions],
+            [("path-collision", (2,)), ("filename-collision", (2,))],
+        )
+        migration.discard_template_migration_plan(plan)
+
     def test_internal_incoming_collision_only_blocks_its_root(self) -> None:
         self._write_template(self.source, mods=[
             {"name": "A", "provider": "modrinth", "project_id": "Project1", "side": "both"},

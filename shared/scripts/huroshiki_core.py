@@ -1359,11 +1359,24 @@ class MetadataCollisionEvidence:
 
 
 class MetadataClosureCollisionError(HuroshikiError):
-    """Shared merge rejection carrying the exact colliding metadata pair."""
+    """Shared merge rejection carrying every exact metadata collision edge."""
 
-    def __init__(self, message: str, evidence: MetadataCollisionEvidence) -> None:
+    def __init__(
+        self,
+        message: str,
+        evidence: MetadataCollisionEvidence | None = None,
+        *,
+        evidences: tuple[MetadataCollisionEvidence, ...] | None = None,
+    ) -> None:
         super().__init__(message)
-        self.evidence = evidence
+        if evidences is None:
+            if evidence is None:
+                raise ValueError("Metadata collision evidence is required")
+            evidences = (evidence,)
+        elif evidence is not None or not evidences:
+            raise ValueError("Provide either one evidence or a non-empty evidence set")
+        self.evidences = evidences
+        self.evidence = evidences[0]
 
 
 @dataclass(frozen=True)
@@ -13925,6 +13938,35 @@ def _metadata_collision_evidence(
     )
 
 
+def _collision_integrity_failure(error: BaseException) -> bool:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if any(
+            getattr(current, attribute, False)
+            for attribute in ("termination_incomplete", "orphaned_descendants")
+        ):
+            return True
+        text = str(current).lower()
+        if any(
+            marker in text
+            for marker in (
+                "cancel",
+                "deadline",
+                "timed out",
+                "termination",
+                "orphan",
+                "background process",
+                "protocol",
+                "invalid json",
+            )
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def merge_metadata_closure(
     staged_source: Path,
     closure: ResolvedModClosure,
@@ -14021,18 +14063,26 @@ def merge_metadata_closure(
                 if owner is not None and owner != identity
             }
             if len(owners) > 1:
-                owner = path_owner if path_owner is not None else filename_owner
-                left = incoming_records[owner]
-                evidence = _metadata_collision_evidence(
-                    "path-collision" if path_owner is not None else "filename-collision",
-                    owner,
-                    identity,
-                    left,
-                    item,
+                assert path_owner is not None and filename_owner is not None
+                evidences = (
+                    _metadata_collision_evidence(
+                        "path-collision",
+                        path_owner,
+                        identity,
+                        incoming_records[path_owner],
+                        item,
+                    ),
+                    _metadata_collision_evidence(
+                        "filename-collision",
+                        filename_owner,
+                        identity,
+                        incoming_records[filename_owner],
+                        item,
+                    ),
                 )
                 raise MetadataClosureCollisionError(
                     "Resolved closure metadata path and filename have different owners",
-                    evidence,
+                    evidences=evidences,
                 )
             if owners:
                 collision_pair = (next(iter(owners)), identity)
@@ -14106,6 +14156,8 @@ def merge_metadata_closure(
                 process_result_callback=process_result_callback,
             )
         except HuroshikiError as error:
+            if _collision_integrity_failure(error):
+                raise
             raise MetadataClosureCollisionError(
                 str(error),
                 _metadata_collision_evidence(
@@ -14180,21 +14232,26 @@ def merge_metadata_closure(
         }
         if collision_owners:
             if len(collision_owners) != 1:
-                collision_identity = (
-                    path_owner if path_owner is not None else filename_owner
-                )
-                collision = existing_by_identity[collision_identity]
-                raise MetadataClosureCollisionError(
-                    "Metadata path and filename are owned by different identities",
+                assert path_owner is not None and filename_owner is not None
+                evidences = (
                     _metadata_collision_evidence(
-                        "path-collision"
-                        if path_owner is not None
-                        else "filename-collision",
-                        collision_identity,
+                        "path-collision",
+                        path_owner,
                         item.identity,
-                        collision,
+                        existing_by_identity[path_owner],
                         item,
                     ),
+                    _metadata_collision_evidence(
+                        "filename-collision",
+                        filename_owner,
+                        item.identity,
+                        existing_by_identity[filename_owner],
+                        item,
+                    ),
+                )
+                raise MetadataClosureCollisionError(
+                    "Metadata path and filename are owned by different identities",
+                    evidences=evidences,
                 )
             collision_identity = next(iter(collision_owners))
             collision = existing_by_identity.get(collision_identity)
@@ -14274,6 +14331,8 @@ def merge_metadata_closure(
                     process_result_callback=process_result_callback,
                 )
             except HuroshikiError as error:
+                if _collision_integrity_failure(error):
+                    raise
                 raise MetadataClosureCollisionError(
                     str(error),
                     _metadata_collision_evidence(

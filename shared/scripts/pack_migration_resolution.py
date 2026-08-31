@@ -2017,58 +2017,67 @@ def _resolve_effective_root_set(
                         if isinstance(error, core.MetadataClosureCollisionError)
                         else None
                     )
-                    collision_reason = (
-                        structured.evidence.reason_code
-                        if structured is not None
-                        else _classify_collision(str(error))
-                    )
-                    if collision_reason is None:
-                        raise
                     message = str(error)[:240]
-                    if collision_reason == "path-collision":
-                        path_collisions.append(message)
-                    elif collision_reason == "filename-collision":
-                        filename_collisions.append(message)
-                    elif collision_reason == "identity-collision":
-                        if structured is not None:
-                            left = ":".join(structured.evidence.left_identity)
-                            right = ":".join(structured.evidence.right_identity)
-                            identity_collisions.append((left, right))
-                        else:
+                    affected_reasons: dict[str, UnresolvedReason] = {}
+                    if structured is None:
+                        collision_reason = _classify_collision(str(error))
+                        if collision_reason is None:
+                            raise
+                        if collision_reason == "path-collision":
+                            path_collisions.append(message)
+                        elif collision_reason == "filename-collision":
+                            filename_collisions.append(message)
+                        elif collision_reason == "identity-collision":
                             identity_collisions.append(
                                 (root.canonical_identity, "collision")
                             )
-                    affected_identities = {root.canonical_identity}
-                    if structured is not None:
-                        evidence = structured.evidence
-                        left_key = (
-                            evidence.left_identity,
-                            evidence.left_path,
-                            evidence.left_filename,
-                        )
-                        right_key = (
-                            evidence.right_identity,
-                            evidence.right_path,
-                            evidence.right_filename,
-                        )
-                        left_owners = collision_member_owners.get(left_key, {})
-                        right_owners = collision_member_owners.get(right_key, {})
-                        if evidence.left_identity != evidence.right_identity:
-                            affected_identities = set(left_owners) | set(right_owners)
-                        elif left_key != right_key:
-                            affected_identities = set(left_owners) & set(right_owners)
-                            if not affected_identities:
-                                affected_identities = set(left_owners) | set(right_owners)
-                        else:
-                            affected_identities = {
-                                identity
-                                for identity, count in left_owners.items()
-                                if count >= 2
-                            }
-                            if not affected_identities:
-                                affected_identities = set(left_owners)
-                        if not affected_identities:
-                            affected_identities.add(root.canonical_identity)
+                        affected_reasons[root.canonical_identity] = collision_reason
+                    else:
+                        for evidence in structured.evidences:
+                            if evidence.reason_code == "path-collision":
+                                path_collisions.append(message)
+                            elif evidence.reason_code == "filename-collision":
+                                filename_collisions.append(message)
+                            elif evidence.reason_code == "identity-collision":
+                                identity_collisions.append(
+                                    (
+                                        ":".join(evidence.left_identity),
+                                        ":".join(evidence.right_identity),
+                                    )
+                                )
+                            left_key = (
+                                evidence.left_identity,
+                                evidence.left_path,
+                                evidence.left_filename,
+                            )
+                            right_key = (
+                                evidence.right_identity,
+                                evidence.right_path,
+                                evidence.right_filename,
+                            )
+                            left_owners = collision_member_owners.get(left_key, {})
+                            right_owners = collision_member_owners.get(right_key, {})
+                            if evidence.left_identity != evidence.right_identity:
+                                affected_edge = set(left_owners) | set(right_owners)
+                            elif left_key != right_key:
+                                affected_edge = set(left_owners) & set(right_owners)
+                                if not affected_edge:
+                                    affected_edge = set(left_owners) | set(right_owners)
+                            else:
+                                affected_edge = {
+                                    identity
+                                    for identity, count in left_owners.items()
+                                    if count >= 2
+                                }
+                                if not affected_edge:
+                                    affected_edge = set(left_owners)
+                            if not affected_edge:
+                                affected_edge.add(root.canonical_identity)
+                            for affected_identity in affected_edge:
+                                affected_reasons.setdefault(
+                                    affected_identity, evidence.reason_code
+                                )
+                    affected_identities = set(affected_reasons)
                     resolved = [
                         item
                         for item in resolved
@@ -2080,7 +2089,7 @@ def _resolve_effective_root_set(
                         unresolved.append(
                             PackMigrationUnresolvedRoot(
                                 roots_by_identity[affected_identity],
-                                collision_reason,
+                                affected_reasons[affected_identity],
                                 message,
                                 False,
                                 True,

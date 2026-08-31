@@ -615,40 +615,48 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
         except BaseException as error:
             if _resolver_integrity(error): raise TemplateMigrationOperationError(str(error)) from error
             structured = error if isinstance(error, core.MetadataClosureCollisionError) else None
-            reason = structured.evidence.reason_code if structured is not None else _collision_reason(error)
-            if reason is None: raise
             if structured is not None:
-                evidence = structured.evidence
-                identities = tuple(sorted((f"{evidence.left_identity[0]}:{evidence.left_identity[1]}", f"{evidence.right_identity[0]}:{evidence.right_identity[1]}")))
-                left_key = (evidence.left_identity, evidence.left_path, evidence.left_filename)
-                right_key = (evidence.right_identity, evidence.right_path, evidence.right_filename)
-                left_owners = collision_member_owners.get(left_key, {})
-                right_owners = collision_member_owners.get(right_key, {})
-                if evidence.left_identity != evidence.right_identity:
-                    affected_set = set(left_owners) | set(right_owners)
-                elif left_key != right_key:
-                    affected_set = set(left_owners) & set(right_owners)
-                    if not affected_set:
+                affected_collisions: dict[int, TemplateCollisionFact] = {}
+                for evidence in structured.evidences:
+                    identities = tuple(sorted((f"{evidence.left_identity[0]}:{evidence.left_identity[1]}", f"{evidence.right_identity[0]}:{evidence.right_identity[1]}")))
+                    left_key = (evidence.left_identity, evidence.left_path, evidence.left_filename)
+                    right_key = (evidence.right_identity, evidence.right_path, evidence.right_filename)
+                    left_owners = collision_member_owners.get(left_key, {})
+                    right_owners = collision_member_owners.get(right_key, {})
+                    if evidence.left_identity != evidence.right_identity:
                         affected_set = set(left_owners) | set(right_owners)
-                else:
-                    affected_set = {
-                        index for index, count in left_owners.items() if count >= 2
-                    }
-                    if not affected_set:
-                        affected_set = set(left_owners)
-                affected = tuple(sorted(affected_set or {source_index}))
-                paths = tuple(sorted({evidence.left_path, evidence.right_path}, key=lambda value: value.as_posix()))
-                filenames = tuple(sorted({evidence.left_filename, evidence.right_filename}))
+                    elif left_key != right_key:
+                        affected_set = set(left_owners) & set(right_owners)
+                        if not affected_set:
+                            affected_set = set(left_owners) | set(right_owners)
+                    else:
+                        affected_set = {
+                            index for index, count in left_owners.items() if count >= 2
+                        }
+                        if not affected_set:
+                            affected_set = set(left_owners)
+                    affected = tuple(sorted(affected_set or {source_index}))
+                    paths = tuple(sorted({evidence.left_path, evidence.right_path}, key=lambda value: value.as_posix()))
+                    filenames = tuple(sorted({evidence.left_filename, evidence.right_filename}))
+                    collision = TemplateCollisionFact(evidence.reason_code, affected, identities, paths, filenames, str(error)[:240])
+                    collisions.append(collision)
+                    for index in affected:
+                        affected_collisions.setdefault(index, collision)
+                for index, collision in sorted(affected_collisions.items()):
+                    root = provisional[index]["root"]
+                    unresolved.append(_unresolved(root, collision.reason_code, collision.detail, canonical_identity=provisional[index]["target_fact"].canonical_identity, retry=False))
+                    provisional.pop(index, None)
             else:
+                reason = _collision_reason(error)
+                if reason is None: raise
                 affected = (source_index,)
                 target_fact = provisional[source_index]["target_fact"]
                 identities = (target_fact.canonical_identity,)
                 paths = (target_fact.metadata_path,)
                 filenames = (target_fact.filename,)
-            collision = TemplateCollisionFact(reason, affected, identities, paths, filenames, str(error)[:240]); collisions.append(collision)
-            for index in affected:
-                root = provisional[index]["root"]
-                unresolved.append(_unresolved(root, reason, collision.detail, canonical_identity=provisional[index]["target_fact"].canonical_identity, retry=False)); provisional.pop(index, None)
+                collision = TemplateCollisionFact(reason, affected, identities, paths, filenames, str(error)[:240]); collisions.append(collision)
+                root = provisional[source_index]["root"]
+                unresolved.append(_unresolved(root, reason, collision.detail, canonical_identity=target_fact.canonical_identity, retry=False)); provisional.pop(source_index, None)
 
     resolved: list[TemplateResolvedRoot] = []
     root_facts: list[TemplateRootResolutionFact] = []
