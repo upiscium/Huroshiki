@@ -32,6 +32,7 @@ class ShellEnvironmentTest(unittest.TestCase):
         self.assertFalse((root / "_just").exists())
         packctl_completion = (root / "_packctl").read_text(encoding="utf-8")
         self.assertNotIn("migrate-template", packctl_completion)
+        self.assertIn("template:template operations", packctl_completion)
         self.assertIn("list-templates", packctl_completion)
 
 

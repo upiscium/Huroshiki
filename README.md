@@ -339,6 +339,18 @@ that dependency is required by a selected root; it is not promoted to a root and
 conflicting dependency blocks migration. Review the complete root/dependency changes and required
 warning acknowledgements before using `--apply`.
 
+Template copy migration uses the preferred nested command:
+
+```bash
+packctl template migrate industrial-base --copy-to industrial-1-21-1 \
+  --display-name "Industrial 1.21.1" --minecraft 1.21.1 \
+  --loader neoforge --loader-version 21.1.234
+```
+
+It is preview-only unless `--apply` is supplied. Resolution choices use repeated
+`--remove SOURCE_INDEX` or `--replace SOURCE_INDEX=PROVIDER:SELECTOR` (selectors may contain
+additional colons); required warnings use repeated `--ack-warning CODE`.
+
 `packctl apply-template <pack> <template> [<template> ...]` prepares a one-shot import into an
 existing pack. The default is a dry run; `--apply` publishes the staged closure. Name, URL selector,
 logical-identity replacement, and resolved-identity conflicts require a version 4 `--resolution`

@@ -17,7 +17,10 @@ PROJECT = core.ProjectInfo(
 class ProjectActionTest(unittest.TestCase):
     def test_project_actions_exposes_migrate_and_publish_for_packs(self) -> None:
         self.assertEqual(core.project_actions("pack:demo"), ("migrate", "publish"))
-        self.assertEqual(core.project_actions("template:base"), ("create MODPACK", "validate"))
+        self.assertEqual(
+            core.project_actions("template:base"),
+            ("create MODPACK", "validate", "Migrate / Copy version"),
+        )
 
 
 class ProjectScreenPublishTest(unittest.IsolatedAsyncioTestCase):

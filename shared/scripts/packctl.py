@@ -6009,6 +6009,154 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         raise _migration_failure(session, error) from error
 
 
+def _template_migration_choice(value: str, core: Any) -> object:
+    """Parse the CLI-only shape of one Template migration choice."""
+    if "=" not in value or value.count("=") != 1:
+        raise ConfigError("Template replacements must use SOURCE_INDEX=PROVIDER:SELECTOR")
+    index_text, replacement = value.split("=", 1)
+    try:
+        source_index = int(index_text)
+    except ValueError as error:
+        raise ConfigError("Template migration source index must be an integer") from error
+    if not replacement or ":" not in replacement:
+        raise ConfigError("Template replacements must use SOURCE_INDEX=PROVIDER:SELECTOR")
+    provider, selector = replacement.split(":", 1)
+    if not provider or not selector:
+        raise ConfigError("Template replacements must use SOURCE_INDEX=PROVIDER:SELECTOR")
+    return core.TemplateMigrationRootResolution(
+        source_index, "replace", replacement_provider=provider,
+        replacement_project_id=selector,
+    )
+
+
+def _template_migration_choices(args: argparse.Namespace, core: Any) -> tuple[object, ...]:
+    removals = tuple(getattr(args, "template_migration_removals", None) or ())
+    replacements = tuple(getattr(args, "template_migration_replacements", None) or ())
+    if len(removals) != len(set(removals)):
+        raise ConfigError("Duplicate Template migration removal")
+    if len(replacements) != len(set(replacements)):
+        raise ConfigError("Duplicate Template migration replacement")
+    result: list[object] = []
+    indexes: set[int] = set()
+    for value in removals:
+        try:
+            index = int(value)
+        except ValueError as error:
+            raise ConfigError("Template migration source index must be an integer") from error
+        if index in indexes:
+            raise ConfigError("A Template migration source index cannot be both removed and replaced")
+        indexes.add(index)
+        result.append(core.TemplateMigrationRootResolution(index, "remove"))
+    for value in replacements:
+        choice = _template_migration_choice(value, core)
+        if choice.source_index in indexes:
+            raise ConfigError("A Template migration source index cannot be both removed and replaced")
+        indexes.add(choice.source_index)
+        result.append(choice)
+    return tuple(result)
+
+
+def _template_migration_requirements(session: object, core: Any) -> None:
+    formatter = core.format_template_copy_migration_requirements
+    lines = formatter(session)
+    if lines:
+        print("\n".join(lines))
+
+
+def _template_migration_preview(preview: object, core: Any) -> None:
+    lines = core.format_template_copy_migration_preview(preview)
+    if lines:
+        print("\n".join(lines))
+
+
+def cmd_template_migrate(args: argparse.Namespace) -> int:
+    """Copy a managed Template into a new Template using one Core session."""
+    if getattr(args, "ack_warnings", None) and not args.apply:
+        raise ConfigError("--ack-warning requires --apply")
+    import huroshiki_core as core
+
+    event = threading.Event()
+    deadline = time.monotonic() + PACKWIZ_OPERATION_TIMEOUT_SECONDS
+    try:
+        target = core.TemplateMigrationTarget(
+            target_id=args.copy_to, display_name=args.display_name,
+            minecraft_version=args.minecraft, loader=args.loader,
+            reference_loader_version=args.loader_version,
+        )
+        session = core.TemplateCopyMigrationSession(
+            args.source_template, target, event, deadline
+        )
+    except Exception as error:
+        raise ConfigError(str(error)) from error
+    try:
+        choices = _template_migration_choices(args, core)
+        session.start()
+        if choices and getattr(session, "state", None) != "resolution-required":
+            raise ConfigError("Template migration conflict choices are not currently required")
+        if getattr(session, "state", None) == "resolution-required":
+            if choices:
+                session.resolve_choices(choices)
+            if getattr(session, "state", None) == "resolution-required":
+                _template_migration_requirements(session, core)
+                try:
+                    session.discard()
+                except BaseException as cleanup_error:
+                    raise ConfigError(f"Template migration cleanup-pending: {cleanup_error}") from cleanup_error
+                return 2
+        if getattr(session, "state", None) != "resolved":
+            raise ConfigError(str(getattr(session, "error", None) or "Template migration failed"))
+        preview = session.preview()
+        _template_migration_preview(preview, core)
+        if not args.apply:
+            session.discard()
+            print("Preview ready; target not published.")
+            return 0
+        session.prepare_publication(
+            tuple(args.ack_warnings or ()), expected_preview=preview
+        )
+        try:
+            session.publish()
+        except BaseException as publish_error:
+            if getattr(session.view, "publication_lifecycle", None) != "committed":
+                raise
+            try:
+                session.retry_cleanup()
+            except BaseException as cleanup_error:
+                raise ConfigError(
+                    "Target Template was published successfully, but Template migration "
+                    f"cleanup is pending: {cleanup_error}"
+                ) from publish_error
+            print("Target Template was published successfully; migration cleanup completed after an initial failure.")
+        print(f"Template migration completed. Target Template: {args.copy_to}")
+        return 0
+    except KeyboardInterrupt as error:
+        event.set()
+        raise _template_migration_failure(session, ConfigError("Template migration cancelled; target not published")) from error
+    except ConfigError as error:
+        raise _template_migration_failure(session, error) from error
+    except Exception as error:
+        raise _template_migration_failure(session, error) from error
+
+
+def _template_migration_failure(session: object, error: BaseException) -> ConfigError:
+    if getattr(session, "state", None) == "cleanup-pending":
+        return ConfigError(f"Template migration cleanup-pending: {error}")
+    lifecycle = getattr(getattr(session, "view", None), "publication_lifecycle", "none")
+    if lifecycle == "uncertain":
+        return ConfigError(f"Template migration publication outcome is uncertain; ownership is retained: {error}")
+    if lifecycle == "committed":
+        try:
+            session.retry_cleanup()
+        except BaseException as cleanup_error:
+            return ConfigError(f"Template migration cleanup-pending: {cleanup_error}")
+        return ConfigError(f"Template migration published; cleanup completed after failure: {error}")
+    try:
+        session.discard()
+    except BaseException as cleanup_error:
+        return ConfigError(f"Template migration cleanup-pending: {cleanup_error}")
+    return ConfigError(str(error))
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Manage multiple Packwiz projects")
     root.add_argument(
@@ -6071,6 +6219,20 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("loader", choices=sorted(LOADER_FLAGS))
     item.add_argument("loader_version")
     item.set_defaults(func=cmd_new_template)
+    template = sub.add_parser("template", help="manage templates")
+    template_sub = template.add_subparsers(dest="template_command", required=True)
+    item = template_sub.add_parser("migrate", help="copy a template to a new Template")
+    item.add_argument("source_template")
+    item.add_argument("--copy-to", required=True, dest="copy_to")
+    item.add_argument("--display-name", required=True, dest="display_name")
+    item.add_argument("--minecraft", required=True)
+    item.add_argument("--loader", required=True, choices=sorted(LOADER_FLAGS))
+    item.add_argument("--loader-version", required=True, dest="loader_version")
+    item.add_argument("--remove", action="append", dest="template_migration_removals", metavar="SOURCE_INDEX")
+    item.add_argument("--replace", action="append", dest="template_migration_replacements", metavar="SOURCE_INDEX=PROVIDER:SELECTOR")
+    item.add_argument("--ack-warning", action="append", dest="ack_warnings", metavar="ID")
+    item.add_argument("--apply", action="store_true")
+    item.set_defaults(func=cmd_template_migrate)
     item = sub.add_parser("validate-template")
     item.add_argument("template")
     item.set_defaults(func=cmd_validate_template)

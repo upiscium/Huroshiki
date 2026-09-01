@@ -115,6 +115,7 @@
             test -f ${huroshiki}/share/zsh/site-functions/_huroshiki
             grep -q "loader-version" ${huroshiki}/share/zsh/site-functions/_packctl
             grep -q "apply-template" ${huroshiki}/share/zsh/site-functions/_packctl
+            grep -q "template:template operations" ${huroshiki}/share/zsh/site-functions/_packctl
             grep -q "show-deployment" ${huroshiki}/share/zsh/site-functions/_packctl
             grep -q "set-deployment" ${huroshiki}/share/zsh/site-functions/_packctl
             grep -q "show-pack-url" ${huroshiki}/share/zsh/site-functions/_packctl
