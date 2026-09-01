@@ -184,7 +184,7 @@ class TemplateMigrationSourceSnapshot:
 
 
 class _State:
-    __slots__ = ("event", "deadline", "snapshot", "target", "locks", "tx", "detached", "staging", "plan_digest", "resolution", "result_digest", "committed", "publication_state", "tx_identity", "tx_parent_identity", "detached_identity", "staging_identity", "target_parent_identity", "publication_token", "cleanup_error", "attempt", "process_results", "effective_roots", "effective_overrides", "removed_roots", "replaced_roots", "consumed_resolution_requests", "transaction_cleaned", "transaction_removal_pending")
+    __slots__ = ("event", "deadline", "snapshot", "target", "locks", "tx", "detached", "staging", "plan_digest", "resolution", "result_digest", "committed", "publication_state", "tx_identity", "tx_parent_identity", "detached_identity", "staging_identity", "target_parent_identity", "publication_token", "cleanup_error", "attempt", "process_results", "effective_roots", "effective_overrides", "removed_roots", "replaced_roots", "pending_replacements", "consumed_resolution_requests", "transaction_cleaned", "transaction_removal_pending")
     def __init__(self, event, deadline, snapshot, target, locks, tx, detached, staging, plan_digest):
         self.event, self.deadline, self.snapshot, self.target, self.locks, self.tx, self.detached, self.staging, self.plan_digest = event, deadline, snapshot, target, locks, tx, detached, staging, plan_digest
         self.resolution = None; self.result_digest = None; self.committed = False; self.publication_state = "not-published"
@@ -196,7 +196,7 @@ class _State:
         except BaseException: self.target_parent_identity = None
         self.publication_token = None; self.cleanup_error = None; self.attempt = 0; self.process_results = []
         self.effective_roots = tuple(snapshot.roots); self.effective_overrides = tuple(snapshot.overrides)
-        self.removed_roots = (); self.replaced_roots = (); self.consumed_resolution_requests = set()
+        self.removed_roots = (); self.replaced_roots = (); self.pending_replacements = (); self.consumed_resolution_requests = set()
         self.transaction_cleaned = False
         self.transaction_removal_pending = False
 
@@ -483,6 +483,7 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
         staged_manifest.unlink()
     state.result_digest = None; state.publication_token = None
     import huroshiki_core as core
+    from template_migration_conflicts import TemplateMigrationConflictResolutionError
     state.attempt += 1
     attempt_root = state.tx / f"resolver-attempt-{state.attempt:04d}"; attempt_root.mkdir(mode=0o700)
     (attempt_root / "roots").mkdir(mode=0o700); (attempt_root / "equivalence").mkdir(mode=0o700)
@@ -492,6 +493,7 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
     effective_roots = tuple(state.effective_roots)
     effective_overrides = tuple(state.effective_overrides)
     replaced_source_indices = {item.source_root.source_index for item in state.replaced_roots}
+    pending_replacements = {item.source_root.source_index: item for item in state.pending_replacements}
     root_constraints = {(value.provider, value.project_id): value for value in effective_overrides if value.scope == "root"}
     dependency_constraints = tuple(value for value in effective_overrides if value.scope == "dependency")
 
@@ -520,6 +522,11 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
             else:
                 provider, project = "url", root.project_id
             canonical_identity = f"{provider}:{project}"
+            pending = pending_replacements.get(root.source_index)
+            if pending is not None and pending.old_identity and canonical_identity == pending.old_identity:
+                raise TemplateMigrationConflictResolutionError(
+                    "Replacement selector resolved to the original canonical identity"
+                )
             exact = root_constraints.get((provider, project))
             source_closure = resolve_runtime(root, provider, project, exact, phase="source", runtime=state.snapshot.target)
             target_closure = resolve_runtime(root, provider, project, exact, phase="target", runtime=plan.target)
@@ -538,10 +545,34 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
                 source_fact.artifact_id == target_fact.artifact_id if source_fact.artifact_id is not None and target_fact.artifact_id is not None else source_fact.metadata_digest == target_fact.metadata_digest
             )
             provisional[root.source_index] = {"root": root, "provider": provider, "project": project, "source": source_closure, "target": target_closure, "source_fact": source_fact, "target_fact": target_fact, "identities": identities, "evidence": evidence, "classification": "updated" if root.source_index in replaced_source_indices else "unchanged" if same_artifact else "updated"}
+        except TemplateMigrationConflictResolutionError:
+            raise
         except BaseException as error:
             if _resolver_integrity(error): raise TemplateMigrationOperationError(str(error)) from error
             unresolved.append(_unresolved(root, "version-intent-blocked" if exact else "no-compatible-file", str(error), canonical_identity=canonical_identity, retry=not bool(exact), version=exact.artifact_id if exact else None))
         if progress: progress(f"resolved root {root.source_index}")
+
+    # Canonically identical explicit roots are a typed root conflict.  This is
+    # derived only after selector resolution and before closure persistence.
+    identity_owners: dict[str, list[int]] = {}
+    for source_index, item in provisional.items():
+        identity_owners.setdefault(f"{item['provider']}:{item['project']}", []).append(source_index)
+    for identity, owners in sorted(identity_owners.items()):
+        if len(owners) < 2:
+            continue
+        affected = tuple(sorted(owners))
+        target_facts = [provisional[index]["target_fact"] for index in affected]
+        collision = TemplateCollisionFact(
+            "identity-collision", affected, (identity,),
+            tuple(sorted({fact.metadata_path for fact in target_facts}, key=lambda value: value.as_posix())),
+            tuple(sorted({fact.filename for fact in target_facts})),
+            f"Multiple Template roots resolve to {identity}",
+        )
+        collisions.append(collision)
+        for index in affected:
+            root = provisional[index]["root"]
+            unresolved.append(_unresolved(root, collision.reason_code, collision.detail, canonical_identity=identity, retry=False))
+            provisional.pop(index, None)
 
     dependency_owner_indices: dict[tuple[str, str, str], tuple[int, ...]] = {}
     for constraint in dependency_constraints:
@@ -759,12 +790,13 @@ def resolve_template_migration_conflicts_at(
     validated = validate_template_migration_resolution_request(plan, request)
     previous = (
         state.effective_roots, state.effective_overrides, state.removed_roots,
-        state.replaced_roots, state.resolution, state.result_digest,
+        state.replaced_roots, state.pending_replacements, state.resolution, state.result_digest,
         state.publication_token,
     )
     state.effective_roots = validated.effective_roots
     state.effective_overrides = validated.effective_overrides
     state.removed_roots = tuple(state.removed_roots) + validated.removed_roots
+    state.pending_replacements = validated.replaced_roots
     replacements = {item.source_root.source_index: item for item in state.replaced_roots}
     for item in validated.replaced_roots:
         prior = replacements.get(item.source_root.source_index)
@@ -772,7 +804,7 @@ def resolve_template_migration_conflicts_at(
             replacements[item.source_root.source_index] = item
         else:
             replacements[item.source_root.source_index] = TemplateMigrationReplacedRoot(
-                prior.source_root, item.replacement_root, prior.old_identity,
+                prior.source_root, item.replacement_root, item.replacement_selector, prior.old_identity,
                 item.new_identity, prior.provider_changed or item.provider_changed,
             )
     state.replaced_roots = tuple(replacements[index] for index in sorted(replacements))
@@ -783,11 +815,12 @@ def resolve_template_migration_conflicts_at(
     except BaseException:
         (
             state.effective_roots, state.effective_overrides, state.removed_roots,
-            state.replaced_roots, state.resolution, state.result_digest,
+            state.replaced_roots, state.pending_replacements, state.resolution, state.result_digest,
             state.publication_token,
         ) = previous
         raise
     state.consumed_resolution_requests.add(validated.request_digest)
+    state.pending_replacements = ()
     identities = {
         item.source_index: f"{item.provider}:{item.project_id}" for item in resolution.resolved
     }
@@ -797,10 +830,13 @@ def resolve_template_migration_conflicts_at(
     )
     finalized = []
     replaced_indices = {item.source_root.source_index for item in validated.replaced_roots}
+    effective_by_index = {item.source_index: item for item in resolution.ordered_roots}
     for item in state.replaced_roots:
         if item.source_root.source_index in replaced_indices:
             finalized.append(TemplateMigrationReplacedRoot(
-                item.source_root, item.replacement_root, item.old_identity,
+                item.source_root,
+                effective_by_index.get(item.source_root.source_index, item.replacement_root),
+                item.replacement_selector, item.old_identity,
                 identities.get(item.source_root.source_index, item.new_identity),
                 item.provider_changed,
             ))

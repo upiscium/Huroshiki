@@ -127,6 +127,21 @@ class TemplateCopyMigrationSessionTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first.plan_digest, "b" * 64)
 
+    def test_view_exposes_replacement_selector_and_canonical_identities(self) -> None:
+        replacement = core.TemplateMigrationReplacedRoot(
+            self.root,
+            core.TemplateRootIntent(0, "Example", "modrinth", "New00001", "both"),
+            "new-project",
+            "modrinth:Old00001",
+            "modrinth:New00001",
+            False,
+        )
+        session = self._started(resolution=self._resolution(replaced_roots=(replacement,)))
+        view = session.preview().view.replaced_roots[0]
+        self.assertEqual(view.old_identity, "modrinth:Old00001")
+        self.assertEqual(view.replacement_selector, "new-project")
+        self.assertEqual(view.new_identity, "modrinth:New00001")
+
     def test_precommit_conflict_failure_preserves_request_for_retry(self) -> None:
         unresolved = SimpleNamespace(
             source_index=0, source_selector="abc", canonical_identity="modrinth:abc",

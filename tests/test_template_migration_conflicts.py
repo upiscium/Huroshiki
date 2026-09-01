@@ -6,6 +6,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+import huroshiki_core as core
 import template_migration as migration
 import tests.test_template_migration as template_migration_tests
 from template_migration_conflicts import (
@@ -84,17 +85,16 @@ class TemplateMigrationConflictApiTest(unittest.TestCase):
         with self.assertRaisesRegex(TemplateMigrationConflictResolutionError, "not awaiting"):
             validate_template_migration_resolution_request(self.plan, request)
 
-    def test_request_requires_complete_current_unresolved_set(self) -> None:
+    def test_request_allows_nonempty_current_unresolved_subset(self) -> None:
         second = migration.TemplateUnresolvedRoot(
             1, "42", "curseforge:42", "identity-collision", "collision"
         )
         self.state.resolution = SimpleNamespace(**{
             **vars(self.state.resolution), "unresolved": self.unresolved + (second,)
         })
-        with self.assertRaisesRegex(
-            TemplateMigrationConflictResolutionError, "Every unresolved root"
-        ):
-            self.request(TemplateMigrationRootResolution(0, "remove"))
+        request = self.request(TemplateMigrationRootResolution(0, "remove"))
+        validated = validate_template_migration_resolution_request(self.plan, request)
+        self.assertEqual([root.source_index for root in validated.effective_roots], [1])
 
     def test_remove_preserves_order_sides_and_only_abandons_root_exact(self) -> None:
         validated = validate_template_migration_resolution_request(self.plan, self.request(TemplateMigrationRootResolution(0, "remove")))
@@ -102,20 +102,30 @@ class TemplateMigrationConflictApiTest(unittest.TestCase):
         self.assertEqual(validated.effective_overrides, (self.dependency_exact,))
         self.assertEqual(validated.removed_roots[0].abandoned_root_exact_constraints, (self.old_exact,))
 
-    def test_replace_preserves_position_side_and_canonicalizes_identity(self) -> None:
+    def test_replace_preserves_selector_position_and_side_before_resolution(self) -> None:
         self.state.effective_overrides = (self.dependency_exact,)
         choice = TemplateMigrationRootResolution(0, "replace", "modrinth", "New00001")
         validated = validate_template_migration_resolution_request(self.plan, self.request(choice))
         replacement = validated.effective_roots[0]
         self.assertEqual((replacement.source_index, replacement.side, replacement.provider, replacement.project_id), (0, "client", "modrinth", "New00001"))
         self.assertEqual(validated.effective_roots[1], self.roots[1])
-        self.assertEqual(validated.replaced_roots[0].new_identity, "modrinth:New00001")
+        self.assertEqual(validated.replaced_roots[0].replacement_selector, "New00001")
+        self.assertIsNone(validated.replaced_roots[0].new_identity)
 
-    def test_replace_rejects_noncanonical_modrinth_selectors(self) -> None:
+    def test_replace_accepts_legal_modrinth_selectors_and_rejects_malformed(self) -> None:
         self.state.effective_overrides = (self.dependency_exact,)
-        for selector in ("project-slug", "https://modrinth.com/mod/example"):
-            with self.subTest(selector=selector), self.assertRaisesRegex(
-                TemplateMigrationConflictResolutionError, "8-character"
+        for selector in ("project-slug", "https://modrinth.com/mod/example", "New00001"):
+            with self.subTest(selector=selector):
+                validated = validate_template_migration_resolution_request(
+                    self.plan,
+                    self.request(TemplateMigrationRootResolution(
+                        0, "replace", "modrinth", selector
+                    )),
+                )
+                self.assertEqual(validated.replaced_roots[0].replacement_selector, selector)
+        for selector in ("bad selector", "http://modrinth.com/mod/example"):
+            with self.subTest(selector=selector), self.assertRaises(
+                TemplateMigrationConflictResolutionError
             ):
                 self.request(TemplateMigrationRootResolution(
                     0, "replace", "modrinth", selector
@@ -132,8 +142,15 @@ class TemplateMigrationConflictApiTest(unittest.TestCase):
             with self.assertRaisesRegex(TemplateMigrationConflictResolutionError, "blocked"):
                 self.validate_replace()
         self.state.resolution = SimpleNamespace(**{**vars(self.state.resolution), "unresolved": self.unresolved})
-        with self.assertRaisesRegex(TemplateMigrationConflictResolutionError, "must change"):
-            validate_template_migration_resolution_request(self.plan, self.request(TemplateMigrationRootResolution(0, "replace", "modrinth", "Old00001")))
+        self.state.effective_overrides = (self.dependency_exact,)
+        same_selector = validate_template_migration_resolution_request(
+            self.plan,
+            self.request(TemplateMigrationRootResolution(
+                0, "replace", "modrinth", "Old00001"
+            )),
+        )
+        self.assertIsNone(same_selector.replaced_roots[0].new_identity)
+        self.state.effective_overrides = (self.old_exact, self.dependency_exact)
         with self.assertRaisesRegex(TemplateMigrationConflictResolutionError, "cannot transfer"):
             validate_template_migration_resolution_request(self.plan, self.request(TemplateMigrationRootResolution(0, "replace", "curseforge", "99")))
 
@@ -153,7 +170,7 @@ class TemplateMigrationConflictOperationTest(unittest.TestCase):
         )
         state = SimpleNamespace(
             resolution=result, effective_roots=(root,), effective_overrides=(), consumed_resolution_requests=set(),
-            removed_roots=(), replaced_roots=(), event=object(), deadline=10,
+            removed_roots=(), replaced_roots=(), pending_replacements=(), event=object(), deadline=10,
             result_digest=None, publication_token=None,
         )
         plan = SimpleNamespace(_state=state, source_snapshot_digest="s", plan_digest="p", target="t", roots=(root,))
@@ -179,7 +196,7 @@ class TemplateMigrationConflictOperationTest(unittest.TestCase):
         event = object()
         state = SimpleNamespace(
             resolution=result, effective_roots=(root,), effective_overrides=(),
-            consumed_resolution_requests=set(), removed_roots=(), replaced_roots=(),
+            consumed_resolution_requests=set(), removed_roots=(), replaced_roots=(), pending_replacements=(),
             event=event, deadline=10, result_digest=None, publication_token=None,
         )
         plan = SimpleNamespace(
@@ -218,6 +235,49 @@ class TemplateMigrationConflictIntegrationTest(unittest.TestCase):
             root_identity=("modrinth", project),
             metadata=(self.metadata("modrinth", project, artifact, path),),
         )
+
+    def _resolve_partial_collision(self, choice: TemplateMigrationRootResolution):
+        self._write_template(self.source, mods=[
+            {"name": "A", "provider": "modrinth", "project_id": "RootA001", "side": "client"},
+            {"name": "B", "provider": "modrinth", "project_id": "RootB001", "side": "server"},
+            {"name": "C", "provider": "modrinth", "project_id": "RootC001", "side": "both"},
+        ])
+        left = self.metadata("modrinth", "DepA0001", "DepAV001", "left")
+        right = self.metadata("curseforge", "999", "9", "right")
+        closures = {
+            "RootA001": SimpleNamespace(root_identity=("modrinth", "RootA001"), metadata=(
+                self.metadata("modrinth", "RootA001", "FileA001", "a"), left,
+            )),
+            "RootB001": self._closure("RootB001", "FileB001", "b"),
+            "RootC001": SimpleNamespace(root_identity=("modrinth", "RootC001"), metadata=(
+                self.metadata("modrinth", "RootC001", "FileC001", "c"), right,
+            )),
+            "NewA0001": self._closure("NewA0001", "NewFile1", "new-a"),
+        }
+        left_fact = migration._metadata_identity(left)
+        right_fact = migration._metadata_identity(right)
+        evidence = core.MetadataCollisionEvidence(
+            "identity-collision", left.identity, right.identity,
+            left.relative_path, right.relative_path,
+            left_fact.filename, right_fact.filename,
+        )
+        context, _ = self.resolver_patches(closure=closures["RootA001"])
+        merge_calls = 0
+        def merge(*_args, **_kwargs):
+            nonlocal merge_calls
+            merge_calls += 1
+            if merge_calls == 3:
+                raise core.MetadataClosureCollisionError("A and C collide", evidence)
+        with context, \
+             patch("huroshiki_core.resolve_mod_closure", side_effect=lambda **kwargs: closures[kwargs["canonical_project_id"]]), \
+             patch("huroshiki_core.merge_metadata_closure", side_effect=merge):
+            plan = self.plan(); initial = migration.resolve_template_migration_plan_at(plan)
+            request = create_template_migration_resolution_request(plan, (choice,))
+            outcome = migration.resolve_template_migration_conflicts_at(
+                plan, request, cancel_event=plan.cancel_event, deadline=plan.deadline
+            )
+        self.assertEqual([item.source_index for item in initial.unresolved], [0, 2])
+        return plan, outcome
 
     def test_remove_rebuilds_ordered_root_only_manifest_on_same_plan(self) -> None:
         self._write_template(self.source, mods=[
@@ -276,6 +336,159 @@ class TemplateMigrationConflictIntegrationTest(unittest.TestCase):
         manifest = (plan._state.staging / "template.yaml").read_text()
         self.assertIn("project_id: New00001", manifest)
         self.assertNotIn("project_id: Old00001", manifest)
+        migration.discard_template_migration_plan(plan, deadline=time.monotonic() + 30)
+
+    def test_modrinth_slug_is_canonicalized_and_bound_after_resolution(self) -> None:
+        self._write_template(self.source, mods=[
+            {"name": "Old", "provider": "modrinth", "project_id": "Old00001", "side": "client"},
+        ])
+        old = self._closure("Old00001", "OldFile1", "old")
+        new = self._closure("New00001", "NewFile1", "new")
+        context, _ = self.resolver_patches(closure=old)
+        def canonical(_provider, selector, **_kwargs):
+            project = "New00001" if selector == "new-project" else "Old00001"
+            return SimpleNamespace(provider="modrinth", canonical_project_id=project)
+        def resolve(**kwargs):
+            project = kwargs["canonical_project_id"]
+            if project == "Old00001" and kwargs["minecraft"] == "1.21.4":
+                raise RuntimeError("no compatible target")
+            return old if project == "Old00001" else new
+        with context, \
+             patch("huroshiki_core.resolve_project_selector", side_effect=canonical) as lookup, \
+             patch("huroshiki_core.resolve_mod_closure", side_effect=resolve):
+            plan = self.plan(); migration.resolve_template_migration_plan_at(plan)
+            request = create_template_migration_resolution_request(plan, (
+                TemplateMigrationRootResolution(0, "replace", "modrinth", "new-project"),
+            ))
+            outcome = migration.resolve_template_migration_conflicts_at(
+                plan, request, cancel_event=plan.cancel_event, deadline=plan.deadline
+            )
+        fact = outcome.resolution.replaced_roots[0]
+        self.assertEqual(fact.old_identity, "modrinth:Old00001")
+        self.assertEqual(fact.replacement_selector, "new-project")
+        self.assertEqual(fact.new_identity, "modrinth:New00001")
+        self.assertEqual((fact.replacement_root.source_index, fact.replacement_root.side), (0, "client"))
+        self.assertEqual(outcome.resolution.ordered_roots[0].project_id, "New00001")
+        manifest = (plan._state.staging / "template.yaml").read_text()
+        self.assertIn("project_id: New00001", manifest)
+        slug_call = next(call for call in lookup.call_args_list if call.args[1] == "new-project")
+        self.assertIs(slug_call.kwargs["cancel_event"], plan.cancel_event)
+        self.assertEqual(slug_call.kwargs["deadline"], plan.deadline)
+        migration.discard_template_migration_plan(plan, deadline=time.monotonic() + 30)
+
+    def test_modrinth_slug_canonicalizing_to_old_identity_is_rejected(self) -> None:
+        self._write_template(self.source, mods=[
+            {"name": "Old", "provider": "modrinth", "project_id": "Old00001", "side": "both"},
+        ])
+        old = self._closure("Old00001", "OldFile1", "old")
+        context, _ = self.resolver_patches(closure=old)
+        def resolve(**kwargs):
+            if kwargs["minecraft"] == "1.21.4":
+                raise RuntimeError("no compatible target")
+            return old
+        with context, \
+             patch("huroshiki_core.resolve_project_selector", return_value=SimpleNamespace(
+                 provider="modrinth", canonical_project_id="Old00001"
+             )), \
+             patch("huroshiki_core.resolve_mod_closure", side_effect=resolve):
+            plan = self.plan(); previous = migration.resolve_template_migration_plan_at(plan)
+            request = create_template_migration_resolution_request(plan, (
+                TemplateMigrationRootResolution(0, "replace", "modrinth", "same-project"),
+            ))
+            with self.assertRaisesRegex(
+                TemplateMigrationConflictResolutionError, "original canonical identity"
+            ):
+                migration.resolve_template_migration_conflicts_at(
+                    plan, request, cancel_event=plan.cancel_event, deadline=plan.deadline
+                )
+        self.assertIs(plan.resolution, previous)
+        self.assertFalse((plan._state.staging / "template.yaml").exists())
+        migration.discard_template_migration_plan(plan, deadline=time.monotonic() + 30)
+
+    def test_modrinth_slug_canonicalizing_to_retained_root_is_typed_conflict(self) -> None:
+        self._write_template(self.source, mods=[
+            {"name": "Old", "provider": "modrinth", "project_id": "Old00001", "side": "client"},
+            {"name": "Keep", "provider": "modrinth", "project_id": "Keep0001", "side": "server"},
+        ])
+        old = self._closure("Old00001", "OldFile1", "old")
+        keep = self._closure("Keep0001", "KeepFile", "keep")
+        context, _ = self.resolver_patches(closure=old)
+        def canonical(_provider, selector, **_kwargs):
+            project = "Keep0001" if selector in {"kept-project", "Keep0001"} else "Old00001"
+            return SimpleNamespace(provider="modrinth", canonical_project_id=project)
+        def resolve(**kwargs):
+            project = kwargs["canonical_project_id"]
+            if project == "Old00001" and kwargs["minecraft"] == "1.21.4":
+                raise RuntimeError("no compatible target")
+            return old if project == "Old00001" else keep
+        with context, \
+             patch("huroshiki_core.resolve_project_selector", side_effect=canonical), \
+             patch("huroshiki_core.resolve_mod_closure", side_effect=resolve):
+            plan = self.plan(); migration.resolve_template_migration_plan_at(plan)
+            request = create_template_migration_resolution_request(plan, (
+                TemplateMigrationRootResolution(0, "replace", "modrinth", "kept-project"),
+            ))
+            outcome = migration.resolve_template_migration_conflicts_at(
+                plan, request, cancel_event=plan.cancel_event, deadline=plan.deadline
+            )
+        self.assertEqual(outcome.state, "resolution-required")
+        self.assertEqual([item.source_index for item in outcome.resolution.unresolved], [0, 1])
+        self.assertEqual(outcome.resolution.identity_collisions[0].canonical_identities, ("modrinth:Keep0001",))
+        self.assertEqual(outcome.resolution.replaced_roots[0].new_identity, "modrinth:Keep0001")
+        self.assertFalse((plan._state.staging / "template.yaml").exists())
+        migration.discard_template_migration_plan(plan, deadline=time.monotonic() + 30)
+
+    def test_partial_remove_recomputes_collision_participant_as_resolved(self) -> None:
+        plan, outcome = self._resolve_partial_collision(
+            TemplateMigrationRootResolution(0, "remove")
+        )
+        self.assertEqual(outcome.state, "resolved")
+        self.assertEqual(
+            [(item.source_index, item.side) for item in outcome.resolution.resolved],
+            [(1, "server"), (2, "both")],
+        )
+        self.assertEqual(outcome.resolution.unresolved, ())
+        migration.discard_template_migration_plan(plan, deadline=time.monotonic() + 30)
+
+    def test_partial_replace_recomputes_collision_participant_as_resolved(self) -> None:
+        plan, outcome = self._resolve_partial_collision(
+            TemplateMigrationRootResolution(
+                0, "replace", "modrinth", "NewA0001"
+            )
+        )
+        self.assertEqual(outcome.state, "resolved")
+        self.assertEqual(
+            [item.source_index for item in outcome.resolution.resolved], [0, 1, 2]
+        )
+        self.assertEqual(outcome.resolution.replaced_roots[0].new_identity, "modrinth:NewA0001")
+        migration.discard_template_migration_plan(plan, deadline=time.monotonic() + 30)
+
+    def test_partial_remove_leaves_independent_unresolved_root(self) -> None:
+        self._write_template(self.source, mods=[
+            {"name": "A", "provider": "modrinth", "project_id": "RootA001", "side": "client"},
+            {"name": "B", "provider": "modrinth", "project_id": "RootB001", "side": "server"},
+        ])
+        closures = {
+            project: self._closure(project, artifact, project.lower())
+            for project, artifact in (("RootA001", "FileA001"), ("RootB001", "FileB001"))
+        }
+        context, _ = self.resolver_patches(closure=closures["RootA001"])
+        def resolve(**kwargs):
+            if kwargs["minecraft"] == "1.21.4":
+                raise RuntimeError(f"{kwargs['canonical_project_id']} unavailable")
+            return closures[kwargs["canonical_project_id"]]
+        with context, patch("huroshiki_core.resolve_mod_closure", side_effect=resolve):
+            plan = self.plan(); initial = migration.resolve_template_migration_plan_at(plan)
+            request = create_template_migration_resolution_request(
+                plan, (TemplateMigrationRootResolution(0, "remove"),)
+            )
+            outcome = migration.resolve_template_migration_conflicts_at(
+                plan, request, cancel_event=plan.cancel_event, deadline=plan.deadline
+            )
+        self.assertEqual([item.source_index for item in initial.unresolved], [0, 1])
+        self.assertEqual(outcome.state, "resolution-required")
+        self.assertEqual([item.source_index for item in outcome.resolution.unresolved], [1])
+        self.assertEqual(outcome.resolution.ordered_roots[0].source_index, 1)
         migration.discard_template_migration_plan(plan, deadline=time.monotonic() + 30)
 
 

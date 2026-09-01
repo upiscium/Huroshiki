@@ -6261,6 +6261,7 @@ class TemplateCopyMigrationRemovedRootView:
 class TemplateCopyMigrationReplacedRootView:
     source_index: int
     old_identity: str
+    replacement_selector: str
     new_identity: str | None
     side: str
 
@@ -6402,7 +6403,8 @@ class TemplateCopyMigrationSession:
             tuple((value.provider, value.project_id, value.artifact_id) for value in item.abandoned_root_exact_constraints),
         ) for item in getattr(result, "removed_roots", ()))
         replaced = tuple(TemplateCopyMigrationReplacedRootView(
-            item.source_root.source_index, item.old_identity, item.new_identity,
+            item.source_root.source_index, item.old_identity,
+            item.replacement_selector, item.new_identity,
             item.source_root.side,
         ) for item in getattr(result, "replaced_roots", ()))
         lifecycle = plan.publication_lifecycle if plan is not None else "none"

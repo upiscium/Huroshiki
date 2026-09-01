@@ -10,16 +10,15 @@ from dataclasses import asdict, dataclass, is_dataclass
 import hashlib
 import json
 from pathlib import Path
-import re
 from typing import TYPE_CHECKING, Literal
 
 from provider_identity import ProviderIdentityError, canonical_identity
+from provider_lookup import LookupError, modrinth_project_reference
 
 if TYPE_CHECKING:
     from template_migration import TemplateMigrationPlan, TemplateRootIntent
 
 ResolutionAction = Literal["remove", "replace"]
-_IMMUTABLE_MODRINTH_ID = re.compile(r"^[A-Za-z0-9]{8}$")
 
 
 class TemplateMigrationConflictResolutionError(ValueError):
@@ -59,6 +58,7 @@ class TemplateMigrationRemovedRoot:
 class TemplateMigrationReplacedRoot:
     source_root: object
     replacement_root: object
+    replacement_selector: str
     old_identity: str
     new_identity: str | None
     provider_changed: bool
@@ -223,25 +223,20 @@ def validate_template_migration_resolution_request(plan: "TemplateMigrationPlan"
                 raise TemplateMigrationConflictResolutionError("Replacement provider must be canonical")
             if provider == "curseforge" and (not project.isdecimal() or int(project) <= 0 or str(int(project)) != project):
                 raise TemplateMigrationConflictResolutionError("CurseForge project ID must be canonical positive decimal")
-            if provider == "modrinth" and _IMMUTABLE_MODRINTH_ID.fullmatch(project) is None:
-                raise TemplateMigrationConflictResolutionError("Modrinth project ID must be an 8-character immutable ID")
-            selector = getattr(item, "source_selector", "")
-            if not isinstance(selector, str):
-                raise TemplateMigrationConflictResolutionError("Malformed root selector")
-            if selector.startswith(("http://", "https://")):
-                raise TemplateMigrationConflictResolutionError("URL roots cannot be replaced")
+            if provider == "modrinth":
+                try:
+                    modrinth_project_reference(project)
+                except LookupError as error:
+                    raise TemplateMigrationConflictResolutionError(str(error)) from error
             root = next((value for value in getattr(state, "effective_roots", getattr(result, "ordered_roots", getattr(plan, "roots", ()))) if getattr(value, "source_index", None) == choice.source_index), None)
+            if getattr(root, "provider", None) == "url" or getattr(root, "url", None) is not None:
+                raise TemplateMigrationConflictResolutionError("URL roots cannot be replaced")
             old = getattr(item, "canonical_identity", None) or _root_identity(root)
-            if old and _identity(provider, project) == old:
+            if provider == "curseforge" and old and _identity(provider, project) == old:
                 raise TemplateMigrationConflictResolutionError("Replacement must change identity")
         else:
             raise TemplateMigrationConflictResolutionError("Unsupported resolution action")
         choices[choice.source_index] = choice
-
-    if set(choices) != set(unresolved):
-        raise TemplateMigrationConflictResolutionError(
-            "Every unresolved root requires exactly one resolution"
-        )
 
     overrides = list(getattr(state, "effective_overrides", getattr(getattr(state, "snapshot", None), "overrides", ())))
     removed: list[TemplateMigrationRemovedRoot] = []
@@ -279,12 +274,12 @@ def validate_template_migration_resolution_request(plan: "TemplateMigrationPlan"
             if owned:
                 raise TemplateMigrationConflictResolutionError("Replacement cannot transfer root exact constraints")
             provider, project = choice.replacement_provider, choice.replacement_project_id
-            new = _identity(provider, project)
-            if any(_root_identity(r) == new for r in effective if r is not source):
+            new = _identity(provider, project) if provider == "curseforge" else None
+            if new is not None and any(_root_identity(r) == new for r in effective if r is not source):
                 raise TemplateMigrationConflictResolutionError("Replacement root identity collision")
             replacement = TemplateRootIntent(index, source.name, provider, project, source.side, None)
             effective[position] = replacement
-            replaced.append(TemplateMigrationReplacedRoot(source, replacement, old or "", new, provider != source.provider))
+            replaced.append(TemplateMigrationReplacedRoot(source, replacement, project, old or "", new, provider != source.provider))
     return ValidatedTemplateMigrationResolution(tuple(root for root in effective if root is not None), tuple(overrides), tuple(removed), tuple(replaced), request_digest(request))
 
 
