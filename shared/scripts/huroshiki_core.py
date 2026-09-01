@@ -245,9 +245,19 @@ from template_migration import (
     discard_template_migration_plan as _discard_template_migration_plan,
     plan_template_copy_migration_at,
     prepare_template_migration_publication as _prepare_template_migration_publication,
+    resolve_template_migration_conflicts_at,
     resolve_template_migration_plan_at,
     retry_template_migration_cleanup as _retry_template_migration_cleanup,
     snapshot_template_migration_source_at,
+)
+from template_migration_conflicts import (
+    TemplateMigrationConflictResolutionError,
+    TemplateMigrationConflictResolutionResult,
+    TemplateMigrationRemovedRoot,
+    TemplateMigrationReplacedRoot,
+    TemplateMigrationResolutionRequest,
+    TemplateMigrationRootResolution,
+    create_template_migration_resolution_request,
 )
 
 
@@ -6156,6 +6166,19 @@ def resolve_template_migration_plan(
     )
 
 
+def resolve_template_migration_conflicts(
+    plan: TemplateMigrationPlan,
+    request: TemplateMigrationResolutionRequest,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> TemplateMigrationConflictResolutionResult:
+    return resolve_template_migration_conflicts_at(
+        plan, request, cancel_event=cancel_event, deadline=deadline, progress=progress
+    )
+
+
 def prepare_template_migration_publication(
     plan: TemplateMigrationPlan,
     resolution: TemplateResolutionResult,
@@ -6190,6 +6213,348 @@ def discard_template_migration_plan(
     deadline: float | None = None,
 ) -> None:
     _discard_template_migration_plan(plan, deadline=deadline)
+
+
+TemplateCopyMigrationSessionState = Literal[
+    "new", "planning", "resolving", "resolution-required", "resolved", "ready",
+    "preparing-publication", "publishing", "published", "cleanup-pending",
+    "publication-uncertain", "discarding", "discarded", "retrying-cleanup",
+    "failed", "cancelled",
+]
+
+
+@dataclass(frozen=True)
+class TemplateCopyMigrationRootView:
+    source_index: int
+    name: str
+    provider: str
+    project_id: str
+    side: str
+    target_identity: str | None
+    artifact_id: str | None
+    classification: str | None
+
+
+@dataclass(frozen=True)
+class TemplateCopyMigrationUnresolvedView:
+    source_index: int
+    source_selector: str
+    canonical_identity: str | None
+    side: str
+    reason_code: str
+    message: str
+    retryable: bool
+    replacement_supported: bool
+    version_intent_issue: str | None
+
+
+@dataclass(frozen=True)
+class TemplateCopyMigrationRemovedRootView:
+    source_index: int
+    source_identity: str
+    side: str
+    reason_code: str
+    abandoned_root_exact_intent: tuple[tuple[str, str, str], ...]
+
+
+@dataclass(frozen=True)
+class TemplateCopyMigrationReplacedRootView:
+    source_index: int
+    old_identity: str
+    replacement_selector: str
+    new_identity: str | None
+    side: str
+
+
+@dataclass(frozen=True)
+class TemplateCopyMigrationView:
+    state: TemplateCopyMigrationSessionState
+    source_id: str
+    target: TemplateMigrationTarget
+    source_minecraft_version: str | None
+    source_loader: str | None
+    source_reference_loader_version: str | None
+    resolved_roots: tuple[TemplateCopyMigrationRootView, ...]
+    updated_roots: tuple[TemplateCopyMigrationRootView, ...]
+    unresolved_roots: tuple[TemplateCopyMigrationUnresolvedView, ...]
+    removed_roots: tuple[TemplateCopyMigrationRemovedRootView, ...]
+    replaced_roots: tuple[TemplateCopyMigrationReplacedRootView, ...]
+    ordered_roots: tuple[TemplateCopyMigrationRootView, ...]
+    url_compatibility: tuple[TemplateUrlEvidence, ...]
+    version_intent_facts: tuple[TemplateVersionIntentFact, ...]
+    version_intent_issues: tuple[TemplateVersionIntentIssue, ...]
+    collision_facts: tuple[TemplateCollisionFact, ...]
+    required_warnings: tuple[str, ...]
+    resolution_attempt: int | None
+    resolution_digest: str | None
+    publication_lifecycle: str
+    cleanup_pending: bool
+    publication_uncertain: bool
+    error_message: str | None
+
+
+@dataclass(frozen=True)
+class TemplateCopyMigrationPreview:
+    view: TemplateCopyMigrationView
+    source_snapshot_digest: str
+    plan_digest: str
+    resolution_attempt: int
+    resolution_digest: str
+
+    @property
+    def required_warnings(self) -> tuple[str, ...]:
+        return self.view.required_warnings
+
+
+class TemplateCopyMigrationSession:
+    """UI-neutral owner for one exact Template Copy migration authority chain."""
+
+    def __init__(
+        self,
+        source_id: str,
+        target: TemplateMigrationTarget,
+        cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> None:
+        packctl.validate_project_id(source_id)
+        if not isinstance(target, TemplateMigrationTarget):
+            raise TypeError("Template migration target must be a TemplateMigrationTarget")
+        self.source_id = source_id
+        self.target = target
+        self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
+        self._deadline = deadline if deadline is not None else time.monotonic() + PACK_MIGRATION_TIMEOUT_SECONDS
+        self._state: TemplateCopyMigrationSessionState = "new"
+        self._snapshot: TemplateMigrationSourceSnapshot | None = None
+        self._plan: TemplateMigrationPlan | None = None
+        self._resolution: TemplateResolutionResult | None = None
+        self._publication: TemplateMigrationPublication | None = None
+        self._published_snapshot: TemplateMigrationSourceSnapshot | None = None
+        self._error: BaseException | None = None
+        self._operation_active = False
+        self._lock = threading.RLock()
+
+    @property
+    def cancel_event(self) -> threading.Event: return self._cancel_event
+
+    @property
+    def deadline(self) -> float: return self._deadline
+
+    @property
+    def state(self) -> TemplateCopyMigrationSessionState:
+        with self._lock: return self._state
+
+    @property
+    def error(self) -> BaseException | None:
+        with self._lock: return self._error
+
+    def _claim(self, allowed: set[TemplateCopyMigrationSessionState], state: TemplateCopyMigrationSessionState) -> None:
+        with self._lock:
+            if self._operation_active:
+                raise TemplateMigrationOperationError("Another Template migration operation is active")
+            if self._state not in allowed:
+                raise TemplateMigrationOperationError(f"Template migration operation is invalid in state {self._state}")
+            self._operation_active = True; self._state = state
+
+    def _release(self) -> None:
+        with self._lock: self._operation_active = False
+
+    def _classify(self, result: TemplateResolutionResult) -> TemplateCopyMigrationSessionState:
+        if result.status == "resolution-required": return "resolution-required"
+        if result.status == "resolved": return "resolved"
+        raise TemplateMigrationOperationError("Template migration returned an invalid resolution state")
+
+    def _failure(self, error: BaseException) -> None:
+        with self._lock:
+            self._error = error; plan = self._plan
+            lifecycle = plan.publication_lifecycle if plan is not None else "precommit"
+            if lifecycle == "uncertain": self._state = "publication-uncertain"
+            elif lifecycle == "committed" or (plan is not None and getattr(plan, "cleanup_pending", False)):
+                self._state = "cleanup-pending"
+            elif self._cancel_event.is_set(): self._state = "cancelled"
+            else: self._state = "failed"
+
+    @staticmethod
+    def _root_view(root: TemplateRootIntent, result: TemplateResolutionResult | None) -> TemplateCopyMigrationRootView:
+        resolved = next((item for item in getattr(result, "resolved", ()) if item.source_index == root.source_index), None)
+        fact = next((item for item in getattr(result, "ordered_root_facts", ()) if item.source_index == root.source_index), None)
+        return TemplateCopyMigrationRootView(
+            root.source_index, root.name, root.provider, root.project_id, root.side,
+            getattr(fact, "target_canonical_identity", None), getattr(resolved, "artifact_id", None),
+            getattr(resolved, "classification", None),
+        )
+
+    def _view_locked(self) -> TemplateCopyMigrationView:
+        result = self._resolution; plan = self._plan; snapshot = self._snapshot
+        roots = tuple(self._root_view(root, result) for root in getattr(result, "ordered_roots", getattr(plan, "roots", ())))
+        resolved_indices = {item.source_index for item in getattr(result, "resolved", ())}
+        resolved = tuple(item for item in roots if item.source_index in resolved_indices)
+        unresolved = []
+        roots_by_index = {root.source_index: root for root in getattr(result, "ordered_roots", getattr(plan, "roots", ())) }
+        for item in getattr(result, "unresolved", ()):
+            root = roots_by_index.get(item.source_index)
+            unresolved.append(TemplateCopyMigrationUnresolvedView(
+                item.source_index, item.source_selector, item.canonical_identity,
+                getattr(root, "side", "both"), item.code, item.detail, item.retry,
+                item.replacement_supported, item.version_issue,
+            ))
+        removed = tuple(TemplateCopyMigrationRemovedRootView(
+            item.source_root.source_index,
+            f"{item.source_root.provider}:{item.source_root.project_id}",
+            item.source_root.side, item.reason_code,
+            tuple((value.provider, value.project_id, value.artifact_id) for value in item.abandoned_root_exact_constraints),
+        ) for item in getattr(result, "removed_roots", ()))
+        replaced = tuple(TemplateCopyMigrationReplacedRootView(
+            item.source_root.source_index, item.old_identity,
+            item.replacement_selector, item.new_identity,
+            item.source_root.side,
+        ) for item in getattr(result, "replaced_roots", ()))
+        lifecycle = plan.publication_lifecycle if plan is not None else "none"
+        message = str(self._error)[:240] if self._error is not None else None
+        return TemplateCopyMigrationView(
+            self._state, self.source_id, self.target,
+            getattr(getattr(snapshot, "target", None), "minecraft_version", None),
+            getattr(getattr(snapshot, "target", None), "loader", None),
+            getattr(getattr(snapshot, "target", None), "reference_loader_version", None),
+            resolved, tuple(item for item in resolved if item.classification == "updated"),
+            tuple(unresolved), removed, replaced, roots,
+            tuple(getattr(result, "url_evidence", ())), tuple(getattr(result, "version_intent_facts", ())),
+            tuple(getattr(result, "version_intent_issues", ())), tuple(getattr(result, "collisions", ())),
+            tuple(getattr(result, "warnings", ())), getattr(result, "resolution_attempt", None),
+            getattr(result, "digest", None), lifecycle, self._state == "cleanup-pending",
+            lifecycle == "uncertain", message,
+        )
+
+    @property
+    def view(self) -> TemplateCopyMigrationView:
+        with self._lock: return self._view_locked()
+
+    def start(self, *, progress: Callable[[str], None] | None = None) -> TemplateCopyMigrationView:
+        self._claim({"new"}, "planning")
+        try:
+            snapshot = snapshot_template_migration_source(self.source_id, cancel_event=self._cancel_event, deadline=self._deadline)
+            with self._lock: self._snapshot = snapshot
+            plan = plan_template_copy_migration(self.source_id, self.target, expected_snapshot=snapshot, cancel_event=self._cancel_event, deadline=self._deadline)
+            with self._lock: self._plan = plan; self._state = "resolving"
+            result = resolve_template_migration_plan(plan, cancel_event=self._cancel_event, deadline=self._deadline, progress=progress)
+            with self._lock: self._resolution = result; self._state = self._classify(result); self._error = None
+            return self.view
+        except BaseException as error:
+            retained = getattr(error, "plan", None)
+            if isinstance(retained, TemplateMigrationPlan):
+                with self._lock: self._plan = retained
+            self._failure(error); raise
+        finally: self._release()
+
+    def cancel(self) -> None: self._cancel_event.set()
+
+    def create_resolution_request(self, choices: tuple[TemplateMigrationRootResolution, ...]) -> TemplateMigrationResolutionRequest:
+        with self._lock:
+            if self._operation_active: raise TemplateMigrationOperationError("Another Template migration operation is active")
+            if self._state != "resolution-required" or self._plan is None:
+                raise TemplateMigrationOperationError("Template migration is not awaiting conflict resolution")
+            return create_template_migration_resolution_request(self._plan, tuple(choices))
+
+    def resolve_conflicts(self, request: TemplateMigrationResolutionRequest, *, progress: Callable[[str], None] | None = None) -> TemplateCopyMigrationView:
+        self._claim({"resolution-required"}, "resolving")
+        try:
+            with self._lock:
+                if self._plan is None: raise TemplateMigrationOperationError("Template migration conflict Authority is incomplete")
+                plan = self._plan
+            outcome = resolve_template_migration_conflicts(plan, request, cancel_event=self._cancel_event, deadline=self._deadline, progress=progress)
+            with self._lock:
+                self._resolution = outcome.resolution; self._publication = None
+                self._state = self._classify(outcome.resolution); self._error = None
+            return self.view
+        except BaseException as error:
+            with self._lock:
+                retryable = (
+                    self._plan is not None
+                    and self._plan.publication_lifecycle == "precommit"
+                    and self._plan.resolution is not None
+                    and self._plan.resolution.status == "resolution-required"
+                    and not self._cancel_event.is_set()
+                    and time.monotonic() < self._deadline
+                )
+                if retryable:
+                    self._resolution = self._plan.resolution
+                    self._error = error
+                    self._state = "resolution-required"
+                else:
+                    self._failure(error)
+            raise
+        finally: self._release()
+
+    def resolve_choices(self, choices: tuple[TemplateMigrationRootResolution, ...], *, progress: Callable[[str], None] | None = None) -> TemplateCopyMigrationView:
+        """Create and immediately consume one exact conflict request."""
+        request = self.create_resolution_request(tuple(choices))
+        return self.resolve_conflicts(request, progress=progress)
+
+    def preview(self) -> TemplateCopyMigrationPreview:
+        with self._lock:
+            if self._operation_active: raise TemplateMigrationOperationError("Another Template migration operation is active")
+            if self._state not in {"resolution-required", "resolved", "ready"} or self._snapshot is None or self._plan is None or self._resolution is None:
+                raise TemplateMigrationOperationError("Template migration preview Authority is incomplete")
+            return TemplateCopyMigrationPreview(self._view_locked(), self._snapshot.snapshot_digest, self._plan.plan_digest, self._resolution.resolution_attempt, self._resolution.digest)
+
+    def prepare_publication(self, warning_acknowledgements: tuple[str, ...] = (), *, expected_preview: TemplateCopyMigrationPreview | None = None) -> TemplateCopyMigrationView:
+        self._claim({"resolved"}, "preparing-publication")
+        try:
+            with self._lock:
+                if self._plan is None or self._resolution is None: raise TemplateMigrationOperationError("Template migration publication Authority is incomplete")
+                plan, result = self._plan, self._resolution
+                if expected_preview is not None and (expected_preview.plan_digest != plan.plan_digest or expected_preview.resolution_attempt != result.resolution_attempt or expected_preview.resolution_digest != result.digest):
+                    raise TemplateMigrationOperationError("Template migration preview is stale")
+            publication = prepare_template_migration_publication(plan, result, warning_acknowledgements=tuple(warning_acknowledgements))
+            with self._lock: self._publication = publication; self._state = "ready"; self._error = None
+            return self.view
+        except BaseException as error: self._failure(error); raise
+        finally: self._release()
+
+    def publish(self) -> TemplateMigrationSourceSnapshot:
+        self._claim({"ready"}, "publishing")
+        try:
+            with self._lock:
+                if self._publication is None: raise TemplateMigrationOperationError("Template migration publication handoff is missing")
+                publication = self._publication
+            published = apply_template_migration_publication(publication)
+            with self._lock: self._published_snapshot = published; self._state = "published"; self._error = None
+            return published
+        except BaseException as error: self._failure(error); raise
+        finally: self._release()
+
+    def discard(self, *, deadline: float | None = None) -> None:
+        with self._lock:
+            if self._operation_active: raise TemplateMigrationOperationError("Another Template migration operation is active")
+            plan = self._plan
+            if plan is None:
+                self._state = "discarded"; return
+            if plan.publication_lifecycle == "committed": raise TemplateMigrationOperationError("Published Template cleanup must use retry_cleanup")
+            if plan.publication_lifecycle == "uncertain":
+                self._state = "publication-uncertain"
+                raise TemplateMigrationOperationError("Template migration publication outcome is uncertain; ownership is retained")
+            self._operation_active = True; self._state = "discarding"
+        try:
+            discard_template_migration_plan(plan, deadline=deadline if deadline is not None else time.monotonic() + PACK_MIGRATION_CLEANUP_TIMEOUT_SECONDS)
+            with self._lock: self._state = "discarded"; self._error = None
+        except BaseException as error:
+            with self._lock: self._state = "cleanup-pending"; self._error = error
+            raise
+        finally: self._release()
+
+    def retry_cleanup(self, *, deadline: float | None = None) -> TemplateMigrationSourceSnapshot:
+        with self._lock:
+            if self._operation_active: raise TemplateMigrationOperationError("Another Template migration operation is active")
+            if self._plan is None or self._publication is None or self._plan.publication_lifecycle != "committed":
+                raise TemplateMigrationOperationError("Template migration has no committed cleanup requiring retry")
+            publication = self._publication; self._operation_active = True; self._state = "retrying-cleanup"
+        try:
+            published = retry_template_migration_cleanup(publication, deadline=deadline if deadline is not None else time.monotonic() + PACK_MIGRATION_CLEANUP_TIMEOUT_SECONDS, cancel_event=threading.Event())
+            with self._lock: self._published_snapshot = published; self._state = "published"; self._error = None
+            return published
+        except BaseException as error:
+            with self._lock: self._state = "cleanup-pending"; self._error = error
+            raise
+        finally: self._release()
 
 
 PackCopyMigrationSessionState = Literal[

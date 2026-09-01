@@ -305,6 +305,57 @@ class TemplateMigrationCoreTest(unittest.TestCase):
             migration.resolve_template_migration_plan_at(plan, deadline=plan.deadline + 1)
         migration.discard_template_migration_plan(plan)
 
+    def test_resolution_rejects_transaction_path_replacement(self) -> None:
+        plan = self.plan()
+        original = plan._state.tx.with_name(plan._state.tx.name + "-original")
+        plan._state.tx.rename(original)
+        plan._state.tx.mkdir()
+        with self.assertRaisesRegex(
+            migration.TemplateMigrationOperationError, "staging identity"
+        ):
+            migration.resolve_template_migration_plan_at(plan)
+        plan._state.tx.rmdir()
+        original.rename(plan._state.tx)
+        migration.discard_template_migration_plan(plan)
+
+    def test_cleanup_retains_ownership_when_transaction_disappears(self) -> None:
+        plan = self.plan()
+        original = plan._state.tx.with_name(plan._state.tx.name + "-missing")
+        plan._state.tx.rename(original)
+        with self.assertRaisesRegex(
+            migration.TemplateMigrationOperationError, "disappeared"
+        ):
+            migration.discard_template_migration_plan(plan)
+        self.assertTrue(packctl.project_lock_is_active("template:base"))
+        original.rename(plan._state.tx)
+        migration.discard_template_migration_plan(plan)
+
+    def test_cleanup_retry_confirms_transaction_removal_durability(self) -> None:
+        plan = self.plan()
+        with patch.object(migration.os, "fsync", side_effect=OSError("fsync failed")):
+            with self.assertRaisesRegex(OSError, "fsync failed"):
+                migration.discard_template_migration_plan(plan)
+        self.assertTrue(plan._state.transaction_removal_pending)
+        self.assertTrue(packctl.project_lock_is_active("template:base"))
+        migration.discard_template_migration_plan(plan)
+        self.assertFalse(packctl.project_lock_is_active("template:base"))
+
+    def test_cleanup_pending_retry_rejects_transaction_parent_replacement(self) -> None:
+        plan = self.plan()
+        with patch.object(migration.os, "fsync", side_effect=OSError("fsync failed")):
+            with self.assertRaises(OSError):
+                migration.discard_template_migration_plan(plan)
+        parent = plan._state.tx.parent
+        original = parent.with_name(parent.name + "-original")
+        parent.rename(original); parent.mkdir()
+        with self.assertRaisesRegex(
+            migration.TemplateMigrationOperationError, "parent changed"
+        ):
+            migration.discard_template_migration_plan(plan)
+        self.assertTrue(packctl.project_lock_is_active("template:base"))
+        parent.rmdir(); original.rename(parent)
+        migration.discard_template_migration_plan(plan)
+
     def test_root_exact_intent_is_resolved_and_persisted(self) -> None:
         self._write_template(self.source, mods=[
             {"name": "Root", "provider": "modrinth", "project_id": "Project1", "side": "both"}],
