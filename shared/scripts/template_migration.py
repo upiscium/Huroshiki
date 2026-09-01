@@ -493,6 +493,7 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
     effective_roots = tuple(state.effective_roots)
     effective_overrides = tuple(state.effective_overrides)
     replaced_source_indices = {item.source_root.source_index for item in state.replaced_roots}
+    replacement_baselines = {item.source_root.source_index: item.source_root for item in state.replaced_roots}
     pending_replacements = {item.source_root.source_index: item for item in state.pending_replacements}
     root_constraints = {(value.provider, value.project_id): value for value in effective_overrides if value.scope == "root"}
     dependency_constraints = tuple(value for value in effective_overrides if value.scope == "dependency")
@@ -507,20 +508,26 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
             return closure
         return core.resolve_mod_closure(provider=provider, selector=root.url if provider == "url" else root.project_id, canonical_project_id=None if provider == "url" else project, minecraft=runtime.minecraft_version, loader=runtime.loader, loader_version=runtime.reference_loader_version, cancel_event=state.event, deadline=state.deadline, resolver_root=workspace, url_max_jar_size_bytes=state.snapshot.url_policy.get("url_max_jar_size_bytes"), url_allow_private_networks=bool(state.snapshot.url_policy.get("url_allow_private_networks", False)), process_result_callback=lambda value: _record_process(state, value), diagnostic_project_id=plan.target.target_id)
 
+    def canonical_root(root: TemplateRootIntent) -> tuple[str, str]:
+        if root.provider == "modrinth":
+            canonical = core.resolve_project_selector(root.provider, root.project_id, cancel_event=state.event, deadline=state.deadline, process_result_callback=lambda value: _record_process(state, value))
+            provider = getattr(canonical, "provider", root.provider)
+            project = str(getattr(canonical, "canonical_project_id", root.project_id))
+            if not project:
+                raise TemplateMigrationError("canonical Modrinth project identity is unavailable")
+            return provider, project
+        if root.provider == "curseforge":
+            if not root.project_id.isdigit() or root.project_id.startswith("0"):
+                raise TemplateMigrationError("CurseForge root is not a canonical positive ID")
+            return root.provider, root.project_id
+        return "url", root.project_id
+
     for root in effective_roots:
         _check(state.event, state.deadline)
         canonical_identity: str | None = None
         exact: TemplateExactConstraint | None = None
         try:
-            if root.provider == "modrinth":
-                canonical = core.resolve_project_selector(root.provider, root.project_id, cancel_event=state.event, deadline=state.deadline, process_result_callback=lambda value: _record_process(state, value))
-                provider = getattr(canonical, "provider", root.provider); project = str(getattr(canonical, "canonical_project_id", root.project_id))
-                if not project: raise TemplateMigrationError("canonical Modrinth project identity is unavailable")
-            elif root.provider == "curseforge":
-                if not root.project_id.isdigit() or root.project_id.startswith("0"): raise TemplateMigrationError("CurseForge root is not a canonical positive ID")
-                provider, project = root.provider, root.project_id
-            else:
-                provider, project = "url", root.project_id
+            provider, project = canonical_root(root)
             canonical_identity = f"{provider}:{project}"
             pending = pending_replacements.get(root.source_index)
             if pending is not None and pending.old_identity and canonical_identity == pending.old_identity:
@@ -528,9 +535,30 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
                     "Replacement selector resolved to the original canonical identity"
                 )
             exact = root_constraints.get((provider, project))
-            source_closure = resolve_runtime(root, provider, project, exact, phase="source", runtime=state.snapshot.target)
+            source_root = root
+            source_provider, source_project = provider, project
+            source_exact = exact
+            if pending is not None:
+                source_root = replacement_baselines.get(root.source_index, pending.source_root)
+                baseline_identity = next(
+                    (item.old_identity for item in state.replaced_roots if item.source_root.source_index == root.source_index),
+                    pending.old_identity,
+                )
+                old_provider, separator, old_project = baseline_identity.partition(":")
+                if separator and old_provider in {"modrinth", "curseforge"} and old_project:
+                    source_provider, source_project = old_provider, old_project
+                else:
+                    source_provider, source_project = canonical_root(source_root)
+                source_exact = root_constraints.get((source_provider, source_project))
+                if source_exact is not None:
+                    raise TemplateMigrationConflictResolutionError(
+                        "Replacement cannot transfer root exact constraints"
+                    )
+            source_closure = resolve_runtime(source_root, source_provider, source_project, source_exact, phase="source", runtime=state.snapshot.target)
             target_closure = resolve_runtime(root, provider, project, exact, phase="target", runtime=plan.target)
-            if provider != "url" and (tuple(getattr(source_closure, "root_identity", ())) != (provider, project) or tuple(getattr(target_closure, "root_identity", ())) != (provider, project)):
+            if source_provider != "url" and tuple(getattr(source_closure, "root_identity", ())) != (source_provider, source_project):
+                raise TemplateMigrationError("source resolver returned a different canonical root identity")
+            if provider != "url" and tuple(getattr(target_closure, "root_identity", ())) != (provider, project):
                 raise TemplateMigrationError("resolver returned a different canonical root identity")
             evidence = None
             if root.provider == "url":
@@ -544,7 +572,7 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
             same_artifact = source_fact.canonical_identity == target_fact.canonical_identity and (
                 source_fact.artifact_id == target_fact.artifact_id if source_fact.artifact_id is not None and target_fact.artifact_id is not None else source_fact.metadata_digest == target_fact.metadata_digest
             )
-            provisional[root.source_index] = {"root": root, "provider": provider, "project": project, "source": source_closure, "target": target_closure, "source_fact": source_fact, "target_fact": target_fact, "identities": identities, "evidence": evidence, "classification": "updated" if root.source_index in replaced_source_indices else "unchanged" if same_artifact else "updated"}
+            provisional[root.source_index] = {"root": root, "provider": provider, "project": project, "source": source_closure, "target": target_closure, "source_fact": source_fact, "target_fact": target_fact, "source_selector": source_root.project_id, "identities": identities, "evidence": evidence, "classification": "updated" if root.source_index in replaced_source_indices else "unchanged" if same_artifact else "updated"}
         except TemplateMigrationConflictResolutionError:
             raise
         except BaseException as error:
@@ -734,7 +762,7 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
         item = provisional[source_index]; root = item["root"]; source_fact = item["source_fact"]; target_fact = item["target_fact"]
         classification = item["classification"]
         resolved.append(TemplateResolvedRoot(source_index, item["provider"], item["project"], root.side, core.resolved_closure_fingerprint(item["target"]), target_fact.artifact_id, item["identities"], classification, item["evidence"]))
-        root_facts.append(TemplateRootResolutionFact(source_index, root.name, item["provider"], root.project_id, source_fact.canonical_identity, target_fact.canonical_identity, root.side, source_fact, target_fact, classification))
+        root_facts.append(TemplateRootResolutionFact(source_index, root.name, item["provider"], item["source_selector"], source_fact.canonical_identity, target_fact.canonical_identity, root.side, source_fact, target_fact, classification))
 
     unresolved_by_index = {item.source_index: item for item in unresolved}
     unresolved = [unresolved_by_index[index] for index in sorted(unresolved_by_index)]

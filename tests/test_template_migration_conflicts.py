@@ -338,7 +338,7 @@ class TemplateMigrationConflictIntegrationTest(unittest.TestCase):
         self.assertNotIn("project_id: Old00001", manifest)
         migration.discard_template_migration_plan(plan, deadline=time.monotonic() + 30)
 
-    def test_modrinth_slug_is_canonicalized_and_bound_after_resolution(self) -> None:
+    def test_replacement_uses_old_source_baseline_and_target_only_replacement(self) -> None:
         self._write_template(self.source, mods=[
             {"name": "Old", "provider": "modrinth", "project_id": "Old00001", "side": "client"},
         ])
@@ -348,15 +348,19 @@ class TemplateMigrationConflictIntegrationTest(unittest.TestCase):
         def canonical(_provider, selector, **_kwargs):
             project = "New00001" if selector == "new-project" else "Old00001"
             return SimpleNamespace(provider="modrinth", canonical_project_id=project)
+        resolver_calls = []
         def resolve(**kwargs):
+            resolver_calls.append((kwargs["canonical_project_id"], kwargs["minecraft"], kwargs["loader"]))
             project = kwargs["canonical_project_id"]
+            if project == "New00001" and kwargs["minecraft"] == "1.21.1":
+                raise AssertionError("replacement must not resolve against source configuration")
             if project == "Old00001" and kwargs["minecraft"] == "1.21.4":
                 raise RuntimeError("no compatible target")
             return old if project == "Old00001" else new
         with context, \
              patch("huroshiki_core.resolve_project_selector", side_effect=canonical) as lookup, \
              patch("huroshiki_core.resolve_mod_closure", side_effect=resolve):
-            plan = self.plan(); migration.resolve_template_migration_plan_at(plan)
+            plan = self.plan(self.target(loader="fabric", reference="0.16.0")); migration.resolve_template_migration_plan_at(plan)
             request = create_template_migration_resolution_request(plan, (
                 TemplateMigrationRootResolution(0, "replace", "modrinth", "new-project"),
             ))
@@ -369,6 +373,13 @@ class TemplateMigrationConflictIntegrationTest(unittest.TestCase):
         self.assertEqual(fact.new_identity, "modrinth:New00001")
         self.assertEqual((fact.replacement_root.source_index, fact.replacement_root.side), (0, "client"))
         self.assertEqual(outcome.resolution.ordered_roots[0].project_id, "New00001")
+        root_fact = outcome.resolution.ordered_root_facts[0]
+        self.assertEqual(root_fact.source_canonical_identity, "modrinth:Old00001")
+        self.assertEqual(root_fact.target_canonical_identity, "modrinth:New00001")
+        self.assertEqual(root_fact.classification, "updated")
+        self.assertNotIn(("New00001", "1.21.1", "neoforge"), resolver_calls)
+        self.assertIn(("Old00001", "1.21.1", "neoforge"), resolver_calls)
+        self.assertIn(("New00001", "1.21.4", "fabric"), resolver_calls)
         manifest = (plan._state.staging / "template.yaml").read_text()
         self.assertIn("project_id: New00001", manifest)
         slug_call = next(call for call in lookup.call_args_list if call.args[1] == "new-project")

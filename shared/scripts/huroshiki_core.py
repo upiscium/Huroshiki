@@ -6367,8 +6367,9 @@ class TemplateCopyMigrationSession:
         with self._lock:
             self._error = error; plan = self._plan
             lifecycle = plan.publication_lifecycle if plan is not None else "precommit"
-            if lifecycle == "committed": self._state = "cleanup-pending"
-            elif lifecycle == "uncertain": self._state = "publication-uncertain"
+            if lifecycle == "uncertain": self._state = "publication-uncertain"
+            elif lifecycle == "committed" or (plan is not None and getattr(plan, "cleanup_pending", False)):
+                self._state = "cleanup-pending"
             elif self._cancel_event.is_set(): self._state = "cancelled"
             else: self._state = "failed"
 

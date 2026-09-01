@@ -66,6 +66,16 @@ class TemplateCopyMigrationSessionTest(unittest.TestCase):
             session.start()
         return session
 
+    def _retained_precommit_plan(self, cleanup_error: BaseException):
+        state = SimpleNamespace(
+            publication_state="not-published",
+            committed=False,
+            cleanup_error=cleanup_error,
+        )
+        return core.TemplateMigrationPlan(
+            "demo", self.target, "a" * 64, "b" * 64, (self.root,), state
+        )
+
     def test_one_event_deadline_and_exact_authorities_reach_every_phase(self) -> None:
         session = self._session()
         publication, published = object(), object()
@@ -202,6 +212,69 @@ class TemplateCopyMigrationSessionTest(unittest.TestCase):
             self.assertFalse(worker.is_alive())
         self.assertIsInstance(errors[0], core.TemplateMigrationOperationError)
         self.assertEqual(session.state, "cancelled")
+
+    def test_planning_failure_with_retained_cleanup_is_cleanup_pending(self) -> None:
+        session = self._session()
+        cleanup_error = core.TemplateMigrationOperationError("cleanup retained")
+        retained = self._retained_precommit_plan(cleanup_error)
+        planning_error = core.TemplateMigrationPlanningError("planning failed", retained)
+        with patch.object(
+            core, "snapshot_template_migration_source", return_value=self.snapshot
+        ) as snapshot, patch.object(
+            core, "plan_template_copy_migration", side_effect=planning_error
+        ) as plan, patch.object(
+            core, "resolve_template_migration_plan"
+        ) as resolve, patch.object(
+            core, "discard_template_migration_plan"
+        ) as discard, patch.object(
+            core, "prepare_template_migration_publication"
+        ) as prepare, patch.object(
+            core, "apply_template_migration_publication"
+        ) as publish:
+            with self.assertRaises(core.TemplateMigrationPlanningError):
+                session.start()
+            self.assertEqual(session.state, "cleanup-pending")
+            self.assertTrue(session.view.cleanup_pending)
+            self.assertEqual(session.view.publication_lifecycle, "precommit")
+            session.discard(deadline=123.0)
+        self.assertEqual(session.state, "discarded")
+        snapshot.assert_called_once()
+        plan.assert_called_once()
+        resolve.assert_not_called()
+        prepare.assert_not_called()
+        publish.assert_not_called()
+        discard.assert_called_once_with(retained, deadline=123.0)
+
+    def test_planning_failure_without_retained_owner_is_failed(self) -> None:
+        session = self._session()
+        with patch.object(
+            core, "snapshot_template_migration_source", return_value=self.snapshot
+        ), patch.object(
+            core, "plan_template_copy_migration", side_effect=RuntimeError("planning failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "planning failed"):
+                session.start()
+        self.assertEqual(session.state, "failed")
+        self.assertFalse(session.view.cleanup_pending)
+
+    def test_cancel_with_retained_cleanup_prioritizes_cleanup_pending(self) -> None:
+        session = self._session()
+        retained = self._retained_precommit_plan(
+            core.TemplateMigrationOperationError("cleanup retained")
+        )
+        planning_error = core.TemplateMigrationPlanningError("cancelled", retained)
+        def fail_plan(*_args, **_kwargs):
+            session.cancel()
+            raise planning_error
+        with patch.object(
+            core, "snapshot_template_migration_source", return_value=self.snapshot
+        ), patch.object(core, "plan_template_copy_migration", side_effect=fail_plan):
+            with self.assertRaises(core.TemplateMigrationPlanningError):
+                session.start()
+        self.assertTrue(session.cancel_event.is_set())
+        self.assertEqual(session.state, "cleanup-pending")
+        self.assertTrue(session.view.cleanup_pending)
+        self.assertEqual(session.view.publication_lifecycle, "precommit")
 
     def test_precommit_discard_failure_retries_without_replanning(self) -> None:
         session = self._started()
