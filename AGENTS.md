@@ -43,9 +43,9 @@
 
 ## Generated and Operational State
 
-- Do not edit `packs/*/dist/`; `packctl build <pack>` recreates `dist/client` and `dist/server`, filters `*.pw.toml` by `side`, overlays `common` plus the target side, then runs `packwiz refresh`.
+- Do not edit `packs/*/dist/`; supported public paths such as `packctl serve <pack>` and a successful `packctl update <pack> --build` invoke the internal build implementation, which recreates `dist/client` and `dist/server`, filters `*.pw.toml` by `side`, overlays `common` plus the target side, then runs `packwiz refresh`. The standalone build commands are not part of the public CLI.
 - Every pack metadata file must have `side = "client"`, `"server"`, or `"both"`; builds stop rather than guess when classification is invalid.
 - `.huroshiki/` contains ignored transaction copies and PTY logs. TUI additions are staged there and atomically applied only if the real source/template has not changed.
 - Use `huroshiki` for interactive management and explicit-ID `packctl` commands for automation. Justfile recipes are development checks only; there is no public `MODPACK` context.
 - Deployment SSH targets, stack paths, and Compose services must pass the shared validators in `packctl.py`; every SSH invocation uses `ssh -- <target> <command>`.
-- Do not run `packctl deploy`, `packctl publish`, or `packctl restart` as verification: deployment uses remote `rsync -av --delete`, and restart invokes Docker Compose over SSH using values from the merged pack configuration.
+- Do not run live `packctl publish <pack>` as verification: without `--preview`, publication transfers and activates a generation and may invoke the configured remote Docker Compose restart. Use `packctl publish <pack> --preview` only when publication planning itself must be verified without remote effects.

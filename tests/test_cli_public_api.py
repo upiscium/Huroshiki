@@ -4,6 +4,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 import re
+import shlex
 import sys
 import tempfile
 import threading
@@ -878,6 +879,61 @@ class PublicCliTest(unittest.TestCase):
                     error.getvalue().strip(),
                     f"packctl {command} has been removed. Use packctl publish <pack>.",
                 )
+
+    def test_retired_commands_are_absent_from_guidance_and_completion(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        guidance = (root / "AGENTS.md").read_text(encoding="utf-8")
+        code_fragments = re.findall(r"`([^`]+)`", guidance)
+        code_fragments.extend(
+            match.group(1)
+            for match in re.finditer(r"```[^\n]*\n(.*?)```", guidance, re.DOTALL)
+        )
+
+        documented_commands = set()
+        for fragment in code_fragments:
+            try:
+                tokens = shlex.split(fragment)
+            except ValueError as error:
+                self.fail(f"invalid shell-like guidance fragment: {fragment!r}: {error}")
+            for index, token in enumerate(tokens):
+                if token != "packctl":
+                    continue
+                skip = False
+                for argument in tokens[index + 1 :]:
+                    if skip:
+                        skip = False
+                    elif argument == "--root":
+                        skip = True
+                    elif argument.startswith("--root=") or argument.startswith("-"):
+                        continue
+                    else:
+                        documented_commands.add(argument)
+                        break
+
+        completion = (root / "shared/completions/zsh/_packctl").read_text(
+            encoding="utf-8"
+        )
+        commands_block = re.search(
+            r"^\s*commands=\(\n(.*?)^\s*\)", completion, re.DOTALL | re.MULTILINE
+        )
+        self.assertIsNotNone(commands_block)
+        assert commands_block is not None
+        completion_commands = set(
+            re.findall(r"^\s*'([^':]+):", commands_block.group(1), re.MULTILINE)
+        )
+
+        self.assertFalse(
+            packctl._RETIRED_COMMANDS & documented_commands,
+            f"retired commands documented as packctl invocations: "
+            f"{sorted(packctl._RETIRED_COMMANDS & documented_commands)}",
+        )
+        self.assertFalse(
+            packctl._RETIRED_COMMANDS & completion_commands,
+            f"retired commands offered by zsh completion: "
+            f"{sorted(packctl._RETIRED_COMMANDS & completion_commands)}",
+        )
+        self.assertIn("serve", completion_commands)
+        self.assertIn("publish", completion_commands)
 
     def _publish_plan(self):
         plan = MagicMock()
