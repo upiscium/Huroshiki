@@ -24,9 +24,8 @@ huroshiki --version
 packctl --version
 ```
 
-After the release follow-up publishes the reviewed tag, the exact release candidate can be run with
-`nix run github:upiscium/Huroshiki/v0.2.0-rc.5 -- --help`. That tag is not created by the release
-preparation PR.
+The current main source identifies as development version `0.3.0-dev`. The latest published release
+example is `v0.2.0-rc.5`, which can be run with `nix run github:upiscium/Huroshiki/v0.2.0-rc.5 -- --help`.
 
 The managed repository is selected by `--root PATH`, then `HUROSHIKI_ROOT`, then the current
 working directory. `huroshiki` accepts `--root` before or after `--pack`/`--template`; `packctl`

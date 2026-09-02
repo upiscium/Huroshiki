@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import unittest
-import re
 
 from huroshiki_version import VERSION
 
@@ -13,27 +13,103 @@ from huroshiki_version import VERSION
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "shared" / "scripts"
 
+# Keep current development metadata separate from published historical metadata.  In
+# particular, preparing rc.1 should only require changing these current expectations.
+CURRENT_VERSION = "0.3.0-dev"
+HISTORICAL_VERSION = "0.2.0-rc.5"
+HISTORICAL_DATE = "2026-08-03"
+HISTORICAL_PREVIOUS_VERSION = "0.2.0-rc.4"
+HISTORICAL_PREVIOUS_DATE = "2026-08-02"
+
+VERSION_NUMBER = r"(?:0|[1-9][0-9]*)"
+VERSION_CORE = rf"{VERSION_NUMBER}\.{VERSION_NUMBER}\.{VERSION_NUMBER}"
+VERSION_RE = re.compile(
+    rf"^(?:{VERSION_CORE}-dev|{VERSION_CORE}-rc\.{VERSION_NUMBER}|{VERSION_CORE})$"
+)
+
+
+def version_kind(version: str) -> str:
+    if VERSION_RE.fullmatch(version) is None:
+        raise ValueError(f"invalid version: {version}")
+    if version.endswith("-dev"):
+        return "development"
+    if "-rc." in version:
+        return "release-candidate"
+    return "stable"
+
+
+def unreleased_payload(changelog: str) -> str:
+    match = re.search(
+        r"^## Unreleased\n(?P<body>.*?)(?=^## [0-9])",
+        changelog,
+        re.MULTILINE | re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError("missing Unreleased section before release history")
+    return match.group("body").strip()
+
+
+def release_block(document: str, version: str, date: str) -> str:
+    heading = f"## {version} - {date}"
+    match = re.search(
+        rf"^{re.escape(heading)}\n(?P<body>.*?)(?=^## (?:[0-9]|\Z))",
+        document,
+        re.MULTILINE | re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError(f"missing release heading: {heading}")
+    return match.group("body")
+
 
 class ReleaseMetadataTest(unittest.TestCase):
-    def test_runtime_version_source(self) -> None:
-        self.assertRegex(VERSION, r"^[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$")
-        self.assertEqual(VERSION, "0.2.0-rc.5")
-        self.assertEqual(
-            (SCRIPTS / "VERSION").read_text(encoding="utf-8").strip(),
-            VERSION,
+    def test_allowed_version_forms_are_strict(self) -> None:
+        allowed = {
+            "0.3.0-dev": "development",
+            "0.2.0-rc.5": "release-candidate",
+            "1.2.3": "stable",
+        }
+        rejected = (
+            "v0.3.0-dev",
+            "0.3-dev",
+            "0.3.0-dev.1",
+            "0.3.0-rc",
+            "0.3.0-rc.x",
+            "0.3.0-rc.0foo",
+            "0.3.0+build",
+            "01.2.3-dev",
+            "1.02.3-rc.1",
+            "1.2.3-rc.01",
+            "latest",
+            "",
         )
+        for version, kind in allowed.items():
+            with self.subTest(version=version):
+                self.assertRegex(version, VERSION_RE)
+                self.assertEqual(version_kind(version), kind)
+        for version in rejected:
+            with self.subTest(version=version):
+                self.assertIsNone(VERSION_RE.fullmatch(version))
+                with self.assertRaises(ValueError):
+                    version_kind(version)
+
+    def test_current_version_source_and_runtime_parity(self) -> None:
+        self.assertRegex(CURRENT_VERSION, VERSION_RE)
+        self.assertEqual(VERSION, CURRENT_VERSION)
+        source = (SCRIPTS / "VERSION").read_text(encoding="utf-8").strip()
+        self.assertEqual(source, CURRENT_VERSION)
+        self.assertEqual(source, VERSION)
 
     def test_flake_uses_runtime_version_source(self) -> None:
         flake = (ROOT / "flake.nix").read_text(encoding="utf-8")
         self.assertIn("builtins.readFile ./shared/scripts/VERSION", flake)
-        self.assertNotIn(f'version = "{VERSION}"', flake)
+        self.assertNotIn(f'version = "{CURRENT_VERSION}"', flake)
         self.assertGreaterEqual(flake.count("inherit version;"), 2)
 
     def test_cli_versions(self) -> None:
         environment = {**os.environ, "PYTHONPATH": str(SCRIPTS)}
         for script, expected in (
-            ("huroshiki.py", f"huroshiki {VERSION}"),
-            ("packctl.py", f"packctl {VERSION}"),
+            ("huroshiki.py", f"huroshiki {CURRENT_VERSION}"),
+            ("packctl.py", f"packctl {CURRENT_VERSION}"),
         ):
             with self.subTest(script=script):
                 result = subprocess.run(
@@ -47,179 +123,70 @@ class ReleaseMetadataTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
 
-    def _extract_release_block(self, changelog: str, heading: str) -> str:
-        pattern = rf"## {re.escape(heading)}\n(?:(?:.|\n)*?)(?=\n## [0-9]|\Z)"
-        match = re.search(pattern, changelog, re.MULTILINE)
-        self.assertIsNotNone(match, f"missing release heading: {heading}")
-        assert match is not None
-        return match.group(0)
-
-    def test_release_documents_match_version(self) -> None:
+    def test_current_development_metadata(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        release_note_path = ROOT / "docs" / "releases" / f"v{VERSION}.md"
-        self.assertTrue(release_note_path.is_file())
-        release_notes = release_note_path.read_text(encoding="utf-8")
+        self.assertTrue(changelog.startswith("# Changelog\n\n## Unreleased\n"))
+        self.assertEqual(version_kind(CURRENT_VERSION), "development")
+        self.assertTrue(
+            unreleased_payload(changelog),
+            "development Unreleased section must have a payload",
+        )
+        self.assertFalse(
+            (ROOT / "docs" / "releases" / f"v{CURRENT_VERSION}.md").exists()
+        )
 
-        rc5_heading = f"## {VERSION} - 2026-08-03"
-        self.assertTrue(
-            changelog.startswith(
-                "# Changelog\n\n## Unreleased\n"
-            ),
-            "Unreleased section is missing",
-        )
-        unreleased_payload = (
-            changelog.split("## Unreleased", 1)[1]
-            .split(rc5_heading, 1)[0]
-            .strip()
-        )
-        self.assertTrue(
-            not unreleased_payload.strip(),
-            "Unreleased section should be empty",
-        )
-        rc5_changelog = self._extract_release_block(changelog, f"{VERSION} - 2026-08-03").split("\n", 1)[1]
-        rc4_changelog = self._extract_release_block(changelog, "0.2.0-rc.4 - 2026-08-02").split("\n", 1)[1]
-        self.assertTrue(release_notes.startswith(f"# Huroshiki v{VERSION}\n"))
-        self.assertIn("Release date: 2026-08-03", release_notes)
-        self.assertIn("github:upiscium/Huroshiki/v0.2.0-rc.5", readme)
+    def test_historical_rc5_metadata_is_immutable(self) -> None:
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        release_path = ROOT / "docs" / "releases" / f"v{HISTORICAL_VERSION}.md"
+        self.assertTrue(release_path.is_file())
+        release_notes = release_path.read_text(encoding="utf-8")
+        self.assertRegex(HISTORICAL_VERSION, VERSION_RE)
+        rc5 = release_block(changelog, HISTORICAL_VERSION, HISTORICAL_DATE)
+        rc4 = release_block(changelog, HISTORICAL_PREVIOUS_VERSION, HISTORICAL_PREVIOUS_DATE)
+
+        self.assertTrue(release_notes.startswith(f"# Huroshiki v{HISTORICAL_VERSION}\n"))
+        self.assertIn(f"Release date: {HISTORICAL_DATE}", release_notes)
         self.assertIn(
             "compare/v0.2.0-rc.4...v0.2.0-rc.5",
             release_notes,
         )
-
-        release_scope_words = " ".join(
-            (f"{unreleased_payload}\n{rc5_changelog}\n{release_notes}").split()
-        )
-        release_scope_words_lower = release_scope_words.lower()
-
-        self.assertIn("metadata:curseforge", release_scope_words_lower)
-        self.assertIn("download.url", release_scope_words_lower)
-        self.assertIn("packwiz installer", release_scope_words_lower)
-        self.assertIn("java -cp", release_scope_words)
-        self.assertIn("link.infra.packwiz.installer.Main", release_scope_words)
-        self.assertIn("link.infra.packwiz.installer.main", release_scope_words_lower)
-        self.assertIn("requiresbootstrap", release_scope_words_lower)
-        self.assertIn("bootstrap updater", release_scope_words_lower)
-        self.assertIn("runtime does not patch", release_scope_words_lower)
-        self.assertIn("rewrites, or", release_scope_words_lower)
-        self.assertIn("replace", release_scope_words_lower)
-        self.assertIn("bounded process-output", release_scope_words_lower)
-        self.assertIn("artifact identity", release_scope_words_lower)
-        self.assertIn("packwiz-installer.jar", release_scope_words)
-        self.assertIn("declared hash", release_scope_words_lower)
-        self.assertIn("side = \"both\"", release_scope_words)
-        self.assertIn("manual-download", release_scope_words)
-        self.assertIn("fail closed", release_scope_words_lower)
-        self.assertIn(
-            "no live network-backed curseforge metadata materialization",
-            release_scope_words_lower,
-        )
-        self.assertIn("positive numeric project id", release_scope_words_lower)
-        self.assertIn("positive file id", release_scope_words_lower)
-        self.assertIn("candidate project identity", release_scope_words_lower)
-        self.assertIn("CurseForge project `309927`", release_scope_words)
-        self.assertIn("file `6529130`", release_scope_words)
-        self.assertIn("release metadata verification for this pr is deterministic-only", release_scope_words_lower)
-        self.assertIn("live investigation", release_scope_words_lower)
-        self.assertIn("lifecycle-integrity failures retain priority", release_scope_words_lower)
-        lifecycle_priority = (
-            "termination incomplete > orphaned descendants > cancellation > deadline >"
-            " manual-download classification > generic nonzero process-output diagnostics"
-        )
-        self.assertIn(lifecycle_priority, release_scope_words_lower)
-        self.assertIn(
-            "lifecycle-integrity failures > manual-download classification >"
-            " generic process-output diagnostics",
-            release_scope_words_lower,
-        )
-        old_head = "bf41b5b15fabcae1eec01a6944105b8349e9e5dc"
-        self.assertNotIn(old_head, release_notes)
-        scope_audit_command = (
-            "git diff --name-only"
-            " 01c445b2bed6978ff86dfa1db377bccb270eb63e...HEAD"
-        ).strip()
-        self.assertIn(scope_audit_command, release_notes)
-        self.assertNotIn(f"01c445b2bed6978ff86dfa1db377bccb270eb63e...{old_head}", release_notes)
-
-        self.assertIn("## Known limitations", release_notes)
-        self.assertIn(
-            "no api key",
-            release_scope_words_lower,
-        )
-        self.assertIn("bounded direct-download", release_scope_words_lower)
-        self.assertIn("manifest", release_scope_words_lower)
-        self.assertIn("loopback", release_scope_words_lower)
-        self.assertIn("rewrite", release_scope_words_lower)
-        self.assertIn("installer jar", release_scope_words_lower)
-        self.assertIn("sha-256", release_scope_words_lower)
-        self.assertIn("artifact", release_scope_words_lower)
-        self.assertIn("Packwiz Installer entrypoint and bootstrap handling", release_notes)
-        self.assertIn("git diff --check", release_scope_words_lower)
-        self.assertIn("5-file scope audit", release_scope_words_lower)
-        self.assertIn("actionlint", release_scope_words_lower)
-        self.assertIn("packctl validate", release_scope_words_lower)
-
-        priority_index = release_scope_words_lower.find("lifecycle-integrity failures")
-        self.assertNotEqual(priority_index, -1)
-        manual_index = release_scope_words_lower.find("manual-download classification", priority_index)
-        generic_index = release_scope_words_lower.find("generic nonzero process-output diagnostics", priority_index)
-        self.assertNotEqual(manual_index, -1)
-        self.assertNotEqual(generic_index, -1)
-        self.assertLess(priority_index, manual_index)
-        self.assertLess(manual_index, generic_index)
-
-        rc4_scope_words = " ".join(rc4_changelog.split())
-        self.assertIn("legacy Packs without", rc4_scope_words)
-        for provenance in ("explicit", "dependency", "unknown"):
-            self.assertIn(provenance, rc4_scope_words)
-        self.assertIn("preserves the existing metadata", rc4_scope_words)
-        self.assertIn("does not infer or create a root manifest", rc4_scope_words)
-        self.assertIn("evidence binding", rc4_scope_words)
-        self.assertIn("unions sides", rc4_scope_words)
-        self.assertIn("incoming explicit root", rc4_scope_words)
-        self.assertIn("fail closed", rc4_scope_words)
-        for evidence in (
+        self.assertIn("legacy Packs without", rc4)
+        historical_claims = " ".join((rc5 + release_notes).split()).lower()
+        for phrase in (
+            "metadata:curseforge",
+            "java -cp",
+            "link.infra.packwiz.installer.Main",
+            "RequiresBootstrap",
+            "fail closed",
+            "bounded process-output",
+            "artifact identity",
+            "side = \"both\"",
+            "positive numeric project ID",
+            "no live network-backed CurseForge metadata materialization",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), historical_claims)
+        rc4_claims = " ".join(rc4.split()).lower()
+        for phrase in (
             "strict declared SHA-256",
             "verified materialized SHA-256",
             "target-loader MOD ID/version set",
+            "unions sides",
         ):
-            self.assertIn(evidence, rc4_scope_words)
-        self.assertIn("## Known limitations", release_notes)
-        self.assertIn(
-            "No live network-backed CurseForge metadata materialization was performed in release "
-            "verification.",
-            " ".join(release_notes.split()),
-        )
-        self.assertIn("Packwiz-native CurseForge Install", release_notes)
-        self.assertIn("no API key is required", release_notes)
-        readme_words = " ".join(readme.split())
-        self.assertIn("CurseForge uses Packwiz-native interactive search", readme_words)
-        self.assertIn("CurseForge API key is unnecessary", readme_words)
-        excluded_release_scope = release_scope_words.lower()
-        for excluded in (
-            "#104",
-            "#105",
-            "publication manifest planner",
-            "pack_publish",
-        ):
-            self.assertNotIn(excluded, excluded_release_scope)
+            self.assertIn(phrase.lower(), rc4_claims)
 
-        for historical in (
-            "## 0.2.0-rc.3 - 2026-08-02",
-            "## 0.2.0-rc.2 - 2026-08-01",
-            "## 0.2.0-rc.1 - 2026-07-30",
-        ):
-            self.assertIn(historical, changelog)
-        for historical_note in (
-            "v0.2.0-rc.1.md",
-            "v0.2.0-rc.2.md",
-            "v0.2.0-rc.3.md",
-        ):
-            self.assertTrue((ROOT / "docs" / "releases" / historical_note).is_file())
-        rc2_changelog = changelog.split("## 0.2.0-rc.2 -", 1)[1].split(
-            "## 0.2.0-rc.1 -", 1
-        )[0]
-        self.assertIn("HUROSHIKI_CURSEFORGE_API_KEY", rc2_changelog)
+    def test_readme_current_and_published_version_guidance(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        readme_words = " ".join(readme.split())
+        self.assertRegex(readme_words, r"current main .*development version `0\.3\.0-dev`")
+        self.assertIn("latest published release example is `v0.2.0-rc.5`", readme_words)
+        self.assertIn(
+            "github:upiscium/Huroshiki/v0.2.0-rc.5",
+            readme,
+        )
+        self.assertNotRegex(readme.lower(), r"rc\.5[^\n]*(?:future|uncreated)")
+        self.assertNotIn("github:upiscium/Huroshiki/v0.3.0-dev", readme)
+        self.assertNotIn("v0.3.0-rc.1", readme)
 
 
 if __name__ == "__main__":

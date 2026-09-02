@@ -2,6 +2,72 @@
 
 ## Unreleased
 
+### Migration
+
+- Added Pack Copy migration for changing a Pack's Minecraft/loader target without
+  mutating the source. The complete source is snapshotted, source and destination
+  locks are acquired in canonical order, and a resolved target with canonical root
+  provenance is exchanged into staging only after its full dependency closures and
+  collision checks succeed. Existing targets are never clobbered, operational
+  deployment/server settings are not copied, and unresolved roots remain
+  `resolution-required` until explicit canonical Remove or Replace choices are made.
+- Added Template Copy migration as a preview-first, one-shot target creation flow,
+  including explicit root selection, complete closure resolution, warning
+  acknowledgements, and atomic publication. Template and Pack origins are resolved
+  through an explicit session Authority: the fixed source snapshot, plan digest,
+  resolution attempt, and selected conflict options remain authoritative from CLI
+  planning through execution; no persistent Template association or content overlay
+  is created.
+- Both Copy flows are available as dry-run-by-default `packctl` commands and as
+  cancellable TUI sessions with deterministic previews, explicit conflict choices,
+  warning acknowledgements, atomic no-clobber publication, and retained cleanup
+  ownership. Template migration preserves its original precommit diagnostic until
+  bounded cleanup completes.
+
+### Publication
+
+- Added side-aware publication manifests with reserved namespace enforcement and
+  descriptor-bound source snapshots, then stages their exact files into immutable
+  remote generations with bounded SSH transfer and full byte, hash, mode, and path
+  verification.
+- Added Packwiz semantic verification, atomic `current` activation, and a bounded
+  restart phase. Stale targets fail before remote work, activation and restart
+  outcomes are reported separately, and an uncertain remote outcome is never
+  retried or presented as success.
+- Unified CLI and TUI Publish on one previewed, digest-bound Core plan with a shared
+  cancellation event and deadline. The TUI retains cleanup ownership and supports
+  cancellation and retry, while the former standalone build, deploy, and restart
+  commands have been retired in favor of `packctl publish`.
+
+### CLI and TUI
+
+- Added exact MOD artifact selection by Modrinth version ID or CurseForge file ID,
+  with dry-run CLI controls and an Installed MOD version browser. Users can keep an
+  exact choice automatic, pin or unpin it, return to automatic selection, browse
+  compatible Modrinth releases, and see current/new file IDs in Update previews.
+- Persisted exact version intent transactionally and enforce it across staged Add,
+  Update, Profiles, Template Import, and Copy migration. Locked choices remain hard
+  constraints, unlocked choices may advance where the operation permits, and stale,
+  drifted, incompatible, orphaned, or contradictory intent fails closed before
+  publication.
+- Normalized safe multiline Modrinth search descriptions, fixed selected checkbox
+  rendering, and made `q` the consistent idle/back or active-cancel key across TUI
+  screens while preserving literal input and cleanup-aware navigation.
+
+### Reliability and Transaction Safety
+
+- Added explicit cleanup-pending and publication-uncertain lifecycle handling.
+  Failed cleanup, incomplete process termination, stale source or staging identity,
+  and uncertain publication retain the transaction diagnostics and canonical lock
+  ownership for bounded retry instead of reporting success or deleting recovery
+  evidence. Cancellation and deadlines remain shared across snapshot, resolution,
+  refresh, publication, and cleanup, with navigation and shutdown waiting for
+  named worker completion.
+- Bounded rsync/SSH output, deadlines, cancellation, process-group termination, and
+  parent/descendant cleanup throughout publication. Packwiz and Packwiz Installer
+  failures now retain redacted bounded logs with lifecycle metadata for CLI and TUI
+  diagnostics instead of losing the resolver's actionable output.
+
 ## 0.2.0-rc.5 - 2026-08-03
 
 ### Provider Artifacts
