@@ -205,6 +205,10 @@ class TemplateCopyMigrationOwner:
     cleanup_done: threading.Event = field(default_factory=threading.Event)
     cleanup_thread: threading.Thread | None = None
     error: BaseException | None = None
+    # The operation failure is retained independently of the currently active
+    # worker and of cleanup failures.  In particular, cancellation must not
+    # erase an error which arrived while navigation was being requested.
+    original_operation_error: BaseException | None = None
     preview: core.TemplateCopyMigrationPreview | None = None
     cleanup_error: BaseException | None = None
 
@@ -2979,14 +2983,23 @@ class TemplateCopyMigrationScreen(Screen[None]):
         try:
             self.owner.thread.start()
         except BaseException as error:
-            self.owner.error = error
+            if name.startswith("cleanup") or name == "failure-cleanup":
+                self.owner.cleanup_error = error
+                self.owner.cleanup_done.set()
+            else:
+                self.owner.error = error
             self.owner.done.set()
+
+    def _record_operation_error(self, error: BaseException) -> None:
+        self.owner.error = error
+        if self.owner.original_operation_error is None:
+            self.owner.original_operation_error = error
 
     def _start(self) -> None:
         try:
             self.session.start()
         except BaseException as error:
-            self.owner.error = error
+            self._record_operation_error(error)
         finally:
             self.owner.done.set()
 
@@ -2994,7 +3007,7 @@ class TemplateCopyMigrationScreen(Screen[None]):
         try:
             self.session.resolve_choices(choices)
         except BaseException as error:
-            self.owner.error = error
+            self._record_operation_error(error)
         finally:
             self.owner.done.set()
 
@@ -3005,7 +3018,7 @@ class TemplateCopyMigrationScreen(Screen[None]):
             self.session.prepare_publication(warnings, expected_preview=self.preview)
             self.session.publish()
         except BaseException as error:
-            self.owner.error = error
+            self._record_operation_error(error)
         finally:
             self.owner.done.set()
 
@@ -3014,6 +3027,10 @@ class TemplateCopyMigrationScreen(Screen[None]):
             self.owner.cleanup_error = None
             state = self.session.state
             lifecycle = self.session.view.publication_lifecycle
+            if lifecycle == "uncertain" or state == "publication-uncertain":
+                # An uncertain publication must retain ownership; it is never
+                # converted into a discard by cancellation or navigation.
+                return
             if state == "published":
                 # A successful publish includes definitive cleanup.
                 return
@@ -3026,6 +3043,37 @@ class TemplateCopyMigrationScreen(Screen[None]):
         finally:
             self.owner.cleanup_done.set()
             self.owner.done.set()
+
+    def _finish_cleanup(self) -> bool:
+        """Report a failed operation only after cleanup has settled."""
+        if self.owner.cleanup_error is not None:
+            original = self._safe_text(self.owner.original_operation_error) if self.owner.original_operation_error is not None else "none"
+            cleanup = self._safe_text(self.owner.cleanup_error)
+            self.query_one("#template-migration-status", Static).update(
+                f"Original migration failure: {original}\n"
+                f"Cleanup pending/retry required: {cleanup}"
+            )
+            return False
+        if self.session.state == "publication-uncertain":
+            self.query_one("#template-migration-status", Static).update(
+                "Publication outcome uncertain; ownership retained. No cleanup or navigation is safe."
+            )
+            return False
+        error = self.owner.original_operation_error
+        if error is not None:
+            self.app.notify(self._safe_text(error), severity="error")
+        lifecycle = self.session.view.publication_lifecycle
+        if self.session.state == "discarded":
+            destination = self.owner.source_key
+        elif lifecycle == "committed" or self.session.state == "published":
+            destination = self.owner.target_key
+        else:
+            return False
+        self.phase = "complete"
+        self.navigation_pending = False
+        self.app.release_template_copy_migration(self.owner)
+        self.app.open_project(destination)
+        return True
 
     @staticmethod
     def _replace_allowed(item: object) -> bool:
@@ -3070,7 +3118,6 @@ class TemplateCopyMigrationScreen(Screen[None]):
         if self.navigation_pending and not self.owner.cleanup_done.is_set():
             # Cancellation is only a request: after the operation has joined,
             # cleanup owns the next transition and runs off the UI loop.
-            self.owner.error = None
             self.owner.cleanup_done.clear()
             self._start_worker("cleanup", self._cleanup)
             return
@@ -3078,6 +3125,7 @@ class TemplateCopyMigrationScreen(Screen[None]):
             if self.session.state == "resolution-required":
                 error = self._safe_text(self.owner.error)
                 self.owner.error = None
+                self.owner.original_operation_error = None
                 self.phase = "conflicts"
                 self.conflicts = list(self.session.view.unresolved_roots)
                 self.choices.clear()
@@ -3091,11 +3139,23 @@ class TemplateCopyMigrationScreen(Screen[None]):
                 return
             if self.session.state not in {"publication-uncertain", "published"} and not self.owner.cleanup_done.is_set():
                 self.navigation_pending = True
-                self.owner.error = None
                 self.owner.cleanup_done.clear()
                 self._start_worker("failure-cleanup", self._cleanup)
                 return
+            if self.owner.cleanup_done.is_set() and self.navigation_pending:
+                self._finish_cleanup()
+                return
             self.query_one("#template-migration-status", Static).update(self._safe_text(self.owner.error))
+            return
+        if (
+            self.navigation_pending
+            and self.owner.cleanup_done.is_set()
+            and (
+                self.owner.original_operation_error is not None
+                or self.owner.cleanup_error is not None
+            )
+        ):
+            self._finish_cleanup()
             return
         state = self.session.state
         if state == "resolution-required":
@@ -3117,6 +3177,9 @@ class TemplateCopyMigrationScreen(Screen[None]):
                 self.app.release_template_copy_migration(self.owner)
                 self.app.open_project(self.owner.target_key)
             elif state == "cleanup-pending":
+                if self.navigation_pending and self.owner.cleanup_done.is_set():
+                    self._finish_cleanup()
+                    return
                 lifecycle = self.session.view.publication_lifecycle
                 message = (
                     "Published; cleanup pending. Press r to retry cleanup."
@@ -3226,6 +3289,7 @@ class TemplateCopyMigrationScreen(Screen[None]):
     def retry_cleanup(self) -> None:
         if self.session.state == "cleanup-pending" and self.session.view.publication_lifecycle in {"precommit", "committed"}:
             self.owner.cleanup_done.clear()
+            self.owner.cleanup_error = None
             self._start_worker("cleanup-retry", self._cleanup)
 
     def on_key(self, event: events.Key) -> None:

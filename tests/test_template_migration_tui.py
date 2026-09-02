@@ -331,14 +331,19 @@ class FakeTemplateMigrationSession:
     block_start = False
     discard_error: BaseException | None = None
     lifecycle = "precommit"
+    start_error: BaseException | None = None
+    block_discard = False
 
     def __init__(self, source_id, target, cancel_event, deadline):
         self.source_id, self.target = source_id, target
         self.cancel_event, self.deadline = cancel_event, deadline
         self.start_entered = threading.Event()
         self.release_start = threading.Event()
+        self.discard_entered = threading.Event()
+        self.release_discard = threading.Event()
         self.start_calls = self.discard_calls = self.resolve_calls = 0
         self.discard_threads: list[threading.Thread] = []
+        self.discard_deadlines: list[float | None] = []
         self._state = "new"
         self.instances.append(self)
 
@@ -358,6 +363,8 @@ class FakeTemplateMigrationSession:
         self.start_entered.set()
         if type(self).block_start:
             self.release_start.wait(2)
+        if type(self).start_error is not None:
+            raise type(self).start_error
         if self.cancel_event.is_set():
             self._state = "cancelled"
             raise RuntimeError("cancelled")
@@ -371,7 +378,11 @@ class FakeTemplateMigrationSession:
 
     def discard(self, *, deadline=None):
         self.discard_calls += 1
+        self.discard_deadlines.append(deadline)
         self.discard_threads.append(threading.current_thread())
+        self.discard_entered.set()
+        if type(self).block_discard:
+            self.release_discard.wait(2)
         if self.discard_error is not None:
             self._state = "cleanup-pending"
             raise self.discard_error
@@ -390,12 +401,65 @@ class TemplateMigrationRealTuiTest(unittest.IsolatedAsyncioTestCase):
         FakeTemplateMigrationSession.block_start = False
         FakeTemplateMigrationSession.discard_error = None
         FakeTemplateMigrationSession.lifecycle = "precommit"
+        FakeTemplateMigrationSession.start_error = None
+        FakeTemplateMigrationSession.block_discard = False
 
     def _values(self, project_id="target"):
         return {
             "template_id": project_id, "display_name": "Target",
             "minecraft": "1.21.1", "loader": "fabric", "reference": "0.16.10",
         }
+
+    @staticmethod
+    def _notification_text(app):
+        return "\n".join(
+            str(getattr(notification, "message", notification))
+            for notification in app._notifications
+        )
+
+    async def test_precommit_start_failure_discards_before_redacted_notification_and_source_navigation(self):
+        FakeTemplateMigrationSession.start_error = RuntimeError(
+            "planning failed: https://user:pass@example.invalid/mod.jar?token=TOPSECRET"
+        )
+        FakeTemplateMigrationSession.block_discard = True
+        with patch.object(huroshiki.core, "TemplateCopyMigrationSession", FakeTemplateMigrationSession), patch.object(
+            huroshiki.HuroshikiApp, "open_project"
+        ) as open_project:
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test() as pilot:
+                app._start_template_copy_migration("template:source", self._values())
+                session = FakeTemplateMigrationSession.instances[0]
+                await pilot.pause(0.1)
+                self.assertTrue(session.discard_entered.wait(1))
+                open_project.assert_not_called()
+                self.assertIsNot(session.discard_threads[0], threading.current_thread())
+                self.assertIsNotNone(session.discard_deadlines[0])
+                self.assertEqual(set(app.template_copy_migration_owners), {"template:source", "template:target"})
+                session.release_discard.set()
+                await pilot.pause(0.2)
+                open_project.assert_called_once_with("template:source")
+                self.assertEqual(app.template_copy_migration_owners, {})
+                notifications = self._notification_text(app)
+                self.assertIn("planning failed", notifications)
+                self.assertNotIn("user:pass", notifications)
+                self.assertNotIn("TOPSECRET", notifications)
+
+    async def test_target_already_exists_failure_reports_collision_without_overwrite_and_returns_source(self):
+        FakeTemplateMigrationSession.start_error = RuntimeError(
+            "target already exists; collision: refusing overwrite"
+        )
+        with patch.object(huroshiki.core, "TemplateCopyMigrationSession", FakeTemplateMigrationSession), patch.object(
+            huroshiki.HuroshikiApp, "open_project"
+        ) as open_project:
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test() as pilot:
+                app._start_template_copy_migration("template:source", self._values())
+                await pilot.pause(0.2)
+                open_project.assert_called_once_with("template:source")
+                diagnostic = self._notification_text(app)
+                self.assertIn("collision", diagnostic)
+                self.assertIn("refusing overwrite", diagnostic)
+                self.assertEqual(app.template_copy_migration_owners, {})
 
     async def test_target_form_path_has_one_session_and_responsive_named_worker(self):
         with patch.object(huroshiki.core, "TemplateCopyMigrationSession", FakeTemplateMigrationSession), patch.object(
@@ -446,7 +510,12 @@ class TemplateMigrationRealTuiTest(unittest.IsolatedAsyncioTestCase):
                 open_project.assert_called_once_with("template:source")
 
     async def test_cleanup_failure_retains_keys_and_retry_does_not_restart_or_resolve(self):
-        FakeTemplateMigrationSession.discard_error = RuntimeError("blocked")
+        FakeTemplateMigrationSession.start_error = RuntimeError(
+            "operation failed: https://user:pass@example.invalid/mod.jar?token=TOPSECRET"
+        )
+        FakeTemplateMigrationSession.discard_error = RuntimeError(
+            "cleanup blocked: https://user:pass@example.invalid/cleanup.jar?access_token=ACCESSSECRET"
+        )
         with patch.object(huroshiki.core, "TemplateCopyMigrationSession", FakeTemplateMigrationSession), patch.object(
             huroshiki.core, "format_template_copy_migration_preview", return_value=("preview",)
         ), patch.object(huroshiki.HuroshikiApp, "open_project") as open_project:
@@ -455,17 +524,27 @@ class TemplateMigrationRealTuiTest(unittest.IsolatedAsyncioTestCase):
                 app._start_template_copy_migration("template:source", self._values())
                 await pilot.pause(0.1)
                 screen = app.screen
-                screen.leave()
-                await pilot.pause(0.2)
+                await pilot.pause(0.1)
                 session = FakeTemplateMigrationSession.instances[0]
                 self.assertEqual(set(app.template_copy_migration_owners), {"template:source", "template:target"})
                 self.assertEqual((session.start_calls, session.resolve_calls), (1, 0))
+                status = app.screen.query_one("#template-migration-status")
+                visible = str(status.render())
+                self.assertIn("Original migration failure", visible)
+                self.assertIn("Cleanup pending/retry required", visible)
+                self.assertNotIn("user:pass", visible)
+                self.assertNotIn("TOPSECRET", visible)
+                self.assertNotIn("ACCESSSECRET", visible)
                 FakeTemplateMigrationSession.discard_error = None
                 screen.retry_cleanup()
                 await pilot.pause(0.2)
                 self.assertEqual((session.start_calls, session.resolve_calls), (1, 0))
                 self.assertEqual(session.discard_calls, 2)
                 open_project.assert_called_once_with("template:source")
+                self.assertEqual(app.template_copy_migration_owners, {})
+                notifications = self._notification_text(app)
+                self.assertIn("operation failed", notifications)
+                self.assertNotIn("TOPSECRET", notifications)
 
     async def test_uncertain_publication_never_discards_or_navigates(self):
         FakeTemplateMigrationSession.lifecycle = "uncertain"
