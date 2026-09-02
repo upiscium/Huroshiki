@@ -9,10 +9,44 @@ import unittest
 from unittest.mock import patch
 
 import packctl
+import url_diagnostics
 from process_runner import BoundedProcessResult
 
 
 class PackwizDiagnosticsTest(unittest.TestCase):
+    def test_shared_url_diagnostics_redacts_credentials_and_sensitive_queries(self) -> None:
+        value = "https://user:pass@example.invalid/mod.jar?normal=value&ACCESS%5FTOKEN=secret"
+        result = url_diagnostics.redact_url(value)
+        self.assertEqual(
+            result,
+            "https://example.invalid/mod.jar?normal=value&ACCESS_TOKEN=%3Credacted%3E",
+        )
+        self.assertNotIn("user", result)
+        self.assertNotIn("secret", result)
+        legacy = url_diagnostics.redact_url(
+            "https://example.invalid/mod.jar?normal=value;"
+            "access_token=SEMICOLONSECRET"
+        )
+        self.assertNotIn("SEMICOLONSECRET", legacy)
+        self.assertIn("normal=value", legacy)
+
+    def test_shared_url_diagnostics_is_fail_closed_for_malformed_urls(self) -> None:
+        self.assertEqual(
+            url_diagnostics.redact_embedded_text(
+                "diagnostic https://[malformed.example/path"
+            ),
+            "diagnostic <redacted-url>",
+        )
+
+    def test_shared_url_diagnostics_redacts_bare_sensitive_assignments(self) -> None:
+        result = url_diagnostics.redact_diagnostic_text(
+            "token=FIRST ACCESS%5FTOKEN=SECOND notatoken=visible"
+        )
+        self.assertEqual(
+            result,
+            "token=<redacted> ACCESS%5FTOKEN=<redacted> notatoken=visible",
+        )
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

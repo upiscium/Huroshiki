@@ -16,9 +16,15 @@ import publish_transfer
 import project_locks
 import publish_target
 import url_artifacts
+import url_diagnostics
 
 
 class ModuleBoundaryTest(unittest.TestCase):
+    def test_url_diagnostics_exports_redactors(self) -> None:
+        self.assertEqual(
+            url_diagnostics.redact_url("https://user:pass@example.invalid/x?token=secret&normal=value"),
+            "https://example.invalid/x?token=%3Credacted%3E&normal=value",
+        )
     def test_packctl_reexports_lock_types_and_error(self) -> None:
         self.assertIs(packctl.ProjectLockMetadata, project_locks.ProjectLockMetadata)
         self.assertTrue(issubclass(packctl.ProjectLock, project_locks.ProjectLock))

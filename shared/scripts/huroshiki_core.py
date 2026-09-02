@@ -30,6 +30,7 @@ from uuid import uuid4
 import tomlkit
 
 import packctl
+from url_diagnostics import redact_embedded_text, redact_url
 from dependency_equivalence import (
     DependencyCandidate,
     EQUIVALENCE_POLICY_VERSION,
@@ -6246,6 +6247,7 @@ class TemplateCopyMigrationUnresolvedView:
     retryable: bool
     replacement_supported: bool
     version_intent_issue: str | None
+    version_intent_scope: str | None = None
 
 
 @dataclass(frozen=True)
@@ -6392,10 +6394,20 @@ class TemplateCopyMigrationSession:
         roots_by_index = {root.source_index: root for root in getattr(result, "ordered_roots", getattr(plan, "roots", ())) }
         for item in getattr(result, "unresolved", ()):
             root = roots_by_index.get(item.source_index)
+            related_version_issues = tuple(
+                issue
+                for issue in getattr(result, "version_intent_issues", ())
+                if item.source_index in issue.owner_source_indices
+            )
+            version_scope = (
+                "dependency"
+                if any(issue.scope == "dependency" for issue in related_version_issues)
+                else ("root" if related_version_issues else None)
+            )
             unresolved.append(TemplateCopyMigrationUnresolvedView(
                 item.source_index, item.source_selector, item.canonical_identity,
                 getattr(root, "side", "both"), item.code, item.detail, item.retry,
-                item.replacement_supported, item.version_issue,
+                item.replacement_supported, item.version_issue, version_scope,
             ))
         removed = tuple(TemplateCopyMigrationRemovedRootView(
             item.source_root.source_index,
@@ -13359,7 +13371,180 @@ def project_actions(project_key_value: str) -> tuple[str, ...]:
     kind, _ = split_project_key(project_key_value)
     if kind == "pack":
         return ("migrate", "publish")
-    return ("create MODPACK", "validate")
+    return ("create MODPACK", "validate", "Migrate / Copy version")
+
+
+def _template_formatter_view(session_or_view: object) -> TemplateCopyMigrationView:
+    """Get the immutable view without doing any migration work."""
+    view = getattr(session_or_view, "view", session_or_view)
+    if not isinstance(view, TemplateCopyMigrationView):
+        raise TypeError("expected a TemplateCopyMigrationSession or TemplateCopyMigrationView")
+    return view
+
+
+def _template_detail(value: object, limit: int = 240) -> str:
+    text = str(value).replace("\n", " ").replace("\r", " ")
+    text = _template_redact_urls(text)
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _template_redact_urls(value: str) -> str:
+    return redact_embedded_text(value)
+
+
+def _template_safe_url(value: str) -> str:
+    """Remove URL userinfo from UI text while preserving migration Authority."""
+    return redact_url(value)
+
+
+def _template_identity(provider: str, project_id: str) -> str:
+    return f"{provider}:{project_id}"
+
+
+def format_template_copy_migration_requirements(
+    session_or_view: TemplateCopyMigrationSession | TemplateCopyMigrationView,
+) -> tuple[str, ...]:
+    """Render resolution requirements using only the session's typed view facts."""
+    view = _template_formatter_view(session_or_view)
+    lines = [f"Template migration state: {view.state}"]
+    if view.state == "resolution-required":
+        lines.append("Migration resolution required; target not published.")
+    elif view.error_message:
+        lines.append(_template_detail(view.error_message))
+
+    global_exact_blocker = any(
+        item.scope == "dependency" and not item.owner_source_indices
+        for item in view.version_intent_issues
+    )
+    for item in view.unresolved_roots:
+        identity = item.canonical_identity or "identity-required"
+        related_issues = tuple(
+            issue
+            for issue in view.version_intent_issues
+            if item.source_index in issue.owner_source_indices
+        )
+        replacement_blocked = (
+            item.version_intent_issue is not None or bool(related_issues)
+        )
+        replacement = "version-intent-authority" if replacement_blocked else (
+            "replace-supported" if item.replacement_supported else "no-replacement"
+        )
+        selector = _template_redact_urls(item.source_selector)
+        lines.append(
+            f"Root [{item.source_index}] {identity} selector={selector} "
+            f"side={item.side} reason={item.reason_code} "
+            f"retryable={str(item.retryable).lower()} {replacement}"
+        )
+        lines.append(f"  detail: {_template_detail(item.message)}")
+        if item.version_intent_issue:
+            lines.append(f"  version-intent issue: {_template_detail(item.version_intent_issue)}")
+        if replacement_blocked:
+            if item.version_intent_scope == "dependency":
+                lines.append(
+                    f"  remedy: --remove {item.source_index} may explicitly remove this "
+                    "root, but the dependency exact constraint remains authoritative; "
+                    "Replace is unavailable."
+                )
+            else:
+                lines.append(
+                    f"  remedy: --remove {item.source_index} may explicitly abandon this "
+                    "root's root-scoped exact intent. Replace never transfers old exact "
+                    "intent."
+                )
+        elif item.replacement_supported:
+            lines.append(
+                f"  remedy: rerun with --remove {item.source_index} or "
+                f"--replace {item.source_index}=PROVIDER:SELECTOR."
+            )
+
+    for fact in view.version_intent_facts:
+        owners = ",".join(str(index) for index in fact.owner_source_indices) or "none"
+        lines.append(
+            f"Exact version intent: {_template_identity(fact.provider, fact.project_id)} "
+            f"artifact={fact.artifact_id} scope={fact.scope} satisfied={str(fact.satisfied).lower()} owners={owners}"
+        )
+    for issue in view.version_intent_issues:
+        owners = ",".join(str(index) for index in issue.owner_source_indices) or "none"
+        lines.append(
+            f"Version-intent issue: {_template_identity(issue.provider, issue.project_id)} "
+            f"artifact={issue.artifact_id} scope={issue.scope} owners={owners}: {_template_detail(issue.detail)}"
+        )
+        if issue.scope == "dependency" and not issue.owner_source_indices:
+            lines.append(
+                "  Template blocker: ownerless dependency exact intent has no root "
+                "Remove or Replace action."
+            )
+    for collision in sorted(view.collision_facts, key=lambda item: (item.reason_code, item.source_indices, item.canonical_identities)):
+        indices = ",".join(str(index) for index in collision.source_indices)
+        identities = ", ".join(collision.canonical_identities) or "none"
+        lines.append(f"Global {collision.reason_code}: roots={indices} identities={identities}: {_template_detail(collision.detail)}")
+    return tuple(lines)
+
+
+def format_template_copy_migration_preview(
+    preview: TemplateCopyMigrationPreview,
+) -> tuple[str, ...]:
+    """Render a deterministic, network/filesystem-free Template migration preview."""
+    if not isinstance(preview, TemplateCopyMigrationPreview):
+        raise TypeError("expected a TemplateCopyMigrationPreview")
+    view = preview.view
+    target = view.target
+    lines = [
+        f"Source Template: {view.source_id}",
+        f"Target Template: {target.target_id} ({target.display_name})",
+        f"Versions: Minecraft {view.source_minecraft_version or '-'} -> {target.minecraft_version}; "
+        f"Loader: {view.source_loader or '-'} (reference {view.source_reference_loader_version or '-'}) -> "
+        f"{target.loader} (reference {target.reference_loader_version})",
+        "Ordered roots:",
+    ]
+    for root in view.ordered_roots:
+        identity = root.target_identity or _template_identity(root.provider, root.project_id)
+        lines.append(f"  [{root.source_index}] {identity} side={root.side}")
+    for root in view.resolved_roots:
+        identity = root.target_identity or _template_identity(root.provider, root.project_id)
+        classification = root.classification or "resolved"
+        lines.append(f"{classification.title()} root [{root.source_index}]: {identity} side={root.side}")
+    for root in view.removed_roots:
+        lines.append(f"Removed root [{root.source_index}]: {root.source_identity} side={root.side} reason={root.reason_code}")
+        for provider, project_id, artifact_id in root.abandoned_root_exact_intent:
+            lines.append(
+                "  Abandoned root exact intent: "
+                f"{provider}:{project_id} artifact={artifact_id}"
+            )
+    for root in view.replaced_roots:
+        replacement_selector = _template_redact_urls(root.replacement_selector)
+        lines.append(f"Replaced root [{root.source_index}]: {_template_detail(root.old_identity)} -> {replacement_selector} -> {_template_detail(root.new_identity or 'unresolved')} side={root.side}")
+    for root in view.unresolved_roots:
+        selector = _template_redact_urls(root.source_selector)
+        lines.append(
+            f"Unresolved root [{root.source_index}]: {root.canonical_identity or 'identity-required'} "
+            f"selector={selector} side={root.side} reason={root.reason_code}: {_template_detail(root.message)}"
+        )
+    for evidence in sorted(view.url_compatibility, key=lambda item: item.url):
+        lines.append(
+            f"URL compatibility: {_template_safe_url(evidence.url)} status={evidence.status} "
+            f"loader={evidence.loader_status} minecraft={evidence.minecraft_status}: {_template_detail(evidence.detail)}"
+        )
+    for fact in view.version_intent_facts:
+        lines.append(
+            f"Version intent: {_template_identity(fact.provider, fact.project_id)} "
+            f"artifact={fact.artifact_id} scope={fact.scope} satisfied={str(fact.satisfied).lower()}"
+        )
+    for issue in view.version_intent_issues:
+        lines.append(
+            f"Version-intent issue: {_template_identity(issue.provider, issue.project_id)} "
+            f"artifact={issue.artifact_id} scope={issue.scope}: {_template_detail(issue.detail)}"
+        )
+    for collision in sorted(view.collision_facts, key=lambda item: (item.reason_code, item.source_indices, item.canonical_identities)):
+        identities = ", ".join(collision.canonical_identities) or "none"
+        paths = ", ".join(str(path) for path in collision.metadata_paths) or "none"
+        filenames = ", ".join(collision.filenames) or "none"
+        lines.append(
+            f"Collision [{collision.reason_code}] roots={','.join(str(index) for index in collision.source_indices)} "
+            f"identities={identities} paths={paths} filenames={filenames}: {_template_detail(collision.detail)}"
+        )
+    lines.extend(f"Warning: {_template_detail(warning)}" for warning in view.required_warnings)
+    return tuple(lines)
 
 
 def format_pack_publish_plan(plan: PackPublishPlan) -> tuple[str, ...]:

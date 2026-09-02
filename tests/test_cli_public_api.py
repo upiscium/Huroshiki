@@ -124,6 +124,24 @@ class PublicCliTest(unittest.TestCase):
             packctl.cmd_version,
         )
 
+    def test_template_migrate_nested_parser_and_selector_colons(self) -> None:
+        args = packctl.parser().parse_args([
+            "template", "migrate", "base", "--copy-to", "new", "--display-name", "New",
+            "--minecraft", "1.21.1", "--loader", "fabric", "--loader-version", "0.16",
+            "--remove", "2", "--replace", "3=modrinth:https://example.invalid/a:b",
+        ])
+        self.assertIs(args.func, packctl.cmd_template_migrate)
+        self.assertEqual(args.source_template, "base")
+        class Choice:
+            def __init__(self, source_index, action, **kwargs):
+                self.source_index = source_index
+                self.action = action
+                self.__dict__.update(kwargs)
+        choices = packctl._template_migration_choices(
+            args, type("Core", (), {"TemplateMigrationRootResolution": Choice})
+        )
+        self.assertEqual(choices[1].replacement_project_id, "https://example.invalid/a:b")
+
     def test_exact_version_preview_discards_and_apply_publishes(self) -> None:
         import huroshiki_core as core
 

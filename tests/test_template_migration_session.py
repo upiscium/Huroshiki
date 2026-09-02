@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from dataclasses import replace
 import threading
 import time
 import unittest
 from unittest.mock import call, patch
 
 import huroshiki_core as core
+import template_migration as migration
 
 
 class TemplateCopyMigrationSessionTest(unittest.TestCase):
@@ -136,6 +138,192 @@ class TemplateCopyMigrationSessionTest(unittest.TestCase):
             first, second = session.preview(), session.preview()
         self.assertEqual(first, second)
         self.assertEqual(first.plan_digest, "b" * 64)
+
+    def test_template_formatters_use_only_typed_view_facts(self) -> None:
+        unresolved = core.TemplateCopyMigrationUnresolvedView(
+            0, "modrinth:abc", "modrinth:abc", "both", "identity-collision",
+            "Choose a replacement\nwith bounded detail", True, True, None,
+        )
+        view = core.TemplateCopyMigrationView(
+            "resolution-required", "demo", self.target, "1.20.1", "forge", "47.2.0",
+            (), (), (unresolved,), (), (), (), (),
+            (core.TemplateVersionIntentFact("modrinth", "abc", "old", "root", False, (0,)),),
+            (core.TemplateVersionIntentIssue("modrinth", "abc", "old", "root", "version-intent-blocked", "Exact artifact unavailable", (0,)),),
+            (core.TemplateCollisionFact("identity-collision", (0,), ("modrinth:abc",), (), (), "collision detail"),),
+            (), 1, "c" * 64, "none", False, False, None,
+        )
+        preview = core.TemplateCopyMigrationPreview(view, "a" * 64, "b" * 64, 1, "c" * 64)
+        with patch.object(core, "resolve_template_migration_plan", side_effect=AssertionError), \
+             patch.object(core, "resolve_template_migration_conflicts", side_effect=AssertionError), \
+             patch("urllib.request.urlopen", side_effect=AssertionError):
+            requirements = core.format_template_copy_migration_requirements(view)
+            first = core.format_template_copy_migration_preview(preview)
+            second = core.format_template_copy_migration_preview(preview)
+        self.assertEqual(first, second)
+        self.assertIn(
+            "Root [0] modrinth:abc selector=modrinth:abc",
+            "\n".join(requirements),
+        )
+        self.assertIn("version-intent-authority", "\n".join(requirements))
+        self.assertIn("owners=0", "\n".join(requirements))
+        self.assertIn("Collision [identity-collision]", "\n".join(first))
+        self.assertIn("Versions: Minecraft 1.20.1 -> 1.21.4", "\n".join(first))
+
+    def test_partial_reresolution_preview_renders_every_current_result_class(self) -> None:
+        resolved = core.TemplateCopyMigrationRootView(
+            0, "Resolved", "modrinth", "old-resolved", "both",
+            "modrinth:new-resolved", "resolved-file", "updated",
+        )
+        unresolved = core.TemplateCopyMigrationUnresolvedView(
+            3, "remaining-selector", "modrinth:remaining", "client",
+            "remaining-conflict", "still unresolved", True, True, None,
+        )
+        removed = core.TemplateCopyMigrationRemovedRootView(
+            1, "modrinth:removed", "server", "explicit-remove", (),
+        )
+        replaced = core.TemplateCopyMigrationReplacedRootView(
+            2, "modrinth:old", "modrinth:new-selector",
+            "modrinth:canonical-new", "both",
+        )
+        issue = core.TemplateVersionIntentIssue(
+            "modrinth", "dependency", "artifact", "dependency",
+            "version-intent-blocked", "ownerless exact dependency", (),
+        )
+        collision = core.TemplateCollisionFact(
+            "metadata-collision", (0, 3),
+            ("modrinth:new-resolved", "modrinth:remaining"),
+            (), (), "current collision",
+        )
+        view = core.TemplateCopyMigrationView(
+            state="resolution-required",
+            source_id="demo",
+            target=self.target,
+            source_minecraft_version="1.20.1",
+            source_loader="forge",
+            source_reference_loader_version="47.2.0",
+            resolved_roots=(resolved,),
+            updated_roots=(resolved,),
+            unresolved_roots=(unresolved,),
+            removed_roots=(removed,),
+            replaced_roots=(replaced,),
+            ordered_roots=(resolved,),
+            url_compatibility=(),
+            version_intent_facts=(),
+            version_intent_issues=(issue,),
+            collision_facts=(collision,),
+            required_warnings=(),
+            resolution_attempt=2,
+            resolution_digest="c" * 64,
+            publication_lifecycle="precommit",
+            cleanup_pending=False,
+            publication_uncertain=False,
+            error_message=None,
+        )
+        preview = core.TemplateCopyMigrationPreview(
+            view, "a" * 64, "b" * 64, 2, "c" * 64
+        )
+        rendered = "\n".join(core.format_template_copy_migration_preview(preview))
+        self.assertIn("Updated root [0]: modrinth:new-resolved", rendered)
+        self.assertIn("Removed root [1]: modrinth:removed", rendered)
+        self.assertIn("Replaced root [2]: modrinth:old -> modrinth:new-selector -> modrinth:canonical-new", rendered)
+        self.assertIn("Unresolved root [3]: modrinth:remaining", rendered)
+        self.assertIn("Version-intent issue: modrinth:dependency", rendered)
+        self.assertIn("Collision [metadata-collision]", rendered)
+
+    def test_template_project_actions_include_copy_version_action(self) -> None:
+        self.assertEqual(
+            core.project_actions("template:demo"),
+            ("create MODPACK", "validate", "Migrate / Copy version"),
+        )
+
+    def test_template_formatter_redacts_embedded_url_userinfo(self) -> None:
+        unresolved = core.TemplateCopyMigrationUnresolvedView(
+            0,
+            "(https://user:password@example.invalid/mod.jar)",
+            None,
+            "both",
+            "url-incompatible",
+            "retry https://user:password@example.invalid/mod.jar",
+            False,
+            False,
+            None,
+        )
+        view = core.TemplateCopyMigrationView(
+            "resolution-required", "demo", self.target, None, None, None,
+            (), (), (unresolved,), (), (), (), (), (), (), (), (),
+            1, "c" * 64, "precommit", False, False, None,
+        )
+        text = "\n".join(core.format_template_copy_migration_requirements(view))
+        self.assertNotIn("user:password", text)
+        self.assertIn("https://example.invalid/mod.jar", text)
+
+    def test_template_requirements_and_preview_redact_url_queries(self) -> None:
+        unresolved = core.TemplateCopyMigrationUnresolvedView(
+            0, "https://user:password@example.invalid/mod.jar?access_token=secret&normal=value",
+            None, "both", "url-incompatible", "retry", False, False, None,
+        )
+        view = core.TemplateCopyMigrationView(
+            "resolution-required", "demo", self.target, None, None, None,
+            (), (), (unresolved,), (), (), (), (), (), (), (), (),
+            1, "c" * 64, "precommit", False, False, None,
+        )
+        view = replace(view, url_compatibility=(SimpleNamespace(
+            url="https://user:password@example.invalid/mod.jar?access_token=secret&normal=value",
+            status="unknown", loader_status="unknown", minecraft_status="unknown",
+            detail="see https://user:password@example.invalid/mod.jar?access_token=secret&normal=value",
+        ),))
+        preview = core.TemplateCopyMigrationPreview(view, "a" * 64, "b" * 64, 1, "c" * 64)
+        text = "\n".join(core.format_template_copy_migration_requirements(view))
+        rendered = "\n".join(core.format_template_copy_migration_preview(preview))
+        for output in (text, rendered):
+            self.assertNotIn("user:password", output)
+            self.assertNotIn("secret", output)
+            self.assertIn("normal=value", output)
+
+    def test_unknown_warning_acknowledgement_requires_exact_sanitized_value(self) -> None:
+        warning = "https://example.invalid/mod.jar?access_token=%3Credacted%3E: compatibility unknown"
+        plan = SimpleNamespace(
+            _state=SimpleNamespace(
+                publication_token=None,
+                staging_identity="staging",
+                tx_identity="transaction",
+                target_parent_identity="target-parent",
+            ),
+            source_snapshot_digest="source",
+            target="target",
+        )
+        result = SimpleNamespace(warnings=(warning,), resolution_attempt=1, digest="digest", staging_digest="stage")
+        with patch.object(migration, "_verify"):
+            publication = core.prepare_template_migration_publication(plan, result, warning_acknowledgements=(warning,))
+            self.assertIsNotNone(publication)
+            for acknowledgements in (("unknown",), (warning, warning)):
+                with self.assertRaisesRegex(core.TemplateMigrationOperationError, "acknowledgement"):
+                    core.prepare_template_migration_publication(plan, result, warning_acknowledgements=acknowledgements)
+
+    def test_dependency_exact_root_remedy_keeps_global_blocker_separate(self) -> None:
+        dependency = core.TemplateCopyMigrationUnresolvedView(
+            0, "modrinth:root", "modrinth:root", "both",
+            "version-intent-blocked", "dependency exact unavailable", False,
+            False, "dependency exact unavailable", "dependency",
+        )
+        ordinary = core.TemplateCopyMigrationUnresolvedView(
+            1, "modrinth:other", "modrinth:other", "client",
+            "identity-collision", "choose", True, True, None,
+        )
+        global_issue = core.TemplateVersionIntentIssue(
+            "modrinth", "dependency", "artifact", "dependency",
+            "version-intent-blocked", "ownerless", (),
+        )
+        view = core.TemplateCopyMigrationView(
+            "resolution-required", "demo", self.target, None, None, None,
+            (), (), (dependency, ordinary), (), (), (), (), (),
+            (global_issue,), (), (), 1, "c" * 64, "precommit", False, False, None,
+        )
+        text = "\n".join(core.format_template_copy_migration_requirements(view))
+        self.assertIn("--remove 0", text)
+        self.assertIn("dependency exact constraint remains authoritative", text)
+        self.assertIn("--remove 1 or --replace 1=PROVIDER:SELECTOR", text)
+        self.assertIn("ownerless dependency exact intent has no root", text)
 
     def test_view_exposes_replacement_selector_and_canonical_identities(self) -> None:
         replacement = core.TemplateMigrationReplacedRoot(

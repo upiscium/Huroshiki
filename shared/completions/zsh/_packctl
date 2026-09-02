@@ -48,6 +48,7 @@ _packctl() {
       'clear-pack-url:clear local Public Pack URL override'
       'new:create a pack'
       'new-template:create a template'
+      'template:template operations'
       'validate:validate the repository'
       'validate-for:validate one pack'
       'validate-template:validate one template'
@@ -86,6 +87,27 @@ _packctl() {
     (show-template-loader-version:1|set-template-loader-version:1)
       candidates=("${(@f)$(_packctl_candidates templates)}")
       _describe template candidates
+      ;;
+    (template:1)
+      candidates=('migrate:copy a template to a new Template')
+      _describe 'template command' candidates
+      ;;
+    (template:2)
+      candidates=("${(@f)$(_packctl_candidates templates)}")
+      _describe template candidates
+      ;;
+    (template:3|template:*)
+      _arguments \
+        '--copy-to=[new target Template ID]:target Template ID' \
+        '--display-name=[target display name]:display name' \
+        '--minecraft=[target Minecraft version]:Minecraft version' \
+        '--loader=[target loader]:loader:(fabric forge neoforge quilt)' \
+        '--loader-version=[target loader version]:loader version' \
+        '*--remove=[remove an unresolved root]:source index' \
+        '*--replace=[replace an unresolved root]:source index=provider:selector' \
+        '*--ack-warning=[acknowledge a migration warning]:warning code' \
+        '--apply[apply the reviewed migration]' \
+        '*:argument:_files'
       ;;
     (apply-template:2|apply-template:*)
       candidates=("${(@f)$(_packctl_candidates templates)}")

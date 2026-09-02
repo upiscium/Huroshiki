@@ -97,7 +97,8 @@
              test -f ${huroshiki}/lib/huroshiki/publish_activation.py
              test -f ${huroshiki}/lib/huroshiki/publish_restart.py
              test -f ${huroshiki}/lib/huroshiki/publish_orchestration.py
-             test -f ${huroshiki}/lib/huroshiki/url_artifacts.py
+            test -f ${huroshiki}/lib/huroshiki/url_artifacts.py
+            test -f ${huroshiki}/lib/huroshiki/url_diagnostics.py
             test -f ${huroshiki}/lib/huroshiki/project_locks.py
             test -f ${huroshiki}/lib/huroshiki/pack_migration.py
             test -f ${huroshiki}/lib/huroshiki/template_migration.py
@@ -115,6 +116,7 @@
             test -f ${huroshiki}/share/zsh/site-functions/_huroshiki
             grep -q "loader-version" ${huroshiki}/share/zsh/site-functions/_packctl
             grep -q "apply-template" ${huroshiki}/share/zsh/site-functions/_packctl
+            grep -q "template:template operations" ${huroshiki}/share/zsh/site-functions/_packctl
             grep -q "show-deployment" ${huroshiki}/share/zsh/site-functions/_packctl
             grep -q "set-deployment" ${huroshiki}/share/zsh/site-functions/_packctl
             grep -q "show-pack-url" ${huroshiki}/share/zsh/site-functions/_packctl

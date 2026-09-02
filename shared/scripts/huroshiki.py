@@ -65,6 +65,7 @@ except ModuleNotFoundError as error:
 import huroshiki_core as core
 from content_workers import ContentWorker
 from packwiz_parser import MenuItem, ParserEvent, visible_menu_items
+from url_diagnostics import redact_diagnostic_text
 from template_import import (
     ActualIdentityConflict,
     CandidateNameConflict,
@@ -114,6 +115,7 @@ PROJECT_ACTION_LABELS = {
     "Content": "content",
     "Apply Template": "apply template",
     "migrate": "migrate / copy version",
+    "Migrate / Copy version": "Migrate / Copy version",
 }
 
 
@@ -188,6 +190,62 @@ class PackCopyMigrationOwner:
     @property
     def keys(self) -> tuple[str, str]:
         return (self.source_key, self.target_key)
+
+
+@dataclass
+class TemplateCopyMigrationOwner:
+    """The sole UI owner of a Template copy session and its cleanup."""
+    source_key: str
+    target_key: str
+    session: core.TemplateCopyMigrationSession
+    cancel_event: threading.Event
+    deadline: float
+    done: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+    cleanup_done: threading.Event = field(default_factory=threading.Event)
+    cleanup_thread: threading.Thread | None = None
+    error: BaseException | None = None
+    preview: core.TemplateCopyMigrationPreview | None = None
+    cleanup_error: BaseException | None = None
+
+    @property
+    def keys(self) -> tuple[str, str]:
+        return (self.source_key, self.target_key)
+
+
+class TemplateCopyMigrationTargetModal(ModalScreen[dict[str, str] | None]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel"), Binding("ctrl+enter", "submit", "Continue")]
+    FIELD_IDS = ("template-migration-id", "template-migration-name", "template-migration-minecraft", "template-migration-loader", "template-migration-reference")
+
+    def compose(self) -> ComposeResult:
+        with Container(id="modal-dialog", classes="form-dialog"):
+            yield Static("Copy Template / migration target", classes="modal-title")
+            for label, field, hint in (("Target Template ID", self.FIELD_IDS[0], "new-template"), ("Display name", self.FIELD_IDS[1], "New Template"), ("Minecraft version", self.FIELD_IDS[2], "1.21.1"), ("Loader", self.FIELD_IDS[3], "fabric"), ("Reference loader version", self.FIELD_IDS[4], "0.16.10")):
+                yield Static(label)
+                yield Input(placeholder=hint, id=field)
+            yield Static("Enter advances; Ctrl+Enter submits; Esc cancels", classes="modal-help")
+
+    def on_mount(self) -> None:
+        self.query_one(f"#{self.FIELD_IDS[0]}", Input).focus()
+
+    @on(Input.Submitted)
+    def submitted(self, event: Input.Submitted) -> None:
+        fields = [self.query_one(item if item.startswith("#") else f"#{item}", Input) for item in self.FIELD_IDS]
+        index = fields.index(event.input)
+        if index + 1 < len(fields):
+            fields[index + 1].focus()
+        else:
+            self.action_submit()
+
+    def action_submit(self) -> None:
+        values = {field: self.query_one(f"#{field}", Input).value.strip() for field in self.FIELD_IDS}
+        if not all(values.values()):
+            self.app.notify("All Template migration target fields are required", severity="error")
+            return
+        self.dismiss({"template_id": values[self.FIELD_IDS[0]], "display_name": values[self.FIELD_IDS[1]], "minecraft": values[self.FIELD_IDS[2]], "loader": values[self.FIELD_IDS[3]], "reference": values[self.FIELD_IDS[4]]})
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 def _session_cancel(session: core.PackCopyMigrationSession) -> None:
@@ -406,6 +464,19 @@ class PackMigrationReplacementModal(ModalScreen[tuple[str, str] | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class TemplateMigrationReplacementSelectorModal(PackMigrationReplacementModal):
+    """Collect a complete provider selector; text is never shortened or normalized."""
+
+    def compose(self) -> ComposeResult:
+        with Container(id="modal-dialog", classes="form-dialog"):
+            yield Static(f"Replace {self.source_identity}", classes="modal-title")
+            yield Static("Provider (modrinth or curseforge)")
+            yield Input(placeholder="modrinth", id="migration-replacement-provider")
+            yield Static("Canonical project selector (full text accepted)")
+            yield Input(placeholder="project ID, slug, or URL", id="migration-replacement-project")
+            yield Static("Enter: continue   Esc: cancel", classes="modal-help")
 
 
 class PackCopyMigrationScreen(Screen[None]):
@@ -1048,6 +1119,7 @@ class HuroshikiApp(App[None]):
         ] = {}
         self.publish_owners: dict[str, PackPublishOwner] = {}
         self.pack_copy_migration_owners: dict[str, PackCopyMigrationOwner] = {}
+        self.template_copy_migration_owners: dict[str, TemplateCopyMigrationOwner] = {}
 
     def on_mount(self) -> None:
         if self.initial_project:
@@ -1118,6 +1190,48 @@ class HuroshikiApp(App[None]):
                     f"{owner.session.view.publication_lifecycle}",
                     file=sys.stderr,
                 )
+        template_migration_owners = tuple(
+            {id(owner): owner for owner in self.template_copy_migration_owners.values()}.values()
+        )
+        for owner in template_migration_owners:
+            owner.cancel_event.set()
+            owner.session.cancel()
+        for owner in template_migration_owners:
+            if owner.done.wait(max(0.0, deadline - time.monotonic())) and owner.thread is not None:
+                owner.thread.join(max(0.0, deadline - time.monotonic()))
+            if owner.thread is not None and owner.thread.is_alive():
+                print(f"Template migration worker did not join before shutdown for {owner.source_key}", file=sys.stderr)
+                continue
+            state = owner.session.state
+            lifecycle = owner.session.view.publication_lifecycle
+            if state == "published":
+                self.release_template_copy_migration(owner)
+                continue
+            if state != "publication-uncertain" and (
+                lifecycle == "precommit" or (lifecycle == "committed" and state == "cleanup-pending")
+            ):
+                cleanup_done = threading.Event()
+                def cleanup(owner: TemplateCopyMigrationOwner = owner) -> None:
+                    try:
+                        if owner.session.view.publication_lifecycle == "committed":
+                            owner.session.retry_cleanup(deadline=deadline)
+                        else:
+                            owner.session.discard(deadline=deadline)
+                    except BaseException as error: owner.cleanup_error = error
+                    finally: cleanup_done.set()
+                cleanup_thread = threading.Thread(target=cleanup, name=f"huroshiki-template-migration-shutdown-cleanup-{owner.source_key.replace(':', '-')}", daemon=False)
+                owner.cleanup_thread = cleanup_thread
+                cleanup_thread.start()
+                completed = cleanup_done.wait(max(0.0, deadline - time.monotonic()))
+                cleanup_thread.join(max(0.0, deadline - time.monotonic()))
+                if not completed or cleanup_thread.is_alive():
+                    print(
+                        f"Template migration cleanup ownership retained for {owner.source_key}",
+                        file=sys.stderr,
+                    )
+                    continue
+            if owner.cleanup_error is None and owner.session.state != "publication-uncertain":
+                self.release_template_copy_migration(owner)
         for project_key, owner in tuple(self.publish_owners.items()):
             if not owner.done.wait(max(0.0, deadline - time.monotonic())):
                 print(f"Publish worker did not stop before shutdown for {project_key}", file=sys.stderr)
@@ -1457,6 +1571,47 @@ class HuroshikiApp(App[None]):
             PackCopyMigrationTargetModal(),
             lambda values: self._start_pack_copy_migration(project_key, values),
         )
+
+    def open_template_copy_migration(self, project_key: str) -> None:
+        if not self.project_is_usable(project_key):
+            return
+        if core.split_project_key(project_key)[0] != "template":
+            self.notify("Template Copy migration is available only for Templates", severity="warning")
+            return
+        if project_key in self.template_copy_migration_owners:
+            self.notify("A migration already uses this Template", severity="warning")
+            return
+        self.selected_project = project_key
+        self.push_screen(TemplateCopyMigrationTargetModal(), lambda values: self._start_template_copy_migration(project_key, values))
+
+    def _start_template_copy_migration(self, source_key: str, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+        target_key = f"template:{values['template_id']}"
+        if (
+            source_key == target_key
+            or source_key in self.template_copy_migration_owners
+            or target_key in self.template_copy_migration_owners
+        ):
+            self.notify("A migration already uses one of these Templates", severity="warning")
+            return
+        try:
+            target = core.TemplateMigrationTarget(values["template_id"], values["display_name"], values["minecraft"], values["loader"], values["reference"])
+            cancel_event = threading.Event()
+            deadline = time.monotonic() + PUBLISH_OPERATION_TIMEOUT_SECONDS
+            session = core.TemplateCopyMigrationSession(source_key.partition(":")[2], target, cancel_event, deadline)
+        except BaseException as error:
+            self.notify(redact_diagnostic_text(str(error)), severity="error")
+            return
+        owner = TemplateCopyMigrationOwner(source_key, target_key, session, cancel_event, deadline)
+        self.template_copy_migration_owners[source_key] = owner
+        self.template_copy_migration_owners[target_key] = owner
+        self.switch_screen(TemplateCopyMigrationScreen(owner))
+
+    def release_template_copy_migration(self, owner: TemplateCopyMigrationOwner) -> None:
+        for key in owner.keys:
+            if self.template_copy_migration_owners.get(key) is owner:
+                self.template_copy_migration_owners.pop(key, None)
 
     def _start_pack_copy_migration(
         self, source_key: str, values: dict[str, str] | None
@@ -2776,6 +2931,317 @@ class PublishScreen(ProjectChildScreen, BaseScreen):
             self.owner.cancel_event.set()
 
 
+class TemplateCopyMigrationScreen(Screen[None]):
+    """Thin coordinator for Core's Template copy migration state machine."""
+    BINDINGS = [Binding("escape", "leave", "Cancel"), Binding("q", "leave", "Cancel")]
+
+    def __init__(self, owner: TemplateCopyMigrationOwner) -> None:
+        super().__init__()
+        self.owner = owner
+        self.session = owner.session
+        self.phase = "starting"
+        self.conflicts: list[object] = []
+        self.choices: dict[int, object] = {}
+        self.preview: core.TemplateCopyMigrationPreview | None = None
+        self.timer: Timer | None = None
+        self.navigation_pending = False
+
+    def compose(self) -> ComposeResult:
+        yield Static(f"Template migration / {self.owner.source_key} → {self.owner.target_key}", id="screen-title")
+        yield Static("Starting migration...", id="template-migration-status", markup=False)
+        yield DataTable(id="template-migration-options")
+        yield Static("Space: Remove   p: Replace   d: Details   Enter: Continue   q/Esc: Cancel   r: Retry cleanup", id="template-migration-help")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#template-migration-options", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("Action", "Facts")
+        table.focus()
+        self.timer = self.set_interval(0.05, self._poll)
+        self._start_worker("start", self._start)
+
+    def on_unmount(self) -> None:
+        if self.timer is not None:
+            self.timer.stop()
+            self.timer = None
+        if self.owner.thread is not None and self.owner.thread.is_alive():
+            self.owner.cancel_event.set()
+            self.session.cancel()
+
+    def _start_worker(self, name: str, target: Callable[[], None]) -> None:
+        # A completed worker may still be retained for diagnostics; only an
+        # active thread owns the operation slot.
+        if self.owner.thread is not None and self.owner.thread.is_alive():
+            return
+        self.owner.done.clear()
+        self.owner.error = None
+        self.owner.thread = threading.Thread(target=target, name=f"huroshiki-template-migration-{name}-{self.owner.source_key.replace(':', '-')}", daemon=False)
+        try:
+            self.owner.thread.start()
+        except BaseException as error:
+            self.owner.error = error
+            self.owner.done.set()
+
+    def _start(self) -> None:
+        try:
+            self.session.start()
+        except BaseException as error:
+            self.owner.error = error
+        finally:
+            self.owner.done.set()
+
+    def _resolve(self, choices: tuple[object, ...]) -> None:
+        try:
+            self.session.resolve_choices(choices)
+        except BaseException as error:
+            self.owner.error = error
+        finally:
+            self.owner.done.set()
+
+    def _publish(self) -> None:
+        try:
+            assert self.preview is not None
+            warnings = tuple(self.preview.required_warnings)
+            self.session.prepare_publication(warnings, expected_preview=self.preview)
+            self.session.publish()
+        except BaseException as error:
+            self.owner.error = error
+        finally:
+            self.owner.done.set()
+
+    def _cleanup(self) -> None:
+        try:
+            self.owner.cleanup_error = None
+            state = self.session.state
+            lifecycle = self.session.view.publication_lifecycle
+            if state == "published":
+                # A successful publish includes definitive cleanup.
+                return
+            if lifecycle == "committed" and state == "cleanup-pending":
+                self.session.retry_cleanup(deadline=time.monotonic() + PUBLISH_CLEANUP_TIMEOUT_SECONDS)
+            elif lifecycle in {"none", "precommit"} and state != "discarded":
+                self.session.discard(deadline=time.monotonic() + PUBLISH_CLEANUP_TIMEOUT_SECONDS)
+        except BaseException as error:
+            self.owner.cleanup_error = error
+        finally:
+            self.owner.cleanup_done.set()
+            self.owner.done.set()
+
+    @staticmethod
+    def _replace_allowed(item: object) -> bool:
+        """Follow the typed Core conflict Authority without interpreting diagnostics."""
+        return bool(getattr(item, "replacement_supported", False))
+
+    @staticmethod
+    def _safe_text(value: object, limit: int = 240) -> str:
+        result = " ".join(redact_diagnostic_text(str(value)).split())
+        return result[:limit] + ("..." if len(result) > limit else "")
+
+    @classmethod
+    def _safe_lines(cls, values: Iterable[object]) -> tuple[str, ...]:
+        return tuple(cls._safe_text(value) for value in values)
+
+    def _render_conflicts(self) -> None:
+        table = self.query_one("#template-migration-options", DataTable)
+        table.clear()
+        for item in self.conflicts:
+            index = int(item.source_index)
+            choice = self.choices.get(index)
+            action = "Remove" if choice is not None and choice.action == "remove" else (f"Replace → {self._safe_text(choice.replacement_provider + ':' + choice.replacement_project_id)}" if choice is not None else ("Required" if self._replace_allowed(item) else "Remove available"))
+            detail = self._safe_text(getattr(item, "message", ""))
+            selector = self._safe_text(getattr(item, "source_selector", ""))
+            version_issue = self._safe_text(getattr(item, "version_intent_issue", None))
+            identity = self._safe_text(getattr(item, "canonical_identity", None))
+            facts = f"source_index={index} | selector={selector} | identity={identity} | side={getattr(item, 'side', '')} | reason={getattr(item, 'reason_code', '')} | retryable={str(getattr(item, 'retryable', False)).lower()} | replacement_supported={str(getattr(item, 'replacement_supported', False)).lower()} | version_issue={version_issue} | detail={detail}"
+            for collision in self.session.view.collision_facts:
+                if index in getattr(collision, "source_indices", ()):
+                    collision_detail = self._safe_text(getattr(collision, "detail", ""))
+                    facts += f" | collision={getattr(collision, 'reason_code', '')}:{collision_detail}"
+            table.add_row(action, facts)
+
+    def _poll(self) -> None:
+        if self.phase == "complete":
+            return
+        thread = self.owner.thread
+        if thread is not None and (self.owner.done.is_set() or self.navigation_pending):
+            thread.join(0)
+        if thread is not None and thread.is_alive():
+            return
+        if self.navigation_pending and not self.owner.cleanup_done.is_set():
+            # Cancellation is only a request: after the operation has joined,
+            # cleanup owns the next transition and runs off the UI loop.
+            self.owner.error = None
+            self.owner.cleanup_done.clear()
+            self._start_worker("cleanup", self._cleanup)
+            return
+        if self.owner.error is not None:
+            if self.session.state == "resolution-required":
+                error = self._safe_text(self.owner.error)
+                self.owner.error = None
+                self.phase = "conflicts"
+                self.conflicts = list(self.session.view.unresolved_roots)
+                self.choices.clear()
+                self._render_conflicts()
+                requirements = core.format_template_copy_migration_requirements(
+                    self.session
+                )
+                self.query_one("#template-migration-status", Static).update(
+                    "\n".join(self._safe_lines((*requirements, f"Resolution attempt failed: {error}")))
+                )
+                return
+            if self.session.state not in {"publication-uncertain", "published"} and not self.owner.cleanup_done.is_set():
+                self.navigation_pending = True
+                self.owner.error = None
+                self.owner.cleanup_done.clear()
+                self._start_worker("failure-cleanup", self._cleanup)
+                return
+            self.query_one("#template-migration-status", Static).update(self._safe_text(self.owner.error))
+            return
+        state = self.session.state
+        if state == "resolution-required":
+            if self.phase != "conflicts":
+                self.choices.clear()
+            self.phase = "conflicts"
+            self.conflicts = list(self.session.view.unresolved_roots)
+            self._render_conflicts()
+            self.query_one("#template-migration-status", Static).update(
+                "\n".join(self._safe_lines(core.format_template_copy_migration_requirements(self.session)))
+            )
+        elif state == "resolved":
+            self.phase = "preview"
+            self.preview = self.session.preview()
+            self.query_one("#template-migration-status", Static).update("\n".join(self._safe_lines(core.format_template_copy_migration_preview(self.preview))) + "\nEnter to continue.")
+        elif state in {"published", "cleanup-pending", "publication-uncertain"}:
+            if state == "published":
+                self.phase = "complete"
+                self.app.release_template_copy_migration(self.owner)
+                self.app.open_project(self.owner.target_key)
+            elif state == "cleanup-pending":
+                lifecycle = self.session.view.publication_lifecycle
+                message = (
+                    "Published; cleanup pending. Press r to retry cleanup."
+                    if lifecycle == "committed"
+                    else "Migration cleanup pending; target not published. Press r to retry cleanup."
+                )
+                self.query_one("#template-migration-status", Static).update(message)
+            elif state == "publication-uncertain":
+                self.query_one("#template-migration-status", Static).update("Publication outcome uncertain; ownership retained.")
+        elif state == "discarded" and self.navigation_pending and self.owner.cleanup_done.is_set():
+            self.phase = "complete"
+            self.navigation_pending = False
+            self.app.release_template_copy_migration(self.owner)
+            self.app.open_project(self.owner.source_key)
+        elif self.navigation_pending and not self.owner.cleanup_done.is_set():
+            self._start_worker("cleanup", self._cleanup)
+
+    def _current_conflict(self) -> object | None:
+        table = self.query_one("#template-migration-options", DataTable)
+        index = table.cursor_row
+        return self.conflicts[index] if 0 <= index < len(self.conflicts) else None
+
+    def toggle_remove(self) -> None:
+        item = self._current_conflict()
+        if item is None:
+            return
+        index = int(item.source_index)
+        self.choices[index] = core.TemplateMigrationRootResolution(index, "remove")
+        self._render_conflicts()
+
+    def replace(self) -> None:
+        item = self._current_conflict()
+        if (
+            item is None
+            or not self._replace_allowed(item)
+        ):
+            return
+        self.app.push_screen(TemplateMigrationReplacementSelectorModal(str(getattr(item, "canonical_identity", item.source_selector))), lambda value: self._replacement(item, value))
+
+    def _replacement(self, item: object, value: tuple[str, str] | None) -> None:
+        if value is None:
+            return
+        index = int(item.source_index)
+        self.choices[index] = core.TemplateMigrationRootResolution(index, "replace", value[0], value[1])
+        self._render_conflicts()
+
+    def details(self) -> None:
+        item = self._current_conflict()
+        if item is not None:
+            index = int(item.source_index)
+            lines = [
+                f"Source index: {index}",
+                f"Selector: {self._safe_text(getattr(item, 'source_selector', ''))}",
+                f"Identity: {self._safe_text(getattr(item, 'canonical_identity', None))}",
+                f"Side: {getattr(item, 'side', '')}",
+                f"Reason: {getattr(item, 'reason_code', '')}",
+                f"Retryable: {str(getattr(item, 'retryable', False)).lower()}",
+                "Replacement supported: "
+                f"{str(getattr(item, 'replacement_supported', False)).lower()}",
+                "Remove available: true",
+                f"Replace available: {str(self._replace_allowed(item)).lower()}",
+                f"Version intent: {self._safe_text(getattr(item, 'version_intent_issue', None))}",
+                f"Detail: {self._safe_text(getattr(item, 'message', ''))}",
+            ]
+            lines.extend(
+                "Collision: "
+                f"{getattr(collision, 'reason_code', '')}: "
+                f"{self._safe_text(getattr(collision, 'detail', ''))}"
+                for collision in self.session.view.collision_facts
+                if index in getattr(collision, "source_indices", ())
+            )
+            self.app.push_screen(MessageModal("Template migration conflict", lines))
+
+    def advance(self) -> None:
+        if self.phase == "conflicts":
+            if not self.choices:
+                self.app.notify("Choose at least one ordinary conflict", severity="warning")
+                return
+            submitted = tuple(self.choices[index] for index in sorted(self.choices))
+            self.choices.clear()
+            self.phase = "resolving"
+            self._start_worker("resolve", lambda: self._resolve(submitted))
+        elif self.phase == "preview" and self.preview is not None:
+            if self.preview.required_warnings:
+                self.app.push_screen(ConfirmModal("Acknowledge Template migration warnings", tuple(self._safe_text(item) for item in self.preview.required_warnings)), self._warnings_confirmed)
+            else:
+                self._warnings_confirmed(True)
+
+    def _warnings_confirmed(self, confirmed: bool | None) -> None:
+        if not confirmed:
+            return
+        self.app.push_screen(ConfirmModal("Publish Template copy", (f"Create {self.owner.target_key} atomically.", "The source Template is unchanged.")), self._publish_confirmed)
+
+    def _publish_confirmed(self, confirmed: bool | None) -> None:
+        if confirmed:
+            self.phase = "publishing"
+            self._start_worker("publish", self._publish)
+
+    def leave(self) -> None:
+        self.navigation_pending = True
+        self.owner.cancel_event.set()
+        self.session.cancel()
+        if self.owner.thread is None or not self.owner.thread.is_alive():
+            self.owner.cleanup_done.clear()
+            self._start_worker("cleanup", self._cleanup)
+
+    def retry_cleanup(self) -> None:
+        if self.session.state == "cleanup-pending" and self.session.view.publication_lifecycle in {"precommit", "committed"}:
+            self.owner.cleanup_done.clear()
+            self._start_worker("cleanup-retry", self._cleanup)
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "j": self.query_one("#template-migration-options", DataTable).move_cursor(row=1)
+        elif event.key == "k": self.query_one("#template-migration-options", DataTable).move_cursor(row=-1)
+        elif event.key == "space" and self.phase == "conflicts": self.toggle_remove()
+        elif event.key == "p" and self.phase == "conflicts": self.replace()
+        elif event.key == "d" and self.phase == "conflicts": self.details()
+        elif event.key in {"space", "p", "d"}: return
+        elif event.key == "enter": self.advance()
+        elif event.key == "r": self.retry_cleanup()
+        elif event.key in {"q", "escape"}: self.leave()
+        else: return
+        event.stop()
+
+
 class ProjectScreen(BaseScreen):
     help_text = "i: install  l: list  j/k: move  Enter: run  q: main"
 
@@ -2801,6 +3267,10 @@ class ProjectScreen(BaseScreen):
                 "i: add MOD  l: MOD list  j/k: move  "
                 "Enter: run  q: main"
             )
+            if self.project.kind == "template":
+                self.help_text = (
+                    "i: add MOD  l: MOD list  j/k: move  Enter: run  q: main"
+                )
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -2835,8 +3305,11 @@ class ProjectScreen(BaseScreen):
         if action == "publish":
             self.app.open_publish(self.project_key, self.project.display_name)
             return
-        if action in {"migrate / copy", "migrate", "copy"}:
-            self.app.open_pack_copy_migration(self.project_key)
+        if action in {"Migrate / Copy version", "migrate / copy", "migrate", "copy"}:
+            if self.project.kind == "template":
+                self.app.open_template_copy_migration(self.project_key)
+            else:
+                self.app.open_pack_copy_migration(self.project_key)
             return
         if action == "create MODPACK":
             self.app.push_screen(
