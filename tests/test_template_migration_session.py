@@ -169,6 +169,67 @@ class TemplateCopyMigrationSessionTest(unittest.TestCase):
         self.assertIn("Collision [identity-collision]", "\n".join(first))
         self.assertIn("Versions: Minecraft 1.20.1 -> 1.21.4", "\n".join(first))
 
+    def test_partial_reresolution_preview_renders_every_current_result_class(self) -> None:
+        resolved = core.TemplateCopyMigrationRootView(
+            0, "Resolved", "modrinth", "old-resolved", "both",
+            "modrinth:new-resolved", "resolved-file", "updated",
+        )
+        unresolved = core.TemplateCopyMigrationUnresolvedView(
+            3, "remaining-selector", "modrinth:remaining", "client",
+            "remaining-conflict", "still unresolved", True, True, None,
+        )
+        removed = core.TemplateCopyMigrationRemovedRootView(
+            1, "modrinth:removed", "server", "explicit-remove", (),
+        )
+        replaced = core.TemplateCopyMigrationReplacedRootView(
+            2, "modrinth:old", "modrinth:new-selector",
+            "modrinth:canonical-new", "both",
+        )
+        issue = core.TemplateVersionIntentIssue(
+            "modrinth", "dependency", "artifact", "dependency",
+            "version-intent-blocked", "ownerless exact dependency", (),
+        )
+        collision = core.TemplateCollisionFact(
+            "metadata-collision", (0, 3),
+            ("modrinth:new-resolved", "modrinth:remaining"),
+            (), (), "current collision",
+        )
+        view = core.TemplateCopyMigrationView(
+            state="resolution-required",
+            source_id="demo",
+            target=self.target,
+            source_minecraft_version="1.20.1",
+            source_loader="forge",
+            source_reference_loader_version="47.2.0",
+            resolved_roots=(resolved,),
+            updated_roots=(resolved,),
+            unresolved_roots=(unresolved,),
+            removed_roots=(removed,),
+            replaced_roots=(replaced,),
+            ordered_roots=(resolved,),
+            url_compatibility=(),
+            version_intent_facts=(),
+            version_intent_issues=(issue,),
+            collision_facts=(collision,),
+            required_warnings=(),
+            resolution_attempt=2,
+            resolution_digest="c" * 64,
+            publication_lifecycle="precommit",
+            cleanup_pending=False,
+            publication_uncertain=False,
+            error_message=None,
+        )
+        preview = core.TemplateCopyMigrationPreview(
+            view, "a" * 64, "b" * 64, 2, "c" * 64
+        )
+        rendered = "\n".join(core.format_template_copy_migration_preview(preview))
+        self.assertIn("Updated root [0]: modrinth:new-resolved", rendered)
+        self.assertIn("Removed root [1]: modrinth:removed", rendered)
+        self.assertIn("Replaced root [2]: modrinth:old -> modrinth:new-selector -> modrinth:canonical-new", rendered)
+        self.assertIn("Unresolved root [3]: modrinth:remaining", rendered)
+        self.assertIn("Version-intent issue: modrinth:dependency", rendered)
+        self.assertIn("Collision [metadata-collision]", rendered)
+
     def test_template_project_actions_include_copy_version_action(self) -> None:
         self.assertEqual(
             core.project_actions("template:demo"),

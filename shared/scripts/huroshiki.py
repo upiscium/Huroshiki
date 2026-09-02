@@ -3027,28 +3027,10 @@ class TemplateCopyMigrationScreen(Screen[None]):
             self.owner.cleanup_done.set()
             self.owner.done.set()
 
-    @classmethod
-    def _remove_allowed(cls, item: object) -> bool:
-        """Remove is valid for roots, including exact roots, but not global issues."""
-        reason = str(getattr(item, "reason_code", ""))
-        return not (
-            reason in {"global-dependency-exact", "ownerless-dependency-exact"}
-            or ("ownerless" in reason and "dependency" in reason)
-        )
-
-    @classmethod
-    def _replace_allowed(cls, item: object) -> bool:
-        """Only ordinary, resolver-supported roots may select a replacement."""
-        reason = str(getattr(item, "reason_code", "")).lower()
-        issue = getattr(item, "version_intent_issue", None)
-        exact_or_version_block = (
-            issue is not None
-            or "exact" in reason
-            or "version" in reason
-            or "ownerless" in reason
-            or getattr(item, "version_intent_scope", None) == "dependency"
-        )
-        return bool(getattr(item, "replacement_supported", False)) and not exact_or_version_block
+    @staticmethod
+    def _replace_allowed(item: object) -> bool:
+        """Follow the typed Core conflict Authority without interpreting diagnostics."""
+        return bool(getattr(item, "replacement_supported", False))
 
     @staticmethod
     def _safe_text(value: object, limit: int = 240) -> str:
@@ -3059,13 +3041,10 @@ class TemplateCopyMigrationScreen(Screen[None]):
     def _safe_lines(cls, values: Iterable[object]) -> tuple[str, ...]:
         return tuple(cls._safe_text(value) for value in values)
 
-    def _visible_conflicts(self) -> tuple[object, ...]:
-        return tuple(item for item in self.conflicts if self._remove_allowed(item))
-
     def _render_conflicts(self) -> None:
         table = self.query_one("#template-migration-options", DataTable)
         table.clear()
-        for item in self._visible_conflicts():
+        for item in self.conflicts:
             index = int(item.source_index)
             choice = self.choices.get(index)
             action = "Remove" if choice is not None and choice.action == "remove" else (f"Replace → {self._safe_text(choice.replacement_provider + ':' + choice.replacement_project_id)}" if choice is not None else ("Required" if self._replace_allowed(item) else "Remove available"))
@@ -3100,7 +3079,8 @@ class TemplateCopyMigrationScreen(Screen[None]):
                 error = self._safe_text(self.owner.error)
                 self.owner.error = None
                 self.phase = "conflicts"
-                self.conflicts = [item for item in self.session.view.unresolved_roots if self._remove_allowed(item)]
+                self.conflicts = list(self.session.view.unresolved_roots)
+                self.choices.clear()
                 self._render_conflicts()
                 requirements = core.format_template_copy_migration_requirements(
                     self.session
@@ -3119,8 +3099,10 @@ class TemplateCopyMigrationScreen(Screen[None]):
             return
         state = self.session.state
         if state == "resolution-required":
+            if self.phase != "conflicts":
+                self.choices.clear()
             self.phase = "conflicts"
-            self.conflicts = [item for item in self.session.view.unresolved_roots if self._remove_allowed(item)]
+            self.conflicts = list(self.session.view.unresolved_roots)
             self._render_conflicts()
             self.query_one("#template-migration-status", Static).update(
                 "\n".join(self._safe_lines(core.format_template_copy_migration_requirements(self.session)))
@@ -3155,12 +3137,11 @@ class TemplateCopyMigrationScreen(Screen[None]):
     def _current_conflict(self) -> object | None:
         table = self.query_one("#template-migration-options", DataTable)
         index = table.cursor_row
-        visible = self._visible_conflicts()
-        return visible[index] if 0 <= index < len(visible) else None
+        return self.conflicts[index] if 0 <= index < len(self.conflicts) else None
 
     def toggle_remove(self) -> None:
         item = self._current_conflict()
-        if item is None or not self._remove_allowed(item):
+        if item is None:
             return
         index = int(item.source_index)
         self.choices[index] = core.TemplateMigrationRootResolution(index, "remove")
@@ -3195,7 +3176,7 @@ class TemplateCopyMigrationScreen(Screen[None]):
                 f"Retryable: {str(getattr(item, 'retryable', False)).lower()}",
                 "Replacement supported: "
                 f"{str(getattr(item, 'replacement_supported', False)).lower()}",
-                f"Remove available: {str(self._remove_allowed(item)).lower()}",
+                "Remove available: true",
                 f"Replace available: {str(self._replace_allowed(item)).lower()}",
                 f"Version intent: {self._safe_text(getattr(item, 'version_intent_issue', None))}",
                 f"Detail: {self._safe_text(getattr(item, 'message', ''))}",
@@ -3250,9 +3231,10 @@ class TemplateCopyMigrationScreen(Screen[None]):
     def on_key(self, event: events.Key) -> None:
         if event.key == "j": self.query_one("#template-migration-options", DataTable).move_cursor(row=1)
         elif event.key == "k": self.query_one("#template-migration-options", DataTable).move_cursor(row=-1)
-        elif event.key == "space": self.toggle_remove()
-        elif event.key == "p": self.replace()
-        elif event.key == "d": self.details()
+        elif event.key == "space" and self.phase == "conflicts": self.toggle_remove()
+        elif event.key == "p" and self.phase == "conflicts": self.replace()
+        elif event.key == "d" and self.phase == "conflicts": self.details()
+        elif event.key in {"space", "p", "d"}: return
         elif event.key == "enter": self.advance()
         elif event.key == "r": self.retry_cleanup()
         elif event.key in {"q", "escape"}: self.leave()

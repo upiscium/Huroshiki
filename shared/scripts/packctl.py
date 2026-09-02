@@ -6061,6 +6061,8 @@ def cmd_template_migrate(args: argparse.Namespace) -> int:
                 session.resolve_choices(choices)
             if getattr(session, "state", None) == "resolution-required":
                 _template_migration_requirements(session, core)
+                preview = session.preview()
+                _template_migration_preview(preview, core)
                 try:
                     session.discard()
                 except BaseException as cleanup_error:

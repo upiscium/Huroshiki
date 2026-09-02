@@ -42,12 +42,14 @@ class TemplateMigrationTuiTest(unittest.TestCase):
         session.resolve_choices.assert_not_called()
         self.assertTrue(owner.done.is_set())
 
-    def test_unsupported_or_version_blocked_roots_allow_remove_not_replace(self) -> None:
-        screen = huroshiki.TemplateCopyMigrationScreen.__new__(huroshiki.TemplateCopyMigrationScreen)
-        for supported, issue in ((False, None), (True, "exact intent")):
-            item = Mock(reason_code="ordinary", version_intent_issue=issue, replacement_supported=supported)
-            self.assertTrue(screen._remove_allowed(item))
-            self.assertFalse(screen._replace_allowed(item))
+    def test_replace_follows_typed_core_authority_not_reason_spelling(self) -> None:
+        for reason in ("ordinary", "version-looking-but-replaceable", "ownerless-exact-looking"):
+            self.assertFalse(huroshiki.TemplateCopyMigrationScreen._replace_allowed(
+                Mock(reason_code=reason, replacement_supported=False)
+            ))
+            self.assertTrue(huroshiki.TemplateCopyMigrationScreen._replace_allowed(
+                Mock(reason_code=reason, replacement_supported=True)
+            ))
 
     def test_menu_action_opens_template_copy_migration(self) -> None:
         screen = huroshiki.ProjectScreen.__new__(huroshiki.ProjectScreen)
@@ -91,13 +93,28 @@ class TemplateMigrationTuiTest(unittest.TestCase):
         self.assertEqual(screen.choices[2].replacement_provider, "modrinth")
         self.assertEqual(screen._render_conflicts.call_count, 2)
 
-    def test_unavailable_or_version_issue_allows_remove_but_not_replace(self) -> None:
+    def test_conflict_actions_are_ignored_while_resolution_worker_runs(self) -> None:
+        screen = huroshiki.TemplateCopyMigrationScreen.__new__(huroshiki.TemplateCopyMigrationScreen)
+        screen.phase = "resolving"
+        screen.toggle_remove = Mock()
+        screen.replace = Mock()
+        screen.details = Mock()
+        for key in ("space", "p", "d"):
+            event = Mock(key=key)
+            screen.on_key(event)
+            event.stop.assert_not_called()
+        screen.toggle_remove.assert_not_called()
+        screen.replace.assert_not_called()
+        screen.details.assert_not_called()
+
+    def test_replace_action_is_hidden_only_when_core_marks_it_unsupported(self) -> None:
         screen = huroshiki.TemplateCopyMigrationScreen.__new__(huroshiki.TemplateCopyMigrationScreen)
         screen._current_conflict = Mock()
         app = Mock()
-        for supported, issue in ((False, None), (True, "exact-version")):
+        for supported in (False, True):
             item = Mock(source_index=1, canonical_identity="modrinth:x", source_selector="x",
-                        reason_code="ordinary", replacement_supported=supported, version_intent_issue=issue)
+                        reason_code="version-looking", replacement_supported=supported,
+                        version_intent_issue="diagnostic text")
             screen._current_conflict.return_value = item
             screen.choices = {}
             screen._render_conflicts = Mock()
@@ -105,27 +122,27 @@ class TemplateMigrationTuiTest(unittest.TestCase):
             self.assertEqual(screen.choices[1].action, "remove")
             with patch.object(huroshiki.TemplateCopyMigrationScreen, "app", app):
                 screen.replace()
-        app.push_screen.assert_not_called()
+        app.push_screen.assert_called_once()
 
-    def test_dependency_scoped_exact_issue_allows_remove_but_not_replace(self) -> None:
-        item = Mock(
-            source_index=1,
-            canonical_identity="modrinth:x",
-            source_selector="x",
-            reason_code="dependency-exact-blocked",
-            version_intent_scope="dependency",
-            version_intent_issue="exact dependency intent",
-            replacement_supported=True,
+    def test_ownerless_dependency_issue_is_global_and_has_no_action_row(self) -> None:
+        target = core.TemplateMigrationTarget(
+            "target", "Target", "1.21.1", "fabric", "0.16"
         )
-        self.assertTrue(huroshiki.TemplateCopyMigrationScreen._remove_allowed(item))
-        self.assertFalse(huroshiki.TemplateCopyMigrationScreen._replace_allowed(item))
-
-    def test_ownerless_dependency_issue_is_not_a_conflict_row(self) -> None:
+        issue = core.TemplateVersionIntentIssue(
+            "modrinth", "dependency", "artifact", "dependency",
+            "version-intent-blocked", "ownerless dependency", (),
+        )
+        view = core.TemplateCopyMigrationView(
+            "resolution-required", "source", target, None, None, None,
+            (), (), (), (), (), (), (), (), (issue,), (), (),
+            1, "c" * 64, "precommit", False, False, None,
+        )
         screen = huroshiki.TemplateCopyMigrationScreen.__new__(huroshiki.TemplateCopyMigrationScreen)
-        screen.owner = Mock()
-        screen.session = Mock(view=Mock(unresolved_roots=(Mock(reason_code="ownerless-dependency-exact"),), collision_facts=()))
-        screen.conflicts = [item for item in screen.session.view.unresolved_roots if screen._remove_allowed(item)]
+        screen.session = Mock(view=view)
+        screen.conflicts = list(screen.session.view.unresolved_roots)
         self.assertEqual(screen.conflicts, [])
+        requirements = "\n".join(core.format_template_copy_migration_requirements(view))
+        self.assertIn("Template blocker: ownerless dependency exact intent", requirements)
 
     def test_query_secrets_are_redacted_in_conflict_details_and_warning_modal(self) -> None:
         secret_url = "https://user:pass@example.invalid/mod.jar?token=TOPSECRET&access_token=ACCESSSECRET&normal=value"
@@ -223,6 +240,7 @@ class TemplateMigrationTuiTest(unittest.TestCase):
         )
         screen.phase = "resolving"
         screen.navigation_pending = False
+        screen.choices = {99: Mock()}
         screen._render_conflicts = Mock()
         status = Mock()
         screen.query_one = Mock(return_value=status)
@@ -234,8 +252,31 @@ class TemplateMigrationTuiTest(unittest.TestCase):
             screen._poll()
         self.assertEqual(screen.phase, "conflicts")
         self.assertIsNone(screen.owner.error)
+        self.assertEqual(screen.choices, {})
         self.assertIn("temporarily unavailable", status.update.call_args.args[0])
         screen.session.discard.assert_not_called()
+
+    def test_poll_preserves_choices_for_unchanged_conflict_view(self) -> None:
+        conflict = Mock(source_index=1)
+        choice = core.TemplateMigrationRootResolution(1, "remove")
+        screen = huroshiki.TemplateCopyMigrationScreen.__new__(huroshiki.TemplateCopyMigrationScreen)
+        screen.owner = Mock(error=None, thread=None, done=threading.Event())
+        screen.session = Mock(
+            state="resolution-required",
+            view=Mock(unresolved_roots=(conflict,), collision_facts=()),
+        )
+        screen.phase = "conflicts"
+        screen.navigation_pending = False
+        screen.choices = {1: choice}
+        screen._render_conflicts = Mock()
+        screen.query_one = Mock(return_value=Mock())
+        with patch.object(
+            core,
+            "format_template_copy_migration_requirements",
+            return_value=("requirements",),
+        ):
+            screen._poll()
+        self.assertEqual(screen.choices, {1: choice})
 
     def test_target_opens_only_after_definitive_publish(self) -> None:
         screen = huroshiki.TemplateCopyMigrationScreen.__new__(huroshiki.TemplateCopyMigrationScreen)

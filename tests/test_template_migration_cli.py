@@ -6,7 +6,7 @@ import sys
 import threading
 import types
 import unittest
-from unittest.mock import ANY, Mock, patch
+from unittest.mock import ANY, Mock, call, patch
 from pathlib import Path
 from contextlib import redirect_stderr
 
@@ -211,24 +211,60 @@ class TemplateMigrationCliTest(unittest.TestCase):
         self.assertEqual([c.action for c in calls[1][1]], ["remove", "replace"])
         self.assertEqual(calls[1][1][1].replacement_project_id, "https://example.test/project:part")
 
-    def test_unresolved_is_partial_and_never_publishes(self) -> None:
+    def test_initial_unresolved_prints_requirements_and_exact_shared_preview(self) -> None:
+        session = Mock(
+            state="resolution-required",
+            view=types.SimpleNamespace(publication_lifecycle="precommit"),
+        )
+        preview = object()
+        session.preview.return_value = preview
+        requirements = Mock(return_value=("required",))
+        preview_formatter = Mock(return_value=("current preview",))
+        fake = types.SimpleNamespace(
+            TemplateMigrationTarget=lambda **kw: object(),
+            TemplateCopyMigrationSession=lambda *a: session,
+            TemplateMigrationRootResolution=core.TemplateMigrationRootResolution,
+            format_template_copy_migration_preview=preview_formatter,
+            format_template_copy_migration_requirements=requirements,
+        )
+        with patch.dict(sys.modules, {"huroshiki_core": fake}), redirect_stdout(StringIO()) as output:
+            result = packctl.cmd_template_migrate(self._args())
+        self.assertEqual(result, 2)
+        requirements.assert_called_once_with(session)
+        session.preview.assert_called_once_with()
+        preview_formatter.assert_called_once_with(preview)
+        session.prepare_publication.assert_not_called()
+        session.publish.assert_not_called()
+        session.discard.assert_called_once_with()
+        self.assertLess(session.method_calls.index(call.preview()), session.method_calls.index(call.discard()))
+        self.assertIn("required\ncurrent preview", output.getvalue())
+
+    def test_partial_choices_still_unresolved_print_current_preview_and_never_publish(self) -> None:
         session = Mock(state="resolution-required", view=types.SimpleNamespace(publication_lifecycle="precommit"))
         session.start.return_value = None
         session.resolve_choices.return_value = None
-        session.preview.return_value = object()
+        preview = object()
+        session.preview.return_value = preview
+        requirements = Mock(return_value=("required",))
+        preview_formatter = Mock(return_value=("partial preview",))
         fake = types.SimpleNamespace(
             TemplateMigrationTarget=lambda **kw: object(), TemplateCopyMigrationSession=lambda *a: session,
             TemplateMigrationRootResolution=core.TemplateMigrationRootResolution,
-            format_template_copy_migration_preview=lambda p: (),
-            format_template_copy_migration_requirements=lambda s: ("required",),
+            format_template_copy_migration_preview=preview_formatter,
+            format_template_copy_migration_requirements=requirements,
         )
         with patch.dict(sys.modules, {"huroshiki_core": fake}), redirect_stdout(StringIO()) as output:
             result = packctl.cmd_template_migrate(self._args(template_migration_removals=["1"]))
         self.assertEqual(result, 2)
         session.resolve_choices.assert_called_once()
-        session.preview.assert_not_called()
-        session.discard.assert_called_once()
-        self.assertIn("required", output.getvalue())
+        requirements.assert_called_once_with(session)
+        session.preview.assert_called_once_with()
+        preview_formatter.assert_called_once_with(preview)
+        session.prepare_publication.assert_not_called()
+        session.publish.assert_not_called()
+        session.discard.assert_called_once_with()
+        self.assertLess(session.method_calls.index(call.preview()), session.method_calls.index(call.discard()))
+        self.assertIn("required\npartial preview", output.getvalue())
 
     def test_duplicate_choices_and_unknown_ack_are_cleaned_by_session(self) -> None:
         with self.assertRaisesRegex(packctl.ConfigError, "Duplicate Template migration removal"):
