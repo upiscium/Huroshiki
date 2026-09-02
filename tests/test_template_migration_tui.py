@@ -202,6 +202,20 @@ class TemplateMigrationTuiTest(unittest.TestCase):
         self.assertIsNotNone(owner.deadline)
         owner.thread.join(1)
 
+    def test_operation_worker_start_failure_retains_error_without_unstarted_thread(self) -> None:
+        owner = huroshiki.TemplateCopyMigrationOwner(
+            "template:base", "template:new", Mock(), threading.Event(), 10.0
+        )
+        screen = huroshiki.TemplateCopyMigrationScreen.__new__(huroshiki.TemplateCopyMigrationScreen)
+        screen.owner = owner
+        failure = RuntimeError("operation worker could not start")
+        with patch.object(threading.Thread, "start", side_effect=failure):
+            screen._start_worker("start", Mock())
+        self.assertIsNone(owner.thread)
+        self.assertIs(owner.error, failure)
+        self.assertIs(owner.original_operation_error, failure)
+        self.assertTrue(owner.done.is_set())
+
     def test_resolved_preview_uses_shared_formatter_and_warning_publish_preview(self) -> None:
         screen = huroshiki.TemplateCopyMigrationScreen.__new__(huroshiki.TemplateCopyMigrationScreen)
         screen.owner = Mock(source_key="template:base", target_key="template:new", error=None)
@@ -545,6 +559,84 @@ class TemplateMigrationRealTuiTest(unittest.IsolatedAsyncioTestCase):
                 notifications = self._notification_text(app)
                 self.assertIn("operation failed", notifications)
                 self.assertNotIn("TOPSECRET", notifications)
+
+    async def test_cleanup_worker_start_failure_is_poll_safe_and_retryable(self):
+        FakeTemplateMigrationSession.start_error = RuntimeError(
+            "operation failed: https://user:pass@example.invalid/mod.jar?token=TOPSECRET"
+        )
+        real_thread_start = threading.Thread.start
+        failed_cleanup_start = False
+
+        def start_thread(thread):
+            nonlocal failed_cleanup_start
+            if "-failure-cleanup-" in thread.name and not failed_cleanup_start:
+                failed_cleanup_start = True
+                raise RuntimeError("cleanup worker could not start")
+            return real_thread_start(thread)
+
+        with patch.object(huroshiki.core, "TemplateCopyMigrationSession", FakeTemplateMigrationSession), patch.object(
+            huroshiki.HuroshikiApp, "open_project"
+        ) as open_project, patch.object(threading.Thread, "start", start_thread):
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test() as pilot:
+                app._start_template_copy_migration("template:source", self._values())
+                await pilot.pause(0.2)
+                screen = app.screen
+                owner = screen.owner
+                session = FakeTemplateMigrationSession.instances[0]
+                self.assertTrue(failed_cleanup_start)
+                self.assertIsNone(owner.thread)
+                self.assertIs(owner.original_operation_error, FakeTemplateMigrationSession.start_error)
+                self.assertIsInstance(owner.cleanup_error, RuntimeError)
+                self.assertIn("could not start", str(owner.cleanup_error))
+                visible = str(screen.query_one("#template-migration-status").render())
+                self.assertIn("Original migration failure", visible)
+                self.assertIn("Cleanup pending/retry required", visible)
+                self.assertEqual(set(app.template_copy_migration_owners), {"template:source", "template:target"})
+                open_project.assert_not_called()
+                self.assertEqual((session.start_calls, session.resolve_calls, session.discard_calls), (1, 0, 0))
+
+                screen.retry_cleanup()
+                await pilot.pause(0.2)
+                self.assertEqual((session.start_calls, session.resolve_calls, session.discard_calls), (1, 0, 1))
+                self.assertEqual(app.template_copy_migration_owners, {})
+                open_project.assert_called_once_with("template:source")
+                diagnostic = self._notification_text(app)
+                self.assertIn("operation failed", diagnostic)
+                self.assertNotIn("user:pass", diagnostic)
+                self.assertNotIn("TOPSECRET", diagnostic)
+
+    async def test_initial_worker_start_failure_is_retained_redacted_and_cleaned(self):
+        secret_error = "worker could not start: https://user:pass@example.invalid/mod.jar?token=TOPSECRET " + "x" * 400
+        real_thread_start = threading.Thread.start
+        failed_operation_start = False
+
+        def start_thread(thread):
+            nonlocal failed_operation_start
+            if "-start-template-source" in thread.name and not failed_operation_start:
+                failed_operation_start = True
+                raise RuntimeError(secret_error)
+            return real_thread_start(thread)
+
+        with patch.object(huroshiki.core, "TemplateCopyMigrationSession", FakeTemplateMigrationSession), patch.object(
+            huroshiki.HuroshikiApp, "open_project"
+        ) as open_project, patch.object(threading.Thread, "start", start_thread):
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test() as pilot:
+                app._start_template_copy_migration("template:source", self._values())
+                owner = app.screen.owner
+                await pilot.pause(0.2)
+                self.assertTrue(failed_operation_start)
+                self.assertIsInstance(owner.original_operation_error, RuntimeError)
+                session = FakeTemplateMigrationSession.instances[0]
+                self.assertEqual(session.start_calls, 0)
+                self.assertEqual(session.discard_calls, 1)
+                open_project.assert_called_once_with("template:source")
+                diagnostic = self._notification_text(app)
+                self.assertIn("worker could not start", diagnostic)
+                self.assertNotIn("user:pass", diagnostic)
+                self.assertNotIn("TOPSECRET", diagnostic)
+                self.assertLessEqual(len(diagnostic), 243)
 
     async def test_uncertain_publication_never_discards_or_navigates(self):
         FakeTemplateMigrationSession.lifecycle = "uncertain"

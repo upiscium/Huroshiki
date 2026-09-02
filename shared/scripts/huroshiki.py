@@ -2979,16 +2979,19 @@ class TemplateCopyMigrationScreen(Screen[None]):
             return
         self.owner.done.clear()
         self.owner.error = None
-        self.owner.thread = threading.Thread(target=target, name=f"huroshiki-template-migration-{name}-{self.owner.source_key.replace(':', '-')}", daemon=False)
+        self.owner.thread = None
+        thread = threading.Thread(target=target, name=f"huroshiki-template-migration-{name}-{self.owner.source_key.replace(':', '-')}", daemon=False)
         try:
-            self.owner.thread.start()
+            thread.start()
         except BaseException as error:
             if name.startswith("cleanup") or name == "failure-cleanup":
                 self.owner.cleanup_error = error
                 self.owner.cleanup_done.set()
             else:
-                self.owner.error = error
+                self._record_operation_error(error)
             self.owner.done.set()
+        else:
+            self.owner.thread = thread
 
     def _record_operation_error(self, error: BaseException) -> None:
         self.owner.error = error
@@ -3287,7 +3290,13 @@ class TemplateCopyMigrationScreen(Screen[None]):
             self._start_worker("cleanup", self._cleanup)
 
     def retry_cleanup(self) -> None:
-        if self.session.state == "cleanup-pending" and self.session.view.publication_lifecycle in {"precommit", "committed"}:
+        if (
+            self.session.state == "cleanup-pending"
+            or (
+                self.owner.cleanup_error is not None
+                and getattr(self, "navigation_pending", False)
+            )
+        ) and self.session.view.publication_lifecycle in {"none", "precommit", "committed"}:
             self.owner.cleanup_done.clear()
             self.owner.cleanup_error = None
             self._start_worker("cleanup-retry", self._cleanup)
