@@ -11,12 +11,12 @@ from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Literal
-from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import yaml
 
 import packctl
+from url_diagnostics import redact_url
 
 __all__ = [
     "TemplateMigrationError", "TemplateMigrationOperationError", "TemplateMigrationPlanningError", "TemplateMigrationUnresolved",
@@ -683,19 +683,8 @@ def resolve_template_migration_plan_at(plan: TemplateMigrationPlan, *, cancel_ev
             if not satisfied: version_issues.append(TemplateVersionIntentIssue(constraint.provider, constraint.project_id, constraint.artifact_id, constraint.scope, "version-intent-blocked", "Exact root artifact is unavailable", tuple(root.source_index for root in effective_roots if (root.provider, root.project_id) == (constraint.provider, constraint.project_id))))
 
     staging_digest = None
-    def safe_warning_url(value: str) -> str:
-        parsed = urlsplit(value)
-        if parsed.username is None and parsed.password is None:
-            return value
-        host = parsed.hostname or ""
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        if parsed.port is not None:
-            host = f"{host}:{parsed.port}"
-        return urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
-
     warnings = tuple(dict.fromkeys(
-        f"{safe_warning_url(fact.url)}: compatibility unknown"
+        f"{redact_url(fact.url)}: compatibility unknown"
         for fact in url_facts if fact.status == "unknown"
     ))
     if not unresolved and not version_issues and len(provisional) == len(effective_roots):

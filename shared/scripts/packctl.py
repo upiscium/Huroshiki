@@ -26,7 +26,7 @@ import time
 import tomllib
 from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 import unicodedata
-from urllib.parse import parse_qsl, urlencode, unquote, urlparse
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 import tomlkit
@@ -64,6 +64,7 @@ from project_locks import (
     process_start_identity,
 )
 from url_artifacts import DEFAULT_URL_MAX_JAR_SIZE_BYTES
+from url_diagnostics import redact_diagnostic_text, redact_url
 
 ROOT = resolve_root(import_root_argument(sys.argv[1:]))
 PACKS = ROOT / "packs"
@@ -85,10 +86,6 @@ PACKWIZ_OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 _LOG_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _LOG_SECRET_OPTION_RE = re.compile(
     r"^--(?:api[-_]?key|authorization|cookie|credential|header|password|secret|token)$",
-    re.IGNORECASE,
-)
-_LOG_SECRET_QUERY_RE = re.compile(
-    r"^(?:api[-_]?key|access[-_]?token|authorization|cookie|credential|password|secret|token)$",
     re.IGNORECASE,
 )
 VALID_SIDES = {"client", "server", "both"}
@@ -2239,21 +2236,10 @@ def _redacted_packwiz_command(command: Sequence[str]) -> tuple[str, ...]:
         except ValueError:
             has_credentials = False
             hostname = None
-        query = urlencode(
-            [
-                (key, "<redacted>" if _LOG_SECRET_QUERY_RE.fullmatch(key) else value)
-                for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-            ],
-            doseq=True,
-        )
         if has_credentials:
-            redacted.append(
-                parsed._replace(
-                    netloc=f"<redacted>@{hostname or ''}", query=query
-                ).geturl()
-            )
+            redacted.append(redact_url(part))
             continue
-        redacted.append(parsed._replace(query=query).geturl())
+        redacted.append(redact_url(part) if parsed.scheme.casefold() in {"http", "https"} and parsed.netloc else part)
     return tuple(redacted)
 
 
@@ -2285,30 +2271,7 @@ def _redacted_packwiz_output(command: Sequence[str], output: str) -> str:
     redacted = output
     for secret in sorted(secrets, key=len, reverse=True):
         redacted = redacted.replace(secret, "<redacted>")
-    redacted = re.sub(
-        r"(?i)\b(https?://)[^\s/@:]+(?::[^\s/@]*)?@",
-        r"\1<redacted>@",
-        redacted,
-    )
-    def redact_url(match: re.Match[str]) -> str:
-        raw_url = match.group(0)
-        parsed = urlparse(raw_url)
-        query = urlencode(
-            [
-                (key, "<redacted>" if _LOG_SECRET_QUERY_RE.fullmatch(key) else value)
-                for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-            ],
-            doseq=True,
-        )
-        return parsed._replace(query=query).geturl()
-
-    redacted = re.sub(r"(?i)https?://[^\s]+", redact_url, redacted)
-    redacted = re.sub(
-        r"(?i)([?&](?:api[-_]?key|access[-_]?token|authorization|cookie|credential|password|secret|token)=)[^\s&#]*",
-        r"\1<redacted>",
-        redacted,
-    )
-    return redacted
+    return redact_diagnostic_text(redacted)
 
 
 def _packwiz_process_log_text(

@@ -502,6 +502,80 @@ class TemplateMigrationConflictIntegrationTest(unittest.TestCase):
         self.assertEqual(outcome.resolution.ordered_roots[0].source_index, 1)
         migration.discard_template_migration_plan(plan, deadline=time.monotonic() + 30)
 
+    def _remove_root_with_dependency_exact(self, *, dependency_retained: bool):
+        self._write_template(self.source, mods=[
+            {"name": "A", "provider": "modrinth", "project_id": "RootA001", "side": "client"},
+            {"name": "B", "provider": "modrinth", "project_id": "RootB001", "side": "server"},
+        ], overrides=[{
+            "provider": "modrinth", "project_id": "DepA0001", "artifact_id": "DepAV001",
+            "scope": "dependency",
+        }])
+        a_source = SimpleNamespace(root_identity=("modrinth", "RootA001"), metadata=(
+            self.metadata("modrinth", "RootA001", "RootAV001", "a"),
+            self.metadata("modrinth", "DepA0001", "DepAOld1", "a-dependency"),
+        ))
+        b_source = self._closure("RootB001", "RootBV001", "b")
+        b_target = SimpleNamespace(root_identity=("modrinth", "RootB001"), metadata=(
+            self.metadata("modrinth", "RootB001", "RootBV002", "b"),
+            *(() if not dependency_retained else (
+                self.metadata("modrinth", "DepA0001", "DepAV001", "b-dependency"),
+            )),
+        ))
+        context, _ = self.resolver_patches(closure=a_source)
+
+        def resolve(**kwargs):
+            project = kwargs["canonical_project_id"]
+            if project == "RootA001":
+                return a_source
+            return b_source if kwargs["minecraft"] == "1.21.1" else b_target
+
+        def exact_selection(provider, project, artifact):
+            return SimpleNamespace(provider=provider, project_id=project, file_id=artifact)
+
+        def exact_resolve(*_args, **kwargs):
+            if "constrained-0" in str(kwargs["source"]):
+                raise RuntimeError("A dependency exact artifact unavailable")
+            if dependency_retained:
+                return b_target
+            raise RuntimeError("B dependency exact artifact unavailable")
+
+        with context, \
+             patch("huroshiki_core.resolve_mod_closure", side_effect=resolve), \
+             patch("huroshiki_core.exact_mod_artifact_selection", side_effect=exact_selection), \
+             patch("huroshiki_core.resolve_exact_mod_closure", side_effect=exact_resolve):
+            plan = self.plan()
+            initial = migration.resolve_template_migration_plan_at(plan)
+            request = create_template_migration_resolution_request(
+                plan, (TemplateMigrationRootResolution(0, "remove"),)
+            )
+            outcome = migration.resolve_template_migration_conflicts_at(
+                plan, request, cancel_event=plan.cancel_event, deadline=plan.deadline
+            )
+        return plan, initial, outcome
+
+    def test_remove_root_preserves_dependency_exact_authority_for_remaining_closure(self) -> None:
+        plan, initial, outcome = self._remove_root_with_dependency_exact(dependency_retained=True)
+        self.assertEqual(initial.status, "resolution-required")
+        self.assertEqual([item.source_index for item in initial.unresolved], [0])
+        self.assertTrue(initial.version_intent_facts[0].satisfied)
+        self.assertEqual(initial.version_intent_facts[0].owner_source_indices, (1,))
+        self.assertEqual(plan._state.effective_overrides[0].scope, "dependency")
+        self.assertEqual(plan._state.effective_overrides[0].artifact_id, "DepAV001")
+        self.assertEqual(outcome.state, "resolved")
+        self.assertTrue(outcome.resolution.version_intent_facts[0].satisfied)
+        self.assertEqual(outcome.resolution.version_intent_facts[0].owner_source_indices, (1,))
+        migration.discard_template_migration_plan(plan, deadline=time.monotonic() + 30)
+
+    def test_remove_root_with_no_matching_closure_is_global_version_intent_blocked(self) -> None:
+        plan, initial, outcome = self._remove_root_with_dependency_exact(dependency_retained=False)
+        self.assertEqual(initial.version_intent_issues[0].owner_source_indices, (0,))
+        self.assertEqual(outcome.state, "resolution-required")
+        issue = outcome.resolution.version_intent_issues[0]
+        self.assertEqual(issue.reason_code, "version-intent-blocked")
+        self.assertEqual(issue.owner_source_indices, ())
+        self.assertEqual(outcome.resolution.unresolved, ())
+        migration.discard_template_migration_plan(plan, deadline=time.monotonic() + 30)
+
 
 if __name__ == "__main__":
     unittest.main()

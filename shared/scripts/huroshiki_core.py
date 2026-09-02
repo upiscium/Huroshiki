@@ -30,6 +30,7 @@ from uuid import uuid4
 import tomlkit
 
 import packctl
+from url_diagnostics import redact_embedded_text, redact_url
 from dependency_equivalence import (
     DependencyCandidate,
     EQUIVALENCE_POLICY_VERSION,
@@ -13388,27 +13389,12 @@ def _template_detail(value: object, limit: int = 240) -> str:
 
 
 def _template_redact_urls(value: str) -> str:
-    return re.sub(
-        r"(?i)https?://[^\s]+",
-        lambda match: _template_safe_url(match.group(0)),
-        value,
-    )
+    return redact_embedded_text(value)
 
 
 def _template_safe_url(value: str) -> str:
     """Remove URL userinfo from UI text while preserving migration Authority."""
-    try:
-        parsed = urlparse(value)
-        if parsed.username is None and parsed.password is None:
-            return value
-        host = parsed.hostname or ""
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        if parsed.port is not None:
-            host = f"{host}:{parsed.port}"
-        return parsed._replace(netloc=host).geturl()
-    except ValueError:
-        return "<redacted-url>"
+    return redact_url(value)
 
 
 def _template_identity(provider: str, project_id: str) -> str:
@@ -13452,17 +13438,19 @@ def format_template_copy_migration_requirements(
         lines.append(f"  detail: {_template_detail(item.message)}")
         if item.version_intent_issue:
             lines.append(f"  version-intent issue: {_template_detail(item.version_intent_issue)}")
-        if global_exact_blocker:
-            lines.append(
-                "  remedy: an ownerless dependency exact issue is a Template-level blocker; "
-                "it has no root Remove or Replace action."
-            )
-        elif replacement_blocked:
-            lines.append(
-                f"  remedy: --remove {item.source_index} may explicitly abandon this "
-                "root's root-scoped exact intent. Replace never transfers old exact "
-                "intent; dependency exact intent remains authoritative."
-            )
+        if replacement_blocked:
+            if item.version_intent_scope == "dependency":
+                lines.append(
+                    f"  remedy: --remove {item.source_index} may explicitly remove this "
+                    "root, but the dependency exact constraint remains authoritative; "
+                    "Replace is unavailable."
+                )
+            else:
+                lines.append(
+                    f"  remedy: --remove {item.source_index} may explicitly abandon this "
+                    "root's root-scoped exact intent. Replace never transfers old exact "
+                    "intent."
+                )
         elif item.replacement_supported:
             lines.append(
                 f"  remedy: rerun with --remove {item.source_index} or "

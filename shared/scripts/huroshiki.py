@@ -4,12 +4,10 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
-import re
 import sys
 import threading
 import time
 from typing import Callable, Iterable, Literal
-from urllib.parse import urlparse
 
 from huroshiki_paths import resolve_root, set_import_root
 from huroshiki_version import VERSION
@@ -67,6 +65,7 @@ except ModuleNotFoundError as error:
 import huroshiki_core as core
 from content_workers import ContentWorker
 from packwiz_parser import MenuItem, ParserEvent, visible_menu_items
+from url_diagnostics import redact_diagnostic_text
 from template_import import (
     ActualIdentityConflict,
     CandidateNameConflict,
@@ -1589,7 +1588,11 @@ class HuroshikiApp(App[None]):
         if values is None:
             return
         target_key = f"template:{values['template_id']}"
-        if source_key in self.template_copy_migration_owners or target_key in self.template_copy_migration_owners:
+        if (
+            source_key == target_key
+            or source_key in self.template_copy_migration_owners
+            or target_key in self.template_copy_migration_owners
+        ):
             self.notify("A migration already uses one of these Templates", severity="warning")
             return
         try:
@@ -1598,7 +1601,7 @@ class HuroshikiApp(App[None]):
             deadline = time.monotonic() + PUBLISH_OPERATION_TIMEOUT_SECONDS
             session = core.TemplateCopyMigrationSession(source_key.partition(":")[2], target, cancel_event, deadline)
         except BaseException as error:
-            self.notify(str(error), severity="error")
+            self.notify(redact_diagnostic_text(str(error)), severity="error")
             return
         owner = TemplateCopyMigrationOwner(source_key, target_key, session, cancel_event, deadline)
         self.template_copy_migration_owners[source_key] = owner
@@ -2966,6 +2969,8 @@ class TemplateCopyMigrationScreen(Screen[None]):
             self.session.cancel()
 
     def _start_worker(self, name: str, target: Callable[[], None]) -> None:
+        # A completed worker may still be retained for diagnostics; only an
+        # active thread owns the operation slot.
         if self.owner.thread is not None and self.owner.thread.is_alive():
             return
         self.owner.done.clear()
@@ -3022,45 +3027,53 @@ class TemplateCopyMigrationScreen(Screen[None]):
             self.owner.cleanup_done.set()
             self.owner.done.set()
 
-    @staticmethod
-    def _blocked(item: object) -> bool:
+    @classmethod
+    def _remove_allowed(cls, item: object) -> bool:
+        """Remove is valid for roots, including exact roots, but not global issues."""
         reason = str(getattr(item, "reason_code", ""))
-        return getattr(item, "version_intent_scope", None) == "dependency" or reason in {"global-dependency-exact", "dependency-exact-blocked"} or (
-            "ownerless" in reason and "dependency" in reason
+        return not (
+            reason in {"global-dependency-exact", "ownerless-dependency-exact"}
+            or ("ownerless" in reason and "dependency" in reason)
         )
+
+    @classmethod
+    def _replace_allowed(cls, item: object) -> bool:
+        """Only ordinary, resolver-supported roots may select a replacement."""
+        reason = str(getattr(item, "reason_code", "")).lower()
+        issue = getattr(item, "version_intent_issue", None)
+        exact_or_version_block = (
+            issue is not None
+            or "exact" in reason
+            or "version" in reason
+            or "ownerless" in reason
+            or getattr(item, "version_intent_scope", None) == "dependency"
+        )
+        return bool(getattr(item, "replacement_supported", False)) and not exact_or_version_block
 
     @staticmethod
     def _safe_text(value: object, limit: int = 240) -> str:
-        text = " ".join(str(value).split())
-        def redact(match: re.Match[str]) -> str:
-            word = match.group(0)
-            try:
-                parsed = urlparse(word)
-                if parsed.username is None and parsed.password is None:
-                    return word
-                host = parsed.hostname or ""
-                if ":" in host and not host.startswith("["):
-                    host = f"[{host}]"
-                if parsed.port is not None:
-                    host = f"{host}:{parsed.port}"
-                return parsed._replace(netloc=host).geturl()
-            except ValueError:
-                return "<redacted-url>"
-
-        result = re.sub(r"(?i)https?://[^\s]+", redact, text)
+        result = " ".join(redact_diagnostic_text(str(value)).split())
         return result[:limit] + ("..." if len(result) > limit else "")
+
+    @classmethod
+    def _safe_lines(cls, values: Iterable[object]) -> tuple[str, ...]:
+        return tuple(cls._safe_text(value) for value in values)
+
+    def _visible_conflicts(self) -> tuple[object, ...]:
+        return tuple(item for item in self.conflicts if self._remove_allowed(item))
 
     def _render_conflicts(self) -> None:
         table = self.query_one("#template-migration-options", DataTable)
         table.clear()
-        for item in self.conflicts:
+        for item in self._visible_conflicts():
             index = int(item.source_index)
             choice = self.choices.get(index)
-            action = "Blocked" if self._blocked(item) else ("Remove" if choice is not None and choice.action == "remove" else (f"Replace → {self._safe_text(choice.replacement_provider + ':' + choice.replacement_project_id)}" if choice is not None else "Required"))
+            action = "Remove" if choice is not None and choice.action == "remove" else (f"Replace → {self._safe_text(choice.replacement_provider + ':' + choice.replacement_project_id)}" if choice is not None else ("Required" if self._replace_allowed(item) else "Remove available"))
             detail = self._safe_text(getattr(item, "message", ""))
             selector = self._safe_text(getattr(item, "source_selector", ""))
             version_issue = self._safe_text(getattr(item, "version_intent_issue", None))
-            facts = f"source_index={index} | selector={selector} | identity={getattr(item, 'canonical_identity', None)} | side={getattr(item, 'side', '')} | reason={getattr(item, 'reason_code', '')} | retryable={str(getattr(item, 'retryable', False)).lower()} | replacement_supported={str(getattr(item, 'replacement_supported', False)).lower()} | version_issue={version_issue} | detail={detail}"
+            identity = self._safe_text(getattr(item, "canonical_identity", None))
+            facts = f"source_index={index} | selector={selector} | identity={identity} | side={getattr(item, 'side', '')} | reason={getattr(item, 'reason_code', '')} | retryable={str(getattr(item, 'retryable', False)).lower()} | replacement_supported={str(getattr(item, 'replacement_supported', False)).lower()} | version_issue={version_issue} | detail={detail}"
             for collision in self.session.view.collision_facts:
                 if index in getattr(collision, "source_indices", ()):
                     collision_detail = self._safe_text(getattr(collision, "detail", ""))
@@ -3068,6 +3081,8 @@ class TemplateCopyMigrationScreen(Screen[None]):
             table.add_row(action, facts)
 
     def _poll(self) -> None:
+        if self.phase == "complete":
+            return
         thread = self.owner.thread
         if thread is not None and (self.owner.done.is_set() or self.navigation_pending):
             thread.join(0)
@@ -3085,13 +3100,13 @@ class TemplateCopyMigrationScreen(Screen[None]):
                 error = self._safe_text(self.owner.error)
                 self.owner.error = None
                 self.phase = "conflicts"
-                self.conflicts = list(self.session.view.unresolved_roots)
+                self.conflicts = [item for item in self.session.view.unresolved_roots if self._remove_allowed(item)]
                 self._render_conflicts()
                 requirements = core.format_template_copy_migration_requirements(
                     self.session
                 )
                 self.query_one("#template-migration-status", Static).update(
-                    "\n".join((*requirements, f"Resolution attempt failed: {error}"))
+                    "\n".join(self._safe_lines((*requirements, f"Resolution attempt failed: {error}")))
                 )
                 return
             if self.session.state not in {"publication-uncertain", "published"} and not self.owner.cleanup_done.is_set():
@@ -3100,22 +3115,23 @@ class TemplateCopyMigrationScreen(Screen[None]):
                 self.owner.cleanup_done.clear()
                 self._start_worker("failure-cleanup", self._cleanup)
                 return
-            self.query_one("#template-migration-status", Static).update(str(self.owner.error))
+            self.query_one("#template-migration-status", Static).update(self._safe_text(self.owner.error))
             return
         state = self.session.state
         if state == "resolution-required":
             self.phase = "conflicts"
-            self.conflicts = list(self.session.view.unresolved_roots)
+            self.conflicts = [item for item in self.session.view.unresolved_roots if self._remove_allowed(item)]
             self._render_conflicts()
             self.query_one("#template-migration-status", Static).update(
-                "\n".join(core.format_template_copy_migration_requirements(self.session))
+                "\n".join(self._safe_lines(core.format_template_copy_migration_requirements(self.session)))
             )
         elif state == "resolved":
             self.phase = "preview"
             self.preview = self.session.preview()
-            self.query_one("#template-migration-status", Static).update("\n".join(core.format_template_copy_migration_preview(self.preview)) + "\nEnter to continue.")
+            self.query_one("#template-migration-status", Static).update("\n".join(self._safe_lines(core.format_template_copy_migration_preview(self.preview))) + "\nEnter to continue.")
         elif state in {"published", "cleanup-pending", "publication-uncertain"}:
             if state == "published":
+                self.phase = "complete"
                 self.app.release_template_copy_migration(self.owner)
                 self.app.open_project(self.owner.target_key)
             elif state == "cleanup-pending":
@@ -3129,6 +3145,8 @@ class TemplateCopyMigrationScreen(Screen[None]):
             elif state == "publication-uncertain":
                 self.query_one("#template-migration-status", Static).update("Publication outcome uncertain; ownership retained.")
         elif state == "discarded" and self.navigation_pending and self.owner.cleanup_done.is_set():
+            self.phase = "complete"
+            self.navigation_pending = False
             self.app.release_template_copy_migration(self.owner)
             self.app.open_project(self.owner.source_key)
         elif self.navigation_pending and not self.owner.cleanup_done.is_set():
@@ -3137,11 +3155,12 @@ class TemplateCopyMigrationScreen(Screen[None]):
     def _current_conflict(self) -> object | None:
         table = self.query_one("#template-migration-options", DataTable)
         index = table.cursor_row
-        return self.conflicts[index] if 0 <= index < len(self.conflicts) else None
+        visible = self._visible_conflicts()
+        return visible[index] if 0 <= index < len(visible) else None
 
     def toggle_remove(self) -> None:
         item = self._current_conflict()
-        if item is None or self._blocked(item):
+        if item is None or not self._remove_allowed(item):
             return
         index = int(item.source_index)
         self.choices[index] = core.TemplateMigrationRootResolution(index, "remove")
@@ -3151,9 +3170,7 @@ class TemplateCopyMigrationScreen(Screen[None]):
         item = self._current_conflict()
         if (
             item is None
-            or self._blocked(item)
-            or getattr(item, "version_intent_issue", None) is not None
-            or not getattr(item, "replacement_supported", False)
+            or not self._replace_allowed(item)
         ):
             return
         self.app.push_screen(TemplateMigrationReplacementSelectorModal(str(getattr(item, "canonical_identity", item.source_selector))), lambda value: self._replacement(item, value))
@@ -3178,6 +3195,8 @@ class TemplateCopyMigrationScreen(Screen[None]):
                 f"Retryable: {str(getattr(item, 'retryable', False)).lower()}",
                 "Replacement supported: "
                 f"{str(getattr(item, 'replacement_supported', False)).lower()}",
+                f"Remove available: {str(self._remove_allowed(item)).lower()}",
+                f"Replace available: {str(self._replace_allowed(item)).lower()}",
                 f"Version intent: {self._safe_text(getattr(item, 'version_intent_issue', None))}",
                 f"Detail: {self._safe_text(getattr(item, 'message', ''))}",
             ]
@@ -3201,7 +3220,7 @@ class TemplateCopyMigrationScreen(Screen[None]):
             self._start_worker("resolve", lambda: self._resolve(submitted))
         elif self.phase == "preview" and self.preview is not None:
             if self.preview.required_warnings:
-                self.app.push_screen(ConfirmModal("Acknowledge Template migration warnings", tuple(self.preview.required_warnings)), self._warnings_confirmed)
+                self.app.push_screen(ConfirmModal("Acknowledge Template migration warnings", tuple(self._safe_text(item) for item in self.preview.required_warnings)), self._warnings_confirmed)
             else:
                 self._warnings_confirmed(True)
 

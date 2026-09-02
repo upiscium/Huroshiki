@@ -26,6 +26,31 @@ class TemplateMigrationCliTest(unittest.TestCase):
         values.update(overrides)
         return types.SimpleNamespace(**values)
 
+    def test_cli_preview_prints_formatter_output_without_url_secret(self) -> None:
+        output = StringIO()
+        raw = "https://user:password@example.invalid/mod.jar?access_token=secret&normal=value"
+        target = core.TemplateMigrationTarget(
+            "new", "New", "1.21.1", "fabric", "0.16"
+        )
+        view = core.TemplateCopyMigrationView(
+            "resolved", "base", target, "1.20.1", "forge", "47.0",
+            (), (), (), (), (), (),
+            (types.SimpleNamespace(
+                url=raw, status="unknown", loader_status="unknown",
+                minecraft_status="unknown", detail=raw,
+            ),),
+            (), (), (), (), 1, "c" * 64, "precommit", False, False, None,
+        )
+        preview = core.TemplateCopyMigrationPreview(
+            view, "a" * 64, "b" * 64, 1, "c" * 64
+        )
+        with redirect_stdout(output):
+            packctl._template_migration_preview(preview, core)
+        rendered = output.getvalue()
+        self.assertNotIn("password", rendered)
+        self.assertNotIn("secret", rendered)
+        self.assertIn("normal=value", rendered)
+
     def test_nested_command_has_required_target_arguments(self) -> None:
         args = packctl.parser().parse_args([
             "template", "migrate", "base", "--copy-to", "new", "--display-name", "New",

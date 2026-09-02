@@ -556,12 +556,16 @@ class TemplateMigrationCoreTest(unittest.TestCase):
         migration.discard_template_migration_plan(plan)
 
     def test_url_compatibility_unknown_and_policy_are_recorded(self) -> None:
+        diagnostic_url = (
+            "https://user:password@example.invalid/jar.jar?"
+            "token=TOPSECRET&normal=value"
+        )
         self._write_template(self.source, mods=[{"name": "Jar", "provider": "url",
-            "project_id": "jar", "side": "both", "url": "https://example.invalid/jar.jar"}],
+            "project_id": "jar", "side": "both", "url": diagnostic_url}],
             local="url_max_jar_size_bytes: 12345\nurl_allow_private_networks: true\n")
         def url_closure(loaders: str, versions: str):
             contents = ("name = 'jar'\nfilename = 'jar.jar'\nside = 'both'\n"
-                        "[download]\nurl = 'https://example.invalid/jar.jar'\n"
+                        f"[download]\nurl = '{diagnostic_url}'\n"
                         f"[huroshiki]\nproject-id = 'jar'\nloaders = [{loaders}]\nminecraft-versions = [{versions}]\n").encode()
             return SimpleNamespace(root_identity=("url", "jar"), metadata=(
                 SimpleNamespace(relative_path=Path("jar.pw.toml"), contents=contents,
@@ -589,6 +593,13 @@ class TemplateMigrationCoreTest(unittest.TestCase):
                 result = migration.resolve_template_migration_plan_at(plan)
             self.assertEqual(result.url_evidence[0].status, expected)
             self.assertEqual(result.status, "resolution-required")
+            self.assertEqual(result.url_evidence[0].url, diagnostic_url)
+            if expected == "unknown":
+                warning = "\n".join(result.warnings)
+                self.assertNotIn("user:password", warning)
+                self.assertNotIn("TOPSECRET", warning)
+                self.assertIn("token=%3Credacted%3E", warning)
+                self.assertIn("normal=value", warning)
             migration.discard_template_migration_plan(plan)
 
     def test_committed_url_size_policy_is_preserved_without_local_policy_copy(self) -> None:

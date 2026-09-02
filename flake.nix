@@ -97,7 +97,8 @@
              test -f ${huroshiki}/lib/huroshiki/publish_activation.py
              test -f ${huroshiki}/lib/huroshiki/publish_restart.py
              test -f ${huroshiki}/lib/huroshiki/publish_orchestration.py
-             test -f ${huroshiki}/lib/huroshiki/url_artifacts.py
+            test -f ${huroshiki}/lib/huroshiki/url_artifacts.py
+            test -f ${huroshiki}/lib/huroshiki/url_diagnostics.py
             test -f ${huroshiki}/lib/huroshiki/project_locks.py
             test -f ${huroshiki}/lib/huroshiki/pack_migration.py
             test -f ${huroshiki}/lib/huroshiki/template_migration.py

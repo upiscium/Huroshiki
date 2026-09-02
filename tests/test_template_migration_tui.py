@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import huroshiki
@@ -10,16 +11,6 @@ import huroshiki_core as core
 
 
 class TemplateMigrationTuiTest(unittest.TestCase):
-    def test_blocked_exact_and_global_conflicts_have_no_action(self) -> None:
-        for reason in ("dependency-exact-blocked", "ownerless-dependency-exact"):
-            item = Mock(reason_code=reason, version_intent_issue=None)
-            self.assertTrue(huroshiki.TemplateCopyMigrationScreen._blocked(item))
-
-        root_exact = Mock(
-            reason_code="version-intent-blocked",
-            version_intent_issue="exact root intent",
-        )
-        self.assertFalse(huroshiki.TemplateCopyMigrationScreen._blocked(root_exact))
 
     def test_owner_keys_are_source_and_target(self) -> None:
         owner = huroshiki.TemplateCopyMigrationOwner(
@@ -35,7 +26,7 @@ class TemplateMigrationTuiTest(unittest.TestCase):
             "selector=(https://user:password@example.invalid/mod.jar)"
         )
         self.assertNotIn("user:password", text)
-        self.assertIn("https://example.invalid/mod.jar", text)
+        self.assertIn("example.invalid/mod.jar", text)
 
     def test_publish_uses_exact_preview_and_does_not_resolve(self) -> None:
         session = Mock()
@@ -51,11 +42,12 @@ class TemplateMigrationTuiTest(unittest.TestCase):
         session.resolve_choices.assert_not_called()
         self.assertTrue(owner.done.is_set())
 
-    def test_unsupported_or_version_blocked_roots_are_not_replaceable(self) -> None:
+    def test_unsupported_or_version_blocked_roots_allow_remove_not_replace(self) -> None:
         screen = huroshiki.TemplateCopyMigrationScreen.__new__(huroshiki.TemplateCopyMigrationScreen)
         for supported, issue in ((False, None), (True, "exact intent")):
             item = Mock(reason_code="ordinary", version_intent_issue=issue, replacement_supported=supported)
-            self.assertTrue(screen._blocked(item) or not supported or issue is not None)
+            self.assertTrue(screen._remove_allowed(item))
+            self.assertFalse(screen._replace_allowed(item))
 
     def test_menu_action_opens_template_copy_migration(self) -> None:
         screen = huroshiki.ProjectScreen.__new__(huroshiki.ProjectScreen)
@@ -115,6 +107,67 @@ class TemplateMigrationTuiTest(unittest.TestCase):
                 screen.replace()
         app.push_screen.assert_not_called()
 
+    def test_dependency_scoped_exact_issue_allows_remove_but_not_replace(self) -> None:
+        item = Mock(
+            source_index=1,
+            canonical_identity="modrinth:x",
+            source_selector="x",
+            reason_code="dependency-exact-blocked",
+            version_intent_scope="dependency",
+            version_intent_issue="exact dependency intent",
+            replacement_supported=True,
+        )
+        self.assertTrue(huroshiki.TemplateCopyMigrationScreen._remove_allowed(item))
+        self.assertFalse(huroshiki.TemplateCopyMigrationScreen._replace_allowed(item))
+
+    def test_ownerless_dependency_issue_is_not_a_conflict_row(self) -> None:
+        screen = huroshiki.TemplateCopyMigrationScreen.__new__(huroshiki.TemplateCopyMigrationScreen)
+        screen.owner = Mock()
+        screen.session = Mock(view=Mock(unresolved_roots=(Mock(reason_code="ownerless-dependency-exact"),), collision_facts=()))
+        screen.conflicts = [item for item in screen.session.view.unresolved_roots if screen._remove_allowed(item)]
+        self.assertEqual(screen.conflicts, [])
+
+    def test_query_secrets_are_redacted_in_conflict_details_and_warning_modal(self) -> None:
+        secret_url = "https://user:pass@example.invalid/mod.jar?token=TOPSECRET&access_token=ACCESSSECRET&normal=value"
+        item = Mock(
+            source_index=1, source_selector=secret_url, canonical_identity="modrinth:x",
+            side="both", reason_code="ordinary", retryable=True,
+            replacement_supported=True, version_intent_issue=None, message=secret_url,
+        )
+        screen = huroshiki.TemplateCopyMigrationScreen.__new__(huroshiki.TemplateCopyMigrationScreen)
+        screen.conflicts, screen.choices = [item], {}
+        screen.session = Mock(view=Mock(collision_facts=()))
+        table = Mock()
+        screen.query_one = Mock(return_value=table)
+        screen._render_conflicts()
+        conflict_text = " ".join(str(arg) for arg in table.add_row.call_args.args)
+        self.assertNotIn("TOPSECRET", conflict_text)
+        self.assertNotIn("ACCESSSECRET", conflict_text)
+        self.assertNotIn("user:pass", conflict_text)
+        self.assertIn("normal=value", conflict_text)
+
+        screen._current_conflict = Mock(return_value=item)
+        app = Mock()
+        with patch.object(huroshiki.TemplateCopyMigrationScreen, "app", app):
+            screen.details()
+        detail_text = " ".join(app.push_screen.call_args.args[0].lines)
+        self.assertNotIn("TOPSECRET", detail_text)
+        self.assertNotIn("ACCESSSECRET", detail_text)
+        self.assertNotIn("user:pass", detail_text)
+        self.assertIn("normal=value", detail_text)
+
+        preview = Mock(required_warnings=(secret_url,))
+        screen.preview, screen.phase = preview, "preview"
+        screen._warnings_confirmed = Mock()
+        with patch.object(huroshiki.TemplateCopyMigrationScreen, "app", app):
+            screen.advance()
+        warning_modal = app.push_screen.call_args.args[0]
+        warning_text = " ".join(warning_modal.lines)
+        self.assertNotIn("TOPSECRET", warning_text)
+        self.assertNotIn("ACCESSSECRET", warning_text)
+        self.assertNotIn("user:pass", warning_text)
+        self.assertIn("normal=value", warning_text)
+
     def test_worker_is_named_non_daemon_and_preserves_one_event_deadline(self) -> None:
         owner = Mock(thread=None, done=threading.Event(), error=None,
                      source_key="template:base", cancel_event=threading.Event(),
@@ -168,6 +221,7 @@ class TemplateMigrationTuiTest(unittest.TestCase):
             state="resolution-required",
             view=Mock(unresolved_roots=(conflict,), collision_facts=()),
         )
+        screen.phase = "resolving"
         screen.navigation_pending = False
         screen._render_conflicts = Mock()
         status = Mock()
@@ -189,6 +243,7 @@ class TemplateMigrationTuiTest(unittest.TestCase):
                             done=threading.Event(), cleanup_done=threading.Event())
         screen.owner.done.set()
         screen.session = Mock(state="published")
+        screen.phase = "publishing"
         screen.navigation_pending = False
         app = Mock()
         with patch.object(huroshiki.TemplateCopyMigrationScreen, "app", app):
@@ -228,6 +283,177 @@ class TemplateMigrationTuiTest(unittest.TestCase):
         screen.session.state = "publication-uncertain"
         screen._cleanup()
         screen.session.discard.assert_not_called()
+
+
+class FakeTemplateMigrationSession:
+    instances: list["FakeTemplateMigrationSession"] = []
+    block_start = False
+    discard_error: BaseException | None = None
+    lifecycle = "precommit"
+
+    def __init__(self, source_id, target, cancel_event, deadline):
+        self.source_id, self.target = source_id, target
+        self.cancel_event, self.deadline = cancel_event, deadline
+        self.start_entered = threading.Event()
+        self.release_start = threading.Event()
+        self.start_calls = self.discard_calls = self.resolve_calls = 0
+        self.discard_threads: list[threading.Thread] = []
+        self._state = "new"
+        self.instances.append(self)
+
+    @property
+    def state(self):
+        return self._state
+
+    @property
+    def view(self):
+        return SimpleNamespace(
+            publication_lifecycle=type(self).lifecycle,
+            unresolved_roots=(), collision_facts=(), required_warnings=(),
+        )
+
+    def start(self):
+        self.start_calls += 1
+        self.start_entered.set()
+        if type(self).block_start:
+            self.release_start.wait(2)
+        if self.cancel_event.is_set():
+            self._state = "cancelled"
+            raise RuntimeError("cancelled")
+        self._state = "resolved"
+
+    def preview(self):
+        return SimpleNamespace(required_warnings=())
+
+    def cancel(self):
+        self.cancel_event.set()
+
+    def discard(self, *, deadline=None):
+        self.discard_calls += 1
+        self.discard_threads.append(threading.current_thread())
+        if self.discard_error is not None:
+            self._state = "cleanup-pending"
+            raise self.discard_error
+        self._state = "discarded"
+
+    def retry_cleanup(self, *, deadline=None):
+        return self.discard(deadline=deadline)
+
+    def resolve_choices(self, choices):
+        self.resolve_calls += 1
+
+
+class TemplateMigrationRealTuiTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        FakeTemplateMigrationSession.instances.clear()
+        FakeTemplateMigrationSession.block_start = False
+        FakeTemplateMigrationSession.discard_error = None
+        FakeTemplateMigrationSession.lifecycle = "precommit"
+
+    def _values(self, project_id="target"):
+        return {
+            "template_id": project_id, "display_name": "Target",
+            "minecraft": "1.21.1", "loader": "fabric", "reference": "0.16.10",
+        }
+
+    async def test_target_form_path_has_one_session_and_responsive_named_worker(self):
+        with patch.object(huroshiki.core, "TemplateCopyMigrationSession", FakeTemplateMigrationSession), patch.object(
+            huroshiki.core, "format_template_copy_migration_preview", return_value=("preview",)
+        ), patch.object(huroshiki.HuroshikiApp, "project_is_usable", return_value=True):
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test() as pilot:
+                app.open_template_copy_migration("template:source")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, huroshiki.TemplateCopyMigrationTargetModal)
+                for field, value in zip(
+                    huroshiki.TemplateCopyMigrationTargetModal.FIELD_IDS,
+                    ("target", "Target", "1.21.1", "fabric", "0.16.10"),
+                    strict=True,
+                ):
+                    app.screen.query_one(f"#{field}", huroshiki.Input).value = value
+                await pilot.press("ctrl+enter")
+                await pilot.pause(0.15)
+                self.assertEqual(len(FakeTemplateMigrationSession.instances), 1)
+                session = FakeTemplateMigrationSession.instances[0]
+                owner = app.screen.owner
+                self.assertIs(owner.cancel_event, session.cancel_event)
+                self.assertEqual(owner.deadline, session.deadline)
+                self.assertIsNotNone(owner.thread)
+                self.assertFalse(owner.thread.daemon)
+                self.assertTrue(owner.thread.name.startswith("huroshiki-template-migration-start-template-source"))
+                self.assertEqual(session.start_calls, 1)
+
+    async def test_cancel_joins_operation_then_cleans_off_loop_before_navigation(self):
+        FakeTemplateMigrationSession.block_start = True
+        with patch.object(huroshiki.core, "TemplateCopyMigrationSession", FakeTemplateMigrationSession), patch.object(
+            huroshiki.core, "format_template_copy_migration_preview", return_value=("preview",)
+        ), patch.object(huroshiki.HuroshikiApp, "open_project") as open_project:
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test() as pilot:
+                app._start_template_copy_migration("template:source", self._values())
+                session = FakeTemplateMigrationSession.instances[0]
+                await pilot.pause(0.05)
+                app.screen.leave()
+                await pilot.pause(0.05)
+                self.assertEqual(session.discard_calls, 0)
+                self.assertFalse(open_project.called)
+                session.release_start.set()
+                await pilot.pause(0.25)
+                self.assertEqual(session.discard_calls, 1)
+                self.assertEqual(len(session.discard_threads), 1)
+                self.assertIsNot(session.discard_threads[0], threading.current_thread())
+                open_project.assert_called_once_with("template:source")
+
+    async def test_cleanup_failure_retains_keys_and_retry_does_not_restart_or_resolve(self):
+        FakeTemplateMigrationSession.discard_error = RuntimeError("blocked")
+        with patch.object(huroshiki.core, "TemplateCopyMigrationSession", FakeTemplateMigrationSession), patch.object(
+            huroshiki.core, "format_template_copy_migration_preview", return_value=("preview",)
+        ), patch.object(huroshiki.HuroshikiApp, "open_project") as open_project:
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test() as pilot:
+                app._start_template_copy_migration("template:source", self._values())
+                await pilot.pause(0.1)
+                screen = app.screen
+                screen.leave()
+                await pilot.pause(0.2)
+                session = FakeTemplateMigrationSession.instances[0]
+                self.assertEqual(set(app.template_copy_migration_owners), {"template:source", "template:target"})
+                self.assertEqual((session.start_calls, session.resolve_calls), (1, 0))
+                FakeTemplateMigrationSession.discard_error = None
+                screen.retry_cleanup()
+                await pilot.pause(0.2)
+                self.assertEqual((session.start_calls, session.resolve_calls), (1, 0))
+                self.assertEqual(session.discard_calls, 2)
+                open_project.assert_called_once_with("template:source")
+
+    async def test_uncertain_publication_never_discards_or_navigates(self):
+        FakeTemplateMigrationSession.lifecycle = "uncertain"
+        with patch.object(huroshiki.core, "TemplateCopyMigrationSession", FakeTemplateMigrationSession), patch.object(
+            huroshiki.core, "format_template_copy_migration_preview", return_value=("preview",)
+        ), patch.object(huroshiki.HuroshikiApp, "open_project") as open_project:
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test() as pilot:
+                app._start_template_copy_migration("template:source", self._values())
+                await pilot.pause(0.1)
+                app.screen.leave()
+                await pilot.pause(0.2)
+                session = FakeTemplateMigrationSession.instances[0]
+                self.assertEqual(session.discard_calls, 0)
+                open_project.assert_not_called()
+                self.assertEqual(set(app.template_copy_migration_owners), {"template:source", "template:target"})
+
+    async def test_second_migration_using_source_or_target_is_rejected(self):
+        with patch.object(huroshiki.core, "TemplateCopyMigrationSession", FakeTemplateMigrationSession), patch.object(
+            huroshiki.core, "format_template_copy_migration_preview", return_value=("preview",)
+        ):
+            app = huroshiki.HuroshikiApp()
+            async with app.run_test():
+                app._start_template_copy_migration("template:source", self._values())
+                with patch.object(app, "notify") as notify:
+                    app._start_template_copy_migration("template:source", self._values("other"))
+                    app._start_template_copy_migration("template:other", self._values("target"))
+                self.assertEqual(len(FakeTemplateMigrationSession.instances), 1)
+                self.assertEqual(notify.call_count, 2)
 
 
 if __name__ == "__main__":
