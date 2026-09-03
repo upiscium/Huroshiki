@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 import re
@@ -12,6 +13,139 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import packctl
+
+
+@dataclass(frozen=True)
+class _PackctlMention:
+    fragment: str
+    fenced: bool
+    before: str = ""
+    after: str = ""
+
+
+def _packctl_commands(fragment: str) -> tuple[str, ...]:
+    """Return commands from shell-like packctl invocations."""
+    try:
+        lexer = shlex.shlex(fragment, posix=True, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        lexer.commenters = "#"
+        tokens = list(lexer)
+    except ValueError as error:
+        raise AssertionError(f"invalid shell-like guidance fragment: {fragment!r}: {error}") from error
+    commands: list[str] = []
+    for index, token in enumerate(tokens):
+        if token != "packctl":
+            continue
+        skip = False
+        for argument in tokens[index + 1 :]:
+            if skip:
+                skip = False
+            elif argument == "--root":
+                skip = True
+            elif argument.startswith("--root=") or argument.startswith("-"):
+                continue
+            else:
+                commands.append(argument)
+                break
+    return tuple(commands)
+
+
+def classify_guidance_context(mention: _PackctlMention) -> str:
+    """Classify a mention as descriptive only when its own context is explicit."""
+    if mention.fenced:
+        return "advertised"
+
+    before = mention.before.rstrip()
+    after = mention.after.lstrip()
+    prohibited = re.search(
+        r"\b(?:do not|don't|must not|never)\s+(?:run|use|invoke|execute)\s*$",
+        before,
+        re.IGNORECASE,
+    )
+    retired_suffix = re.match(
+        r"(?:command\s+)?(?:"
+        r"(?:is|was)\s+(?:retired|removed|no longer supported|not part of the public CLI)"
+        r"|has been removed"
+        r")\s*(?:[.!?]|$)",
+        after,
+        re.IGNORECASE,
+    )
+    if prohibited or retired_suffix:
+        return "descriptive"
+    return "advertised"
+
+
+def extract_packctl_mentions(markdown: str) -> list[_PackctlMention]:
+    """Extract inline and shell-like fenced packctl snippets from Markdown."""
+    mentions: list[_PackctlMention] = []
+    fenced_ranges: list[tuple[int, int]] = []
+    fence_pattern = re.compile(r"```([^\n]*)\n(.*?)```", re.DOTALL)
+    for match in fence_pattern.finditer(markdown):
+        fenced_ranges.append(match.span())
+        if match.group(1).strip().lower() not in {
+            "",
+            "bash",
+            "console",
+            "dash",
+            "fish",
+            "ksh",
+            "sh",
+            "shell",
+            "shell-session",
+            "zsh",
+        }:
+            continue
+        for line in match.group(2).splitlines():
+            if _packctl_commands(line):
+                mentions.append(_PackctlMention(line, True))
+
+    inline_pattern = re.compile(r"`([^`\n]+)`")
+    for match in inline_pattern.finditer(markdown):
+        if any(start <= match.start() < end for start, end in fenced_ranges):
+            continue
+        if not _packctl_commands(match.group(1)):
+            continue
+        line_start = markdown.rfind("\n", 0, match.start()) + 1
+        line_end = markdown.find("\n", match.end())
+        if line_end < 0:
+            line_end = len(markdown)
+        mentions.append(
+            _PackctlMention(
+                match.group(1),
+                False,
+                markdown[line_start : match.start()],
+                markdown[match.end() : line_end],
+            )
+        )
+    return mentions
+
+
+def advertised_retired_commands(markdown: str) -> set[str]:
+    """Return retired commands actually advertised by guidance."""
+    advertised: set[str] = set()
+    for mention in extract_packctl_mentions(markdown):
+        if classify_guidance_context(mention) != "advertised":
+            continue
+        advertised.update(packctl._RETIRED_COMMANDS & set(_packctl_commands(mention.fragment)))
+    return advertised
+
+
+def parse_completion_commands(completion: str) -> set[str]:
+    """Parse the command descriptions from the zsh completion command block."""
+    commands_block = re.search(
+        r"^\s*commands=\(\n(.*?)^\s*\)", completion, re.DOTALL | re.MULTILINE
+    )
+    if commands_block is None:
+        raise AssertionError("completion command block is missing")
+    commands: set[str] = set()
+    for line in commands_block.group(1).splitlines():
+        try:
+            tokens = shlex.split(line)
+        except ValueError as error:
+            raise AssertionError(f"invalid completion entry: {line!r}: {error}") from error
+        if tokens and ":" in tokens[0]:
+            commands.add(tokens[0].split(":", 1)[0])
+    return commands
 
 
 class PublicCliTest(unittest.TestCase):
@@ -880,58 +1014,79 @@ class PublicCliTest(unittest.TestCase):
                     f"packctl {command} has been removed. Use packctl publish <pack>.",
                 )
 
-    def test_retired_commands_are_absent_from_guidance_and_completion(self) -> None:
+    def test_guidance_helpers_classify_inline_retired_command_examples(self) -> None:
+        descriptive = (
+            "`packctl build` is retired.",
+            "Do not run `packctl deploy`; use `packctl publish` instead.",
+            "The former `packctl restart` command has been removed.",
+            "`packctl build` is not part of the public CLI.",
+        )
+        for example in descriptive:
+            with self.subTest(example=example):
+                mentions = extract_packctl_mentions(example)
+                retired_mentions = [
+                    mention
+                    for mention in mentions
+                    if packctl._RETIRED_COMMANDS
+                    & set(_packctl_commands(mention.fragment))
+                ]
+                self.assertEqual(len(retired_mentions), 1)
+                self.assertEqual(
+                    classify_guidance_context(retired_mentions[0]), "descriptive"
+                )
+                self.assertEqual(advertised_retired_commands(example), set())
+
+        advertised = (
+            "Run `packctl build demo` before publishing.",
+            "Use `packctl deploy demo` to update the server.",
+            "`packctl restart demo` recreates the service.",
+        )
+        for example in advertised:
+            with self.subTest(example=example):
+                mentions = extract_packctl_mentions(example)
+                self.assertEqual(len(mentions), 1)
+                self.assertEqual(classify_guidance_context(mentions[0]), "advertised")
+                self.assertEqual(
+                    advertised_retired_commands(example),
+                    set(_packctl_commands(mentions[0].fragment)),
+                )
+
+    def test_fenced_shell_examples_are_advertised_without_context_inference(self) -> None:
+        guidance = "Negative prose: do not treat this as a command.\n\n```bash\npackctl build demo\n```"
+        self.assertEqual(advertised_retired_commands(guidance), {"build"})
+
+    def test_guidance_helpers_fail_closed_and_parse_shell_boundaries(self) -> None:
+        contradictory = "The retired command `packctl build` is still supported."
+        self.assertEqual(advertised_retired_commands(contradictory), {"build"})
+        self.assertEqual(
+            advertised_retired_commands("Run `packctl build;` before publishing."),
+            {"build"},
+        )
+        self.assertEqual(
+            advertised_retired_commands("```fish\npackctl deploy;\n```"),
+            {"deploy"},
+        )
+        self.assertEqual(
+            advertised_retired_commands("```bash\n# packctl restart demo\n```"),
+            set(),
+        )
+
+    def test_retired_commands_are_absent_from_guidance(self) -> None:
         root = Path(__file__).resolve().parents[1]
         guidance = (root / "AGENTS.md").read_text(encoding="utf-8")
-        code_fragments = re.findall(r"`([^`]+)`", guidance)
-        code_fragments.extend(
-            match.group(1)
-            for match in re.finditer(r"```[^\n]*\n(.*?)```", guidance, re.DOTALL)
-        )
-
-        documented_commands = set()
-        for fragment in code_fragments:
-            try:
-                tokens = shlex.split(fragment)
-            except ValueError as error:
-                self.fail(f"invalid shell-like guidance fragment: {fragment!r}: {error}")
-            for index, token in enumerate(tokens):
-                if token != "packctl":
-                    continue
-                skip = False
-                for argument in tokens[index + 1 :]:
-                    if skip:
-                        skip = False
-                    elif argument == "--root":
-                        skip = True
-                    elif argument.startswith("--root=") or argument.startswith("-"):
-                        continue
-                    else:
-                        documented_commands.add(argument)
-                        break
-
-        completion = (root / "shared/completions/zsh/_packctl").read_text(
-            encoding="utf-8"
-        )
-        commands_block = re.search(
-            r"^\s*commands=\(\n(.*?)^\s*\)", completion, re.DOTALL | re.MULTILINE
-        )
-        self.assertIsNotNone(commands_block)
-        assert commands_block is not None
-        completion_commands = set(
-            re.findall(r"^\s*'([^':]+):", commands_block.group(1), re.MULTILINE)
-        )
+        documented_commands = advertised_retired_commands(guidance)
 
         self.assertFalse(
             packctl._RETIRED_COMMANDS & documented_commands,
             f"retired commands documented as packctl invocations: "
             f"{sorted(packctl._RETIRED_COMMANDS & documented_commands)}",
         )
-        self.assertFalse(
-            packctl._RETIRED_COMMANDS & completion_commands,
-            f"retired commands offered by zsh completion: "
-            f"{sorted(packctl._RETIRED_COMMANDS & completion_commands)}",
-        )
+
+    def test_completion_commands_are_disjoint_from_retired_commands(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        completion = (root / "shared/completions/zsh/_packctl").read_text(encoding="utf-8")
+        completion_commands = parse_completion_commands(completion)
+        self.assertFalse(packctl._RETIRED_COMMANDS & completion_commands)
         self.assertIn("serve", completion_commands)
         self.assertIn("publish", completion_commands)
 
