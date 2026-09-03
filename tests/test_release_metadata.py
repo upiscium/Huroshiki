@@ -13,33 +13,36 @@ from huroshiki_version import VERSION
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "shared" / "scripts"
 
-# Keep source preparation expectations separate from immutable published history.  A
-# stable release transition should only need to change the current-release constants.
-CURRENT_VERSION = "0.3.0-rc.1"
-CURRENT_DATE = "2026-09-03"
-CURRENT_TAG = f"v{CURRENT_VERSION}"
-CURRENT_RELEASE_SCOPE = (
+# Keep source preparation expectations separate from immutable published history.
+CURRENT_SOURCE_VERSION = "0.3.0-rc.1.dev"
+PUBLISHED_VERSION = "0.3.0-rc.1"
+PUBLISHED_DATE = "2026-09-03"
+PUBLISHED_TAG = f"v{PUBLISHED_VERSION}"
+PUBLISHED_RELEASE_SCOPE = (
     "Pack Copy migration",
     "Template Copy migration",
     "Installed MOD version browser",
     "packctl publish",
     "publication-uncertain",
 )
-PUBLISHED_VERSION = "0.2.0-rc.5"
-PUBLISHED_DATE = "2026-08-03"
-PUBLISHED_PREVIOUS_VERSION = "0.2.0-rc.4"
-PUBLISHED_PREVIOUS_DATE = "2026-08-02"
+HISTORICAL_VERSION = "0.2.0-rc.5"
+HISTORICAL_DATE = "2026-08-03"
+HISTORICAL_PREVIOUS_VERSION = "0.2.0-rc.4"
+HISTORICAL_PREVIOUS_DATE = "2026-08-02"
 
 VERSION_NUMBER = r"(?:0|[1-9][0-9]*)"
 VERSION_CORE = rf"{VERSION_NUMBER}\.{VERSION_NUMBER}\.{VERSION_NUMBER}"
 VERSION_RE = re.compile(
-    rf"^(?:{VERSION_CORE}-dev|{VERSION_CORE}-rc\.{VERSION_NUMBER}|{VERSION_CORE})$"
+    rf"^(?:{VERSION_CORE}-rc\.{VERSION_NUMBER}\.dev|{VERSION_CORE}-dev|"
+    rf"{VERSION_CORE}-rc\.{VERSION_NUMBER}|{VERSION_CORE})$"
 )
 
 
 def version_kind(version: str) -> str:
     if VERSION_RE.fullmatch(version) is None:
         raise ValueError(f"invalid version: {version}")
+    if re.search(r"-rc\.[0-9]+\.dev$", version):
+        return "post-RC development"
     if version.endswith("-dev"):
         return "development"
     if "-rc." in version:
@@ -73,21 +76,27 @@ def release_block(document: str, version: str, date: str) -> str:
 class ReleaseMetadataTest(unittest.TestCase):
     def test_allowed_version_forms_are_strict(self) -> None:
         allowed = {
-            CURRENT_VERSION: "release-candidate",
+            CURRENT_SOURCE_VERSION: "post-RC development",
             PUBLISHED_VERSION: "release-candidate",
             "1.2.3": "stable",
+            "1.2.3-dev": "development",
         }
         rejected = (
             "v0.3.0-dev",
             "0.3-dev",
             "0.3.0-dev.1",
             "0.3.0-rc",
+            "0.3.0-rc.dev",
             "0.3.0-rc.x",
             "0.3.0-rc.0foo",
+            "0.3.0-rc.1dev",
+            "0.3.0-rc.1.dev.1",
             "0.3.0+build",
             "01.2.3-dev",
+            "01.2.3-rc.1.dev",
             "1.02.3-rc.1",
             "1.2.3-rc.01",
+            "1.2.3-rc.01.dev",
             "latest",
             "",
         )
@@ -102,24 +111,24 @@ class ReleaseMetadataTest(unittest.TestCase):
                     version_kind(version)
 
     def test_current_version_source_and_runtime_parity(self) -> None:
-        self.assertRegex(CURRENT_VERSION, VERSION_RE)
-        self.assertEqual(version_kind(CURRENT_VERSION), "release-candidate")
-        self.assertEqual(VERSION, CURRENT_VERSION)
+        self.assertRegex(CURRENT_SOURCE_VERSION, VERSION_RE)
+        self.assertEqual(version_kind(CURRENT_SOURCE_VERSION), "post-RC development")
+        self.assertEqual(VERSION, CURRENT_SOURCE_VERSION)
         source = (SCRIPTS / "VERSION").read_text(encoding="utf-8").strip()
-        self.assertEqual(source, CURRENT_VERSION)
+        self.assertEqual(source, CURRENT_SOURCE_VERSION)
         self.assertEqual(source, VERSION)
 
     def test_flake_uses_runtime_version_source(self) -> None:
         flake = (ROOT / "flake.nix").read_text(encoding="utf-8")
         self.assertIn("builtins.readFile ./shared/scripts/VERSION", flake)
-        self.assertNotIn(f'version = "{CURRENT_VERSION}"', flake)
+        self.assertNotIn(f'version = "{CURRENT_SOURCE_VERSION}"', flake)
         self.assertGreaterEqual(flake.count("inherit version;"), 2)
 
     def test_cli_versions(self) -> None:
         environment = {**os.environ, "PYTHONPATH": str(SCRIPTS)}
         for script, expected in (
-            ("huroshiki.py", f"huroshiki {CURRENT_VERSION}"),
-            ("packctl.py", f"packctl {CURRENT_VERSION}"),
+            ("huroshiki.py", f"huroshiki {CURRENT_SOURCE_VERSION}"),
+            ("packctl.py", f"packctl {CURRENT_SOURCE_VERSION}"),
         ):
             with self.subTest(script=script):
                 result = subprocess.run(
@@ -133,36 +142,46 @@ class ReleaseMetadataTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
 
-    def test_current_release_candidate_metadata(self) -> None:
+    def test_current_source_has_no_dev_release_metadata(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         self.assertTrue(changelog.startswith("# Changelog\n\n## Unreleased\n"))
         self.assertEqual(unreleased_payload(changelog), "")
+        self.assertNotIn(f"## {CURRENT_SOURCE_VERSION} - ", changelog)
+        self.assertFalse(
+            (ROOT / "docs" / "releases" / f"v{CURRENT_SOURCE_VERSION}.md").exists()
+        )
 
-        current = release_block(changelog, CURRENT_VERSION, CURRENT_DATE)
-        self.assertTrue(current.strip(), "current release block must have a payload")
-        self.assertIn(f"## {CURRENT_VERSION} - {CURRENT_DATE}\n", changelog)
+    def test_published_rc1_metadata_is_deterministic_and_consistent(self) -> None:
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        current = release_block(changelog, PUBLISHED_VERSION, PUBLISHED_DATE)
+        self.assertTrue(current.strip(), "published release block must have a payload")
+        self.assertIn(f"## {PUBLISHED_VERSION} - {PUBLISHED_DATE}\n", changelog)
 
-        release_path = ROOT / "docs" / "releases" / f"{CURRENT_TAG}.md"
+        release_path = ROOT / "docs" / "releases" / f"{PUBLISHED_TAG}.md"
         self.assertTrue(release_path.is_file())
         release_notes = release_path.read_text(encoding="utf-8")
-        self.assertTrue(release_notes.startswith(f"# Huroshiki v{CURRENT_VERSION}\n"))
-        self.assertIn(f"Release date: {CURRENT_DATE}", release_notes)
+        self.assertTrue(release_notes.startswith(f"# Huroshiki {PUBLISHED_TAG}\n"))
+        self.assertIn(f"Release date: {PUBLISHED_DATE}", release_notes)
+        self.assertIn(
+            f"compare/v0.2.0-rc.5...{PUBLISHED_TAG}", release_notes
+        )
+        self.assertIn(f"{PUBLISHED_VERSION} - {PUBLISHED_DATE}", changelog)
         release_material = " ".join(release_notes.split()).lower()
-        for phrase in CURRENT_RELEASE_SCOPE:
+        for phrase in PUBLISHED_RELEASE_SCOPE:
             with self.subTest(scope=phrase):
                 self.assertIn(phrase.lower(), release_material)
 
     def test_historical_published_rc5_metadata_is_immutable(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        release_path = ROOT / "docs" / "releases" / f"v{PUBLISHED_VERSION}.md"
+        release_path = ROOT / "docs" / "releases" / f"v{HISTORICAL_VERSION}.md"
         self.assertTrue(release_path.is_file())
         release_notes = release_path.read_text(encoding="utf-8")
-        self.assertRegex(PUBLISHED_VERSION, VERSION_RE)
-        rc5 = release_block(changelog, PUBLISHED_VERSION, PUBLISHED_DATE)
-        rc4 = release_block(changelog, PUBLISHED_PREVIOUS_VERSION, PUBLISHED_PREVIOUS_DATE)
+        self.assertRegex(HISTORICAL_VERSION, VERSION_RE)
+        rc5 = release_block(changelog, HISTORICAL_VERSION, HISTORICAL_DATE)
+        rc4 = release_block(changelog, HISTORICAL_PREVIOUS_VERSION, HISTORICAL_PREVIOUS_DATE)
 
-        self.assertTrue(release_notes.startswith(f"# Huroshiki v{PUBLISHED_VERSION}\n"))
-        self.assertIn(f"Release date: {PUBLISHED_DATE}", release_notes)
+        self.assertTrue(release_notes.startswith(f"# Huroshiki v{HISTORICAL_VERSION}\n"))
+        self.assertIn(f"Release date: {HISTORICAL_DATE}", release_notes)
         self.assertIn(
             "compare/v0.2.0-rc.4...v0.2.0-rc.5",
             release_notes,
@@ -195,23 +214,19 @@ class ReleaseMetadataTest(unittest.TestCase):
     def test_readme_current_and_published_version_guidance(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         readme_words = " ".join(readme.split())
-        self.assertIn(f"prepared for `{CURRENT_TAG}`", readme_words)
-        self.assertIn("release candidate is not published yet", readme_words)
-        self.assertIn("publication happen separately after merge", readme_words)
-        self.assertIn(
-            f"latest actually published GitHub Release is still `v{PUBLISHED_VERSION}`",
+        self.assertIn(CURRENT_SOURCE_VERSION, readme_words)
+        self.assertIn(f"{PUBLISHED_TAG}", readme_words)
+        self.assertIn(f"nix run github:upiscium/Huroshiki/{PUBLISHED_TAG}", readme_words)
+        self.assertRegex(
             readme_words,
+            rf"latest(?: actually)? published.*{re.escape(PUBLISHED_TAG)}",
         )
         self.assertIn(
-            f"github:upiscium/Huroshiki/v{PUBLISHED_VERSION}",
+            f"github:upiscium/Huroshiki/{PUBLISHED_TAG}",
             readme,
         )
-        self.assertNotRegex(readme.lower(), r"rc\.5[^\n]*(?:future|uncreated)")
-        self.assertNotIn(
-            f"latest actually published GitHub Release is still `{CURRENT_TAG}`",
-            readme_words,
-        )
-        self.assertNotIn(f"github:upiscium/Huroshiki/{CURRENT_TAG}", readme)
+        self.assertNotRegex(readme_words, r"latest actually published[^.]*rc\.2")
+        self.assertNotRegex(readme_words, r"latest actually published[^.]*v0\.3\.0[ `.,)]")
 
 
 if __name__ == "__main__":
