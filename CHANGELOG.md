@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0-rc.1 - 2026-09-03
+
 ### Migration
 
 - Added Pack Copy migration for changing a Pack's Minecraft/loader target without
@@ -37,7 +39,8 @@
 - Unified CLI and TUI Publish on one previewed, digest-bound Core plan with a shared
   cancellation event and deadline. The TUI retains cleanup ownership and supports
   cancellation and retry, while the former standalone build, deploy, and restart
-  commands have been retired in favor of `packctl publish`.
+  commands have been retired in favor of `packctl publish`; `packctl serve` remains
+  the supported local serving path.
 
 ### CLI and TUI
 
