@@ -24,10 +24,12 @@ huroshiki --version
 packctl --version
 ```
 
-This source tree is prepared for `v0.3.0-rc.1`, but that release candidate is not published yet.
-Tag and GitHub Release publication happen separately after merge and verification. The latest
-actually published GitHub Release is still `v0.2.0-rc.5`, which can be run with
-`nix run github:upiscium/Huroshiki/v0.2.0-rc.5 -- --help`.
+The current main/source version is `0.3.0-rc.1.dev`. The latest published GitHub Release is
+`v0.3.0-rc.1`, which can be run with:
+
+```bash
+nix run github:upiscium/Huroshiki/v0.3.0-rc.1 -- --help
+```
 
 The managed repository is selected by `--root PATH`, then `HUROSHIKI_ROOT`, then the current
 working directory. `huroshiki` accepts `--root` before or after `--pack`/`--template`; `packctl`
