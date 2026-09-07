@@ -22,7 +22,7 @@ from publish_target import (
     PublishRestartTarget,
     PublishSshEndpoint,
     PublishTargetError,
-    publish_remote_target_from_legacy_settings,
+    rebuild_legacy_publish_target_for_revalidation,
     validate_publish_remote_path,
 )
 from publish_transfer import compute_publish_generation_id
@@ -267,6 +267,7 @@ def _validate_target(target: PublishRemoteTarget) -> PublishRemoteTarget:
                 target.publication_endpoint.user,
             ),
             publication_root=target.publication_root,
+            publication_root_source=target.publication_root_source,
             restart=restart,
             config_digest=target.config_digest,
         )
@@ -317,13 +318,12 @@ def _resolve_current_target(
 ) -> PublishRemoteTarget:
     try:
         settings = packctl.deployment_settings(manifest.pack_id)
-        return publish_remote_target_from_legacy_settings(
+        return rebuild_legacy_publish_target_for_revalidation(
+            target,
             rsync_target=settings.rsync_target,
             ssh_host=settings.ssh_host,
             stack_dir=settings.stack_dir,
             service=settings.service,
-            server_id=target.server_id,
-            remote_path=target.publication_root.as_posix(),
         )
     except (packctl.ConfigError, PublishTargetError) as error:
         raise PublishRestartError(

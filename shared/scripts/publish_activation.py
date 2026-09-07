@@ -17,7 +17,7 @@ from process_runner import BoundedProcessResult, process_failure_message
 from publish_target import (
     PublishRemoteTarget,
     PublishTargetError,
-    publish_remote_target_from_legacy_settings,
+    rebuild_legacy_publish_target_for_revalidation,
 )
 from publish_transfer import (
     PublishStagedFile,
@@ -190,13 +190,12 @@ def _resolve_current_publish_target(
 ) -> PublishRemoteTarget:
     try:
         settings = packctl.deployment_settings(manifest.pack_id)
-        return publish_remote_target_from_legacy_settings(
+        return rebuild_legacy_publish_target_for_revalidation(
+            target,
             rsync_target=settings.rsync_target,
             ssh_host=settings.ssh_host,
             stack_dir=settings.stack_dir,
             service=settings.service,
-            server_id=target.server_id,
-            remote_path=target.publication_root.as_posix(),
         )
     except (packctl.ConfigError, PublishTargetError) as error:
         raise PublishTargetError(str(error)) from error
@@ -304,6 +303,41 @@ def _validate_response(
             )
 
 
+def _validate_current_response(
+    response: dict[str, object],
+    *,
+    operation_id: str,
+    activated: PublishActivatedGeneration,
+    manifest: PackPublishManifest,
+    target: PublishRemoteTarget,
+    pack_digest: str,
+    index_digest: str,
+) -> None:
+    expected = {
+        "ok": True,
+        "request": "verify-current",
+        "status": "verified-current",
+        "operation_id": operation_id,
+        "manifest_digest": manifest.manifest_digest,
+        "target_config_digest": target.config_digest,
+        "generation_id": activated.generation_id,
+        "generation_path": activated.generation_path.as_posix(),
+        "current_path": activated.current_path.as_posix(),
+        "current_generation_id": activated.generation_id,
+        "pack_toml_sha256": pack_digest,
+        "index_toml_sha256": index_digest,
+    }
+    if set(response) != set(expected):
+        raise PublishSemanticVerificationUncertainError(
+            "remote authoritative verification response shape is invalid"
+        )
+    for key, value in expected.items():
+        if response.get(key) != value:
+            raise PublishSemanticVerificationUncertainError(
+                f"remote authoritative verification response does not bind {key}"
+            )
+
+
 def verify_publish_generation(
     staged: PublishStagedGeneration,
     manifest: PackPublishManifest,
@@ -350,6 +384,109 @@ def verify_publish_generation(
         manifest.manifest_digest,
         target.config_digest,
         staged.generation_id,
+        pack_digest,
+        index_digest,
+        len(files),
+        manifest,
+    )
+
+
+def verify_activated_publish_generation(
+    activated: PublishActivatedGeneration,
+    manifest: PackPublishManifest,
+    target: PublishRemoteTarget,
+    *,
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    progress: Callable[[str], object] | None = None,
+) -> PublishSemanticVerification:
+    """Authoritatively verify that the requested, already-activated generation is current."""
+    if not isinstance(activated, PublishActivatedGeneration):
+        raise PublishSemanticVerificationError("authoritative verification requires an activated generation")
+    try:
+        validate_publish_manifest(manifest)
+    except (PackPublishError, AttributeError, TypeError) as error:
+        raise PublishSemanticVerificationError(str(error)) from error
+    if not isinstance(target, PublishRemoteTarget):
+        raise PublishSemanticVerificationError("authoritative verification requires a PublishRemoteTarget")
+    staged = PublishStagedGeneration(
+        activated.manifest_digest,
+        activated.target_config_digest,
+        activated.generation_id,
+        activated.generation_path,
+        _expected_staged_files(manifest),
+        manifest.total_bytes,
+        activated.reused,
+    )
+    try:
+        files = _validate_inputs(staged, manifest, target)
+    except (AttributeError, TypeError) as error:
+        raise PublishSemanticVerificationError("activated generation identity is malformed") from error
+    expected_generation = compute_publish_generation_id(manifest, target)
+    expected_generation_path = target.publication_root / "generations" / expected_generation
+    expected_current_path = target.publication_root / "current"
+    if (
+        activated.generation_id != expected_generation
+        or activated.generation_path != expected_generation_path
+        or activated.current_path != expected_current_path
+    ):
+        raise PublishSemanticVerificationError("activated generation identity or path is not canonical")
+    operation_deadline = _deadline(deadline)
+    _checkpoint(cancel_event, operation_deadline)
+    _check_current_publish_target(manifest, target, PublishSemanticVerificationError)
+    _emit(progress, "verifying-current-generation")
+    operation_id = uuid4().hex
+    header = _verification_header(
+        staged,
+        manifest,
+        target,
+        operation_id,
+        files,
+        request="verify-current",
+    )
+    header.update(
+        {
+            "generation_path": expected_generation_path.as_posix(),
+            "current_path": expected_current_path.as_posix(),
+        }
+    )
+    result, response = run_publish_remote_control_request(
+        target,
+        header,
+        deadline=operation_deadline,
+        cancel_event=cancel_event,
+    )
+    lifecycle_failure = _lifecycle_failure(result)
+    if lifecycle_failure is not None:
+        raise PublishSemanticVerificationUncertainError(lifecycle_failure)
+    if not result.succeeded:
+        failure = process_failure_message(result, label="Publish authoritative verification")
+        detail = (
+            str(response["error"])
+            if response is not None and response.get("error") is not None
+            else failure
+        )
+        raise PublishSemanticVerificationError(
+            detail or "active Publish generation integrity could not be verified"
+        )
+    if response is None or response.get("ok") is not True:
+        raise PublishSemanticVerificationError(_response_error(response))
+    pack_digest = next(entry.sha256 for entry in files if entry.relative_path.as_posix() == "pack.toml")
+    index_digest = next(entry.sha256 for entry in files if entry.relative_path.as_posix() == "index.toml")
+    _validate_current_response(
+        response,
+        operation_id=operation_id,
+        activated=activated,
+        manifest=manifest,
+        target=target,
+        pack_digest=pack_digest,
+        index_digest=index_digest,
+    )
+    _emit(progress, "verified-current-generation")
+    return PublishSemanticVerification(
+        manifest.manifest_digest,
+        target.config_digest,
+        activated.generation_id,
         pack_digest,
         index_digest,
         len(files),

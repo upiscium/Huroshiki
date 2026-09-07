@@ -42,7 +42,7 @@ from process_runner import (
 from publish_target import (
     PublishRemoteTarget,
     PublishTargetError,
-    publish_remote_target_from_legacy_settings,
+    rebuild_legacy_publish_target_for_revalidation,
 )
 
 
@@ -215,6 +215,7 @@ PublishRemoteRequest = Literal[
     "status",
     "cleanup",
     "verify",
+    "verify-current",
     "activate",
     "activation-status",
     "activation-cleanup",
@@ -482,12 +483,29 @@ def verify_tree(root, expected):
         parent, owned = open_relative_dir(root, parts[:-1], create=False)
         fd = os.open(parts[-1], READ_FLAGS, dir_fd=parent)
         try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+                or opened.st_size != size
+                or stat.S_IMODE(opened.st_mode) != mode
+            ):
+                raise RuntimeError("staged file changed while opening")
             actual = hashlib.sha256()
             while True:
                 chunk = os.read(fd, CHUNK)
                 if not chunk:
                     break
                 actual.update(chunk)
+            after = os.fstat(fd)
+            if (
+                (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+                or after.st_nlink != 1
+                or after.st_size != size
+                or stat.S_IMODE(after.st_mode) != mode
+            ):
+                raise RuntimeError("staged file changed during verification")
             if actual.hexdigest() != digest:
                 raise RuntimeError("staged file digest mismatch")
             verified[path] = (size, digest, mode)
@@ -1005,6 +1023,55 @@ def process_verify(header):
         os.close(lock)
         os.close(root)
 
+def process_verify_current(header):
+    root = open_absolute(header["publication_root"], create=False)
+    lock = lock_root(root)
+    try:
+        generations = open_child_dir(root, "generations", create=False)
+        try:
+            expected_current_path = header["publication_root"] + "/current"
+            expected_generation_path = (
+                header["publication_root"] + "/generations/" + header["generation_id"]
+            )
+            if header.get("current_path") != expected_current_path:
+                raise RuntimeError("current path is not bound to the publication root")
+            if header.get("generation_path") != expected_generation_path:
+                raise RuntimeError("generation path is not bound to the requested generation")
+            expected = expected_map(header)
+            current = current_generation(root, generations)
+            if current != header["generation_id"]:
+                raise RuntimeError("current does not reference the requested generation")
+            generation = os.open(header["generation_id"], DIR_FLAGS, dir_fd=generations)
+            try:
+                verified = verify_tree(generation, expected)
+                pack_digest, index_digest = verify_semantics(
+                    header, generation, expected, verified
+                )
+            finally:
+                os.close(generation)
+            if current_generation(root, generations) != header["generation_id"]:
+                raise RuntimeError("current changed during authoritative verification")
+            return {
+                "ok": True,
+                "request": "verify-current",
+                "status": "verified-current",
+                "operation_id": header["operation_id"],
+                "manifest_digest": header["manifest_digest"],
+                "target_config_digest": header["target_config_digest"],
+                "generation_id": header["generation_id"],
+                "generation_path": expected_generation_path,
+                "current_path": expected_current_path,
+                "current_generation_id": header["generation_id"],
+                "pack_toml_sha256": pack_digest,
+                "index_toml_sha256": index_digest,
+            }
+        finally:
+            os.close(generations)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
+        os.close(root)
+
 def remove_activation_temp(root, name, expected_target):
     try:
         metadata = os.stat(name, dir_fd=root, follow_symlinks=False)
@@ -1285,6 +1352,8 @@ def main():
             send(process_status(header))
         elif request == "verify":
             send(process_verify(header))
+        elif request == "verify-current":
+            send(process_verify_current(header))
         elif request == "activate":
             send(process_activate(header))
         elif request == "activation-status":
@@ -1352,6 +1421,7 @@ def compute_publish_generation_id(
     manifest: PackPublishManifest,
     target: PublishRemoteTarget,
 ) -> str:
+    """Bind one generation ID to one manifest and target, hence one exact tree."""
     validate_publish_manifest(manifest)
     if not isinstance(target, PublishRemoteTarget):
         raise PublishTransferError("publish transfer requires a PublishRemoteTarget")
@@ -2075,12 +2145,12 @@ def _cleanup_remote_publish_stage(
 def _resolve_current_target(plan: PublishTransferPlan) -> PublishRemoteTarget:
     try:
         settings = packctl.deployment_settings(plan.pack_id)
-        return publish_remote_target_from_legacy_settings(
+        return rebuild_legacy_publish_target_for_revalidation(
+            plan.target,
             rsync_target=settings.rsync_target,
             ssh_host=settings.ssh_host,
             stack_dir=settings.stack_dir,
             service=settings.service,
-            remote_path=plan.target.publication_root.as_posix(),
         )
     except (packctl.ConfigError, PublishTargetError) as error:
         raise PublishTransferExecutionError(str(error)) from error

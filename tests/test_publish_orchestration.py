@@ -4,7 +4,7 @@ from dataclasses import FrozenInstanceError, replace
 import threading
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import pack_publish
 import packctl
@@ -105,6 +105,7 @@ class PublishOrchestrationTest(unittest.TestCase):
             "execute_publish_transfer": Mock(return_value=staged),
             "verify_publish_generation": Mock(return_value=verified),
             "activate_publish_generation": Mock(return_value=activated),
+            "verify_activated_publish_generation": Mock(return_value=verified),
             "restart_activated_publish": Mock(
                 return_value=successful_restart if restart is None else restart
             ),
@@ -164,6 +165,7 @@ class PublishOrchestrationTest(unittest.TestCase):
             "execute_publish_transfer": staged,
             "verify_publish_generation": verified,
             "activate_publish_generation": activated,
+            "verify_activated_publish_generation": verified,
             "restart_activated_publish": restart,
         }
         for name, value in values.items():
@@ -175,13 +177,71 @@ class PublishOrchestrationTest(unittest.TestCase):
             result = publish.execute_pack_publish(plan, cancel_event=self.cancel, deadline=self.deadline)
         self.assertEqual([name for name, _ in calls], [
             "prepare_publish_transfer", "execute_publish_transfer", "verify_publish_generation",
-            "activate_publish_generation", "restart_activated_publish", "cleanup",
+            "activate_publish_generation", "verify_activated_publish_generation",
+            "restart_activated_publish", "cleanup",
         ])
         self.assertIs(calls[1][1][0], owner)
         self.assertIs(calls[2][1][0], staged)
         self.assertIs(calls[3][1][0], staged)
         self.assertIs(calls[4][1][0], activated)
+        self.assertIs(calls[5][1][0], activated)
         self.assertEqual(result.final_status, "published")
+
+    def test_active_generation_verification_is_after_activation_before_restart(self) -> None:
+        plan = self.plan()
+        mocks, (_, _, verified, activated, restart) = self.phase_mocks(plan)
+        calls: list[str] = []
+        for name in (
+            "prepare_publish_transfer",
+            "execute_publish_transfer",
+            "verify_publish_generation",
+            "activate_publish_generation",
+            "verify_activated_publish_generation",
+            "restart_activated_publish",
+        ):
+            mocks[name].side_effect = lambda *args, _name=name, **kwargs: (
+                calls.append(_name), mocks[_name].return_value
+            )[1]
+        with self.patch_phases(mocks):
+            result = publish.execute_pack_publish(
+                plan, cancel_event=self.cancel, deadline=self.deadline
+            )
+        self.assertEqual(
+            calls,
+            [
+                "prepare_publish_transfer",
+                "execute_publish_transfer",
+                "verify_publish_generation",
+                "activate_publish_generation",
+                "verify_activated_publish_generation",
+                "restart_activated_publish",
+            ],
+        )
+        mocks["verify_activated_publish_generation"].assert_called_once_with(
+            activated, plan.manifest, plan.target,
+            cancel_event=self.cancel, deadline=self.deadline,
+            progress=ANY,
+        )
+        self.assertEqual(result.final_status, "published")
+
+    def test_active_generation_verification_failure_prevents_restart_and_preserves_publication_state(self) -> None:
+        plan = self.plan()
+        mocks, (_, _, _, activated, _) = self.phase_mocks(plan)
+        drift = publish_activation.PublishSemanticVerificationError("active generation drift")
+        mocks["verify_activated_publish_generation"].side_effect = drift
+        with self.patch_phases(mocks):
+            with self.assertRaises(publish.PackPublishExecutionError) as raised:
+                publish.execute_pack_publish(
+                    plan, cancel_event=self.cancel, deadline=self.deadline
+                )
+        self.assertIs(raised.exception.primary_error, drift)
+        self.assertTrue(raised.exception.result.publication_succeeded)
+        self.assertTrue(raised.exception.result.activated)
+        self.assertFalse(raised.exception.result.restart_attempted)
+        self.assertEqual(raised.exception.result.restart_status, "not_started")
+        self.assertEqual(raised.exception.result.final_status, "restart_not_started")
+        mocks["verify_activated_publish_generation"].assert_called_once()
+        mocks["restart_activated_publish"].assert_not_called()
 
     def test_same_controls_reach_all_phases_and_replacements_fail(self) -> None:
         plan = self.plan()
@@ -190,7 +250,8 @@ class PublishOrchestrationTest(unittest.TestCase):
             publish.execute_pack_publish(plan, cancel_event=self.cancel, deadline=self.deadline)
         for name in (
             "prepare_publish_transfer", "execute_publish_transfer", "verify_publish_generation",
-            "activate_publish_generation", "restart_activated_publish",
+            "activate_publish_generation", "verify_activated_publish_generation",
+            "restart_activated_publish",
         ):
             call = mocks[name].call_args
             self.assertIs(call.kwargs["cancel_event"], self.cancel)
@@ -222,9 +283,10 @@ class PublishOrchestrationTest(unittest.TestCase):
             "execute_publish_transfer",
             "verify_publish_generation",
             "activate_publish_generation",
+            "verify_activated_publish_generation",
             "restart_activated_publish",
         ]
-        for failed in range(5):
+        for failed in range(len(phase_names)):
             with self.subTest(failed=failed):
                 plan = self.plan()
                 mocks, _ = self.phase_mocks(plan)
@@ -692,9 +754,10 @@ class PublishOrchestrationTest(unittest.TestCase):
         with self.patch_phases(mocks):
             publish.execute_pack_publish(plan, cancel_event=self.cancel, deadline=self.deadline)
         self.assertEqual(order[-1], "cleanup")
-        self.assertEqual(order[:5], [
+        self.assertEqual(order[:6], [
             "prepare_publish_transfer", "execute_publish_transfer", "verify_publish_generation",
-            "activate_publish_generation", "restart_activated_publish",
+            "activate_publish_generation", "verify_activated_publish_generation",
+            "restart_activated_publish",
         ])
         progress = publish.PackPublishProgress("published")
         self.assertRaises(FrozenInstanceError, setattr, progress, "phase", "secret")

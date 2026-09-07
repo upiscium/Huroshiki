@@ -25,6 +25,7 @@ from publish_activation import (
     PublishSemanticVerificationUncertainError,
     activate_publish_generation,
     retry_publish_activation_cleanup,
+    verify_activated_publish_generation,
     verify_publish_generation,
 )
 from publish_restart import (
@@ -672,6 +673,18 @@ def execute_pack_publish(
             verification,
             plan.target,
             manifest=plan.manifest,
+            cancel_event=operation_event,
+            deadline=operation_deadline,
+            progress=_phase_progress(progress, phase),
+        )
+
+        phase = "verifying-active"
+        _checkpoint(operation_event, operation_deadline)
+        _emit(progress, PackPublishProgress(phase))
+        verify_activated_publish_generation(
+            activated_token,
+            plan.manifest,
+            plan.target,
             cancel_event=operation_event,
             deadline=operation_deadline,
             progress=_phase_progress(progress, phase),

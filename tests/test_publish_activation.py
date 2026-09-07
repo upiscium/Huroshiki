@@ -174,6 +174,36 @@ class PublishSemanticVerificationTest(PackPublishManifestTest):
         finally:
             transfer.discard_publish_transfer_plan(plan)
 
+    def test_configured_publication_path_drift_is_rejected_before_remote_request(self) -> None:
+        manifest = pack_publish.plan_pack_publish_manifest("demo")
+        target = publish_target.publish_remote_target_from_legacy_settings(
+            rsync_target=f"publisher@publish.example:{self.root / 'remote'}",
+            ssh_host="minecraft@game.example",
+            stack_dir="/srv/minecraft",
+            service="minecraft",
+        )
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        current = packctl.DeploymentSettings(
+            f"publisher@publish.example:{self.root / 'remote'}",
+            "minecraft@game.example",
+            "/srv/minecraft",
+            "minecraft",
+        )
+        stale = replace(current, rsync_target=f"publisher@publish.example:{self.root / 'other'}")
+        try:
+            with patch.object(packctl, "deployment_settings", return_value=current), patch.object(
+                transfer, "run_bounded_process", side_effect=self._fake_runner()
+            ):
+                staged = transfer.execute_publish_transfer(plan)
+            with patch.object(packctl, "deployment_settings", return_value=stale), patch.object(
+                transfer, "run_bounded_process"
+            ) as run:
+                with self.assertRaises(activation.PublishSemanticVerificationError):
+                    activation.verify_publish_generation(staged, manifest, target)
+            run.assert_not_called()
+        finally:
+            transfer.discard_publish_transfer_plan(plan)
+
     def test_activate_rejects_stale_restart_target_before_remote_request(self) -> None:
         manifest, target, plan, staged, verification = self._verified_generation()
         stale_settings = replace(self.current_settings, stack_dir="/srv/other-minecraft")
@@ -213,6 +243,41 @@ class PublishSemanticVerificationTest(PackPublishManifestTest):
                 Path(target.publication_root, "current").readlink().as_posix(),
                 f"generations/{staged.generation_id}",
             )
+        finally:
+            transfer.discard_publish_transfer_plan(plan)
+
+    def test_activated_nested_generation_drift_is_rejected_by_authoritative_verification(self) -> None:
+        expected_content = {
+            "kubejs/server_scripts/common.js": b"common script\n",
+            "kubejs/server_scripts/server.js": b"server script\n",
+            "config/example.toml": b"[example]\nvalue = true\n",
+        }
+        for source, contents in (
+            ("content/common/kubejs/server_scripts/common.js", expected_content["kubejs/server_scripts/common.js"]),
+            ("content/server/kubejs/server_scripts/server.js", expected_content["kubejs/server_scripts/server.js"]),
+            ("content/common/config/example.toml", expected_content["config/example.toml"]),
+        ):
+            path = self.pack / source
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents)
+        manifest, target, plan, staged, verification = self._verified_generation()
+        try:
+            with patch.object(transfer, "run_bounded_process", side_effect=self._fake_runner()):
+                activated = activation.activate_publish_generation(
+                    staged, verification, target, manifest=manifest
+                )
+            for relative, contents in expected_content.items():
+                self.assertEqual((Path(activated.current_path) / relative).read_bytes(), contents)
+            with patch.object(transfer, "run_bounded_process", side_effect=self._fake_runner()):
+                current_verification = activation.verify_activated_publish_generation(
+                    activated, manifest, target
+                )
+            self.assertEqual(current_verification.generation_id, activated.generation_id)
+            active_server_file = Path(activated.current_path) / "kubejs/server_scripts/server.js"
+            active_server_file.write_bytes(b"drifted after activation")
+            with patch.object(transfer, "run_bounded_process", side_effect=self._fake_runner()):
+                with self.assertRaises(activation.PublishSemanticVerificationError):
+                    activation.verify_activated_publish_generation(activated, manifest, target)
         finally:
             transfer.discard_publish_transfer_plan(plan)
 

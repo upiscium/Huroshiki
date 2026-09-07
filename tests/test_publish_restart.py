@@ -207,6 +207,35 @@ class PublishRestartTest(PackPublishManifestTest):
                     )
                 run.assert_not_called()
 
+    def test_configured_publication_path_drift_is_rejected_without_runner(self) -> None:
+        target = publish_target.publish_remote_target_from_legacy_settings(
+            rsync_target=f"publisher@publish.example:{self.root / 'remote'}",
+            ssh_host="minecraft@game.example",
+            stack_dir="/srv/minecraft",
+            service="minecraft",
+        )
+        manifest = pack_publish.plan_pack_publish_manifest("demo")
+        generation = restart.compute_publish_generation_id(manifest, target)
+        activated = restart.PublishActivatedGeneration(
+            manifest.manifest_digest,
+            target.config_digest,
+            generation,
+            target.publication_root / "generations" / generation,
+            target.publication_root / "current",
+            None,
+            False,
+        )
+        stale = replace(
+            self.settings,
+            rsync_target=f"publisher@publish.example:{self.root / 'other'}",
+        )
+        with patch.object(packctl, "deployment_settings", return_value=stale), patch.object(
+            restart, "run_bounded_process"
+        ) as run:
+            with self.assertRaisesRegex(restart.PublishRestartError, "stale"):
+                restart.restart_activated_publish(activated, manifest, target)
+        run.assert_not_called()
+
     def test_stack_and_service_are_protocol_only_and_command_is_hardened(self) -> None:
         stack_dir = "/srv/minecraft;literal-$HOME"
         target = publish_target.publish_remote_target_from_legacy_settings(
