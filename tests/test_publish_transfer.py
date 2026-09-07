@@ -73,6 +73,189 @@ class PublishTransferTest(PackPublishManifestTest):
 
         return run
 
+    def _nested_content_manifest_and_target(self):
+        files = {
+            "content/common/kubejs/server_scripts/common.js": b"common script\n",
+            "content/server/kubejs/server_scripts/server.js": b"server script\n",
+            "content/common/config/example.toml": b"[example]\nvalue = true\n",
+        }
+        for relative, contents in files.items():
+            path = self.pack / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents)
+        return self._manifest_and_target()
+
+    def _publish_nested_generation(self):
+        manifest, target = self._nested_content_manifest_and_target()
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        with patch.object(packctl, "deployment_settings", return_value=self._settings(target)), patch.object(
+            transfer, "run_bounded_process", side_effect=self._fake_runner([])
+        ):
+            result = transfer.execute_publish_transfer(plan)
+        self.assertFalse(result.reused)
+        transfer.discard_publish_transfer_plan(plan)
+        return manifest, target, result
+
+    def _assert_nested_reuse_rejected(self, mutate) -> None:
+        manifest, target, first = self._publish_nested_generation()
+        generation = Path(target.publication_root) / "generations" / first.generation_id
+        mutate(generation)
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        with patch.object(packctl, "deployment_settings", return_value=self._settings(target)), patch.object(
+            transfer, "run_bounded_process", side_effect=self._fake_runner([])
+        ):
+            try:
+                with self.assertRaises(transfer.PublishTransferExecutionError):
+                    transfer.execute_publish_transfer(plan)
+            finally:
+                transfer.discard_publish_transfer_plan(plan)
+
+    def test_nested_content_manifest_workspace_header_spool_and_generation_are_identical(self) -> None:
+        manifest, target = self._nested_content_manifest_and_target()
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        captured: dict[str, object] = {}
+
+        def run(command, *, stdin_file, **kwargs):
+            encoded = stdin_file.read()
+            magic_end = len(transfer._FRAME_HEADER)
+            self.assertEqual(encoded[:magic_end], transfer._FRAME_HEADER)
+            version = struct.unpack("!I", encoded[magic_end:magic_end + 4])[0]
+            self.assertEqual(version, 1)
+            header_size = struct.unpack("!I", encoded[magic_end + 4:magic_end + 8])[0]
+            header_start = magic_end + 8
+            header = json.loads(encoded[header_start:header_start + header_size])
+            captured["header"] = header
+            offset = header_start + header_size
+            frames: dict[str, bytes] = {}
+            for item in header["files"]:
+                size = struct.unpack("!Q", encoded[offset:offset + 8])[0]
+                offset += 8
+                frames[item["path"]] = encoded[offset:offset + size]
+                offset += size
+            self.assertEqual(offset, len(encoded))
+            captured["frames"] = frames
+            helper = transfer._REMOTE_HELPER_SCRIPT.replace(
+                "            verify_tree(stage, expected)\n            os.fsync(stage)",
+                "            verify_tree(stage, expected)\n"
+                "            __import__('time').sleep(0.5)\n"
+                "            os.fsync(stage)",
+                1,
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", helper],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=kwargs["cwd"],
+            )
+            completed: dict[str, tuple[bytes, bytes]] = {}
+
+            def communicate() -> None:
+                completed["output"] = process.communicate(encoded)
+
+            worker = threading.Thread(target=communicate)
+            worker.start()
+            stage = (
+                Path(header["publication_root"])
+                / "generations"
+                / f".huroshiki-stage-{header['operation_id']}"
+            )
+            for _ in range(100):
+                if stage.is_dir() and sum(
+                    path.is_file() for path in stage.rglob("*")
+                ) == len(header["files"]):
+                    break
+                time.sleep(0.01)
+            self.assertTrue(stage.is_dir())
+            captured["staging"] = {
+                path.relative_to(stage).as_posix(): {
+                    "size": path.stat().st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "mode": path.stat().st_mode & 0o777,
+                }
+                for path in stage.rglob("*")
+                if path.is_file()
+            }
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+            stdout, stderr = completed["output"]
+            return BoundedProcessResult(
+                process.returncode,
+                stdout.decode("utf-8", errors="replace"),
+                stderr.decode("utf-8", errors="replace"),
+                False,
+                False,
+            )
+
+        try:
+            with patch.object(packctl, "deployment_settings", return_value=self._settings(target)), patch.object(
+                transfer, "run_bounded_process", side_effect=run
+            ):
+                result = transfer.execute_publish_transfer(plan)
+            self.assertFalse(result.reused)
+            header_files = {item["path"]: item for item in captured["header"]["files"]}
+            manifest_files = {entry.relative_path.as_posix(): entry for entry in manifest.files}
+            self.assertTrue(
+                {
+                    "kubejs/server_scripts/common.js",
+                    "kubejs/server_scripts/server.js",
+                    "config/example.toml",
+                }.issubset(manifest_files)
+            )
+            self.assertEqual(set(header_files), set(manifest_files))
+            self.assertEqual(set(captured["staging"]), set(manifest_files))
+            generation = Path(target.publication_root) / "generations" / result.generation_id
+            for relative, entry in manifest_files.items():
+                detached = plan._payload_root / Path(*entry.relative_path.parts)
+                remote = generation / Path(*entry.relative_path.parts)
+                descriptor = header_files[relative]
+                self.assertEqual(descriptor["path"], relative)
+                self.assertEqual(descriptor["size"], entry.size)
+                self.assertEqual(descriptor["sha256"], entry.sha256)
+                self.assertEqual(descriptor["mode"], entry.mode)
+                self.assertEqual(descriptor["source_kind"], entry.source_kind)
+                self.assertEqual(
+                    captured["staging"][relative],
+                    {"size": entry.size, "sha256": entry.sha256, "mode": entry.mode},
+                )
+                self.assertEqual(captured["frames"][relative], detached.read_bytes())
+                self.assertEqual(remote.read_bytes(), detached.read_bytes())
+                self.assertEqual(remote.stat().st_size, entry.size)
+                self.assertEqual(hashlib.sha256(remote.read_bytes()).hexdigest(), entry.sha256)
+                self.assertEqual(remote.stat().st_mode & 0o777, entry.mode)
+        finally:
+            transfer.discard_publish_transfer_plan(plan)
+
+    def test_existing_generation_reuse_rejects_missing_nested_content_file(self) -> None:
+        self._assert_nested_reuse_rejected(
+            lambda generation: (generation / "kubejs/server_scripts/common.js").unlink()
+        )
+
+    def test_existing_generation_reuse_rejects_modified_nested_content_same_size(self) -> None:
+        def mutate(generation: Path) -> None:
+            path = generation / "kubejs/server_scripts/server.js"
+            path.write_bytes(b"X" * len(b"server script\n"))
+            self.assertEqual(path.stat().st_size, len(b"server script\n"))
+
+        self._assert_nested_reuse_rejected(mutate)
+
+    def test_existing_generation_reuse_rejects_modified_nested_content_different_size(self) -> None:
+        self._assert_nested_reuse_rejected(
+            lambda generation: (generation / "config/example.toml").write_bytes(b"different\n")
+        )
+
+    def test_existing_generation_reuse_rejects_nested_content_mode_drift(self) -> None:
+        def mutate(generation: Path) -> None:
+            path = generation / "kubejs/server_scripts/common.js"
+            path.chmod(0o600 if path.stat().st_mode & 0o777 != 0o600 else 0o644)
+
+        self._assert_nested_reuse_rejected(mutate)
+
+    def test_existing_generation_reuse_rejects_unexpected_nested_content_file(self) -> None:
+        self._assert_nested_reuse_rejected(
+            lambda generation: (generation / "kubejs/server_scripts/unexpected.js").write_bytes(b"unexpected")
+        )
+
     def test_prepare_materializes_exact_manifest_files_and_modes(self) -> None:
         manifest, target = self._manifest_and_target()
         plan = transfer.prepare_publish_transfer("demo", manifest, target)
@@ -240,6 +423,31 @@ class PublishTransferTest(PackPublishManifestTest):
         with self.assertRaisesRegex(transfer.PublishTransferExecutionError, "not ready"):
             transfer.execute_publish_transfer(plan)
         transfer.discard_publish_transfer_plan(plan)
+
+    def test_configured_publication_path_drift_is_rejected_before_remote_process(self) -> None:
+        manifest = pack_publish.plan_pack_publish_manifest("demo")
+        target = publish_target.publish_remote_target_from_legacy_settings(
+            rsync_target=f"publisher@publish.example:{self.root / 'remote'}",
+            ssh_host="minecraft@game.example",
+            stack_dir="/srv/minecraft",
+            service="minecraft",
+        )
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        stale = packctl.DeploymentSettings(
+            f"publisher@publish.example:{self.root / 'other'}",
+            "minecraft@game.example",
+            "/srv/minecraft",
+            "minecraft",
+        )
+        try:
+            with patch.object(packctl, "deployment_settings", return_value=stale), patch.object(
+                transfer, "run_bounded_process"
+            ) as run:
+                with self.assertRaisesRegex(transfer.PublishTransferExecutionError, "target changed"):
+                    transfer.execute_publish_transfer(plan)
+            run.assert_not_called()
+        finally:
+            transfer.discard_publish_transfer_plan(plan)
 
     def test_source_changed_after_ready_is_rejected_before_remote_process(self) -> None:
         manifest, target = self._manifest_and_target()

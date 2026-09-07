@@ -59,10 +59,14 @@ class PublishTargetModelTest(unittest.TestCase):
         self.assertEqual(target_value.publication_endpoint.host, "publish.example.org")
         self.assertEqual(target_value.publication_endpoint.user, "deploy")
         self.assertEqual(target_value.publication_root, PurePosixPath("/srv/custom/root"))
+        self.assertEqual(target_value.publication_root_source, "explicit_override")
         self.assertEqual(target_value.restart.endpoint.host, "restart.example.org")
         self.assertEqual(target_value.restart.endpoint.user, "operator")
         self.assertFalse(hasattr(target_value, "rsync_target"))
         self.assertNotIn("publish.example.org:/srv/packs/demo", repr(target_value))
+
+        configured = _legacy_publish_target()
+        self.assertEqual(configured.publication_root_source, "rsync_target")
 
 
 class PublishPathValidationTest(unittest.TestCase):
@@ -220,6 +224,7 @@ class PublishRemoteTargetDigestTest(unittest.TestCase):
                 server_id=base.server_id,
                 publication_endpoint=publication_port_changed,
                 publication_root=base.publication_root,
+                publication_root_source=base.publication_root_source,
                 restart=base.restart,
             ),
         )
@@ -229,6 +234,7 @@ class PublishRemoteTargetDigestTest(unittest.TestCase):
                 server_id=base.server_id,
                 publication_endpoint=base.publication_endpoint,
                 publication_root=base.publication_root,
+                publication_root_source=base.publication_root_source,
                 restart=restart_port_changed,
             ),
         )
@@ -244,6 +250,27 @@ class PublishRemoteTargetDigestTest(unittest.TestCase):
                 os.chdir(original)
 
         self.assertEqual(first_target.config_digest, second_target.config_digest)
+
+    def test_root_provenance_is_digest_bound_and_controls_revalidation(self) -> None:
+        configured = _legacy_publish_target()
+        explicit = _legacy_publish_target(remote_path="/srv/packs/demo")
+        self.assertEqual(configured.publication_root, explicit.publication_root)
+        self.assertNotEqual(configured.config_digest, explicit.config_digest)
+
+        changed = {
+            "rsync_target": "publish.example.org:/srv/packs/other",
+            "ssh_host": "restart.example.org",
+            "stack_dir": "/srv/restart/demo",
+            "service": "minecraft",
+        }
+        rebuilt_configured = target.rebuild_legacy_publish_target_for_revalidation(
+            configured, **changed
+        )
+        rebuilt_explicit = target.rebuild_legacy_publish_target_for_revalidation(
+            explicit, **changed
+        )
+        self.assertNotEqual(rebuilt_configured.config_digest, configured.config_digest)
+        self.assertEqual(rebuilt_explicit.config_digest, explicit.config_digest)
 
     def test_publish_remote_target_from_legacy_allows_restart_publication_host_mismatch(self) -> None:
         mismatched = _legacy_publish_target(

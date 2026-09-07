@@ -25,6 +25,7 @@ class PublishTargetError(ValueError):
 
 
 LEGACY_SERVER_ID = "legacy-pack-config"
+PublishRootSource = Literal["rsync_target", "explicit_override"]
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,7 @@ class PublishRemoteTarget:
     server_id: str
     publication_endpoint: PublishSshEndpoint
     publication_root: PurePosixPath
+    publication_root_source: PublishRootSource
     restart: PublishRestartTarget
     config_digest: str
 
@@ -90,17 +92,22 @@ class PublishRemoteTarget:
         server_id = _validate_server_id(self.server_id)
         publication_endpoint = _coerce_publish_ssh_endpoint(self.publication_endpoint)
         publication_root = validate_publish_remote_path(str(self.publication_root))
+        publication_root_source = _validate_publish_root_source(
+            self.publication_root_source
+        )
         restart = _coerce_publish_restart_target(self.restart)
 
         object.__setattr__(self, "server_id", server_id)
         object.__setattr__(self, "publication_endpoint", publication_endpoint)
         object.__setattr__(self, "publication_root", publication_root)
+        object.__setattr__(self, "publication_root_source", publication_root_source)
         object.__setattr__(self, "restart", restart)
 
         expected_digest = compute_publish_remote_target_digest(
             server_id=server_id,
             publication_endpoint=publication_endpoint,
             publication_root=publication_root,
+            publication_root_source=publication_root_source,
             restart=restart,
         )
         if not isinstance(self.config_digest, str):
@@ -215,6 +222,9 @@ def publish_remote_target_from_legacy_settings(
         raise PublishTargetError(str(error)) from error
 
     publication_root_value = remote_path if remote_path is not None else rsync_parts.path
+    publication_root_source: PublishRootSource = (
+        "explicit_override" if remote_path is not None else "rsync_target"
+    )
     publication_root = validate_publish_remote_path(
         publication_root_value,
         field="publication_root" if remote_path is None else "remote_path",
@@ -249,13 +259,40 @@ def publish_remote_target_from_legacy_settings(
         server_id=validated_server_id,
         publication_endpoint=publication_endpoint,
         publication_root=publication_root,
+        publication_root_source=publication_root_source,
         restart=restart,
         config_digest=compute_publish_remote_target_digest(
             server_id=validated_server_id,
             publication_endpoint=publication_endpoint,
             publication_root=publication_root,
+            publication_root_source=publication_root_source,
             restart=restart,
         ),
+    )
+
+
+def rebuild_legacy_publish_target_for_revalidation(
+    planned: PublishRemoteTarget,
+    *,
+    rsync_target: str,
+    ssh_host: str,
+    stack_dir: str,
+    service: str,
+) -> PublishRemoteTarget:
+    """Rebuild current settings while preserving an explicit root authority."""
+
+    remote_path = (
+        planned.publication_root.as_posix()
+        if planned.publication_root_source == "explicit_override"
+        else None
+    )
+    return publish_remote_target_from_legacy_settings(
+        rsync_target=rsync_target,
+        ssh_host=ssh_host,
+        stack_dir=stack_dir,
+        service=service,
+        server_id=planned.server_id,
+        remote_path=remote_path,
     )
 
 
@@ -314,7 +351,7 @@ def _validate_server_id(value: str) -> str:
 
 
 _PUBLISH_REMOTE_TARGET_SCHEMA = "publish-remote-target"
-_PUBLISH_REMOTE_TARGET_VERSION = 1
+_PUBLISH_REMOTE_TARGET_VERSION = 2
 _CONFIG_DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
 _WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
@@ -324,6 +361,7 @@ def compute_publish_remote_target_digest(
     server_id: str,
     publication_endpoint: PublishSshEndpoint,
     publication_root: PurePosixPath | str,
+    publication_root_source: PublishRootSource,
     restart: PublishRestartTarget,
 ) -> str:
     """Return the semantic digest for a validated remote target configuration."""
@@ -331,11 +369,13 @@ def compute_publish_remote_target_digest(
     validated_server_id = _validate_server_id(server_id)
     validated_endpoint = _coerce_publish_ssh_endpoint(publication_endpoint)
     validated_root = validate_publish_remote_path(str(publication_root))
+    validated_root_source = _validate_publish_root_source(publication_root_source)
     validated_restart = _coerce_publish_restart_target(restart)
     return _compute_publish_remote_target_digest(
         server_id=validated_server_id,
         publication_endpoint=validated_endpoint,
         publication_root=validated_root,
+        publication_root_source=validated_root_source,
         restart=validated_restart,
     )
 
@@ -345,6 +385,7 @@ def _compute_publish_remote_target_digest(
     server_id: str,
     publication_endpoint: PublishSshEndpoint,
     publication_root: PurePosixPath,
+    publication_root_source: PublishRootSource,
     restart: PublishRestartTarget,
 ) -> str:
     payload = {
@@ -357,6 +398,7 @@ def _compute_publish_remote_target_digest(
             "user": publication_endpoint.user,
         },
         "publication_root": publication_root.as_posix(),
+        "publication_root_source": publication_root_source,
         "restart_enabled": True,
         "restart": {
             "enabled": restart.enabled,
@@ -372,6 +414,12 @@ def _compute_publish_remote_target_digest(
     }
     payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+
+
+def _validate_publish_root_source(value: object) -> PublishRootSource:
+    if value not in {"rsync_target", "explicit_override"}:
+        raise PublishTargetError("publication_root_source is invalid")
+    return value  # type: ignore[return-value]
 
 
 def _coerce_publish_ssh_endpoint(value: PublishSshEndpoint) -> PublishSshEndpoint:
