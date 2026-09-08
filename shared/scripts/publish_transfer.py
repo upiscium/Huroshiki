@@ -645,9 +645,9 @@ def verify_semantics(header, generation, expected, verified):
     if index.get("hash-format") != "sha256" or not isinstance(records, list) or len(records) > MAX_INDEX_RECORDS:
         raise RuntimeError("remote index.toml structure is invalid")
     expected_records = {
-        path: path.endswith(".pw.toml")
+        path: source_kind == "packwiz" and path.endswith(".pw.toml")
         for path, source_kind in semantic_files.items()
-        if source_kind == "packwiz" and path not in {"pack.toml", "index.toml"}
+        if source_kind in {"packwiz", "content"}
     }
     actual_records = {}
     for record in records:
