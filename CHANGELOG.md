@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## 0.3.0-rc.2 - 2026-09-08
+
+### Publication
+
+- Hardened immutable generation reuse and activation: an existing generation must
+  still match its bound manifest, active generations are reverified before restart,
+  target provenance participates in identity, and concurrent remote metadata or tree
+  drift fails closed without weakening restart-uncertainty semantics.
+- Added Pack Content to final generated Packwiz indexes. Common and side-specific
+  Content files are ordinary `metafile = false` entries with exact SHA-256 values;
+  the final `pack.toml` index hash binds the final `index.toml`, and semantic
+  verification covers the resulting Content-backed files.
+- Changed `packctl publish <pack>` to publish both variants from one fixed source
+  snapshot: server remains at the existing publication root and client is published
+  beneath `<publication_root>/client`. Both transfer and verify before ordered client
+  then server activation, and restart occurs only after both active variants verify.
+  Variant identities and cleanup authority remain independent, while partial remote
+  facts are retained instead of being reported as rollback.
+
+### Diagnostics
+
+- Publish planning failures now retain orchestration context while surfacing the
+  direct `primary_error` through the existing bounded, redacted diagnostic policy.
+  Managed-root paths are relativized, preview and normal Publish use the same policy,
+  and cancellation, deadline, result-bearing, restart, and cleanup diagnostics keep
+  their existing behavior.
+
 ## 0.3.0-rc.1 - 2026-09-03
 
 ### Migration
