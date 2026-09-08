@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,8 +10,11 @@ import shutil
 import sys
 import threading
 import time
+import tomllib
 import unittest
 from unittest.mock import patch
+
+import tomlkit
 
 from tests.test_pack_publish_manifest import PackPublishManifestTest
 
@@ -91,6 +95,148 @@ class PublishSemanticVerificationTest(PackPublishManifestTest):
         with patch.object(transfer, "run_bounded_process", side_effect=self._fake_runner()):
             verification = activation.verify_publish_generation(staged, manifest, target)
         return manifest, target, plan, staged, verification
+
+    def _write_nested_content_fixtures(self) -> dict[str, bytes]:
+        fixtures = {
+            "common/config/common.toml": b"common config\n",
+            "common/kubejs/client_scripts/common.js": b"common script\n",
+            "client/kubejs/client_scripts/client.js": b"client script\n",
+            "server/kubejs/server_scripts/server.js": b"server script\n",
+        }
+        for relative, contents in fixtures.items():
+            path = self.pack / "content" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents)
+        return fixtures
+
+    def _mutated_content_manifest(self, target_side: str, mutation: str):
+        manifest = pack_publish.plan_pack_publish_manifest("demo", target_side=target_side)
+        index_entry = next(entry for entry in manifest.files if entry.relative_path.as_posix() == "index.toml")
+        pack_entry = next(entry for entry in manifest.files if entry.relative_path.as_posix() == "pack.toml")
+        index = tomllib.loads((index_entry.contents or b"").decode("utf-8"))
+        records = [dict(record) for record in index.get("files", [])]
+        content_paths = [
+            entry.relative_path.as_posix()
+            for entry in manifest.files
+            if entry.source_kind == "content"
+        ]
+        selected_path = content_paths[0]
+        selected_index = next(
+            index
+            for index, record in enumerate(records)
+            if record["file"] == selected_path
+        )
+        if mutation == "missing":
+            records.pop(selected_index)
+        elif mutation == "wrong-hash":
+            records[selected_index] = {"file": selected_path, "hash": "0" * 64}
+        elif mutation == "metafile":
+            records[selected_index] = {
+                "file": selected_path,
+                "hash": records[selected_index]["hash"],
+                "metafile": True,
+            }
+        elif mutation == "unexpected":
+            records.append({"file": "unexpected/content.txt", "hash": "0" * 64})
+        elif mutation == "wrong-side":
+            opposite_path = (
+                "kubejs/server_scripts/server.js"
+                if target_side == "client"
+                else "kubejs/client_scripts/client.js"
+            )
+            records.append({"file": opposite_path, "hash": "0" * 64})
+        else:
+            self.fail(f"unsupported test mutation: {mutation}")
+        index_text = 'hash-format = "sha256"\n'
+        for record in records:
+            index_text += "\n[[files]]\n"
+            index_text += f'file = {json.dumps(record["file"])}\n'
+            index_text += f'hash = "{record["hash"]}"\n'
+            if "metafile" in record:
+                index_text += f'metafile = {str(record["metafile"]).lower()}\n'
+        index_bytes = index_text.encode("utf-8")
+        pack_document = tomlkit.parse((pack_entry.contents or b"").decode("utf-8"))
+        pack_document["index"]["hash"] = hashlib.sha256(index_bytes).hexdigest()
+        pack_bytes = tomlkit.dumps(pack_document).encode("utf-8")
+        replacements = {
+            "index.toml": replace(index_entry, size=len(index_bytes), sha256=hashlib.sha256(index_bytes).hexdigest(), contents=index_bytes),
+            "pack.toml": replace(pack_entry, size=len(pack_bytes), sha256=hashlib.sha256(pack_bytes).hexdigest(), contents=pack_bytes),
+        }
+        files = tuple(
+            replacements.get(entry.relative_path.as_posix(), entry)
+            for entry in manifest.files
+        )
+        updated = replace(
+            manifest,
+            files=files,
+            total_bytes=sum(entry.size for entry in files),
+            manifest_digest="",
+        )
+        return replace(updated, manifest_digest=pack_publish.compute_publish_manifest_digest(updated))
+
+    def _content_staged_generation(self, target_side: str):
+        manifest = pack_publish.plan_pack_publish_manifest("demo", target_side=target_side)
+        target = self._target()
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        with patch.object(transfer, "run_bounded_process", side_effect=self._fake_runner()):
+            staged = transfer.execute_publish_transfer(plan)
+        return manifest, target, plan, staged
+
+    def _assert_mutated_content_manifest_rejected(
+        self, target_side: str, mutation: str
+    ) -> None:
+        manifest = self._mutated_content_manifest(target_side, mutation)
+        target = self._target()
+        with patch.object(transfer, "plan_pack_publish_manifest", return_value=manifest):
+            plan = transfer.prepare_publish_transfer("demo", manifest, target)
+            try:
+                with patch.object(transfer, "run_bounded_process", side_effect=self._fake_runner()):
+                    staged = transfer.execute_publish_transfer(plan)
+                    with self.assertRaises(activation.PublishSemanticVerificationError):
+                        activation.verify_publish_generation(staged, manifest, target)
+            finally:
+                transfer.discard_publish_transfer_plan(plan)
+
+    def _assert_content_mutation_rejected_for_both_sides(self, mutation: str) -> None:
+        self._write_nested_content_fixtures()
+        for target_side in ("client", "server"):
+            with self.subTest(target_side=target_side):
+                self._assert_mutated_content_manifest_rejected(
+                    target_side, mutation
+                )
+
+    def test_issue_191_nested_content_records_are_verified_for_both_sides(self) -> None:
+        self._write_nested_content_fixtures()
+        for target_side in ("client", "server"):
+            with self.subTest(target_side=target_side):
+                manifest, target, plan, staged = self._content_staged_generation(target_side)
+                try:
+                    records = self.generated_index_records(manifest)
+                    for entry in manifest.files:
+                        if entry.source_kind == "content":
+                            self.assertEqual(records[entry.relative_path.as_posix()].get("metafile", False), False)
+                    for path, record in records.items():
+                        if path.endswith(".pw.toml"):
+                            self.assertTrue(record.get("metafile", False))
+                    with patch.object(transfer, "run_bounded_process", side_effect=self._fake_runner()):
+                        activation.verify_publish_generation(staged, manifest, target)
+                finally:
+                    transfer.discard_publish_transfer_plan(plan)
+
+    def test_remote_semantics_rejects_missing_content_record(self) -> None:
+        self._assert_content_mutation_rejected_for_both_sides("missing")
+
+    def test_remote_semantics_rejects_wrong_content_hash(self) -> None:
+        self._assert_content_mutation_rejected_for_both_sides("wrong-hash")
+
+    def test_remote_semantics_rejects_content_marked_metafile(self) -> None:
+        self._assert_content_mutation_rejected_for_both_sides("metafile")
+
+    def test_remote_semantics_rejects_unexpected_index_record(self) -> None:
+        self._assert_content_mutation_rejected_for_both_sides("unexpected")
+
+    def test_remote_semantics_rejects_wrong_side_content_record(self) -> None:
+        self._assert_content_mutation_rejected_for_both_sides("wrong-side")
 
     def test_valid_generation_is_semantically_verified_without_touching_current(self) -> None:
         manifest, target, plan, staged = self._staged_generation()

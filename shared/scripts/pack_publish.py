@@ -99,6 +99,15 @@ class PackPublishManifest:
     warnings: tuple[PublishWarning, ...] = ()
 
 
+@dataclass(frozen=True)
+class _PackwizSelection:
+    source_files: tuple[PublishFileEntry, ...]
+    index_records: tuple[tuple[Path, str, bool], ...]
+    version_tuple: tuple[str, str, str]
+    jar_destinations: frozenset[str]
+    pack_bytes: bytes
+
+
 Progress = Callable[[str], object]
 _D_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _CHUNK = 1024 * 1024
@@ -327,7 +336,7 @@ def _variant_index_bytes(
     return bytes(result)
 
 
-def _packwiz_files(root_fd: int, scan: PackTreeScan, side: str, *, cancel_event: threading.Event | None, deadline: float | None) -> tuple[list[PublishFileEntry], tuple[str, str, str], frozenset[str]]:
+def _select_packwiz_files(root_fd: int, scan: PackTreeScan, side: str, *, cancel_event: threading.Event | None, deadline: float | None) -> _PackwizSelection:
     entries = _entry_map(scan)
     directories = _directory_map(entries)
     def read(name: str) -> bytes:
@@ -443,6 +452,10 @@ def _packwiz_files(root_fd: int, scan: PackTreeScan, side: str, *, cancel_event:
         metadata_paths.add(relative)
         if parsed.side in (side, "both"):
             jar_destination = relative.parent / parsed.filename
+            if _collides_with_generated_descriptor(jar_destination):
+                raise PackPublishError(
+                    "metadata JAR destination collides with generated descriptor"
+                )
             try:
                 jar_destinations.add(portable_relative_path_key(jar_destination))
             except PortablePathError as error:
@@ -476,34 +489,7 @@ def _packwiz_files(root_fd: int, scan: PackTreeScan, side: str, *, cancel_event:
         raise PackPublishError(
             "selected Packwiz file collides with metadata JAR destination"
         )
-    generated_index = _variant_index_bytes(
-        selected_records,
-        lambda: _checkpoint(cancel_event, deadline),
-    )
-    generated_index_digest = hashlib.sha256(generated_index).hexdigest()
-    try:
-        pack_document = tomlkit.parse(pack_bytes.decode("utf-8"))
-        document_index = pack_document.get("index")
-        if not isinstance(document_index, dict):
-            raise PackPublishError("pack.toml index descriptor is invalid")
-        document_index["hash"] = generated_index_digest
-        generated_pack = tomlkit.dumps(pack_document).encode("utf-8")
-    except (UnicodeError, tomlkit.exceptions.ParseError) as error:
-        raise PackPublishError(f"invalid Packwiz TOML: {error}") from error
-    files = [
-        _generated_entry(
-            scan,
-            Path("source/pack.toml"),
-            PurePosixPath("pack.toml"),
-            generated_pack,
-        ),
-        _generated_entry(
-            scan,
-            Path("source/index.toml"),
-            PurePosixPath("index.toml"),
-            generated_index,
-        ),
-    ]
+    files: list[PublishFileEntry] = []
     for path, _, metafile in selected_records:
         if not metafile:
             files.append(
@@ -526,7 +512,46 @@ def _packwiz_files(root_fd: int, scan: PackTreeScan, side: str, *, cancel_event:
                     source_relative_path=Path("source") / relative,
                 )
             )
-    return files, tuple(tuple_value), frozenset(jar_destinations)
+    return _PackwizSelection(
+        tuple(files),
+        tuple(selected_records),
+        tuple(tuple_value),
+        frozenset(jar_destinations),
+        pack_bytes,
+    )
+
+
+def _generated_descriptors(
+    scan: PackTreeScan,
+    pack_bytes: bytes,
+    records: list[tuple[Path, str, bool]],
+    checkpoint: Callable[[], None],
+) -> list[PublishFileEntry]:
+    generated_index = _variant_index_bytes(records, checkpoint)
+    generated_index_digest = hashlib.sha256(generated_index).hexdigest()
+    try:
+        pack_document = tomlkit.parse(pack_bytes.decode("utf-8"))
+        document_index = pack_document.get("index")
+        if not isinstance(document_index, dict):
+            raise PackPublishError("pack.toml index descriptor is invalid")
+        document_index["hash"] = generated_index_digest
+        generated_pack = tomlkit.dumps(pack_document).encode("utf-8")
+    except (UnicodeError, tomlkit.exceptions.ParseError) as error:
+        raise PackPublishError(f"invalid Packwiz TOML: {error}") from error
+    return [
+        _generated_entry(
+            scan,
+            Path("source/pack.toml"),
+            PurePosixPath("pack.toml"),
+            generated_pack,
+        ),
+        _generated_entry(
+            scan,
+            Path("source/index.toml"),
+            PurePosixPath("index.toml"),
+            generated_index,
+        ),
+    ]
 
 
 def compute_publish_manifest_digest(manifest: PackPublishManifest) -> str:
@@ -642,11 +667,11 @@ def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", can
             _progress(progress, "validating-config")
             _config(root_fd, entries, pack_id, cancel_event=cancel_event, deadline=deadline)
             _progress(progress, "validating-packwiz")
-            pack_files, tuple_value, jar_destinations = _packwiz_files(root_fd, scan, target_side, cancel_event=cancel_event, deadline=deadline)
+            packwiz = _select_packwiz_files(root_fd, scan, target_side, cancel_event=cancel_event, deadline=deadline)
             _progress(progress, "validating-content")
             content_files = _content_files(scan, target_side)
-            files = list(pack_files)
-            portable = _portable_output_map(files)
+            source_files = list(packwiz.source_files)
+            portable = _portable_output_map(source_files)
             for overlay_path, overlay in content_files:
                 _checkpoint(cancel_event, deadline)
                 relative = Path(*overlay_path.parts[2:])
@@ -655,7 +680,11 @@ def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", can
                     key = portable_relative_path_key(destination)
                 except PortablePathError as error:
                     raise PackPublishError(f"invalid content destination: {destination}") from error
-                if key in portable or key in jar_destinations:
+                if (
+                    key in portable
+                    or key in packwiz.jar_destinations
+                    or _collides_with_generated_descriptor(relative)
+                ):
                     raise PackPublishError(f"content destination collision: {destination}")
                 portable[key] = destination
                 item = entries.get(overlay_path)
@@ -668,7 +697,7 @@ def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", can
                     deadline=deadline,
                     retain_bytes=False,
                 )
-                files.append(
+                source_files.append(
                     PublishFileEntry(
                         destination,
                         item.size,
@@ -679,6 +708,20 @@ def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", can
                         overlay_path,
                     )
                 )
+            _portable_output_map(source_files)
+            complete_records = list(packwiz.index_records)
+            complete_records.extend(
+                (Path(*entry.relative_path.parts), entry.sha256, False)
+                for entry in source_files
+                if entry.source_kind == "content"
+            )
+            generated = _generated_descriptors(
+                scan,
+                packwiz.pack_bytes,
+                complete_records,
+                lambda: _checkpoint(cancel_event, deadline),
+            )
+            files = generated + source_files
             files.sort(key=lambda entry: entry.relative_path.as_posix())
             _portable_output_map(files)
             _progress(progress, "building-manifest")
@@ -687,6 +730,7 @@ def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", can
                 if entry.size < 0 or total_bytes > _MAX_TOTAL_BYTES - entry.size:
                     raise PackPublishError("publication manifest byte total overflow")
                 total_bytes += entry.size
+            tuple_value = packwiz.version_tuple
             result = PackPublishManifest(pack_id, target_side, scan.content_digest, tuple_value[0], tuple_value[1], tuple_value[2], tuple(files), total_bytes, "", ())
             result = PackPublishManifest(result.pack_id, result.target_side, result.source_snapshot_digest, result.minecraft_version, result.loader, result.loader_version, result.files, result.total_bytes, compute_publish_manifest_digest(result), result.warnings)
             _checkpoint(cancel_event, deadline)

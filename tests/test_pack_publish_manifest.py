@@ -213,6 +213,67 @@ class PackPublishManifestTest(unittest.TestCase):
         self.assertNotIn("mods/client.pw.toml", self.manifest_entries(server))
         self.assertNotIn("mods/client.pw.toml", self.generated_index_records(server))
 
+    def _assert_index_matches_manifest_sources(self, manifest: object) -> None:
+        entries = self.manifest_entries(manifest)
+        records = self.generated_index_records(manifest)
+        expected_paths = {
+            path
+            for path, entry in entries.items()
+            if entry.source_kind in {"packwiz", "content"}
+        }
+        self.assertEqual(set(records), expected_paths)
+        for path, record in records.items():
+            entry = entries[path]
+            self.assertEqual(record["hash"], entry.sha256)
+            self.assertEqual(
+                record.get("metafile", False),
+                entry.source_kind == "packwiz" and path.endswith(".pw.toml"),
+            )
+        pack = tomllib.loads(self.generated_contents(manifest, "pack.toml").decode("utf-8"))
+        index_bytes = self.generated_contents(manifest, "index.toml")
+        self.assertEqual(pack["index"]["hash"], hashlib.sha256(index_bytes).hexdigest())
+
+    def _issue_191_content_fixtures(self) -> dict[str, bytes]:
+        fixtures = {
+            "common/config/common.toml": b"common config\n",
+            "common/kubejs/client_scripts/common.js": b"common script\n",
+            "client/kubejs/client_scripts/client.js": b"client script\n",
+            "server/kubejs/server_scripts/server.js": b"server script\n",
+        }
+        for relative, contents in fixtures.items():
+            path = self.pack / "content" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents)
+        return fixtures
+
+    def test_client_manifest_indexes_common_and_client_content_only(self) -> None:
+        fixtures = self._issue_191_content_fixtures()
+        manifest = pack_publish.plan_pack_publish_manifest("demo", target_side="client")
+        entries = self.manifest_entries(manifest)
+        selected = {
+            "config/common.toml": fixtures["common/config/common.toml"],
+            "kubejs/client_scripts/common.js": fixtures["common/kubejs/client_scripts/common.js"],
+            "kubejs/client_scripts/client.js": fixtures["client/kubejs/client_scripts/client.js"],
+        }
+        for path, contents in selected.items():
+            self.assertEqual(entries[path].sha256, hashlib.sha256(contents).hexdigest())
+        self.assertNotIn("kubejs/server_scripts/server.js", entries)
+        self._assert_index_matches_manifest_sources(manifest)
+
+    def test_server_manifest_indexes_common_and_server_content_only(self) -> None:
+        fixtures = self._issue_191_content_fixtures()
+        manifest = pack_publish.plan_pack_publish_manifest("demo", target_side="server")
+        entries = self.manifest_entries(manifest)
+        selected = {
+            "config/common.toml": fixtures["common/config/common.toml"],
+            "kubejs/client_scripts/common.js": fixtures["common/kubejs/client_scripts/common.js"],
+            "kubejs/server_scripts/server.js": fixtures["server/kubejs/server_scripts/server.js"],
+        }
+        for path, contents in selected.items():
+            self.assertEqual(entries[path].sha256, hashlib.sha256(contents).hexdigest())
+        self.assertNotIn("kubejs/client_scripts/client.js", entries)
+        self._assert_index_matches_manifest_sources(manifest)
+
     def test_content_root_is_not_a_publication_plan(self) -> None:
         (self.pack / "content" / "root.txt").write_bytes(b"root files are not overlays")
         with self.assertRaises(pack_publish.PackPublishError):
@@ -303,7 +364,7 @@ class PackPublishManifestTest(unittest.TestCase):
         with self.assertRaises(pack_publish.PackPublishError):
             pack_publish.plan_pack_publish_manifest("demo")
 
-    def test_empty_index_is_supported(self) -> None:
+    def test_empty_packwiz_index_still_indexes_selected_content(self) -> None:
         shutil.rmtree(self.pack / "source" / "mods")
         (self.pack / "source" / "README.md").unlink()
         (self.pack / "source" / "index.toml").write_text(
@@ -311,7 +372,10 @@ class PackPublishManifestTest(unittest.TestCase):
         )
         self.update_pack_index_hash()
         manifest = pack_publish.plan_pack_publish_manifest("demo")
-        self.assertEqual(self.generated_index_records(manifest), {})
+        self.assertEqual(
+            set(self.generated_index_records(manifest)),
+            {"config.txt", "server.cfg"},
+        )
         self.assertEqual(
             {
                 path
@@ -509,6 +573,21 @@ class PackPublishManifestTest(unittest.TestCase):
         self.write_index()
         with self.assertRaises(pack_publish.PackPublishError):
             pack_publish.plan_pack_publish_manifest("demo")
+
+    def test_metadata_jar_descriptor_compatibility_collisions_are_rejected(self) -> None:
+        metadata = self.pack / "source" / "root.pw.toml"
+        for filename in ("ｐａｃｋ．ｔｏｍｌ", "ｉｎｄｅｘ．ｔｏｍｌ"):
+            with self.subTest(filename=filename):
+                metadata.write_text(
+                    f'filename = "{filename}"\nside = "server"\n'
+                    '[update.modrinth]\nmod-id = "root"\nversion = "v1"\n',
+                    encoding="utf-8",
+                )
+                self.write_index()
+                with self.assertRaisesRegex(
+                    pack_publish.PackPublishError, "generated descriptor"
+                ):
+                    pack_publish.plan_pack_publish_manifest("demo")
 
     def test_non_normalized_index_paths_are_rejected(self) -> None:
         for relative in ("./README.md", "mods//server.pw.toml", "mods/./server.pw.toml"):
