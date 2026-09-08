@@ -322,7 +322,10 @@ def execute_pack_publish(plan, *, cancel_event=None, deadline=None, progress=Non
             manifest, target = getattr(plan.bundle, side), getattr(plan, f"{side}_target")
             try: owners[side] = prepare_publish_transfer(plan.pack_id, manifest, target, cancel_event=plan.cancel_event, deadline=plan.deadline, progress=_phase_progress(progress, phase))
             except PublishTransferCleanupError as e:
-                owners[side] = e.plan; raise e
+                if e.plan is not None:
+                    owners[side] = e.plan
+                    plan._transfer_plans[side] = e.plan
+                raise
             plan._transfer_plans[side] = owners[side]
         for side in ("client", "server"):
             _checkpoint(plan.cancel_event, plan.deadline); phase = f"transferring-{side}"; _emit(progress, PackPublishProgress(phase))
@@ -392,7 +395,15 @@ def execute_pack_publish(plan, *, cancel_event=None, deadline=None, progress=Non
             primary = error.primary_error
         else:
             primary = error
-        cancelled = isinstance(error, (PackPublishCancelled, PackPublishDeadlineExceeded)) or plan.cancel_event.is_set() or time.monotonic() >= plan.deadline
+        cancelled = isinstance(
+            error,
+            (
+                PackPublishCancelled,
+                PackPublishDeadlineExceeded,
+                PublishRestartCancelled,
+                PublishRestartDeadlineExceeded,
+            ),
+        ) or plan.cancel_event.is_set() or time.monotonic() >= plan.deadline
         failed_restart: PublishRestartResult | None = None
         failure_status = (
             "restart_not_started"

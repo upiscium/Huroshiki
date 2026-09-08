@@ -320,6 +320,43 @@ class PublishOrchestrationTest(unittest.TestCase):
             self.assertTrue(raised.exception.publication_succeeded)
             self.assertEqual(raised.exception.result.final_status, expected)
 
+    def test_restart_cancel_and_deadline_preserve_completed_publication(self):
+        cases = (
+            (
+                publish_restart.PublishRestartCancelled("cancelled"),
+                publish.PackPublishCancelled,
+            ),
+            (
+                publish_restart.PublishRestartDeadlineExceeded("deadline"),
+                publish.PackPublishDeadlineExceeded,
+            ),
+        )
+        for failure, expected_error in cases:
+            with self.subTest(error=type(failure).__name__):
+                plan = self.plan()
+                mocks, calls = self.phase_mocks(plan)
+                mocks["restart_activated_publish"].side_effect = failure
+                with patch.multiple(publish, **mocks):
+                    with self.assertRaises(expected_error) as raised:
+                        publish.execute_pack_publish(plan)
+
+                result = raised.exception.result
+                self.assertTrue(result.client.active_verified)
+                self.assertTrue(result.server.active_verified)
+                self.assertTrue(result.publication_succeeded)
+                self.assertFalse(result.restart_attempted)
+                self.assertEqual(result.restart_status, "not_started")
+                self.assertEqual(result.final_status, "cancelled")
+                mocks["restart_activated_publish"].assert_called_once()
+                self.assertEqual(
+                    [name for name, _ in calls][-2:],
+                    ["cleanup", "cleanup"],
+                )
+                self.assertEqual(
+                    mocks["discard_publish_transfer_plan"].call_count,
+                    2,
+                )
+
     def test_uncertain_restart_result_and_prelaunch_controls_preserve_publication(self):
         plan = self.plan(); mocks, _ = self.phase_mocks(plan)
         uncertain = publish_restart.PublishRestartResult(plan.manifest_digest, plan.target_config_digest,
@@ -378,6 +415,85 @@ class PublishOrchestrationTest(unittest.TestCase):
         with patch.multiple(publish, **mocks):
             with self.assertRaises(KeyboardInterrupt): publish.execute_pack_publish(plan)
         mocks["discard_publish_transfer_plan"].assert_called_once()
+
+    def test_prepare_cleanup_owner_is_retained_for_cleanup_retry(self):
+        for failed_side in ("client", "server"):
+            with self.subTest(side=failed_side):
+                plan = self.plan()
+                mocks, _ = self.phase_mocks(plan)
+                retained_owner = Mock(
+                    name=f"retained-{failed_side}", target_side=failed_side
+                )
+                successful_owners = {
+                    side: Mock(name=f"prepared-{side}", target_side=side)
+                    for side in ("client", "server")
+                }
+                primary = RuntimeError(f"{failed_side} preparation failed")
+
+                def prepare(pack_id, manifest, target, **kwargs):
+                    if manifest.target_side == failed_side:
+                        raise publish_transfer.PublishTransferCleanupError(
+                            "cleanup pending",
+                            plan=retained_owner,
+                            primary_error=primary,
+                        )
+                    return successful_owners[manifest.target_side]
+
+                discarded_retained = False
+
+                def discard(owner, **kwargs):
+                    nonlocal discarded_retained
+                    if owner is retained_owner and not discarded_retained:
+                        discarded_retained = True
+                        raise RuntimeError("initial cleanup failed")
+
+                mocks["prepare_publish_transfer"].side_effect = prepare
+                mocks["discard_publish_transfer_plan"].side_effect = discard
+                with patch.multiple(publish, **mocks):
+                    with self.assertRaises(publish.PackPublishCleanupError) as raised:
+                        publish.execute_pack_publish(plan)
+
+                self.assertIs(raised.exception.primary_error, primary)
+                self.assertIs(plan._primary_error, primary)
+                self.assertEqual(plan.state, "cleanup-pending")
+                self.assertIs(plan._transfer_plans[failed_side], retained_owner)
+                for phase_name in (
+                    "execute_publish_transfer",
+                    "verify_publish_generation",
+                    "activate_publish_generation",
+                    "verify_activated_publish_generation",
+                    "restart_activated_publish",
+                ):
+                    mocks[phase_name].assert_not_called()
+
+                phase_counts = {
+                    name: mock.call_count
+                    for name, mock in mocks.items()
+                    if name not in {
+                        "discard_publish_transfer_plan",
+                        "retry_discard_publish_transfer_plan",
+                    }
+                }
+                with patch.object(
+                    publish, "retry_discard_publish_transfer_plan"
+                ) as retry:
+                    publish.retry_pack_publish_cleanup(plan)
+
+                retry.assert_called_once()
+                self.assertIs(retry.call_args.args[0], retained_owner)
+                self.assertEqual(plan.state, "failed")
+                self.assertIs(plan._primary_error, primary)
+                self.assertEqual(
+                    phase_counts,
+                    {
+                        name: mock.call_count
+                        for name, mock in mocks.items()
+                        if name not in {
+                            "discard_publish_transfer_plan",
+                            "retry_discard_publish_transfer_plan",
+                        }
+                    },
+                )
 
     def test_activation_cleanup_retains_publication_and_retries_only_cleanup(self):
         plan = self.plan(); mocks, _ = self.phase_mocks(plan)
