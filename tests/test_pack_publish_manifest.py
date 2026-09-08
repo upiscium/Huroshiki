@@ -11,10 +11,13 @@ import tempfile
 import tomlkit
 import tomllib
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from unittest.mock import patch
 
 import pack_publish
 import packctl
+import publish_orchestration
 from portable_paths import portable_relative_path_key
 
 
@@ -640,6 +643,32 @@ class PackPublishManifestTest(unittest.TestCase):
         (mods / "server.jar").write_bytes(b"overlay")
         with self.assertRaisesRegex(pack_publish.PackPublishError, "destination collision"):
             pack_publish.plan_pack_publish_manifest("demo")
+
+    def test_cli_reports_real_content_portable_collision_during_planning(self) -> None:
+        for overlay in ("common", "client"):
+            path = self.pack / "content" / overlay / "config" / ".gitkeep"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"")
+
+        args = type("Args", (), {"pack": "demo", "yes": True, "preview": False})()
+        stderr = StringIO()
+        with patch.object(publish_orchestration, "prepare_publish_transfer") as prepare, patch.object(
+            publish_orchestration, "execute_publish_transfer"
+        ) as execute, patch.object(publish_orchestration, "verify_publish_generation") as verify, patch.object(
+            publish_orchestration, "activate_publish_generation"
+        ) as activate, patch.object(
+            publish_orchestration, "restart_activated_publish"
+        ) as restart, redirect_stderr(stderr):
+            self.assertEqual(packctl.cmd_publish(args), 1)
+
+        output = stderr.getvalue()
+        self.assertIn("Pack Publish planning failed", output)
+        self.assertIn("content portable collision", output)
+        prepare.assert_not_called()
+        execute.assert_not_called()
+        verify.assert_not_called()
+        activate.assert_not_called()
+        restart.assert_not_called()
 
     def test_project_root_symlink_is_rejected(self) -> None:
         physical = self.packs / "physical"

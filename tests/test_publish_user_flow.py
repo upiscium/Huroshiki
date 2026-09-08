@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import huroshiki_core as core
 import packctl
 import publish_orchestration as publish
+from publish_target import PublishTargetError
 
 
 def result(status: str) -> publish.PackPublishResult:
@@ -130,6 +131,129 @@ class PublishCliOutcomeTest(unittest.TestCase):
         ), patch.object(packctl, "_print_pack_publish_result"):
             self.assertNotEqual(packctl.cmd_publish(args), 0)
         retry.assert_called_once_with(plan)
+
+    def _planning_error_output(self, primary_error: BaseException, *, preview: bool) -> str:
+        args = type("Args", (), {"pack": "demo", "yes": not preview, "preview": preview})()
+        error = publish.PackPublishExecutionError(
+            "Pack Publish planning failed",
+            result=None,
+            phase="planning",
+            primary_error=primary_error,
+        )
+        stderr = StringIO()
+        with patch.object(core, "plan_pack_publish", side_effect=error), patch.object(
+            core, "execute_pack_publish"
+        ) as execute, redirect_stderr(stderr):
+            self.assertEqual(packctl.cmd_publish(args), 1)
+        execute.assert_not_called()
+        return stderr.getvalue()
+
+    def test_planning_config_error_keeps_actionable_cause(self) -> None:
+        output = self._planning_error_output(packctl.ConfigError("pack.yaml is missing deployment.rsync_target"), preview=False)
+        self.assertEqual(
+            output,
+            "error: Pack Publish planning failed: pack.yaml is missing deployment.rsync_target\n",
+        )
+
+    def test_planning_target_error_keeps_actionable_cause(self) -> None:
+        output = self._planning_error_output(
+            PublishTargetError("publication root must be an absolute POSIX path"), preview=False
+        )
+        self.assertIn("error: Pack Publish planning failed: publication root must be an absolute POSIX path", output)
+
+    def test_preview_and_yes_planning_failures_share_policy_and_stop_before_phases(self) -> None:
+        causes = packctl.ConfigError("invalid deployment target")
+        outputs = [self._planning_error_output(causes, preview=preview) for preview in (True, False)]
+        self.assertEqual(outputs[0], outputs[1])
+
+    def test_planning_diagnostic_redacts_nested_credential_url(self) -> None:
+        output = self._planning_error_output(
+            RuntimeError("resolver failed at https://alice:secret@example.invalid/a?token=secret"),
+            preview=False,
+        )
+        self.assertNotIn("alice", output)
+        self.assertNotIn("secret", output)
+        self.assertIn("https://example.invalid", output)
+        self.assertIn("token=<redacted>", output)
+
+    def test_planning_diagnostic_is_bounded(self) -> None:
+        cause = "diagnostic " + ("x" * (packctl.RSYNC_DIAGNOSTIC_MAX_CHARS + 100))
+        output = self._planning_error_output(RuntimeError(cause), preview=False)
+        self.assertLessEqual(
+            len(output),
+            len("error: Pack Publish planning failed: ")
+            + packctl.RSYNC_DIAGNOSTIC_MAX_CHARS
+            + len("... [diagnostic truncated; 100 characters omitted]\n"),
+        )
+        self.assertIn("[diagnostic truncated;", output)
+
+    def test_planning_diagnostic_formatter_failure_keeps_outer_context(self) -> None:
+        with patch.object(
+            packctl,
+            "redact_diagnostic_text",
+            side_effect=RuntimeError("formatter failed"),
+        ):
+            output = self._planning_error_output(
+                RuntimeError("actionable cause"), preview=False
+            )
+        self.assertEqual(output, "error: Pack Publish planning failed\n")
+
+    def test_planning_diagnostic_makes_managed_root_paths_relative(self) -> None:
+        absolute = packctl.ROOT / ".huroshiki" / "transactions" / "publish-state"
+        output = self._planning_error_output(
+            RuntimeError(f"snapshot paths=[{absolute}] path:{absolute}"), preview=False
+        )
+        self.assertNotIn(str(packctl.ROOT), output)
+        self.assertEqual(
+            output.count("./.huroshiki/transactions/publish-state"),
+            2,
+        )
+
+    def test_planning_error_deduplicates_equal_outer_and_inner_messages(self) -> None:
+        output = self._planning_error_output(RuntimeError("Pack Publish planning failed"), preview=False)
+        self.assertEqual(output, "error: Pack Publish planning failed\n")
+
+    def test_result_bearing_error_keeps_existing_lifecycle_formatter(self) -> None:
+        error = publish.PackPublishExecutionError(
+            "outer",
+            result=result("restart_failed"),
+            phase="restarting",
+            primary_error=RuntimeError("nested secret=do-not-print"),
+        )
+        with patch.object(packctl, "_print_pack_publish_result") as print_result, patch.object(
+            packctl, "_pack_publish_error_message"
+        ) as planning_message:
+            packctl._print_pack_publish_error(error, core)
+        print_result.assert_called_once_with(error.result, core)
+        planning_message.assert_not_called()
+
+    def test_resultless_cancel_and_deadline_diagnostics_remain_unchanged(self) -> None:
+        cases = (
+            (
+                publish.PackPublishCancelled(
+                    "outer",
+                    result=None,
+                    phase="planning",
+                    primary_error=RuntimeError("nested"),
+                ),
+                "error: publish cancelled\n",
+            ),
+            (
+                publish.PackPublishDeadlineExceeded(
+                    "outer",
+                    result=None,
+                    phase="planning",
+                    primary_error=RuntimeError("nested"),
+                ),
+                "error: publish deadline exceeded\n",
+            ),
+        )
+        for error, expected in cases:
+            with self.subTest(error=type(error).__name__):
+                stderr = StringIO()
+                with redirect_stderr(stderr):
+                    packctl._print_pack_publish_error(error, core)
+                self.assertEqual(stderr.getvalue(), expected)
 
     def test_preview_uses_core_formatter_and_includes_digest_authority(self) -> None:
         endpoint = SimpleNamespace(user="publisher", host="example.org", port=22)
