@@ -5348,18 +5348,53 @@ def _print_pack_publish_result(result: object, publish_core: object) -> None:
         print(line, file=sys.stderr)
 
 
+def _pack_publish_error_message(error: BaseException, publish_core: object) -> str:
+    if isinstance(error, publish_core.PackPublishDeadlineExceeded):
+        outer = "publish deadline exceeded"
+    elif isinstance(error, publish_core.PackPublishCancelled):
+        outer = "publish cancelled"
+    else:
+        try:
+            outer = str(error)
+        except BaseException:
+            outer = "Pack Publish failed"
+    if (
+        getattr(error, "phase", None) != "planning"
+        or isinstance(
+            error,
+            (
+                publish_core.PackPublishDeadlineExceeded,
+                publish_core.PackPublishCancelled,
+            ),
+        )
+    ):
+        return f"error: {outer}"
+    primary_error = getattr(error, "primary_error", None)
+    if primary_error is None:
+        return f"error: {outer}"
+    try:
+        diagnostic = redact_diagnostic_text(str(primary_error))
+        root = str(ROOT)
+        if root and root != os.sep:
+            diagnostic = re.sub(
+                rf"{re.escape(root)}(?=$|/)",
+                ".",
+                diagnostic,
+            )
+        diagnostic = bounded_diagnostic(diagnostic).strip()
+    except BaseException:
+        return f"error: {outer}"
+    if diagnostic and diagnostic != outer:
+        return f"error: {outer}: {diagnostic}"
+    return f"error: {outer}"
+
+
 def _print_pack_publish_error(error: BaseException, publish_core: object) -> None:
     result = getattr(error, "result", None)
     if result is not None:
         _print_pack_publish_result(result, publish_core)
         return
-    if isinstance(error, publish_core.PackPublishDeadlineExceeded):
-        print("error: publish deadline exceeded", file=sys.stderr)
-        return
-    if isinstance(error, publish_core.PackPublishCancelled):
-        print("error: publish cancelled", file=sys.stderr)
-        return
-    print(f"error: {error}", file=sys.stderr)
+    print(_pack_publish_error_message(error, publish_core), file=sys.stderr)
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
