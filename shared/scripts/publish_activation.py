@@ -15,8 +15,12 @@ import packctl
 from pack_publish import PackPublishError, PackPublishManifest, PublishFileEntry, validate_publish_manifest
 from process_runner import BoundedProcessResult, process_failure_message
 from publish_target import (
+    PublishTarget,
     PublishRemoteTarget,
     PublishTargetError,
+    publish_target_side,
+    rebuild_publish_targets_for_revalidation,
+    validate_publish_target_for_manifest,
     rebuild_legacy_publish_target_for_revalidation,
 )
 from publish_transfer import (
@@ -81,6 +85,7 @@ class PublishSemanticVerification:
     index_toml_sha256: str
     verified_file_count: int
     manifest: PackPublishManifest | None = field(default=None, repr=False, compare=False)
+    target_side: str = "server"
 
 
 @dataclass(frozen=True)
@@ -92,6 +97,7 @@ class PublishActivatedGeneration:
     current_path: PurePosixPath
     previous_generation_id: str | None
     reused: bool
+    target_side: str = "server"
 
 
 _VERIFY_TIMEOUT_SECONDS = 600.0
@@ -143,7 +149,7 @@ def _expected_staged_files(
 def _validate_inputs(
     staged: PublishStagedGeneration,
     manifest: PackPublishManifest,
-    target: PublishRemoteTarget,
+    target: PublishTarget,
 ) -> tuple[PublishFileEntry, ...]:
     try:
         validate_publish_manifest(manifest)
@@ -151,8 +157,14 @@ def _validate_inputs(
         raise PublishSemanticVerificationError(str(error)) from error
     if not isinstance(staged, PublishStagedGeneration):
         raise PublishSemanticVerificationError("semantic verification requires a staged generation")
-    if not isinstance(target, PublishRemoteTarget):
-        raise PublishSemanticVerificationError("semantic verification requires a PublishRemoteTarget")
+    try:
+        validate_publish_target_for_manifest(target, manifest.target_side)
+    except PublishTargetError as error:
+        raise PublishSemanticVerificationError(str(error)) from error
+    if manifest.target_side not in {"server", "client"}:
+        raise PublishSemanticVerificationError("manifest target side is invalid")
+    if staged.target_side != manifest.target_side or staged.target_side != publish_target_side(target):
+        raise PublishSemanticVerificationError("staged generation target side does not match manifest and target")
     expected_generation = compute_publish_generation_id(manifest, target)
     expected_path = target.publication_root / "generations" / expected_generation
     if staged.manifest_digest != manifest.manifest_digest:
@@ -186,31 +198,39 @@ def _validate_inputs(
 
 def _resolve_current_publish_target(
     manifest: PackPublishManifest,
-    target: PublishRemoteTarget,
-) -> PublishRemoteTarget:
+    target: PublishTarget,
+) -> PublishTarget:
     try:
         settings = packctl.deployment_settings(manifest.pack_id)
-        return rebuild_legacy_publish_target_for_revalidation(
+        if isinstance(target, PublishRemoteTarget):
+            return rebuild_legacy_publish_target_for_revalidation(
+                target,
+                rsync_target=settings.rsync_target,
+                ssh_host=settings.ssh_host,
+                stack_dir=settings.stack_dir,
+                service=settings.service,
+            )
+        return rebuild_publish_targets_for_revalidation(
             target,
             rsync_target=settings.rsync_target,
             ssh_host=settings.ssh_host,
             stack_dir=settings.stack_dir,
             service=settings.service,
-        )
+        ).client
     except (packctl.ConfigError, PublishTargetError) as error:
         raise PublishTargetError(str(error)) from error
 
 
 def _check_current_publish_target(
     manifest: PackPublishManifest,
-    target: PublishRemoteTarget,
+    target: PublishTarget,
     error_type: type[PublishTransferError],
 ) -> None:
     try:
         current = _resolve_current_publish_target(manifest, target)
     except PublishTargetError as error:
         raise error_type("current Publish target could not be resolved") from error
-    if current.config_digest != target.config_digest:
+    if publish_target_side(current) != publish_target_side(target) or current.config_digest != target.config_digest:
         raise error_type("Publish target configuration is stale")
 
 
@@ -230,7 +250,7 @@ def _header_files(files: tuple[PublishFileEntry, ...]) -> list[dict[str, object]
 def _verification_header(
     staged: PublishStagedGeneration,
     manifest: PackPublishManifest,
-    target: PublishRemoteTarget,
+    target: PublishTarget,
     operation_id: str,
     files: tuple[PublishFileEntry, ...],
     request: str = "verify",
@@ -247,7 +267,7 @@ def _verification_header(
         files=_header_files(files),
         total_bytes=manifest.total_bytes,
         semantic={
-            "target_side": manifest.target_side,
+            "target_side": staged.target_side,
             "minecraft_version": manifest.minecraft_version,
             "loader": manifest.loader,
             "loader_version": manifest.loader_version,
@@ -280,7 +300,7 @@ def _validate_response(
     *,
     operation_id: str,
     manifest: PackPublishManifest,
-    target: PublishRemoteTarget,
+    target: PublishTarget,
     staged: PublishStagedGeneration,
     pack_digest: str,
     index_digest: str,
@@ -292,6 +312,7 @@ def _validate_response(
         "operation_id": operation_id,
         "manifest_digest": manifest.manifest_digest,
         "target_config_digest": target.config_digest,
+        "target_side": staged.target_side,
         "generation_id": staged.generation_id,
         "pack_toml_sha256": pack_digest,
         "index_toml_sha256": index_digest,
@@ -309,7 +330,7 @@ def _validate_current_response(
     operation_id: str,
     activated: PublishActivatedGeneration,
     manifest: PackPublishManifest,
-    target: PublishRemoteTarget,
+    target: PublishTarget,
     pack_digest: str,
     index_digest: str,
 ) -> None:
@@ -320,6 +341,7 @@ def _validate_current_response(
         "operation_id": operation_id,
         "manifest_digest": manifest.manifest_digest,
         "target_config_digest": target.config_digest,
+        "target_side": activated.target_side,
         "generation_id": activated.generation_id,
         "generation_path": activated.generation_path.as_posix(),
         "current_path": activated.current_path.as_posix(),
@@ -341,7 +363,7 @@ def _validate_current_response(
 def verify_publish_generation(
     staged: PublishStagedGeneration,
     manifest: PackPublishManifest,
-    target: PublishRemoteTarget,
+    target: PublishTarget,
     *,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
@@ -388,13 +410,14 @@ def verify_publish_generation(
         index_digest,
         len(files),
         manifest,
+        staged.target_side,
     )
 
 
 def verify_activated_publish_generation(
     activated: PublishActivatedGeneration,
     manifest: PackPublishManifest,
-    target: PublishRemoteTarget,
+    target: PublishTarget,
     *,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
@@ -407,8 +430,12 @@ def verify_activated_publish_generation(
         validate_publish_manifest(manifest)
     except (PackPublishError, AttributeError, TypeError) as error:
         raise PublishSemanticVerificationError(str(error)) from error
-    if not isinstance(target, PublishRemoteTarget):
-        raise PublishSemanticVerificationError("authoritative verification requires a PublishRemoteTarget")
+    try:
+        validate_publish_target_for_manifest(target, manifest.target_side)
+    except PublishTargetError as error:
+        raise PublishSemanticVerificationError(str(error)) from error
+    if activated.target_side != manifest.target_side or activated.target_side != publish_target_side(target):
+        raise PublishSemanticVerificationError("activated generation target side does not match manifest and target")
     staged = PublishStagedGeneration(
         activated.manifest_digest,
         activated.target_config_digest,
@@ -417,6 +444,7 @@ def verify_activated_publish_generation(
         _expected_staged_files(manifest),
         manifest.total_bytes,
         activated.reused,
+        activated.target_side,
     )
     try:
         files = _validate_inputs(staged, manifest, target)
@@ -491,13 +519,14 @@ def verify_activated_publish_generation(
         index_digest,
         len(files),
         manifest,
+        activated.target_side,
     )
 
 
 def _validate_activation_inputs(
     staged: PublishStagedGeneration,
     manifest: PackPublishManifest,
-    target: PublishRemoteTarget,
+    target: PublishTarget,
     verification: PublishSemanticVerification,
 ) -> tuple[tuple[PublishFileEntry, ...], str, str]:
     try:
@@ -508,10 +537,13 @@ def _validate_activation_inputs(
     index_digest = next(entry.sha256 for entry in files if entry.relative_path.as_posix() == "index.toml")
     if not isinstance(verification, PublishSemanticVerification):
         raise PublishActivationError("activation requires semantic verification")
+    if verification.target_side not in {"server", "client"} or verification.target_side != staged.target_side:
+        raise PublishActivationError("verification token does not bind target_side")
     expected = {
         "manifest_digest": manifest.manifest_digest,
         "target_config_digest": target.config_digest,
         "generation_id": staged.generation_id,
+        "target_side": staged.target_side,
         "pack_toml_sha256": pack_digest,
         "index_toml_sha256": index_digest,
     }
@@ -529,7 +561,7 @@ def _validate_activation_response(
     operation_id: str,
     staged: PublishStagedGeneration,
     manifest: PackPublishManifest,
-    target: PublishRemoteTarget,
+    target: PublishTarget,
     pack_digest: str,
     index_digest: str,
 ) -> tuple[str | None, bool]:
@@ -540,6 +572,7 @@ def _validate_activation_response(
         "operation_id": operation_id,
         "manifest_digest": manifest.manifest_digest,
         "target_config_digest": target.config_digest,
+        "target_side": staged.target_side,
         "generation_id": staged.generation_id,
     }
     for key, value in expected.items():
@@ -578,7 +611,7 @@ def _validate_activation_response(
 def _activation_header(
     staged: PublishStagedGeneration,
     manifest: PackPublishManifest,
-    target: PublishRemoteTarget,
+    target: PublishTarget,
     operation_id: str,
     files: tuple[PublishFileEntry, ...],
     request: str,
@@ -596,7 +629,7 @@ def _activation_header(
 
 
 def _activation_cleanup(
-    target: PublishRemoteTarget,
+    target: PublishTarget,
     header: dict[str, object],
     *,
     deadline: float,
@@ -633,6 +666,7 @@ def _activation_cleanup(
         or response.get("manifest_digest") != header["manifest_digest"]
         or response.get("target_config_digest") != header["target_config_digest"]
         or response.get("generation_id") != header["generation_id"]
+        or response.get("target_side") != header["target_side"]
         or response.get("finalize_receipt") is not finalize_receipt
         or response.get("expected_activation_status") != expected_status
     ):
@@ -646,7 +680,7 @@ def _activation_cleanup(
 def retry_publish_activation_cleanup(
     staged: PublishStagedGeneration,
     manifest: PackPublishManifest,
-    target: PublishRemoteTarget,
+    target: PublishTarget,
     operation_id: str,
     *,
     deadline: float | None = None,
@@ -697,7 +731,7 @@ def retry_publish_activation_cleanup(
 def activate_publish_generation(
     staged: PublishStagedGeneration,
     verification: PublishSemanticVerification,
-    target: PublishRemoteTarget,
+    target: PublishTarget,
     *,
     manifest: PackPublishManifest | None = None,
     cancel_event: threading.Event | None = None,
@@ -764,6 +798,7 @@ def activate_publish_generation(
                 target.publication_root / "current",
                 previous,
                 reused,
+                staged.target_side,
             )
             try:
                 _activation_cleanup(
@@ -851,6 +886,7 @@ def activate_publish_generation(
                 target.publication_root / "current",
                 previous,
                 reused,
+                staged.target_side,
             )
             try:
                 _activation_cleanup(

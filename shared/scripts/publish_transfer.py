@@ -40,9 +40,11 @@ from process_runner import (
     run_bounded_process,
 )
 from publish_target import (
-    PublishRemoteTarget,
+    PublishTarget,
     PublishTargetError,
-    rebuild_legacy_publish_target_for_revalidation,
+    publish_target_side,
+    rebuild_publish_targets_for_revalidation,
+    validate_publish_target_for_manifest,
 )
 
 
@@ -102,6 +104,7 @@ class PublishStagedGeneration:
     files: tuple[PublishStagedFile, ...]
     total_bytes: int
     reused: bool
+    target_side: str = "server"
 
 
 class PublishTransferPlan:
@@ -112,7 +115,7 @@ class PublishTransferPlan:
         *,
         pack_id: str,
         manifest: PackPublishManifest,
-        target: PublishRemoteTarget,
+        target: PublishTarget,
         operation_id: str,
         workspace: Path,
         payload_root: Path,
@@ -138,7 +141,7 @@ class PublishTransferPlan:
         return self._manifest
 
     @property
-    def target(self) -> PublishRemoteTarget:
+    def target(self) -> PublishTarget:
         return self._target
 
     @property
@@ -155,7 +158,7 @@ class PublishTransferPlan:
 
     @property
     def target_side(self) -> str:
-        return self._manifest.target_side
+        return publish_target_side(self._target)
 
     @property
     def pack_id(self) -> str:
@@ -452,6 +455,8 @@ def validate_ids(header):
         raise RuntimeError("invalid publish operation ID")
     if not isinstance(generation, str) or not re.fullmatch(r"v1-[0-9a-f]{64}", generation):
         raise RuntimeError("invalid publish generation ID")
+    if header.get("target_side") not in {"server", "client"}:
+        raise RuntimeError("invalid publish target side")
 
 def verify_tree(root, expected):
     found = {}
@@ -708,6 +713,7 @@ def process_transfer(header):
             return {
                 "ok": True,
                 "status": "reused",
+                "target_side": header["target_side"],
                 "operation_id": header["operation_id"],
                 "manifest_digest": header["manifest_digest"],
                 "target_config_digest": header["target_config_digest"],
@@ -763,6 +769,7 @@ def process_transfer(header):
             return {
                 "ok": True,
                 "status": "reused",
+                "target_side": header["target_side"],
                 "operation_id": header["operation_id"],
                 "manifest_digest": header["manifest_digest"],
                 "target_config_digest": header["target_config_digest"],
@@ -771,6 +778,7 @@ def process_transfer(header):
         return {
             "ok": True,
             "status": "committed",
+            "target_side": header["target_side"],
             "operation_id": header["operation_id"],
             "manifest_digest": header["manifest_digest"],
             "target_config_digest": header["target_config_digest"],
@@ -824,6 +832,7 @@ def process_status(header):
                 response = {
                     "ok": True,
                     "status": "committed",
+                    "target_side": header["target_side"],
                     "operation_id": header["operation_id"],
                     "manifest_digest": header["manifest_digest"],
                     "target_config_digest": header["target_config_digest"],
@@ -847,6 +856,7 @@ def process_status(header):
                 return {
                     "ok": True,
                     "status": "not_committed",
+                    "target_side": header["target_side"],
                     "operation_id": header["operation_id"],
                     "manifest_digest": header["manifest_digest"],
                     "target_config_digest": header["target_config_digest"],
@@ -857,6 +867,7 @@ def process_status(header):
                 return {
                     "ok": True,
                     "status": "not_committed",
+                    "target_side": header["target_side"],
                     "operation_id": header["operation_id"],
                     "manifest_digest": header["manifest_digest"],
                     "target_config_digest": header["target_config_digest"],
@@ -979,6 +990,7 @@ def activation_response(header, status, *, pack_digest=None, index_digest=None, 
         "ok": error is None,
         "request": header["request"],
         "status": status,
+        "target_side": header["target_side"],
         "operation_id": header["operation_id"],
         "manifest_digest": header["manifest_digest"],
         "target_config_digest": header["target_config_digest"],
@@ -1009,6 +1021,7 @@ def process_verify(header):
                 "ok": True,
                 "request": "verify",
                 "status": "verified",
+                "target_side": header["target_side"],
                 "operation_id": header["operation_id"],
                 "manifest_digest": header["manifest_digest"],
                 "target_config_digest": header["target_config_digest"],
@@ -1055,6 +1068,7 @@ def process_verify_current(header):
                 "ok": True,
                 "request": "verify-current",
                 "status": "verified-current",
+                "target_side": header["target_side"],
                 "operation_id": header["operation_id"],
                 "manifest_digest": header["manifest_digest"],
                 "target_config_digest": header["target_config_digest"],
@@ -1298,6 +1312,7 @@ def process_activation_cleanup(header):
             "ok": True,
             "request": "activation-cleanup",
             "status": "cleaned",
+            "target_side": header["target_side"],
             "operation_id": header["operation_id"],
             "manifest_digest": header["manifest_digest"],
             "target_config_digest": header["target_config_digest"],
@@ -1323,7 +1338,15 @@ def process_cleanup(header):
                 remove_tree(generations, stage_name)
             except FileNotFoundError:
                 pass
-            return {"ok": True, "status": "cleaned"}
+            return {
+                "ok": True,
+                "status": "cleaned",
+                "target_side": header["target_side"],
+                "operation_id": header["operation_id"],
+                "manifest_digest": header["manifest_digest"],
+                "target_config_digest": header["target_config_digest"],
+                "generation_id": header["generation_id"],
+            }
         finally:
             os.close(generations)
     finally:
@@ -1332,6 +1355,7 @@ def process_cleanup(header):
         os.close(root)
 
 def main():
+    header = None
     try:
         if read_exact(sys.stdin.buffer, len(MAGIC)) != MAGIC:
             raise RuntimeError("invalid publish transfer magic")
@@ -1370,12 +1394,17 @@ def main():
             "status": "integrity_failure",
             "error": str(error)[:512],
         }
+        if isinstance(header, dict) and header.get("target_side") in {"server", "client"}:
+            response["target_side"] = header["target_side"]
         if error.recovery_path is not None:
             response["recovery_path"] = error.recovery_path
         send(response)
         return 1
     except BaseException as error:
-        send({"ok": False, "status": "integrity_failure", "error": str(error)[:512]})
+        response = {"ok": False, "status": "integrity_failure", "error": str(error)[:512]}
+        if isinstance(header, dict) and header.get("target_side") in {"server", "client"}:
+            response["target_side"] = header["target_side"]
+        send(response)
         return 1
     return 0
 
@@ -1419,12 +1448,14 @@ def _emit(
 
 def compute_publish_generation_id(
     manifest: PackPublishManifest,
-    target: PublishRemoteTarget,
+    target: PublishTarget,
 ) -> str:
     """Bind one generation ID to one manifest and target, hence one exact tree."""
     validate_publish_manifest(manifest)
-    if not isinstance(target, PublishRemoteTarget):
-        raise PublishTransferError("publish transfer requires a PublishRemoteTarget")
+    try:
+        validate_publish_target_for_manifest(target, manifest.target_side)
+    except PublishTargetError as error:
+        raise PublishTransferError(str(error)) from error
     payload = (
         _GENERATION_SCHEMA.encode("ascii")
         + b"\0"
@@ -1623,7 +1654,7 @@ def _verify_workspace(
 def prepare_publish_transfer(
     pack_id: str,
     manifest: PackPublishManifest,
-    target: PublishRemoteTarget,
+    target: PublishTarget,
     *,
     cancel_event: threading.Event | None = None,
     deadline: float | None = None,
@@ -1634,8 +1665,10 @@ def prepare_publish_transfer(
         validate_publish_manifest(manifest)
     except PackPublishError as error:
         raise PublishTransferPlanningError(str(error)) from error
-    if not isinstance(target, PublishRemoteTarget):
-        raise PublishTransferPlanningError("publish transfer requires a PublishRemoteTarget")
+    try:
+        validate_publish_target_for_manifest(target, manifest.target_side)
+    except PublishTargetError as error:
+        raise PublishTransferPlanningError(str(error)) from error
     if pack_id != manifest.pack_id:
         raise PublishTransferPlanningError("publish transfer pack ID does not match manifest")
     if len(manifest.files) > _MAX_FILES or manifest.total_bytes > _MAX_TOTAL_BYTES:
@@ -1862,13 +1895,13 @@ def retry_discard_publish_transfer_plan(
     discard_publish_transfer_plan(plan, deadline=deadline)
 
 
-def _endpoint_destination(target: PublishRemoteTarget) -> str:
+def _endpoint_destination(target: PublishTarget) -> str:
     endpoint = target.publication_endpoint
     host = f"[{endpoint.host}]" if ":" in endpoint.host else endpoint.host
     return f"{endpoint.user}@{host}" if endpoint.user else host
 
 
-def _ssh_command(target: PublishRemoteTarget) -> list[str]:
+def _ssh_command(target: PublishTarget) -> list[str]:
     endpoint = target.publication_endpoint
     return [
         "ssh",
@@ -1910,7 +1943,7 @@ def _header(
         files=files,
         total_bytes=plan.manifest.total_bytes,
         semantic={
-            "target_side": plan.target_side,
+            "target_side": publish_target_side(plan.target),
             "minecraft_version": plan.manifest.minecraft_version,
             "loader": plan.manifest.loader,
             "loader_version": plan.manifest.loader_version,
@@ -2043,7 +2076,7 @@ def _run_remote_request(
 
 
 def run_publish_remote_control_request(
-    target: PublishRemoteTarget,
+    target: PublishTarget,
     header: dict[str, object],
     *,
     deadline: float,
@@ -2138,20 +2171,29 @@ def _cleanup_remote_publish_stage(
             )
         )
         raise PublishTransferCleanupError(detail)
+    try:
+        _validate_committed_response(plan, cleanup_response)
+    except PublishTransferExecutionError as error:
+        with plan._lock:
+            plan._state = "cleanup-pending"
+        raise PublishTransferCleanupError(str(error)) from error
     with plan._lock:
         plan._recovery_path = None
 
 
-def _resolve_current_target(plan: PublishTransferPlan) -> PublishRemoteTarget:
+def _resolve_current_target(plan: PublishTransferPlan) -> PublishTarget:
     try:
         settings = packctl.deployment_settings(plan.pack_id)
-        return rebuild_legacy_publish_target_for_revalidation(
+        targets = rebuild_publish_targets_for_revalidation(
             plan.target,
             rsync_target=settings.rsync_target,
             ssh_host=settings.ssh_host,
             stack_dir=settings.stack_dir,
             service=settings.service,
         )
+        if plan.target_side == "server":
+            return targets.server
+        return targets.client
     except (packctl.ConfigError, PublishTargetError) as error:
         raise PublishTransferExecutionError(str(error)) from error
 
@@ -2168,6 +2210,7 @@ def _validate_committed_response(
     response: dict[str, object],
 ) -> None:
     expected = {
+        "target_side": plan.target_side,
         "operation_id": plan.operation_id,
         "manifest_digest": plan.manifest_digest,
         "target_config_digest": plan.target_config_digest,
@@ -2178,6 +2221,10 @@ def _validate_committed_response(
             raise PublishTransferExecutionError(
                 f"remote helper response does not bind to transfer {key}"
             )
+    if response.get("target_side") != plan.target_side:
+        raise PublishTransferExecutionError(
+            "remote helper response does not bind to transfer target side"
+        )
     if (
         "recovery_path" in response
         and response.get("recovery_path") != plan.staging_path.as_posix()
@@ -2294,6 +2341,7 @@ def execute_publish_transfer(
                 _result_files(plan),
                 plan.manifest.total_bytes,
                 reused,
+                plan.target_side,
             )
             with plan._lock:
                 plan._state = "executed"
@@ -2377,6 +2425,7 @@ def execute_publish_transfer(
                     _result_files(plan),
                     plan.manifest.total_bytes,
                     False,
+                    plan.target_side,
                 )
         with plan._lock:
             plan._state = "uncertain"

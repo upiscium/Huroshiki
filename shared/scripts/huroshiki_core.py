@@ -333,6 +333,7 @@ from pack_publish import (
     PackPublishDeadlineExceeded,
     PackPublishError,
     PackPublishManifest,
+    PackPublishManifestBundle,
     PublishFileEntry,
     PublishWarning,
     plan_pack_publish_manifest,
@@ -342,6 +343,7 @@ from publish_target import (
     PUBLISH_RESERVED_NAMES,
     PUBLISH_RESERVED_PREFIX,
     PublishRemoteTarget,
+    PublishClientTarget,
     PublishRestartTarget,
     PublishSshEndpoint,
     PublishTargetError,
@@ -398,6 +400,7 @@ from publish_orchestration import (
     PackPublishRestartError,
     PackPublishRestartUncertainError,
     PackPublishResult,
+    PublishVariantFacts,
     execute_pack_publish,
     plan_pack_publish,
     retry_pack_publish_cleanup,
@@ -13549,8 +13552,6 @@ def format_template_copy_migration_preview(
 
 def format_pack_publish_plan(plan: PackPublishPlan) -> tuple[str, ...]:
     """Return deterministic, safe, network-free preview lines for a plan."""
-    target = plan.target
-
     def endpoint_text(endpoint: object) -> str:
         host = endpoint.host
         if ":" in host:
@@ -13558,30 +13559,40 @@ def format_pack_publish_plan(plan: PackPublishPlan) -> tuple[str, ...]:
         identity = f"{endpoint.user}@" if endpoint.user is not None else ""
         return f"{identity}{host}:{endpoint.port}"
 
-    lines = [
-        f"Pack: {plan.pack_id}",
-        f"Side: {plan.target_side}",
-        f"Publication endpoint: {endpoint_text(target.publication_endpoint)}",
-        f"Publication root: {target.publication_root}",
-        f"Restart endpoint: {endpoint_text(target.restart.endpoint)}",
-        f"Restart stack/service: {target.restart.stack_dir} / {target.restart.service}",
-        f"Manifest digest: {plan.manifest_digest}",
-        f"Generation: {plan.generation_id}",
-        f"Files: {len(plan.manifest.files)} ({plan.manifest.total_bytes} bytes)",
-    ]
-    lines.extend(
-        f"Warning [{warning.code}]: {warning.message}"
-        for warning in plan.manifest.warnings
-    )
-    lines.append("Files:")
+    lines = [f"Pack: {plan.pack_id}"]
     preview_limit = 50
-    lines.extend(
-        f"  {entry.relative_path} ({entry.size} bytes, {entry.source_kind})"
-        for entry in plan.manifest.files[:preview_limit]
-    )
-    omitted = len(plan.manifest.files) - preview_limit
-    if omitted > 0:
-        lines.append(f"  ... {omitted} additional files")
+    for side in ("client", "server"):
+        manifest = getattr(plan, f"{side}_manifest", None)
+        target = getattr(plan, f"{side}_target", None)
+        if manifest is None or target is None:
+            continue
+        label = side.title()
+        lines.extend((
+            f"{label}:",
+            f"  Manifest digest: {manifest.manifest_digest}",
+            f"  Generation: {getattr(plan, f'{side}_generation_id')}",
+            f"  Canonical publication root: {target.publication_root}",
+            f"  Publication endpoint: {endpoint_text(target.publication_endpoint)}",
+            f"  Files: {len(manifest.files)} ({manifest.total_bytes} bytes)",
+        ))
+        lines.extend(
+            f"  Warning [{warning.code}]: {warning.message}"
+            for warning in manifest.warnings
+        )
+        lines.append("  Files:")
+        lines.extend(
+            f"    {entry.relative_path} ({entry.size} bytes, {entry.source_kind})"
+            for entry in manifest.files[:preview_limit]
+        )
+        omitted = len(manifest.files) - preview_limit
+        if omitted > 0:
+            lines.append(f"    ... {omitted} additional files")
+    restart = plan.server_target.restart
+    lines.extend((
+        "Restart:",
+        f"  Endpoint: {endpoint_text(restart.endpoint)}",
+        f"  Stack/service: {restart.stack_dir} / {restart.service}",
+    ))
     return tuple(lines)
 
 
@@ -13619,12 +13630,27 @@ def format_pack_publish_result(
         summary = (
             "Publication did not complete; generation activation was not confirmed"
         )
+    def fact(value: bool) -> str:
+        return "complete" if value else "not complete"
+
+    client = result.client_facts
+    server = result.server_facts
     return (
         summary,
+        f"Client transfer: {fact(client.transferred)}",
+        f"Client publication verification: {fact(client.remote_verified)}",
+        f"Client activation: {fact(client.activated)}",
+        f"Client active verification: {fact(client.active_verified)}",
+        f"Client cleanup: {'pending' if client.cleanup_pending else 'complete'}",
+        f"Server transfer: {fact(server.transferred)}",
+        f"Server publication verification: {fact(server.remote_verified)}",
+        f"Server activation: {fact(server.activated)}",
+        f"Server active verification: {fact(server.active_verified)}",
+        f"Server cleanup: {'pending' if server.cleanup_pending else 'complete'}",
+        f"Restart: {result.restart_status}",
         f"Publication status: {result.final_status}",
         f"Manifest digest: {result.manifest_digest}",
         f"Generation: {result.generation_id}",
-        f"Restart: {result.restart_status}",
     )
 
 

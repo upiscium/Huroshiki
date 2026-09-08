@@ -272,6 +272,67 @@ class PublishRemoteTargetDigestTest(unittest.TestCase):
         self.assertNotEqual(rebuilt_configured.config_digest, configured.config_digest)
         self.assertEqual(rebuilt_explicit.config_digest, explicit.config_digest)
 
+    def test_client_target_uses_canonical_namespace_and_is_immutable(self) -> None:
+        base = _legacy_publish_target()
+        client = target.publish_client_target_from_remote_target(base)
+
+        self.assertIsInstance(client, target.PublishClientTarget)
+        self.assertEqual(client.publication_root, PurePosixPath("/srv/packs/demo/client"))
+        self.assertEqual(client.publication_endpoint, base.publication_endpoint)
+        self.assertEqual(client.publication_root_source, base.publication_root_source)
+        self.assertEqual(client.target_side, "client")
+        self.assertRaises(FrozenInstanceError, setattr, client, "namespace", "server")
+
+    def test_client_digest_is_deterministic_independent_and_restart_decoupled(self) -> None:
+        base = _legacy_publish_target()
+        client = target.publish_client_target_from_remote_target(base)
+        restart_changed = _legacy_publish_target(
+            ssh_host="another.example.org", stack_dir="/srv/restart/other", service="java"
+        )
+        self.assertEqual(
+            client.config_digest,
+            target.publish_client_target_from_remote_target(restart_changed).config_digest,
+        )
+        self.assertNotEqual(
+            client.config_digest,
+            target.publish_client_target_from_remote_target(
+                _legacy_publish_target(rsync_target="other.example.org:/srv/packs/demo")
+            ).config_digest,
+        )
+        self.assertNotEqual(
+            client.config_digest,
+            target.publish_client_target_from_remote_target(
+                _legacy_publish_target(remote_path="/srv/packs/other")
+            ).config_digest,
+        )
+
+    def test_server_digest_and_client_rebuild_follow_separate_semantics(self) -> None:
+        base = _legacy_publish_target()
+        original_server_digest = base.config_digest
+        original = target.PublishTargetSet(
+            base, target.publish_client_target_from_remote_target(base)
+        )
+        self.assertEqual(base.config_digest, original_server_digest)
+        rebuilt = target.rebuild_legacy_publish_targets_for_revalidation(
+            original,
+            rsync_target="publish.example.org:/srv/packs/demo",
+            ssh_host="new-restart.example.org",
+            stack_dir="/srv/restart/new",
+            service="new-service",
+        )
+        self.assertNotEqual(rebuilt.server.config_digest, original_server_digest)
+        self.assertEqual(rebuilt.client.config_digest, original.client.config_digest)
+
+    def test_target_validation_rejects_cross_use(self) -> None:
+        base = _legacy_publish_target()
+        client = target.publish_client_target_from_remote_target(base)
+        target.validate_publish_target(base, "server")
+        target.validate_publish_target_for_manifest(client, "client")
+        with self.assertRaises(target.PublishTargetError):
+            target.validate_publish_target(client, "server")
+        with self.assertRaises(target.PublishTargetError):
+            target.validate_publish_target(base, "client")
+
     def test_publish_remote_target_from_legacy_allows_restart_publication_host_mismatch(self) -> None:
         mismatched = _legacy_publish_target(
             rsync_target="publish.example.org:/srv/packs/demo",
