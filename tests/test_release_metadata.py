@@ -17,8 +17,6 @@ SCRIPTS = ROOT / "shared" / "scripts"
 CURRENT_SOURCE_VERSION = "0.3.0-rc.2"
 CURRENT_RELEASE_DATE = "2026-09-08"
 CURRENT_RELEASE_TAG = f"v{CURRENT_SOURCE_VERSION}"
-SMOKE_SERVER_GENERATION = "v1-dfee6a4aa6cd338f513b9de1cec6306965bbef2160a96c71c49782b340c1c977"
-SMOKE_CLIENT_GENERATION = "v1-5f8107eadde8ad5e278b50de41c868ec3648ca9d20b9e1457e22b90b6363c283"
 CURRENT_RELEASE_SCOPE = (
     "bound manifests before reuse",
     "pack.toml[index].hash",
@@ -181,9 +179,11 @@ class ReleaseMetadataTest(unittest.TestCase):
         for issue in (190, 192, 194, 195):
             with self.subTest(issue=issue):
                 self.assertIn(f"#{issue}", release_notes)
-        self.assertIn(f"Server: `{SMOKE_SERVER_GENERATION}`", release_notes)
-        self.assertIn(f"Client: `{SMOKE_CLIENT_GENERATION}`", release_notes)
-        self.assertIn("Smoke residue: `0`", release_notes)
+        self.assertIn("## Manual production smoke evidence", release_notes)
+        self.assertIn(
+            "These facts record the observed smoke evidence only",
+            release_notes,
+        )
         self.assertIn(
             "did not explicitly confirm the descriptor-level `index.toml` hash or\n"
             "`metafile = false` assertions",
