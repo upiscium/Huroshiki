@@ -50,6 +50,9 @@ class PublishSemanticVerificationTest(PackPublishManifestTest):
             remote_path=str(self.root / "remote"),
         )
 
+    def _client_target(self) -> publish_target.PublishClientTarget:
+        return publish_target.publish_client_target_from_remote_target(self._target())
+
     def _settings(self, target: publish_target.PublishRemoteTarget) -> packctl.DeploymentSettings:
         publication = target.publication_endpoint
         restart = target.restart.endpoint
@@ -176,7 +179,7 @@ class PublishSemanticVerificationTest(PackPublishManifestTest):
 
     def _content_staged_generation(self, target_side: str):
         manifest = pack_publish.plan_pack_publish_manifest("demo", target_side=target_side)
-        target = self._target()
+        target = self._client_target() if target_side == "client" else self._target()
         plan = transfer.prepare_publish_transfer("demo", manifest, target)
         with patch.object(transfer, "run_bounded_process", side_effect=self._fake_runner()):
             staged = transfer.execute_publish_transfer(plan)
@@ -186,7 +189,7 @@ class PublishSemanticVerificationTest(PackPublishManifestTest):
         self, target_side: str, mutation: str
     ) -> None:
         manifest = self._mutated_content_manifest(target_side, mutation)
-        target = self._target()
+        target = self._client_target() if target_side == "client" else self._target()
         with patch.object(transfer, "plan_pack_publish_manifest", return_value=manifest):
             plan = transfer.prepare_publish_transfer("demo", manifest, target)
             try:
@@ -788,6 +791,47 @@ class PublishSemanticVerificationTest(PackPublishManifestTest):
             run.assert_not_called()
         finally:
             transfer.discard_publish_transfer_plan(plan)
+
+    def test_client_activation_uses_client_namespace(self) -> None:
+        manifest = pack_publish.plan_pack_publish_manifest("demo", target_side="client")
+        target = self._client_target()
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        try:
+            with patch.object(transfer, "run_bounded_process", side_effect=self._fake_runner()):
+                staged = transfer.execute_publish_transfer(plan)
+                verification = activation.verify_publish_generation(staged, manifest, target)
+                activated = activation.activate_publish_generation(
+                    staged, verification, target, manifest=manifest
+                )
+            self.assertEqual(staged.target_side, "client")
+            self.assertEqual(verification.target_side, "client")
+            self.assertEqual(activated.target_side, "client")
+            self.assertEqual(activated.current_path, target.publication_root / "current")
+            self.assertEqual(
+                Path(target.publication_root, "current").readlink().as_posix(),
+                f"generations/{staged.generation_id}",
+            )
+            self.assertFalse((Path(target.publication_root).parent / "current").exists())
+        finally:
+            transfer.discard_publish_transfer_plan(plan)
+
+    def test_client_and_server_tokens_cannot_cross(self) -> None:
+        server_manifest, server_target, server_plan, server_staged, server_verification = self._verified_generation()
+        client_manifest = pack_publish.plan_pack_publish_manifest("demo", target_side="client")
+        client_target = self._client_target()
+        client_plan = transfer.prepare_publish_transfer("demo", client_manifest, client_target)
+        try:
+            with patch.object(transfer, "run_bounded_process", side_effect=self._fake_runner()):
+                client_staged = transfer.execute_publish_transfer(client_plan)
+            with self.assertRaises(activation.PublishActivationError):
+                activation.activate_publish_generation(
+                    client_staged, server_verification, client_target, manifest=client_manifest
+                )
+            with self.assertRaises(activation.PublishSemanticVerificationError):
+                activation.verify_publish_generation(server_staged, client_manifest, client_target)
+        finally:
+            transfer.discard_publish_transfer_plan(server_plan)
+            transfer.discard_publish_transfer_plan(client_plan)
 
 
 if __name__ == "__main__":

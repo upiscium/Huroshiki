@@ -100,6 +100,21 @@ class PackPublishManifest:
 
 
 @dataclass(frozen=True)
+class PackPublishManifestBundle:
+    """The client and server manifests planned from one immutable snapshot."""
+
+    pack_id: str
+    source_snapshot_digest: str
+    client: PackPublishManifest
+    server: PackPublishManifest
+    bundle_digest: str
+
+    @property
+    def manifests(self) -> tuple[PackPublishManifest, PackPublishManifest]:
+        return (self.client, self.server)
+
+
+@dataclass(frozen=True)
 class _PackwizSelection:
     source_files: tuple[PublishFileEntry, ...]
     index_records: tuple[tuple[Path, str, bool], ...]
@@ -636,15 +651,97 @@ def validate_publish_manifest(manifest: PackPublishManifest) -> PackPublishManif
 _manifest_digest = compute_publish_manifest_digest
 
 
-def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", cancel_event: threading.Event | None = None, deadline: float | None = None, progress: Progress | None = None) -> PackPublishManifest:
-    if target_side not in {"client", "server"}:
-        raise PackPublishError("target_side must be client or server")
+def _plan_manifest_from_snapshot(
+    pack_id: str,
+    root_fd: int,
+    scan: PackTreeScan,
+    target_side: Literal["client", "server"],
+    *,
+    cancel_event: threading.Event | None,
+    deadline: float | None,
+    progress: Progress | None,
+) -> PackPublishManifest:
+    """Derive one side without taking another lock or snapshot."""
+    entries = _entry_map(scan)
+    _progress(progress, "validating-packwiz")
+    packwiz = _select_packwiz_files(root_fd, scan, target_side, cancel_event=cancel_event, deadline=deadline)
+    _progress(progress, "validating-content")
+    content_files = _content_files(scan, target_side)
+    source_files = list(packwiz.source_files)
+    portable = _portable_output_map(source_files)
+    directories = _directory_map(entries)
+    for overlay_path, overlay in content_files:
+        _checkpoint(cancel_event, deadline)
+        relative = Path(*overlay_path.parts[2:])
+        destination = PurePosixPath(relative.as_posix())
+        try:
+            key = portable_relative_path_key(destination)
+        except PortablePathError as error:
+            raise PackPublishError(f"invalid content destination: {destination}") from error
+        if (
+            key in portable
+            or key in packwiz.jar_destinations
+            or _collides_with_generated_descriptor(relative)
+        ):
+            raise PackPublishError(f"content destination collision: {destination}")
+        portable[key] = destination
+        item = entries.get(overlay_path)
+        _read_bound(
+            root_fd, overlay_path, item, directories=directories,
+            cancel_event=cancel_event, deadline=deadline, retain_bytes=False,
+        )
+        source_files.append(
+            PublishFileEntry(
+                destination, item.size, item.digest, stat.S_IMODE(item.mode),
+                "content", None, overlay_path,
+            )
+        )
+    _portable_output_map(source_files)
+    complete_records = list(packwiz.index_records)
+    complete_records.extend(
+        (Path(*entry.relative_path.parts), entry.sha256, False)
+        for entry in source_files if entry.source_kind == "content"
+    )
+    generated = _generated_descriptors(
+        scan, packwiz.pack_bytes, complete_records,
+        lambda: _checkpoint(cancel_event, deadline),
+    )
+    files = generated + source_files
+    files.sort(key=lambda entry: entry.relative_path.as_posix())
+    _portable_output_map(files)
+    _progress(progress, "building-manifest")
+    total_bytes = 0
+    for entry in files:
+        if entry.size < 0 or total_bytes > _MAX_TOTAL_BYTES - entry.size:
+            raise PackPublishError("publication manifest byte total overflow")
+        total_bytes += entry.size
+    tuple_value = packwiz.version_tuple
+    result = PackPublishManifest(
+        pack_id, target_side, scan.content_digest, tuple_value[0], tuple_value[1],
+        tuple_value[2], tuple(files), total_bytes, "", (),
+    )
+    return PackPublishManifest(
+        result.pack_id, result.target_side, result.source_snapshot_digest,
+        result.minecraft_version, result.loader, result.loader_version,
+        result.files, result.total_bytes, compute_publish_manifest_digest(result),
+        result.warnings,
+    )
+
+
+def _snapshot_and_plan_manifests(
+    pack_id: str,
+    *,
+    cancel_event: threading.Event | None,
+    deadline: float | None,
+    progress: Progress | None,
+    sides: tuple[Literal["client", "server"], ...] = ("client", "server"),
+) -> dict[str, PackPublishManifest]:
     try:
         packctl.validate_pack_id(pack_id)
     except packctl.ConfigError as error:
         raise PackPublishError(str(error)) from error
     _checkpoint(cancel_event, deadline)
-    with packctl.ProjectLock(f"pack:{pack_id}", "plan publication manifest"):
+    with packctl.ProjectLock(f"pack:{pack_id}", "plan publication manifests"):
         root = Path(os.path.abspath(packctl.PACKS)) / pack_id
         _progress(progress, "snapshotting")
         try:
@@ -666,73 +763,13 @@ def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", can
             entries = _entry_map(scan)
             _progress(progress, "validating-config")
             _config(root_fd, entries, pack_id, cancel_event=cancel_event, deadline=deadline)
-            _progress(progress, "validating-packwiz")
-            packwiz = _select_packwiz_files(root_fd, scan, target_side, cancel_event=cancel_event, deadline=deadline)
-            _progress(progress, "validating-content")
-            content_files = _content_files(scan, target_side)
-            source_files = list(packwiz.source_files)
-            portable = _portable_output_map(source_files)
-            for overlay_path, overlay in content_files:
-                _checkpoint(cancel_event, deadline)
-                relative = Path(*overlay_path.parts[2:])
-                destination = PurePosixPath(relative.as_posix())
-                try:
-                    key = portable_relative_path_key(destination)
-                except PortablePathError as error:
-                    raise PackPublishError(f"invalid content destination: {destination}") from error
-                if (
-                    key in portable
-                    or key in packwiz.jar_destinations
-                    or _collides_with_generated_descriptor(relative)
-                ):
-                    raise PackPublishError(f"content destination collision: {destination}")
-                portable[key] = destination
-                item = entries.get(overlay_path)
-                _read_bound(
-                    root_fd,
-                    overlay_path,
-                    item,
-                    directories=_directory_map(entries),
-                    cancel_event=cancel_event,
-                    deadline=deadline,
-                    retain_bytes=False,
+            planned = {
+                side: _plan_manifest_from_snapshot(
+                    pack_id, root_fd, scan, side, cancel_event=cancel_event,
+                    deadline=deadline, progress=progress,
                 )
-                source_files.append(
-                    PublishFileEntry(
-                        destination,
-                        item.size,
-                        item.digest,
-                        stat.S_IMODE(item.mode),
-                        "content",
-                        None,
-                        overlay_path,
-                    )
-                )
-            _portable_output_map(source_files)
-            complete_records = list(packwiz.index_records)
-            complete_records.extend(
-                (Path(*entry.relative_path.parts), entry.sha256, False)
-                for entry in source_files
-                if entry.source_kind == "content"
-            )
-            generated = _generated_descriptors(
-                scan,
-                packwiz.pack_bytes,
-                complete_records,
-                lambda: _checkpoint(cancel_event, deadline),
-            )
-            files = generated + source_files
-            files.sort(key=lambda entry: entry.relative_path.as_posix())
-            _portable_output_map(files)
-            _progress(progress, "building-manifest")
-            total_bytes = 0
-            for entry in files:
-                if entry.size < 0 or total_bytes > _MAX_TOTAL_BYTES - entry.size:
-                    raise PackPublishError("publication manifest byte total overflow")
-                total_bytes += entry.size
-            tuple_value = packwiz.version_tuple
-            result = PackPublishManifest(pack_id, target_side, scan.content_digest, tuple_value[0], tuple_value[1], tuple_value[2], tuple(files), total_bytes, "", ())
-            result = PackPublishManifest(result.pack_id, result.target_side, result.source_snapshot_digest, result.minecraft_version, result.loader, result.loader_version, result.files, result.total_bytes, compute_publish_manifest_digest(result), result.warnings)
+                for side in sides
+            }
             _checkpoint(cancel_event, deadline)
             try:
                 final = scan_pack_migration_source(
@@ -744,6 +781,74 @@ def plan_pack_publish_manifest(pack_id: str, *, target_side: str = "server", can
                 raise PackPublishError(f"Pack changed while planning publication: {error}") from error
             if final.root_identity != scan.root_identity or final.snapshot_digest != scan.snapshot_digest:
                 raise PackPublishError("Pack changed while planning publication")
-            return result
+            return planned
         finally:
             os.close(root_fd)
+
+
+def _bundle_digest(bundle: PackPublishManifestBundle) -> str:
+    payload = {
+        "pack_id": bundle.pack_id,
+        "source_snapshot_digest": bundle.source_snapshot_digest,
+        "client": bundle.client.manifest_digest,
+        "server": bundle.server.manifest_digest,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def validate_publish_manifest_bundle(
+    bundle: PackPublishManifestBundle,
+) -> PackPublishManifestBundle:
+    if not isinstance(bundle, PackPublishManifestBundle):
+        raise PackPublishError("publish transfer requires a PackPublishManifestBundle")
+    validate_publish_manifest(bundle.client)
+    validate_publish_manifest(bundle.server)
+    if bundle.pack_id != bundle.client.pack_id or bundle.pack_id != bundle.server.pack_id:
+        raise PackPublishError("publication bundle pack identity is inconsistent")
+    if bundle.client.target_side != "client" or bundle.server.target_side != "server":
+        raise PackPublishError("publication bundle sides are invalid")
+    if (
+        bundle.client.source_snapshot_digest != bundle.server.source_snapshot_digest
+        or bundle.source_snapshot_digest != bundle.client.source_snapshot_digest
+    ):
+        raise PackPublishError("publication bundle source snapshot is inconsistent")
+    if bundle.bundle_digest != _bundle_digest(bundle):
+        raise PackPublishError("publication bundle digest is invalid")
+    return bundle
+
+
+def plan_pack_publish_manifest_bundle(
+    pack_id: str, *, cancel_event: threading.Event | None = None,
+    deadline: float | None = None, progress: Progress | None = None,
+) -> PackPublishManifestBundle:
+    """Plan both publication sides atomically from one lock-bound snapshot."""
+    _checkpoint(cancel_event, deadline)
+    planned = _snapshot_and_plan_manifests(
+        pack_id, cancel_event=cancel_event, deadline=deadline, progress=progress,
+    )
+    client, server = planned["client"], planned["server"]
+    if client.source_snapshot_digest != server.source_snapshot_digest:
+        raise PackPublishError("publication sides have different source snapshots")
+    bundle = PackPublishManifestBundle(
+        pack_id, client.source_snapshot_digest, client, server, "",
+    )
+    return validate_publish_manifest_bundle(PackPublishManifestBundle(
+        bundle.pack_id, bundle.source_snapshot_digest, bundle.client, bundle.server,
+        _bundle_digest(bundle),
+    ))
+
+
+def plan_pack_publish_manifest(
+    pack_id: str, *, target_side: str = "server",
+    cancel_event: threading.Event | None = None, deadline: float | None = None,
+    progress: Progress | None = None,
+) -> PackPublishManifest:
+    """Compatibility API; still plans only the requested side."""
+    if target_side not in {"client", "server"}:
+        raise PackPublishError("target_side must be client or server")
+    # Keep the historical singular operation independent of the dual API.
+    manifests = _snapshot_and_plan_manifests(
+        pack_id, cancel_event=cancel_event, deadline=deadline, progress=progress,
+        sides=(target_side,),
+    )
+    return manifests[target_side]

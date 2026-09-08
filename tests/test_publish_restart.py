@@ -189,6 +189,42 @@ class PublishRestartTest(PackPublishManifestTest):
                 )
         run.assert_not_called()
 
+    def test_restart_is_server_only_across_manifest_target_and_activation_token(self) -> None:
+        server_manifest, server_activated = self._inputs()
+        client_manifest = pack_publish.plan_pack_publish_manifest(
+            "demo", target_side="client"
+        )
+        client_target = publish_target.publish_client_target_from_remote_target(
+            self.target
+        )
+        client_generation = restart.compute_publish_generation_id(
+            client_manifest, client_target
+        )
+        client_activated = replace(
+            server_activated,
+            target_side="client",
+            generation_id=client_generation,
+            manifest_digest=client_manifest.manifest_digest,
+            target_config_digest=client_target.config_digest,
+            generation_path=(
+                client_target.publication_root
+                / "generations"
+                / client_generation
+            ),
+        )
+        cases = (
+            (client_activated, server_manifest, self.target, "activation token"),
+            (server_activated, client_manifest, self.target, "manifest"),
+            (server_activated, server_manifest, client_target, "target"),
+        )
+        for activated, manifest, target, label in cases:
+            with self.subTest(label=label), patch.object(
+                restart, "run_bounded_process"
+            ) as run:
+                with self.assertRaises(restart.PublishRestartError):
+                    restart.restart_activated_publish(activated, manifest, target)
+                run.assert_not_called()
+
     def test_stale_deployment_fields_are_rejected_without_runner(self) -> None:
         for field, value in (
             ("rsync_target", f"other@publish.example:{self.root / 'configured'}"),

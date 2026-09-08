@@ -290,10 +290,14 @@ def _validate_binding(
         raise PublishRestartError(
             "Publish restart requires a PublishActivatedGeneration"
         )
+    if activated.target_side != "server":
+        raise PublishRestartError("Publish restart requires a server activation token")
     try:
         validate_publish_manifest(manifest)
     except PackPublishError as error:
         raise PublishRestartError(str(error)) from error
+    if manifest.target_side != "server":
+        raise PublishRestartError("Publish restart requires a server manifest")
     expected_generation_id = compute_publish_generation_id(manifest, target)
     expected_generation_path = (
         target.publication_root / "generations" / expected_generation_id

@@ -14,7 +14,7 @@ import re
 import unicodedata
 from ipaddress import IPv6Address
 from pathlib import PurePosixPath
-from typing import Literal
+from typing import Literal, TypeAlias
 
 import packctl
 from deploy_support import split_rsync_target
@@ -116,6 +116,85 @@ class PublishRemoteTarget:
             raise PublishTargetError("Publish remote config digest must be lowercase hex")
         if self.config_digest != expected_digest:
             raise PublishTargetError("Publish remote config digest is invalid")
+
+PublishTargetSide: TypeAlias = Literal["server", "client"]
+PublishManifestSide: TypeAlias = PublishTargetSide
+
+
+@dataclass(frozen=True)
+class PublishClientTarget:
+    """The canonical client namespace below a server publication target.
+
+    This deliberately contains no restart configuration (or server digest).
+    The base root and its provenance are retained as identity inputs so that a
+    client target cannot silently move when the base target changes.
+    """
+
+    publication_endpoint: PublishSshEndpoint
+    publication_root: PurePosixPath
+    publication_root_source: PublishRootSource
+    namespace: Literal["client"]
+    config_digest: str
+
+    def __post_init__(self) -> None:
+        endpoint = _coerce_publish_ssh_endpoint(self.publication_endpoint)
+        root = validate_publish_remote_path(str(self.publication_root))
+        source = _validate_publish_root_source(self.publication_root_source)
+        if self.namespace != "client":
+            raise PublishTargetError("Publish client target namespace must be 'client'")
+        object.__setattr__(self, "publication_endpoint", endpoint)
+        object.__setattr__(self, "publication_root", root)
+        object.__setattr__(self, "publication_root_source", source)
+        expected = compute_publish_client_target_digest(
+            publication_endpoint=endpoint,
+            base_publication_root=root.parent,
+            publication_root_source=source,
+        )
+        if root != root.parent / "client":
+            raise PublishTargetError("Publish client target root must be base root/client")
+        if not isinstance(self.config_digest, str) or not _CONFIG_DIGEST_RE.fullmatch(
+            self.config_digest
+        ):
+            raise PublishTargetError("Publish client config digest must be lowercase hex")
+        if self.config_digest != expected:
+            raise PublishTargetError("Publish client config digest is invalid")
+
+    @property
+    def target_side(self) -> PublishTargetSide:
+        return "client"
+
+    @property
+    def base_publication_root(self) -> PurePosixPath:
+        return self.publication_root.parent
+
+
+PublishTarget: TypeAlias = PublishRemoteTarget | PublishClientTarget
+
+
+@dataclass(frozen=True)
+class PublishTargetSet:
+    """The server and canonical client targets rebuilt from one configuration."""
+
+    server: PublishRemoteTarget
+    client: PublishClientTarget
+
+    def __post_init__(self) -> None:
+        validate_publish_target(self.server, "server")
+        validate_publish_target(self.client, "client")
+        if self.client.publication_endpoint != self.server.publication_endpoint:
+            raise PublishTargetError("Client target endpoint does not match server target")
+        if self.client.publication_root_source != self.server.publication_root_source:
+            raise PublishTargetError("Client target root provenance does not match server target")
+        if self.client.publication_root != self.server.publication_root / "client":
+            raise PublishTargetError("Client target root does not match server target")
+
+    @property
+    def server_target(self) -> PublishRemoteTarget:
+        return self.server
+
+    @property
+    def client_target(self) -> PublishClientTarget:
+        return self.client
 
 
 PUBLISH_RESERVED_NAMES = frozenset({"generations", "current"})
@@ -294,6 +373,134 @@ def rebuild_legacy_publish_target_for_revalidation(
         server_id=planned.server_id,
         remote_path=remote_path,
     )
+
+
+def publish_client_target_from_remote_target(
+    base: PublishRemoteTarget,
+) -> PublishClientTarget:
+    """Derive the sole supported client publication namespace from ``base``."""
+
+    validate_publish_target(base, "server")
+    return PublishClientTarget(
+        publication_endpoint=base.publication_endpoint,
+        publication_root=base.publication_root / "client",
+        publication_root_source=base.publication_root_source,
+        namespace="client",
+        config_digest=compute_publish_client_target_digest(
+            publication_endpoint=base.publication_endpoint,
+            base_publication_root=base.publication_root,
+            publication_root_source=base.publication_root_source,
+        ),
+    )
+
+
+def compute_publish_client_target_digest(
+    *,
+    publication_endpoint: PublishSshEndpoint,
+    base_publication_root: PurePosixPath | str,
+    publication_root_source: PublishRootSource,
+) -> str:
+    """Return the client digest, excluding all restart and server identity data."""
+
+    endpoint = _coerce_publish_ssh_endpoint(publication_endpoint)
+    root = validate_publish_remote_path(str(base_publication_root), field="base_publication_root")
+    source = _validate_publish_root_source(publication_root_source)
+    payload = {
+        "schema": "publish-client-target",
+        "version": 1,
+        "namespace": "client",
+        "publication_endpoint": {
+            "host": endpoint.host,
+            "port": endpoint.port,
+            "user": endpoint.user,
+        },
+        "base_publication_root": root.as_posix(),
+        "publication_root_source": source,
+    }
+    payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+
+
+def validate_publish_target(target: object, target_side: PublishTargetSide) -> PublishTarget:
+    """Validate that a target is of the type required by a manifest side."""
+
+    if target_side not in {"server", "client"}:
+        raise PublishTargetError("target_side must be 'server' or 'client'")
+    if target_side == "server" and isinstance(target, PublishRemoteTarget):
+        return target
+    if target_side == "client" and isinstance(target, PublishClientTarget):
+        return target
+    raise PublishTargetError(
+        f"publish target cannot be used for {target_side} publication"
+    )
+
+
+def validate_publish_target_for_manifest(
+    target: object, manifest_side: PublishManifestSide
+) -> PublishTarget:
+    """Manifest-facing spelling of :func:`validate_publish_target`."""
+
+    return validate_publish_target(target, manifest_side)
+
+
+def publish_target_side(target: object) -> PublishTargetSide:
+    """Return the side a target can publish, rejecting unknown target objects."""
+
+    if isinstance(target, PublishRemoteTarget):
+        return "server"
+    if isinstance(target, PublishClientTarget):
+        return "client"
+    raise PublishTargetError("invalid publish target")
+
+
+validate_publish_target_for_side = validate_publish_target
+
+
+def rebuild_legacy_publish_targets_for_revalidation(
+    planned: PublishTargetSet | PublishRemoteTarget | PublishClientTarget,
+    *,
+    rsync_target: str,
+    ssh_host: str,
+    stack_dir: str,
+    service: str,
+) -> PublishTargetSet:
+    """Rebuild the base target and derive its client target from current settings."""
+
+    if isinstance(planned, PublishTargetSet):
+        base = planned.server
+    elif isinstance(planned, PublishClientTarget):
+        base = publish_remote_target_from_legacy_settings(
+            rsync_target=rsync_target,
+            ssh_host=ssh_host,
+            stack_dir=stack_dir,
+            service=service,
+            server_id=LEGACY_SERVER_ID,
+            remote_path=(
+                planned.base_publication_root.as_posix()
+                if planned.publication_root_source == "explicit_override"
+                else None
+            ),
+        )
+    else:
+        base = planned
+    rebuilt = (
+        base
+        if isinstance(planned, PublishClientTarget)
+        else rebuild_legacy_publish_target_for_revalidation(
+            base,
+            rsync_target=rsync_target,
+            ssh_host=ssh_host,
+            stack_dir=stack_dir,
+            service=service,
+        )
+    )
+    return PublishTargetSet(rebuilt, publish_client_target_from_remote_target(rebuilt))
+
+
+# Short aliases keep callers from having to know that the legacy adapter is
+# the source of the current configuration.
+rebuild_publish_targets_for_revalidation = rebuild_legacy_publish_targets_for_revalidation
+publish_client_target = publish_client_target_from_remote_target
 
 
 def _validate_publish_host(value: str) -> str:

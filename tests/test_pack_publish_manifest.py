@@ -213,6 +213,44 @@ class PackPublishManifestTest(unittest.TestCase):
         self.assertNotIn("mods/client.pw.toml", self.manifest_entries(server))
         self.assertNotIn("mods/client.pw.toml", self.generated_index_records(server))
 
+    def test_dual_bundle_uses_one_snapshot_for_both_sides(self) -> None:
+        calls = 0
+        original = pack_publish.scan_pack_migration_source
+
+        def counted(*args: object, **kwargs: object):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        with patch.object(pack_publish, "scan_pack_migration_source", side_effect=counted):
+            bundle = pack_publish.plan_pack_publish_manifest_bundle("demo")
+
+        self.assertEqual(calls, 2)  # initial fixed scan plus the final identity check
+        self.assertEqual(bundle.manifests, (bundle.client, bundle.server))
+        self.assertEqual(bundle.client.source_snapshot_digest, bundle.server.source_snapshot_digest)
+        self.assertEqual(bundle.source_snapshot_digest, bundle.client.source_snapshot_digest)
+        self.assertEqual(bundle.client.target_side, "client")
+        self.assertEqual(bundle.server.target_side, "server")
+        self.assertEqual(bundle.bundle_digest, pack_publish._bundle_digest(bundle))
+
+    def test_dual_bundle_rejects_mutation_instead_of_mixing_sides(self) -> None:
+        changed = False
+
+        def mutate(phase: str) -> None:
+            nonlocal changed
+            if phase == "building-manifest" and not changed:
+                changed = True
+                source = self.pack / "source" / "README.md"
+                source.write_bytes(b"changed between side derivations")
+
+        with self.assertRaises(pack_publish.PackPublishError):
+            pack_publish.plan_pack_publish_manifest_bundle("demo", progress=mutate)
+
+    def test_dual_bundle_preserves_generated_descriptor_derivations(self) -> None:
+        bundle = pack_publish.plan_pack_publish_manifest_bundle("demo")
+        for manifest in bundle.manifests:
+            self._assert_index_matches_manifest_sources(manifest)
+
     def _assert_index_matches_manifest_sources(self, manifest: object) -> None:
         entries = self.manifest_entries(manifest)
         records = self.generated_index_records(manifest)

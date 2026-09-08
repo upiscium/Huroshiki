@@ -48,6 +48,77 @@ class PublishTransferTest(PackPublishManifestTest):
             target.restart.service,
         )
 
+    def _client_target(self) -> publish_target.PublishClientTarget:
+        return publish_target.publish_client_target_from_remote_target(self._target())
+
+    def test_client_target_uses_client_namespace_and_independent_generation_id(self) -> None:
+        server_manifest = pack_publish.plan_pack_publish_manifest("demo", target_side="server")
+        client_manifest = pack_publish.plan_pack_publish_manifest("demo", target_side="client")
+        target = self._target()
+        client = self._client_target()
+        self.assertEqual(client.publication_root, target.publication_root / "client")
+        self.assertNotEqual(
+            transfer.compute_publish_generation_id(server_manifest, target),
+            transfer.compute_publish_generation_id(client_manifest, client),
+        )
+        with self.assertRaises(transfer.PublishTransferPlanningError):
+            transfer.prepare_publish_transfer("demo", server_manifest, client)
+        with self.assertRaises(transfer.PublishTransferPlanningError):
+            transfer.prepare_publish_transfer("demo", client_manifest, target)
+
+    def test_client_transfer_commits_and_reuses_in_client_namespace(self) -> None:
+        manifest = pack_publish.plan_pack_publish_manifest("demo", target_side="client")
+        target = self._client_target()
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        try:
+            with patch.object(packctl, "deployment_settings", return_value=self._settings(self._target())), patch.object(
+                transfer, "run_bounded_process", side_effect=self._fake_runner([])
+            ):
+                first = transfer.execute_publish_transfer(plan)
+            self.assertFalse(first.reused)
+            self.assertTrue(Path(first.generation_path).is_dir())
+        finally:
+            transfer.discard_publish_transfer_plan(plan)
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        try:
+            with patch.object(packctl, "deployment_settings", return_value=self._settings(self._target())), patch.object(
+                transfer, "run_bounded_process", side_effect=self._fake_runner([])
+            ):
+                second = transfer.execute_publish_transfer(plan)
+            self.assertTrue(second.reused)
+            self.assertEqual(second.target_side, "client")
+        finally:
+            transfer.discard_publish_transfer_plan(plan)
+
+    def test_client_reuse_rejects_corrupted_exact_tree(self) -> None:
+        manifest = pack_publish.plan_pack_publish_manifest("demo", target_side="client")
+        target = self._client_target()
+        settings = self._settings(self._target())
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        try:
+            with patch.object(
+                packctl, "deployment_settings", return_value=settings
+            ), patch.object(
+                transfer, "run_bounded_process", side_effect=self._fake_runner([])
+            ):
+                staged = transfer.execute_publish_transfer(plan)
+        finally:
+            transfer.discard_publish_transfer_plan(plan)
+
+        generation = Path(staged.generation_path)
+        (generation / "unexpected.txt").write_text("not in the manifest\n")
+        retry = transfer.prepare_publish_transfer("demo", manifest, target)
+        with patch.object(
+            packctl, "deployment_settings", return_value=settings
+        ), patch.object(
+            transfer, "run_bounded_process", side_effect=self._fake_runner([])
+        ):
+            try:
+                with self.assertRaises(transfer.PublishTransferExecutionError):
+                    transfer.execute_publish_transfer(retry)
+            finally:
+                transfer.discard_publish_transfer_plan(retry)
+
     def _manifest_and_target(self):
         manifest = self.plan_manifest = pack_publish.plan_pack_publish_manifest("demo")
         return manifest, self._target()
@@ -467,6 +538,7 @@ class PublishTransferTest(PackPublishManifestTest):
         committed = json.dumps({
             "ok": True,
             "status": "committed",
+            "target_side": plan.target_side,
             "operation_id": plan.operation_id,
             "manifest_digest": plan.manifest_digest,
             "target_config_digest": plan.target_config_digest,
@@ -534,7 +606,14 @@ class PublishTransferTest(PackPublishManifestTest):
             "run_bounded_process",
             return_value=BoundedProcessResult(
                 0,
-                '{"ok":true,"status":"cleaned"}\n',
+                json.dumps({
+                    "ok": True, "status": "cleaned",
+                    "target_side": plan.target_side,
+                    "operation_id": plan.operation_id,
+                    "manifest_digest": plan.manifest_digest,
+                    "target_config_digest": plan.target_config_digest,
+                    "generation_id": plan.generation_id,
+                }) + "\n",
                 "",
                 False,
                 False,
@@ -567,7 +646,14 @@ class PublishTransferTest(PackPublishManifestTest):
             "run_bounded_process",
             return_value=BoundedProcessResult(
                 0,
-                '{"ok":true,"status":"cleaned"}\n',
+                json.dumps({
+                    "ok": True, "status": "cleaned",
+                    "target_side": plan.target_side,
+                    "operation_id": plan.operation_id,
+                    "manifest_digest": plan.manifest_digest,
+                    "target_config_digest": plan.target_config_digest,
+                    "generation_id": plan.generation_id,
+                }) + "\n",
                 "",
                 False,
                 False,
@@ -587,6 +673,7 @@ class PublishTransferTest(PackPublishManifestTest):
         committed = {
             "ok": True,
             "status": "committed",
+            "target_side": plan.target_side,
             "operation_id": plan.operation_id,
             "manifest_digest": plan.manifest_digest,
             "target_config_digest": plan.target_config_digest,
@@ -613,7 +700,14 @@ class PublishTransferTest(PackPublishManifestTest):
                 BoundedProcessResult(0, json.dumps(committed) + "\n", "", False, False),
                 BoundedProcessResult(
                     0,
-                    '{"ok":true,"status":"cleaned"}\n',
+                    json.dumps({
+                        "ok": True, "status": "cleaned",
+                        "target_side": plan.target_side,
+                        "operation_id": plan.operation_id,
+                        "manifest_digest": plan.manifest_digest,
+                        "target_config_digest": plan.target_config_digest,
+                        "generation_id": plan.generation_id,
+                    }) + "\n",
                     "",
                     False,
                     False,
@@ -661,6 +755,7 @@ class PublishTransferTest(PackPublishManifestTest):
                         {
                             "ok": True,
                             "status": "not_committed",
+                            "target_side": plan.target_side,
                             "operation_id": plan.operation_id,
                             "manifest_digest": plan.manifest_digest,
                             "target_config_digest": plan.target_config_digest,
@@ -717,7 +812,14 @@ class PublishTransferTest(PackPublishManifestTest):
             "run_bounded_process",
             return_value=BoundedProcessResult(
                 0,
-                '{"ok":true,"status":"cleaned"}\n',
+                json.dumps({
+                    "ok": True, "status": "cleaned",
+                    "target_side": plan.target_side,
+                    "operation_id": plan.operation_id,
+                    "manifest_digest": plan.manifest_digest,
+                    "target_config_digest": plan.target_config_digest,
+                    "generation_id": plan.generation_id,
+                }) + "\n",
                 "",
                 False,
                 False,
@@ -762,7 +864,14 @@ class PublishTransferTest(PackPublishManifestTest):
                     "run_bounded_process",
                     return_value=BoundedProcessResult(
                         0,
-                        '{"ok":true,"status":"cleaned"}\n',
+                        json.dumps({
+                            "ok": True, "status": "cleaned",
+                            "target_side": plan.target_side,
+                            "operation_id": plan.operation_id,
+                            "manifest_digest": plan.manifest_digest,
+                            "target_config_digest": plan.target_config_digest,
+                            "generation_id": plan.generation_id,
+                        }) + "\n",
                         "",
                         False,
                         False,
@@ -797,6 +906,7 @@ class PublishTransferTest(PackPublishManifestTest):
                                 {
                                     "ok": True,
                                     "status": "not_committed",
+                                    "target_side": plan.target_side,
                                     "operation_id": plan.operation_id,
                                     "manifest_digest": plan.manifest_digest,
                                     "target_config_digest": plan.target_config_digest,
@@ -810,7 +920,14 @@ class PublishTransferTest(PackPublishManifestTest):
                         ),
                         BoundedProcessResult(
                             0,
-                            '{"ok":true,"status":"cleaned"}\n',
+                            json.dumps({
+                                "ok": True, "status": "cleaned",
+                                "target_side": plan.target_side,
+                                "operation_id": plan.operation_id,
+                                "manifest_digest": plan.manifest_digest,
+                                "target_config_digest": plan.target_config_digest,
+                                "generation_id": plan.generation_id,
+                            }) + "\n",
                             "",
                             False,
                             False,
@@ -858,6 +975,7 @@ class PublishTransferProtocolTest(unittest.TestCase):
             "manifest_digest": "b" * 64,
             "source_snapshot_digest": "c" * 64,
             "target_config_digest": "d" * 64,
+            "target_side": "server",
             "generation_id": "v1-" + "e" * 64,
             "publication_root": root,
             "files": [{
