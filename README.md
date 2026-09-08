@@ -24,8 +24,9 @@ huroshiki --version
 packctl --version
 ```
 
-The current main/source version is `0.3.0-rc.1.dev`. The latest published GitHub Release is
-`v0.3.0-rc.1`, which can be run with:
+The `0.3.0-rc.2` release candidate is prepared in the current source tree, but its tag and GitHub
+Release have not been published. The latest published prerelease remains `v0.3.0-rc.1`, which can
+be run with:
 
 ```bash
 nix run github:upiscium/Huroshiki/v0.3.0-rc.1 -- --help
