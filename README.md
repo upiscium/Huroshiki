@@ -24,12 +24,11 @@ huroshiki --version
 packctl --version
 ```
 
-The `0.3.0-rc.2` release candidate is prepared in the current source tree, but its tag and GitHub
-Release have not been published. The latest published prerelease remains `v0.3.0-rc.1`, which can
-be run with:
+The current main/source version is `0.3.0-rc.2.dev`. The latest published prerelease is
+`v0.3.0-rc.2`, which can be run with:
 
 ```bash
-nix run github:upiscium/Huroshiki/v0.3.0-rc.1 -- --help
+nix run github:upiscium/Huroshiki/v0.3.0-rc.2 -- --help
 ```
 
 The managed repository is selected by `--root PATH`, then `HUROSHIKI_ROOT`, then the current
