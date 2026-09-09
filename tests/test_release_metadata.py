@@ -292,9 +292,16 @@ class ReleaseMetadataTest(unittest.TestCase):
             "tag and GitHub Release have not been published", readme_words
         )
         self.assertNotIn("v0.3.0-rc.3", readme)
+        stable_release_reference = (
+            r"github:upiscium/Huroshiki/v0\.3\.0(?:[\s`)]|$)"
+        )
+        self.assertRegex(
+            "nix run github:upiscium/Huroshiki/v0.3.0 -- --help",
+            stable_release_reference,
+        )
         self.assertNotRegex(
             readme,
-            r"github:upiscium/Huroshiki/v0\.3\.0(?:[\s`)]|$)",
+            stable_release_reference,
         )
 
 
