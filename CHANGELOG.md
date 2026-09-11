@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-09-11
+
+### Stable Release
+
+- Promoted the tested 0.3.0 release-candidate line to stable without changing runtime or
+  Publish behavior relative to `v0.3.0-rc.2`.
+- Consolidated the public `huroshiki` TUI and explicit-ID `packctl` CLI workflows for Pack and
+  Template management, exact MOD version intent, Template Import, loader migration, Pack Content,
+  retained-state recovery, and bounded cleanup.
+
+### Migration and Management
+
+- Includes preview-first Pack and Template Copy migration with immutable source snapshots,
+  canonical root provenance, explicit Remove/Replace resolution, warning acknowledgements,
+  atomic no-clobber target publication, and retained cleanup ownership.
+- Preserves exact provider artifact intent across Add, Update, Profiles, Template Import, and Copy
+  migration, while canonical Modrinth/CurseForge identities and verified dependency equivalence
+  remain fail-closed constraints.
+
+### Publication
+
+- `packctl publish <pack>` is the sole publication operation. One fixed source snapshot produces
+  independent server and client manifests/generations; both variants transfer and verify before
+  ordered client-then-server activation, and restart occurs only after both active variants verify.
+- Immutable generation reuse remains bound to exact manifests and publication-target provenance;
+  active generations are reverified before restart and concurrent remote metadata/tree drift fails
+  closed without claiming false rollback.
+- Pack Content participates in final generated Packwiz indexes as ordinary `metafile = false`
+  records with exact SHA-256 values, while `pack.toml[index].hash` binds the final `index.toml`.
+
+### Reliability and Diagnostics
+
+- Cleanup-pending and publication-uncertain lifecycle states retain bounded recovery evidence and
+  lock ownership when completion cannot be proven. Resolver, Packwiz, rsync, SSH, transaction, and
+  cleanup work remain bounded by cancellation/deadline and process-lifecycle rules.
+- Publish planning diagnostics preserve orchestration context while exposing the direct
+  `primary_error` through the existing bounded, redacted policy.
+
 ## 0.3.0-rc.2 - 2026-09-08
 
 ### Publication
