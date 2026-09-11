@@ -192,9 +192,20 @@ class ReleaseMetadataTest(unittest.TestCase):
             "The `v0.3.0` annotated tag and GitHub Release do\nnot yet exist",
             release_notes,
         )
+        normalized = " ".join(release_notes.split())
+        for evidence in (
+            "common smoke Content was present in both server and client variants",
+            "server-only and client-only smoke Content was present only on its intended side",
+            "each observed Content index record had `metafile = false`",
+            "each index SHA-256 matched the physical file",
+            "Wrong-side smoke entries were absent",
+            "This completes the production Content-descriptor gate",
+        ):
+            with self.subTest(evidence=evidence):
+                self.assertIn(evidence, normalized)
         self.assertIn(
-            "This preparation does not claim that final per-entry production check has passed",
-            " ".join(release_notes.split()),
+            "This preparation does not claim that final per-entry production check has passed based on deterministic repository tests alone",
+            normalized,
         )
 
     def test_latest_published_rc2_metadata_is_immutable(self) -> None:
