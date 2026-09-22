@@ -781,6 +781,7 @@ def process_transfer(header):
             final = os.open(generation_name, DIR_FLAGS, dir_fd=generations_fd)
             try:
                 verify_tree(final, expected)
+                make_public_directories(final)
             finally:
                 os.close(final)
             try:
