@@ -338,6 +338,23 @@ def close_owned(root, current, owned):
     for fd in reversed(owned):
         os.close(fd)
 
+def make_public_directories(root):
+    os.fchmod(root, 0o755)
+    for entry in os.scandir(root):
+        metadata = entry.stat(follow_symlinks=False)
+        if stat.S_ISLNK(metadata.st_mode) or not (
+            stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise RuntimeError("unexpected special or symlink entry")
+        if not stat.S_ISDIR(metadata.st_mode):
+            continue
+        child = os.open(entry.name, DIR_FLAGS, dir_fd=root)
+        try:
+            make_public_directories(child)
+        finally:
+            os.close(child)
+    os.fsync(root)
+
 def rename_noreplace(old_dir_fd, old_name, new_dir_fd, new_name):
     if sys.platform != "linux":
         raise OSError(errno.ENOTSUP, "atomic generation commit is unavailable")
@@ -691,6 +708,8 @@ def process_transfer(header):
     try:
         lock = lock_root(root)
         generations_fd = open_child_dir(root, "generations", create=True)
+        os.fchmod(root, 0o755)
+        os.fchmod(generations_fd, 0o755)
         expected = expected_map(header)
         if header.get("total_bytes") != sum(item[1] for item in expected.values()):
             raise RuntimeError("publication byte total does not match file list")
@@ -701,6 +720,7 @@ def process_transfer(header):
         if final >= 0:
             try:
                 verify_tree(final, expected)
+                make_public_directories(final)
             finally:
                 os.close(final)
             for item in expected.values():
@@ -744,6 +764,7 @@ def process_transfer(header):
                 if actual_size != size or actual_digest != digest:
                     raise RuntimeError("incoming file digest or size mismatch")
             verify_tree(stage, expected)
+            make_public_directories(stage)
             os.fsync(stage)
             if sys.stdin.buffer.read(1):
                 raise RuntimeError("trailing publish transfer data")
