@@ -206,8 +206,11 @@ class PublishTransferTest(PackPublishManifestTest):
             self.assertEqual(offset, len(encoded))
             captured["frames"] = frames
             helper = transfer._REMOTE_HELPER_SCRIPT.replace(
-                "            verify_tree(stage, expected)\n            os.fsync(stage)",
                 "            verify_tree(stage, expected)\n"
+                "            make_public_directories(stage)\n"
+                "            os.fsync(stage)",
+                "            verify_tree(stage, expected)\n"
+                "            make_public_directories(stage)\n"
                 "            __import__('time').sleep(0.5)\n"
                 "            os.fsync(stage)",
                 1,
@@ -276,6 +279,18 @@ class PublishTransferTest(PackPublishManifestTest):
             self.assertEqual(set(header_files), set(manifest_files))
             self.assertEqual(set(captured["staging"]), set(manifest_files))
             generation = Path(target.publication_root) / "generations" / result.generation_id
+            public_directories = [
+                Path(target.publication_root),
+                Path(target.publication_root) / "generations",
+                generation,
+                *(
+                    path
+                    for path in generation.rglob("*")
+                    if path.is_dir()
+                ),
+            ]
+            for directory in public_directories:
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
             for relative, entry in manifest_files.items():
                 detached = plan._payload_root / Path(*entry.relative_path.parts)
                 remote = generation / Path(*entry.relative_path.parts)
@@ -293,6 +308,40 @@ class PublishTransferTest(PackPublishManifestTest):
                 self.assertEqual(remote.read_bytes(), detached.read_bytes())
                 self.assertEqual(remote.stat().st_size, entry.size)
                 self.assertEqual(hashlib.sha256(remote.read_bytes()).hexdigest(), entry.sha256)
+                self.assertEqual(remote.stat().st_mode & 0o777, entry.mode)
+        finally:
+            transfer.discard_publish_transfer_plan(plan)
+
+    def test_existing_generation_reuse_repairs_public_directory_modes(self) -> None:
+        manifest, target, first = self._publish_nested_generation()
+        publication_root = Path(target.publication_root)
+        generation = publication_root / "generations" / first.generation_id
+        directories = [
+            publication_root,
+            publication_root / "generations",
+            generation,
+            *(path for path in generation.rglob("*") if path.is_dir()),
+        ]
+        for directory in directories:
+            directory.chmod(0o700)
+
+        plan = transfer.prepare_publish_transfer("demo", manifest, target)
+        try:
+            with patch.object(
+                packctl,
+                "deployment_settings",
+                return_value=self._settings(target),
+            ), patch.object(
+                transfer,
+                "run_bounded_process",
+                side_effect=self._fake_runner([]),
+            ):
+                reused = transfer.execute_publish_transfer(plan)
+            self.assertTrue(reused.reused)
+            for directory in directories:
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
+            for entry in manifest.files:
+                remote = generation / Path(*entry.relative_path.parts)
                 self.assertEqual(remote.stat().st_mode & 0o777, entry.mode)
         finally:
             transfer.discard_publish_transfer_plan(plan)
