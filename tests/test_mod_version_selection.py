@@ -2108,7 +2108,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             self.assertEqual(
                 [(root.canonical_identity, root.side) for root in roots],
                 [
-                    (f"modrinth:{mr_project('dependency')}", "client"),
+                    (f"modrinth:{mr_project('dependency')}", "both"),
                     (f"modrinth:{mr_project('root')}", "server"),
                 ],
             )
@@ -2121,7 +2121,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             self.assertEqual(
                 [(root.canonical_identity, root.side) for root in published_roots],
                 [
-                    (f"modrinth:{mr_project('dependency')}", "client"),
+                    (f"modrinth:{mr_project('dependency')}", "both"),
                     (f"modrinth:{mr_project('root')}", "server"),
                 ],
             )

@@ -3300,6 +3300,13 @@ class PackTransaction:
         exact_selection: ExactModArtifactSelection | None = None
         exact_cancel = threading.Event()
         exact_deadline = time.monotonic() + UPDATE_OPERATION_TIMEOUT_SECONDS
+
+        def exact_checkpoint() -> None:
+            if exact_cancel.is_set():
+                raise ExactModVersionCancelled("Exact Add was cancelled")
+            if time.monotonic() >= exact_deadline:
+                raise ExactModVersionDeadlineExceeded("Exact Add deadline exceeded")
+
         if artifact_id is not None:
             resolved_selector = resolve_project_selector(
                 provider,
@@ -3371,20 +3378,24 @@ class PackTransaction:
                                 "Exact Add provenance promotion requires "
                                 "authoritative root provenance"
                             )
-                        existing_root = next(
-                            (
-                                root
-                                for root in read_pack_root_manifest(self.source)
-                                if root.canonical_identity
-                                == exact_selection.identity_label
-                            ),
-                            None,
+                        source_scan = scan_pack_migration_source(
+                            self.source, checkpoint=exact_checkpoint
                         )
-                        root_side = (
-                            normalized_side
-                            if existing_root is None
-                            else union_side(existing_root.side, normalized_side)
-                        )
+                        try:
+                            extract_pack_migration_roots(
+                                self.source,
+                                expected_identity=source_scan.root_identity,
+                                expected_snapshot_digest=source_scan.snapshot_digest,
+                                checkpoint=exact_checkpoint,
+                            )
+                        except PackMigrationRootError as error:
+                            raise HuroshikiError(
+                                f"Exact Add requires authoritative root provenance: {error}"
+                            ) from error
+                        # An already-satisfied re-add records the installed
+                        # distribution; it must not narrow root provenance or
+                        # claim that it repaired the baseline dependency graph.
+                        root_side = installed_mod.side
                         existing_override = get_mod_version_override(
                             self.source,
                             exact_selection.identity_label,
@@ -3419,14 +3430,33 @@ class PackTransaction:
                         self._validated_version_overrides()
                         self._version_override_mutated = True
                         self._record_source_mutation(intent_only=True)
-                        self.apply(refresh=False)
+                        if not self._intent_only_mutation:
+                            # Earlier metadata edits still require refreshed
+                            # index bindings even though this Add is intent-only.
+                            expected = _file_content_snapshot(self.source, exact_checkpoint)
+                            _exact_run_refresh(
+                                self.source,
+                                cancel_event=exact_cancel,
+                                deadline=exact_deadline,
+                                checkpoint=exact_checkpoint,
+                                process_result_callback=self._record_equivalence_process_result,
+                                diagnostic_project_id=self.project_key.partition(":")[2],
+                            )
+                            _assert_exact_refresh_postconditions(
+                                self.source, expected, exact_checkpoint
+                            )
+                        self.apply(
+                            refresh=False, cancel_event=exact_cancel, deadline=exact_deadline
+                        )
                         return 0
 
                     self.prepare_exact_mod_version(
                         exact_selection,
                         promote_to_root_side=normalized_side,
+                        cancel_event=exact_cancel,
+                        deadline=exact_deadline,
                     )
-                    self.apply()
+                    self.apply(cancel_event=exact_cancel, deadline=exact_deadline)
                     return 0
 
             minecraft, loader, loader_version = packctl.project_versions(self.source)
@@ -3495,7 +3525,9 @@ class PackTransaction:
             self._record_source_mutation()
 
             if exact_selection is not None:
-                self.prepare_exact_mod_version(exact_selection)
+                self.prepare_exact_mod_version(
+                    exact_selection, cancel_event=exact_cancel, deadline=exact_deadline
+                )
 
         self.apply()
         return 0
@@ -4605,6 +4637,7 @@ class PackTransaction:
             except (ModVersionOverrideError, OSError) as error:
                 raise HuroshikiError(str(error)) from error
             ensure_safe_pack_source(self.source, checkpoint=checkpoint)
+            refresh_expected = _file_content_snapshot(self.source, checkpoint)
             _exact_run_refresh(
                 self.source,
                 cancel_event=operation_cancel,
@@ -4615,6 +4648,7 @@ class PackTransaction:
                 diagnostic_callback=record_diagnostic,
             )
             ensure_safe_pack_source(self.source, checkpoint=checkpoint)
+            _assert_exact_refresh_postconditions(self.source, refresh_expected, checkpoint)
             if packctl.project_versions(self.source) != versions:
                 raise HuroshikiError(
                     "Exact MOD staging changed the Minecraft or loader version"
@@ -4658,21 +4692,20 @@ class PackTransaction:
 
             if promotion_side is not None:
                 promotion_graph = _build_exact_dependency_graph(
-                    exact_verifications,
-                    {selection.identity},
-                    checkpoint,
+                    exact_verifications, {selection.identity}, checkpoint
                 )
                 promotion_identities = {
-                    identity
-                    for identity, owners in promotion_graph.root_reachability
+                    identity for identity, owners in promotion_graph.root_reachability
                     if selection.identity in owners
                 }
                 if selection.identity not in promotion_identities:
                     raise HuroshikiError(
-                        f"Exact root promotion could not reach "
-                        f"{selection.identity_label}"
+                        f"Exact root promotion could not reach {selection.identity_label}"
                     )
-
+                # Derive expected records from verified bytes, not from anything
+                # a subsequent refresh may return. Cover the complete required
+                # closure, including dependencies which are explicit roots too.
+                promoted_records = dict(final_records)
                 for identity in sorted(promotion_identities):
                     checkpoint()
                     entries = final_records.get(identity, ())
@@ -4683,30 +4716,27 @@ class PackTransaction:
                         )
                     relative, contents, mod = entries[0]
                     promoted_side = union_side(mod.side, promotion_side)
-                    if promoted_side != mod.side:
-                        safe_child(self.source, relative).write_bytes(
-                            _metadata_contents_with_side(contents, promoted_side)
-                        )
+                    promoted_contents = _metadata_contents_with_side(contents, promoted_side)
+                    promoted_mod = read_mod_data(
+                        relative, tomllib.loads(promoted_contents.decode("utf-8"))
+                    )
+                    promoted_records[identity] = ((relative, promoted_contents, promoted_mod),)
+                    if promoted_contents != contents:
+                        safe_child(self.source, relative).write_bytes(promoted_contents)
+                    final_reachability.setdefault(identity, {})[selection.identity_label] = (
+                        parse_provider_metadata(relative, promoted_contents).file_id
+                    )
 
-                existing_root_record = next(
-                    (
-                        root
-                        for root in read_pack_root_manifest(self.source)
-                        if root.canonical_identity == selection.identity_label
-                    ),
-                    None,
+                promoted_root_ids = {
+                    (root.provider, root.project_id) for root in explicit_roots
+                } | {selection.identity}
+                promoted_roots = tuple(
+                    PackRootRecord(identity[0], identity[1], promoted_records[identity][0][2].side)
+                    for identity in sorted(promoted_root_ids)
                 )
-                root_side = (
-                    promotion_side
-                    if existing_root_record is None
-                    else union_side(existing_root_record.side, promotion_side)
-                )
-                record_pack_root(
-                    self.source,
-                    selection.provider,
-                    str(selection.project_id),
-                    root_side,
-                )
+                write_pack_root_manifest(self.source, promoted_roots)
+                _exact_assert_complete_metadata_graph(self.source, promoted_records, checkpoint)
+                refresh_expected = _file_content_snapshot(self.source, checkpoint)
                 _exact_run_refresh(
                     self.source,
                     cancel_event=operation_cancel,
@@ -4716,43 +4746,12 @@ class PackTransaction:
                     diagnostic_project_id=project_id,
                     diagnostic_callback=record_diagnostic,
                 )
-                ensure_safe_pack_source(self.source, checkpoint=checkpoint)
-                if packctl.project_versions(self.source) != versions:
-                    raise HuroshikiError(
-                        "Exact root promotion changed the Minecraft or loader version"
-                    )
-                promoted_records = _exact_metadata_records(self.source, checkpoint)
-                if promoted_records.keys() != final_records.keys():
-                    raise HuroshikiError(
-                        "Exact root promotion changed the installed metadata graph"
-                    )
-                final_records = promoted_records
-                _exact_assert_root_manifest_identities(self.source, final_records)
-                final_root_records = final_records.get(selection.identity, ())
-                if len(final_root_records) != 1:
-                    raise HuroshikiError(
-                        f"Exact root promotion produced an invalid target identity: "
-                        f"{selection.identity_label}"
-                    )
-                final_relative, final_contents, final_mod = final_root_records[0]
-                _verify_exact_root_metadata(
-                    selection,
-                    (
-                        ResolvedMetadata(
-                            selection.identity,
-                            final_relative,
-                            final_mod.filename,
-                            final_contents,
-                            selection.provider,
-                            selection.project_id,
-                        ),
-                    ),
-                )
-                expected_promoted_side = union_side(selected_side, promotion_side)
-                if final_mod.side != expected_promoted_side:
-                    raise HuroshikiError(
-                        "Exact root promotion did not preserve requested side coverage"
-                    )
+                _assert_exact_refresh_postconditions(self.source, refresh_expected, checkpoint)
+                _exact_assert_complete_metadata_graph(self.source, promoted_records, checkpoint)
+                if read_pack_root_manifest(self.source) != promoted_roots:
+                    raise HuroshikiError("Exact root promotion changed authorized root provenance")
+                final_records = _exact_metadata_records(self.source, checkpoint)
+                final_relative, final_contents, final_mod = final_records[selection.identity][0]
 
             final_after = _file_content_snapshot(self.source, checkpoint)
             added = tuple(
@@ -10426,6 +10425,76 @@ def _exact_assert_root_manifest_identities(
                 f"Exact MOD selection removed or duplicated root "
                 f"{root.canonical_identity}"
             )
+
+
+def _assert_exact_refresh_postconditions(
+    source: Path,
+    expected: Mapping[Path, bytes],
+    checkpoint: Callable[[], None],
+) -> None:
+    """Refresh may update index bindings, not re-authorize other Pack state."""
+    checkpoint()
+    ensure_safe_pack_source(source, checkpoint=checkpoint)
+    expected_pack = _pack_toml_semantic_snapshot(expected[Path("pack.toml")])
+    _assert_refreshed_pack_toml(source, expected_pack)
+    index_relative = Path(expected_pack.index_path or "index.toml")
+    generated = {Path("pack.toml"), index_relative}
+    actual = _file_content_snapshot(source, checkpoint)
+    if expected_pack.index_path is not None:
+        _assert_exact_index_entries(actual, index_relative, expected, checkpoint)
+    for relative in sorted(expected.keys() | actual.keys()):
+        checkpoint()
+        if relative in generated:
+            continue
+        before, after = expected.get(relative), actual.get(relative)
+        if before == after:
+            continue
+        if before is not None and after is not None and relative.name.endswith(".pw.toml"):
+            try:
+                if tomllib.loads(before.decode("utf-8")) == tomllib.loads(after.decode("utf-8")):
+                    continue  # Comments/formatting do not change metadata semantics.
+            except (UnicodeError, tomllib.TOMLDecodeError):
+                pass
+        raise HuroshikiError(f"Exact refresh changed unauthorized Pack state: {relative}")
+
+
+
+def _assert_exact_index_entries(
+    actual: Mapping[Path, bytes],
+    index_relative: Path,
+    expected: Mapping[Path, bytes],
+    checkpoint: Callable[[], None],
+) -> None:
+    """A correct pack-to-index hash cannot certify stale index-to-file hashes."""
+    try:
+        index = tomllib.loads(actual[index_relative].decode("utf-8"))
+        algorithm = index["hash-format"]
+        records = index.get("files", [])
+        if not isinstance(algorithm, str) or not isinstance(records, list):
+            raise ValueError("invalid index hash format or file records")
+        indexed: set[Path] = set()
+        for record in records:
+            checkpoint()
+            if not isinstance(record, dict) or not isinstance(record.get("file"), str):
+                raise ValueError("invalid index record")
+            relative = portable_relative_path(Path(record["file"]))
+            if relative.as_posix() != record["file"] or relative in indexed:
+                raise ValueError(f"non-canonical or duplicate index path: {relative}")
+            indexed.add(relative)
+            contents = actual.get(relative)
+            declared_hash = record.get("hash")
+            if contents is None or not isinstance(declared_hash, str):
+                raise ValueError(f"missing indexed file or hash: {relative}")
+            digest = hashlib.new(algorithm.replace("-", ""), contents).hexdigest()
+            if digest != declared_hash.lower():
+                raise ValueError(f"index hash mismatch: {relative}")
+            if relative.name.endswith(".pw.toml") and record.get("metafile") is not True:
+                raise ValueError(f"MOD metadata is not indexed as a metafile: {relative}")
+        missing = {p for p in expected if p.name.endswith(".pw.toml")} - indexed
+        if missing:
+            raise ValueError("metadata missing from index: " + ", ".join(map(str, sorted(missing))))
+    except (KeyError, UnicodeError, tomllib.TOMLDecodeError, ValueError) as error:
+        raise HuroshikiError(f"Exact refresh produced an invalid Packwiz index: {error}") from error
 
 
 def _exact_run_refresh(

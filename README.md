@@ -105,8 +105,8 @@ manages retained state. This basic file editor does not provide directory moves,
 multi-file transactions, or dedicated KubeJS management.
 Template composition matches Minecraft and loader type, resolves current compatible files for the
 new pack's loader version, preserves template order, and unions sides for identical provider IDs.
-Every Packwiz root added through the TUI, CLI, a profile, or template composition is resolved in an
-isolated temporary project. Its requested side applies to the complete dependency closure, including
+New Packwiz roots added through the TUI, CLI, a profile, or template composition are resolved in an
+isolated temporary project. Each requested side applies to the complete dependency closure, including
 dependencies whose metadata was already installed and would not otherwise change. Metadata merges
 use canonical provider/project identity, preserve existing locations, union sides, and reject
 version/download/update disagreements plus portable metadata-path or JAR-filename collisions. URL
@@ -140,6 +140,23 @@ After a resolver parent exits, MATOI also checks the Linux process table for liv
 process group. Background descendants are terminated and make the resolver result fail closed;
 zombie-only groups are not treated as running work. Termination, forced killing, and parent reaping
 each have bounded waits; an undrained group or unreaped parent is reported as an integrity failure.
+
+### Already-installed exact re-add
+
+For CLI `packctl add` with an exact artifact already installed and requested sides already
+covered by that metadata, re-add is a **provenance/version-intent operation**, not a reinstall or
+Pack health check. It preserves every installed MOD descriptor and its effective side coverage,
+records the selected MOD as an explicit root using its installed side, and retains existing lock
+and reason fields. Authoritative root/metadata consistency is required before changing controls.
+It does not fetch unrelated roots, upgrade dependencies, or claim to revalidate/repair a pre-existing
+missing dependency or incorrect dependency side. The runtime distribution does not gain any new
+side or artifact from this operation. A subset request never narrows existing coverage.
+
+Earlier metadata edits in the same transaction still require Packwiz refresh and validated index
+bindings. A different artifact or a request for additional sides uses full exact dependency
+verification instead; side expansion covers the verified required closure, including any members
+that are also explicit roots. Both refreshes in that path are checked against the authorized
+metadata, roots, exact intent, ignore rules and other Pack files before stage evidence is accepted.
 
 ### Navigation
 

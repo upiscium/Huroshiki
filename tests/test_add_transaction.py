@@ -354,7 +354,7 @@ class AddTransactionTest(unittest.TestCase):
             {(root.canonical_identity, root.side) for root in roots},
             {
                 (f'modrinth:{MODRINTH_IDS["root"]}', "both"),
-                (f'modrinth:{MODRINTH_IDS["dependency"]}', "client"),
+                (f'modrinth:{MODRINTH_IDS["dependency"]}', "both"),
             },
         )
         override = core.get_mod_version_override(
