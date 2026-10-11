@@ -1577,10 +1577,10 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             target = transaction.staged_exact_mod_targets()[0]
             validate = transaction._validate_exact_selection_stage
 
-            def blocking_validate(evidence):
+            def blocking_validate(evidence, **kwargs):
                 entered_validation.set()
                 self.assertTrue(release_validation.wait(2))
-                validate(evidence)
+                validate(evidence, **kwargs)
 
             def apply() -> None:
                 try:
@@ -2108,7 +2108,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             self.assertEqual(
                 [(root.canonical_identity, root.side) for root in roots],
                 [
-                    (f"modrinth:{mr_project('dependency')}", "client"),
+                    (f"modrinth:{mr_project('dependency')}", "both"),
                     (f"modrinth:{mr_project('root')}", "server"),
                 ],
             )
@@ -2121,7 +2121,7 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             self.assertEqual(
                 [(root.canonical_identity, root.side) for root in published_roots],
                 [
-                    (f"modrinth:{mr_project('dependency')}", "client"),
+                    (f"modrinth:{mr_project('dependency')}", "both"),
                     (f"modrinth:{mr_project('root')}", "server"),
                 ],
             )
