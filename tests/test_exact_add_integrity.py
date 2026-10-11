@@ -255,6 +255,33 @@ class InstalledExactReaddIntegrityTest(unittest.TestCase):
         self.assert_indexes_valid()
 
 
+    def test_legacy_missing_ignore_is_repaired_in_staging_then_refreshed(self):
+        (self.source / '.packwizignore').write_text('*.log\n')
+        before = self.f.snapshot()
+        calls = []
+        def run(command, *, cwd, **kwargs):
+            self.assertEqual(self.f.snapshot(), before)
+            calls.append(tuple(command))
+            self.assertIn('/.huroshiki-roots.json', (cwd / '.packwizignore').read_text())
+            refresh_index(cwd)
+            return core.ResolverProcessResult(0, '', '', False, False)
+        with patch.object(core, 'run_resolver_process', side_effect=run):
+            self.assertEqual(self.add(), 0)
+        self.assertEqual(calls, [('packwiz', 'refresh')])
+        self.assert_indexes_valid()
+        authoritative_roots(self.source)
+
+    def test_ignore_repair_does_not_authorize_a_stale_root(self):
+        (self.source / '.packwizignore').write_text('*.log\n')
+        core.write_pack_root_manifest(self.source, core.read_pack_root_manifest(self.source) + (
+            core.PackRootRecord('modrinth', 'Ghost001', 'both'),))
+        before = self.f.snapshot()
+        with self.assertRaises(core.HuroshikiError):
+            self.add()
+        self.assertEqual(self.f.snapshot(), before)
+        self.f.assert_unlocked()
+
+
 class ExactPromotionRefreshIntegrityTest(unittest.TestCase):
     def setUp(self):
         self.f = exact_fixture.ExactModVersionSelectionTest('runTest')

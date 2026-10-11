@@ -3378,6 +3378,14 @@ class PackTransaction:
                                 "Exact Add provenance promotion requires "
                                 "authoritative root provenance"
                             )
+                        # Legacy manually restored manifests may lack the
+                        # ignore rule. Repair only the staged control file;
+                        # root identities and sides must still validate.
+                        ignore_path = self.source / ".packwizignore"
+                        ignore_before = ignore_path.read_bytes() if ignore_path.exists() else None
+                        ensure_pack_root_manifest_ignored(
+                            self.source, checkpoint=exact_checkpoint
+                        )
                         source_scan = scan_pack_migration_source(
                             self.source, checkpoint=exact_checkpoint
                         )
@@ -3429,7 +3437,8 @@ class PackTransaction:
                         )
                         self._validated_version_overrides()
                         self._version_override_mutated = True
-                        self._record_source_mutation(intent_only=True)
+                        ignore_changed = ignore_path.read_bytes() != ignore_before
+                        self._record_source_mutation(intent_only=not ignore_changed)
                         if not self._intent_only_mutation:
                             # Earlier metadata edits still require refreshed
                             # index bindings even though this Add is intent-only.

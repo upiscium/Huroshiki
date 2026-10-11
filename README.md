@@ -152,8 +152,9 @@ It does not fetch unrelated roots, upgrade dependencies, or claim to revalidate/
 missing dependency or incorrect dependency side. The runtime distribution does not gain any new
 side or artifact from this operation. A subset request never narrows existing coverage.
 
-Earlier metadata edits in the same transaction still require Packwiz refresh and validated index
-bindings. A different artifact or a request for additional sides uses full exact dependency
+Missing control-file ignore rules are repaired only in staging, without accepting stale roots.
+Such ignore repairs and earlier metadata edits in the same transaction still require Packwiz refresh
+and validated index bindings. A different artifact or a request for additional sides uses full exact dependency
 verification instead; side expansion covers the verified required closure, including any members
 that are also explicit roots. Both refreshes in that path are checked against the authorized
 metadata, roots, exact intent, ignore rules and other Pack files before stage evidence is accepted.
