@@ -7,6 +7,7 @@ import signal
 import sys
 import time
 import unittest
+from unittest.mock import patch
 from collections.abc import Callable
 
 
@@ -26,7 +27,14 @@ def run_pty_script(
 ) -> tuple[bytes, int]:
     environment = os.environ.copy()
     environment.pop("TEXTUAL_ALLOW_SIGNALS", None)
-    pid, master = os.forkpty()
+    try:
+        pid, master = os.forkpty()
+    except OSError as error:
+        if error.errno in {errno.ENOSYS, errno.ENODEV, errno.ENOENT,
+                           errno.ENXIO, errno.EACCES, errno.EPERM}:
+            raise unittest.SkipTest(f"controlling PTY unavailable: {error}") from error
+        # Resource exhaustion or unexpected I/O errors must not become skips.
+        raise
     if pid == 0:
         try:
             os.execve(sys.executable, [sys.executable, "-c", script], environment)
@@ -150,12 +158,7 @@ finally:
     os.write(1, f"RESTORED:{int(ok)}\n".encode())
 '''
 
-        try:
-            output, exit_code = run_pty_script(script)
-        except OSError as error:
-            if error.errno in {errno.ENOSYS, errno.ENODEV, errno.ENOENT}:
-                self.skipTest(f"controlling PTY unavailable: {error}")
-            raise
+        output, exit_code = run_pty_script(script)
         text = output.decode(errors="replace")
         self.assertIn("RAW:1", text)
         self.assertIn("KEYS:sc", text)
@@ -165,6 +168,16 @@ finally:
 
 @unittest.skipUnless(os.name == "posix" and hasattr(os, "forkpty"), "requires a POSIX PTY")
 class PtyHarnessLifecycleTest(unittest.TestCase):
+    def test_pty_permission_failure_is_an_explicit_skip(self) -> None:
+        with patch.object(os, "forkpty", side_effect=OSError(errno.EACCES, "denied")):
+            with self.assertRaisesRegex(unittest.SkipTest, "controlling PTY unavailable"):
+                run_pty_script("")
+
+    def test_unexpected_allocation_error_is_not_hidden_by_skip(self) -> None:
+        with patch.object(os, "forkpty", side_effect=OSError(errno.EIO, "I/O error")):
+            with self.assertRaises(OSError):
+                run_pty_script("")
+
     def assert_reaped(self, pid: int) -> None:
         with self.assertRaises(ChildProcessError):
             os.waitpid(pid, os.WNOHANG)
