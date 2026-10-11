@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## 0.3.2 - 2026-10-11
+
+### MATOI and Compatibility
+
+- Adopt MATOI (纏) as the public project name and `matoi` as the preferred TUI/Nix entrypoint.
+  Preserve `huroshiki`, `packctl`, `HUROSHIKI_*`, and persisted `.huroshiki-*` formats.
+- This is release preparation, not a claim that the v0.3.2 tag or GitHub Release is published.
+
+### Exact Add and Transaction Integrity
+
+- Bind exact provider artifact selection before the first Add resolution; same-artifact re-add
+  preserves installed descriptors, effective sides, version locks, and reasons while promoting roots.
+- Reject stale root provenance, unauthorized refresh changes, stale index hashes, and omitted
+  previously indexed files. Repair missing legacy control ignore rules only in transaction staging.
+- Restore pre-operation staging after failed re-add; honor cancellation and deadlines through
+  publication. Additional sides and artifact changes still use complete exact verification.
+
+### Migration UI and Test Reliability
+
+- Make completed migration navigation one-shot, stopping old-screen polling before asynchronous
+  destination mounting. Cancellation and successful-publication tests wait for actual UI readiness.
+- Require actual PTY child exit and reaping, not just success markers. Separate cold startup from
+  the unchanged five-second input/exit budget, and diagnose restricted PTY environments consistently.
+
+### Scope
+
+- No on-disk namespace migration, automatic live Pack deployment, or server restart.
+- Existing v0.3.1 tags and historical release notes remain unchanged; see the v0.3.2 preparation notes.
+
 ## 0.3.0 - 2026-09-11
 
 ### Stable Release

@@ -29,7 +29,8 @@ huroshiki --version  # legacy compatibility
 packctl --version
 ```
 
-The current main/source version is `0.3.1-dev`. The latest published stable release is `v0.3.1`
+The current main/source version is `0.3.2`. This is the `v0.3.2` release preparation;
+the tag and GitHub Release are not yet published. The latest published stable release is `v0.3.1`
 (released under the former Huroshiki name), which can be run with:
 
 ```bash

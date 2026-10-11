@@ -14,7 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "shared" / "scripts"
 
 # Keep current development expectations separate from immutable published history.
-CURRENT_SOURCE_VERSION = "0.3.1-dev"
+CURRENT_SOURCE_VERSION = "0.3.2"
+CURRENT_RELEASE_DATE = "2026-10-11"
 PUBLISHED_STABLE_VERSION = "0.3.0"
 PUBLISHED_STABLE_DATE = "2026-09-11"
 PUBLISHED_STABLE_TAG = f"v{PUBLISHED_STABLE_VERSION}"
@@ -101,7 +102,8 @@ def release_block(document: str, version: str, date: str) -> str:
 class ReleaseMetadataTest(unittest.TestCase):
     def test_allowed_version_forms_are_strict(self) -> None:
         allowed = {
-            CURRENT_SOURCE_VERSION: "development",
+            CURRENT_SOURCE_VERSION: "stable",
+            "0.3.3-dev": "development",
             PUBLISHED_STABLE_VERSION: "stable",
             "0.3.0-rc.2.dev": "post-RC development",
             HISTORICAL_RC2_VERSION: "release-candidate",
@@ -137,7 +139,7 @@ class ReleaseMetadataTest(unittest.TestCase):
 
     def test_current_version_source_and_runtime_parity(self) -> None:
         self.assertRegex(CURRENT_SOURCE_VERSION, VERSION_RE)
-        self.assertEqual(version_kind(CURRENT_SOURCE_VERSION), "development")
+        self.assertEqual(version_kind(CURRENT_SOURCE_VERSION), "stable")
         self.assertEqual(VERSION, CURRENT_SOURCE_VERSION)
         source = (SCRIPTS / "VERSION").read_text(encoding="utf-8").strip()
         self.assertEqual(source, CURRENT_SOURCE_VERSION)
@@ -152,6 +154,7 @@ class ReleaseMetadataTest(unittest.TestCase):
     def test_cli_versions(self) -> None:
         environment = {**os.environ, "PYTHONPATH": str(SCRIPTS)}
         for script, expected in (
+            ("matoi.py", f"matoi {CURRENT_SOURCE_VERSION}"),
             ("huroshiki.py", f"huroshiki {CURRENT_SOURCE_VERSION}"),
             ("packctl.py", f"packctl {CURRENT_SOURCE_VERSION}"),
         ):
@@ -167,18 +170,21 @@ class ReleaseMetadataTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
 
-    def test_current_post_stable_development_metadata_is_deterministic(self) -> None:
+    def test_current_release_preparation_metadata_is_deterministic(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertTrue(changelog.startswith("# Changelog\n\n## Unreleased\n"))
         self.assertEqual(unreleased_payload(changelog), "")
-        self.assertNotIn(f"## {CURRENT_SOURCE_VERSION} - ", changelog)
+        current = release_block(changelog, CURRENT_SOURCE_VERSION, CURRENT_RELEASE_DATE)
+        notes = (ROOT / "docs/releases" / f"v{CURRENT_SOURCE_VERSION}.md").read_text()
+        self.assertTrue(notes.startswith(f"# MATOI v{CURRENT_SOURCE_VERSION}\n"))
+        self.assertIn(f"Release date: {CURRENT_RELEASE_DATE}", notes)
+        self.assertIn("tag and GitHub Release do not yet exist", notes)
+        for phrase in ("same-artifact", "one-shot", ".huroshiki-roots.json", "#211"):
+            self.assertIn(phrase, notes.lower())
+        self.assertIn("Exact Add", current)
+        self.assertIn("compare/v0.3.1...v0.3.2", notes)
+        # v0.3.1 exists on GitHub, but do not invent or rewrite historical notes.
         self.assertNotIn("## 0.3.1 - ", changelog)
-        development_release_path = (
-            ROOT / "docs" / "releases" / f"v{CURRENT_SOURCE_VERSION}.md"
-        )
-        future_release_path = ROOT / "docs" / "releases" / "v0.3.1.md"
-        self.assertFalse(development_release_path.exists())
-        self.assertFalse(future_release_path.exists())
+        self.assertFalse((ROOT / "docs/releases/v0.3.1.md").exists())
 
     def test_published_stable_metadata_is_immutable(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
