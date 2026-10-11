@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import redirect_stderr
 from io import StringIO
 import threading
@@ -507,7 +508,15 @@ class PackMigrationTuiTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause(0.05)
                 self.assertEqual(session.root_calls, [(('mods/a.pw.toml', 'modrinth:a'),)])
                 self.assertEqual(session.discard_calls, 1)
+                # switch_screen updates app.screen before Compose/Mount finish.
+                # Drain the destination before run_test starts tearing it down.
+                await pilot.pause()
                 self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+                self.assertTrue(app.screen.is_mounted)
+                self.assertEqual(
+                    app.screen.query_one("#project-actions", DataTable).row_count,
+                    len(app.screen.actions),
+                )
 
     async def test_conflict_rendering_includes_complete_bounded_typed_facts(self) -> None:
         FakeMigrationSession.initial_state = "resolution-required"
@@ -611,6 +620,17 @@ class PackMigrationTuiTest(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause(0.05)
                 self.assertEqual(session.prepare_calls, [("review-config",)])
                 self.assertEqual(session.publish_calls, 1)
+                deadline = time.monotonic() + 2
+                while not isinstance(app.screen, huroshiki.ProjectScreen) and time.monotonic() < deadline:
+                    await pilot.pause(0.05)
+                await pilot.pause()
+                self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+                self.assertTrue(app.screen.is_mounted)
+                self.assertEqual(app.screen.project_key, "pack:next")
+                self.assertEqual(
+                    app.screen.query_one("#project-actions", DataTable).row_count,
+                    len(app.screen.actions),
+                )
 
     async def test_escape_cancels_waits_then_discards_before_navigation(self) -> None:
         FakeMigrationSession.delay_start = True
@@ -643,9 +663,48 @@ class PackMigrationTuiTest(unittest.IsolatedAsyncioTestCase):
                 while app.screen is screen and time.monotonic() < deadline:
                     await pilot.pause(0.05)
                 self.assertEqual(session.discard_calls, 1)
+                # switch_screen updates app.screen before Compose/Mount finish.
+                # Drain the destination before run_test starts tearing it down.
+                await pilot.pause()
                 self.assertIsInstance(app.screen, huroshiki.ProjectScreen)
+                self.assertTrue(app.screen.is_mounted)
+                self.assertEqual(
+                    app.screen.query_one("#project-actions", DataTable).row_count,
+                    len(app.screen.actions),
+                )
                 self.assertNotIn("pack:demo", app.pack_copy_migration_owners)
                 self.assertNotIn("pack:next", app.pack_copy_migration_owners)
+
+
+    async def _assert_navigation_with_delayed_project_compose(self, navigation_test) -> None:
+        compose = huroshiki.ProjectScreen._on_compose
+        observed_running = []
+
+        async def delayed_compose(screen, event):
+            # A deterministic scheduling perturbation reproduces the former
+            # teardown-before-composition race without CPU load or retries.
+            await asyncio.sleep(0.15)
+            observed_running.append(screen.app._running)
+            await compose(screen, event)
+
+        with patch.object(huroshiki.ProjectScreen, "_on_compose", delayed_compose):
+            await navigation_test()
+        self.assertEqual(observed_running, [True])
+
+    async def test_cancel_waits_for_delayed_project_composition(self) -> None:
+        await self._assert_navigation_with_delayed_project_compose(
+            self.test_escape_cancels_waits_then_discards_before_navigation
+        )
+
+    async def test_root_cancel_waits_for_delayed_project_composition(self) -> None:
+        await self._assert_navigation_with_delayed_project_compose(
+            self.test_cancel_after_root_selection_waits_then_discards
+        )
+
+    async def test_publish_waits_for_delayed_project_composition(self) -> None:
+        await self._assert_navigation_with_delayed_project_compose(
+            self.test_required_warnings_have_explicit_step_before_exact_publish
+        )
 
 
 if __name__ == "__main__":

@@ -503,6 +503,7 @@ class PackCopyMigrationScreen(Screen[None]):
         self.acknowledged_warnings: tuple[str, ...] = ()
         self.phase = "start"
         self._timer: Timer | None = None
+        self._navigation_started = False
         self._rendered_phase: str | None = None
 
     def compose(self) -> ComposeResult:
@@ -587,7 +588,22 @@ class PackCopyMigrationScreen(Screen[None]):
                 self.owner.cleanup_pending = True
             self.owner.done.set()
 
+    def _finish_navigation(self, project_key: str) -> None:
+        """A screen switch is scheduled immediately but mounts asynchronously."""
+        if self._navigation_started:
+            return
+        self._navigation_started = True
+        # Stop before switching: on_unmount can run after several timer ticks.
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+        self.app.release_pack_copy_migration(self.owner)
+        if not self.app.open_project(project_key):
+            self.app.go_main()
+
     def _poll(self) -> None:
+        if self._navigation_started:
+            return
         with self.owner.lock:
             progress_message = self.owner.progress_message
         if progress_message:
@@ -619,10 +635,10 @@ class PackCopyMigrationScreen(Screen[None]):
                         "Cleanup failed; transaction retained. Press r to retry cleanup."
                     )
             else:
-                self.app.release_pack_copy_migration(self.owner)
-                self.app.open_project(
+                self._finish_navigation(
                     self.owner.target_key if self.owner.published else self.owner.source_key
                 )
+                return
             self.query_one("#migration-status", Static).update(self.status)
             return
         if self.phase == "failure-cleanup":
@@ -730,8 +746,8 @@ class PackCopyMigrationScreen(Screen[None]):
                     self.status = "Published; cleanup pending. Press r to retry cleanup."
                 else:
                     self.status = "Published; cleanup complete. Opening target..."
-                    self.app.release_pack_copy_migration(self.owner)
-                    self.app.open_project(self.owner.target_key)
+                    self._finish_navigation(self.owner.target_key)
+                    return
         self.query_one("#migration-status", Static).update(self.status)
 
     def _render_roots(self) -> None:
@@ -945,6 +961,9 @@ class PackCopyMigrationScreen(Screen[None]):
             self.owner.done.set()
 
     def on_key(self, event: events.Key) -> None:
+        if self._navigation_started:
+            event.stop()
+            return
         if event.key == "space" and self.phase == "roots":
             table = self.query_one("#migration-options", DataTable)
             index = (
@@ -1027,7 +1046,7 @@ class PackCopyMigrationScreen(Screen[None]):
             self._retry_cleanup()
         elif event.key in {"q", "escape"}:
             if self.phase == "failure-cleaned":
-                self.app.open_project(self.owner.source_key)
+                self._finish_navigation(self.owner.source_key)
                 event.stop()
                 return
             self.owner.cleanup_for_failure = False
