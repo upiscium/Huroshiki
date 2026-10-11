@@ -5,6 +5,8 @@ import hashlib
 import json
 from pathlib import Path
 import tomllib
+import threading
+import time
 import unittest
 import zipfile
 
@@ -280,6 +282,71 @@ class InstalledExactReaddIntegrityTest(unittest.TestCase):
             self.add()
         self.assertEqual(self.f.snapshot(), before)
         self.f.assert_unlocked()
+
+
+    def test_refresh_preserves_previously_indexed_ordinary_files(self):
+        ordinary = self.source / 'settings.json'
+        ordinary.write_text('{"enabled":true}')
+        index = tomlkit.parse((self.source / 'index.toml').read_text())
+        index['files'].append({'file':'settings.json', 'hash':hashlib.sha256(ordinary.read_bytes()).hexdigest()})
+        raw = tomlkit.dumps(index).encode()
+        (self.source / 'index.toml').write_bytes(raw)
+        pack = tomlkit.parse((self.source / 'pack.toml').read_text())
+        pack['index']['hash'] = hashlib.sha256(raw).hexdigest()
+        (self.source / 'pack.toml').write_text(tomlkit.dumps(pack))
+        before = core._file_content_snapshot(self.source)
+        refresh_index(self.source)  # Incorrectly omits the existing ordinary file.
+        with self.assertRaises(core.HuroshikiError):
+            core._assert_exact_refresh_postconditions(self.source, before, lambda:None)
+
+    def test_failed_readd_restores_prior_staging_and_can_be_reused(self):
+        tx = core.PackTransaction.create(self.f.key)
+        self.addCleanup(tx.discard)
+        tx.set_side(Path('mods/root.pw.toml'), False, True)
+        before = core._file_content_snapshot(tx.source)
+        generation = tx._mutation_generation
+        def corrupt(command, *, cwd, **kwargs):
+            (cwd / 'unapproved.txt').write_text('failed refresh')
+            return core.ResolverProcessResult(2, '', 'failed', False, False)
+        with patch.object(core, 'run_resolver_process', side_effect=corrupt):
+            with self.assertRaises(core.HuroshikiError):
+                tx.add_mod_transactionally('modrinth','dependency','client',artifact_id='Exact001')
+        self.assertEqual(core._file_content_snapshot(tx.source), before)
+        self.assertEqual(tx._mutation_generation, generation)
+        def refresh(command, *, cwd, **kwargs):
+            refresh_index(cwd)
+            return core.ResolverProcessResult(0,'','',False,False)
+        with patch.object(core,'run_resolver_process',side_effect=refresh):
+            tx.apply()
+        self.assertEqual(len(core.read_pack_root_manifest(self.source)),1)
+        self.assertIsNone(core.get_mod_version_override(self.source,'modrinth:Depn0001'))
+        self.assert_indexes_valid()
+
+    def test_expired_apply_does_not_publish(self):
+        before = self.f.snapshot()
+        tx = core.PackTransaction.create(self.f.key)
+        self.addCleanup(tx.discard)
+        tx.set_side(Path('mods/root.pw.toml'), False, True)
+        with self.assertRaises(core.HuroshikiError):
+            tx.apply(refresh=False,deadline=time.monotonic()-1)
+        self.assertEqual(self.f.snapshot(),before)
+
+    def test_cancellation_between_publication_renames_restores_live_source(self):
+        before = self.f.snapshot()
+        tx = core.PackTransaction.create(self.f.key)
+        self.addCleanup(tx.discard)
+        tx.set_side(Path('mods/root.pw.toml'), False, True)
+        cancel = threading.Event()
+        rename = Path.rename
+        def trigger(path, target):
+            result = rename(path,target)
+            if path == self.source and Path(target) == tx.root/'replaced-source':
+                cancel.set()
+            return result
+        with patch.object(Path,'rename',autospec=True,side_effect=trigger):
+            with self.assertRaises(core.HuroshikiError):
+                tx.apply(refresh=False,cancel_event=cancel)
+        self.assertEqual(self.f.snapshot(),before)
 
 
 class ExactPromotionRefreshIntegrityTest(unittest.TestCase):

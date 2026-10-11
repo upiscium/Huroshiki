@@ -158,6 +158,9 @@ and validated index bindings. A different artifact or a request for additional s
 verification instead; side expansion covers the verified required closure, including any members
 that are also explicit roots. Both refreshes in that path are checked against the authorized
 metadata, roots, exact intent, ignore rules and other Pack files before stage evidence is accepted.
+Failed re-add preparation restores the prior staged Pack, including earlier edits, so retrying the
+transaction cannot publish intent from a failed operation. Previously indexed ordinary files are
+retained, and cancellation/deadline checks continue through final validation and up to publication.
 
 ### Navigation
 

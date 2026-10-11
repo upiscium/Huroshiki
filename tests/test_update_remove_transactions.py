@@ -1596,9 +1596,9 @@ url = "https://example.invalid/manual.jar"
         original_snapshot = core.tree_digest_snapshot
         wrote_late = False
 
-        def snapshot_then_write(path: Path):
+        def snapshot_then_write(path: Path, **kwargs):
             nonlocal wrote_late
-            snapshot = original_snapshot(path)
+            snapshot = original_snapshot(path, **kwargs)
             if path == replaced and not wrote_late:
                 wrote_late = True
                 os.write(held_fd, b"\nlate old-fd write\n")

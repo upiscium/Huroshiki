@@ -1577,10 +1577,10 @@ class ExactModVersionSelectionTest(unittest.TestCase):
             target = transaction.staged_exact_mod_targets()[0]
             validate = transaction._validate_exact_selection_stage
 
-            def blocking_validate(evidence):
+            def blocking_validate(evidence, **kwargs):
                 entered_validation.set()
                 self.assertTrue(release_validation.wait(2))
-                validate(evidence)
+                validate(evidence, **kwargs)
 
             def apply() -> None:
                 try:
